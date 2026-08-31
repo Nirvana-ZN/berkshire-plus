@@ -53,11 +53,22 @@ def seed_local_user(session: Session) -> None:
     session.commit()
 
 
+def _ensure_listed_year(engine: Engine) -> None:
+    from sqlalchemy import text
+
+    with engine.begin() as conn:
+        rows = conn.execute(text("PRAGMA table_info(instruments)")).fetchall()
+        names = {row[1] for row in rows}
+        if "listed_year" not in names:
+            conn.execute(text("ALTER TABLE instruments ADD COLUMN listed_year INTEGER"))
+
+
 def init_db(db_path: Path | None = None) -> Engine:
     from app import models as _models  # noqa: F401
 
     engine = create_db_engine(db_path)
     Base.metadata.create_all(engine)
+    _ensure_listed_year(engine)
     SessionLocal = create_session_factory(engine)
     with SessionLocal() as session:
         seed_local_user(session)

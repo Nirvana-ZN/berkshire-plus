@@ -1,5 +1,7 @@
 .env
 data/app.db
+portfolio/
+reports/
 web/node_modules
 web/dist
 __pycache__/

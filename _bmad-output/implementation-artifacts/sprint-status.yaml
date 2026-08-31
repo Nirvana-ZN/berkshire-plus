@@ -29,28 +29,48 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 08-28-2026 09:38
-last_updated: 08-28-2026 10:15
+last_updated: 08-30-2026 11:40
+
 project: berkshire-plus
 project_key: NOKEY
 tracking_system: file-system
 story_location: d:\code\berkshire-plus\_bmad-output\implementation-artifacts
 development_status:
-  epic-1: in-progress
-  1-1-打开本机工作台: review
-  1-2-一次性迁入-yaml-并看到持仓: backlog
-  1-3-手记买卖: backlog
-  1-4-刷新现价与手工价: backlog
-  1-5-设定目标仓位: backlog
-  1-6-规则灯: backlog
-  1-7-配置模型密钥: backlog
+  epic-1: done
+  1-1-打开本机工作台: done
+  1-2-一次性迁入-yaml-并看到持仓: done
+  1-3-手记买卖: done
+  1-4-刷新现价与手工价: done
+  1-5-设定目标仓位: done
+  1-6-规则灯: done
+  1-7-配置模型密钥: done
   epic-1-retrospective: optional
 
-  epic-2: backlog
-  2-1-按范围跑漏斗得到三态名单: backlog
-  2-2-终选-checklist-与决策备忘录: backlog
-  2-3-观察池与预填记账: backlog
+  epic-2: done
+  2-1-按范围跑漏斗得到三态名单: done
+  2-2-终选-checklist-与决策备忘录: done
+  2-3-观察池与预填记账: done
   epic-2-retrospective: optional
 
-  epic-3: backlog
-  3-1-一键审视得到纸面决定: backlog
-  epic-3-retrospective: optional
+  epic-3: done
+  3-1-一键审视得到纸面决定: done
+  epic-3-retrospective: done
+action_items:
+  - id: "epic-3-retro-item-1-将冲刺-3-1-一键审视得到纸面决定-从-review-标为-done-若接受纸"
+    epic: 3
+    action: "将冲刺 3-1-一键审视得到纸面决定 从 review 标为 done（若接受纸面审视已落地）"
+    owner: "zhangnan"
+    status: done
+    ref: "d:\\code\\berkshire-plus\\_bmad-output\\implementation-artifacts\\epic-3-retro-2026-08-30.md"
+  - id: "epic-3-retro-item-2-补测-审视占锁时-post-api-screens-与-post-api-res"
+    epic: 3
+    action: "补测：审视占锁时 POST /api/screens 与 POST /api/research 返回 409"
+    owner: "zhangnan"
+    status: done
+    ref: "d:\\code\\berkshire-plus\\_bmad-output\\implementation-artifacts\\epic-3-retro-2026-08-30.md"
+  - id: "epic-3-retro-item-3-给-get-api-jobs-id-加类型或复合查找-避免三表主键碰撞"
+    epic: 3
+    action: "给 GET /api/jobs/{id} 加类型或复合查找，避免三表主键碰撞"
+    owner: "zhangnan"
+    status: done
+    ref: "d:\\code\\berkshire-plus\\_bmad-output\\implementation-artifacts\\epic-3-retro-2026-08-30.md"

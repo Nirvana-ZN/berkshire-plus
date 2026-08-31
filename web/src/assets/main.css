@@ -22,7 +22,7 @@ body {
   min-height: 100vh;
   display: flex;
   flex-direction: column;
-  max-width: 52rem;
+  max-width: 88rem;
   margin: 0 auto;
   padding: 1.25rem 1.5rem 2rem;
 }
@@ -81,6 +81,151 @@ h2 {
 
 .entries a {
   color: inherit;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  background: #fff;
+}
+
+th,
+td {
+  border: 1px solid #d8d2c4;
+  padding: 0.5rem 0.75rem;
+  text-align: left;
+}
+
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem 1rem;
+  margin-bottom: 0.75rem;
+}
+
+.toolbar h1 {
+  margin: 0 auto 0 0;
+}
+
+.hint,
+.muted {
+  color: #5c564c;
+  font-size: 0.9rem;
+}
+
+.cash-line {
+  margin: 0.25rem 0 0.75rem;
+}
+
+.book-wrap {
+  overflow-x: auto;
+  margin: 0.5rem 0 1rem;
+}
+
+.book input {
+  width: 6.25rem;
+}
+
+.cash-row td {
+  background: #f6f4ef;
+}
+
+.memo {
+  white-space: pre-wrap;
+  background: #fff;
+  border: 1px solid #d8d2c4;
+  padding: 1rem;
+}
+
+.name-cell {
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 0.15em;
+}
+
+.inline-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem 1rem;
+  align-items: flex-end;
+}
+
+.inline-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  font-size: 0.9rem;
+}
+
+.inline-form label.check-inline {
+  flex-direction: row;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+button {
+  padding: 0.35rem 0.75rem;
+  cursor: pointer;
+}
+
+input,
+select {
+  padding: 0.3rem 0.45rem;
+}
+
+.book td,
+.book th {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.book-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem 1rem;
+}
+
+.book-form .book-wrap {
+  flex: 1 1 100%;
+}
+
+.fold {
+  border: 1px solid #d8d2c4;
+  background: #fff;
+  padding: 0.35rem 1rem 0.85rem;
+  margin: 0.75rem 0;
+}
+
+.fold summary {
+  cursor: pointer;
+  font-weight: 600;
+  padding: 0.5rem 0;
+}
+
+.fold h2 {
+  font-size: 1.1rem;
+  margin: 0.75rem 0 0.35rem;
+}
+
+.stack-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+  max-width: 28rem;
+}
+
+.stack-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.check-inline {
+  flex-direction: row !important;
+  align-items: center;
+  gap: 0.4rem;
 }
 
 footer p {

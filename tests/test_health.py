@@ -4,6 +4,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 
 from app.main import create_app
+from market.quotes import FakeQuoteClient
 
 ROOT = Path(__file__).resolve().parents[1]
 APP_DIR = ROOT / "app"
@@ -17,7 +18,11 @@ def _assert_single_user(db_path: Path) -> None:
 
 
 def test_health_ok(tmp_path: Path) -> None:
-    app = create_app(db_path=tmp_path / "app.db")
+    app = create_app(
+        db_path=tmp_path / "app.db",
+        quote_client=FakeQuoteClient(),
+        env_path=tmp_path / ".env",
+    )
     with TestClient(app) as client:
         response = client.get("/api/health")
     assert 200 <= response.status_code < 300
@@ -28,16 +33,34 @@ def test_health_ok(tmp_path: Path) -> None:
 
 def test_seed_user_id_1_on_first_start(tmp_path: Path) -> None:
     db_path = tmp_path / "app.db"
-    with TestClient(create_app(db_path=db_path)) as client:
+    with TestClient(
+        create_app(
+            db_path=db_path,
+            quote_client=FakeQuoteClient(),
+            env_path=tmp_path / ".env",
+        )
+    ) as client:
         assert client.get("/api/health").status_code == 200
     _assert_single_user(db_path)
 
 
 def test_restart_keeps_single_user_id_1(tmp_path: Path) -> None:
     db_path = tmp_path / "app.db"
-    with TestClient(create_app(db_path=db_path)) as client:
+    with TestClient(
+        create_app(
+            db_path=db_path,
+            quote_client=FakeQuoteClient(),
+            env_path=tmp_path / ".env",
+        )
+    ) as client:
         assert client.get("/api/health").status_code == 200
-    with TestClient(create_app(db_path=db_path)) as client:
+    with TestClient(
+        create_app(
+            db_path=db_path,
+            quote_client=FakeQuoteClient(),
+            env_path=tmp_path / ".env",
+        )
+    ) as client:
         assert client.get("/api/health").status_code == 200
     _assert_single_user(db_path)
 
@@ -71,12 +94,12 @@ def test_empty_screen_shell_does_not_invent_list() -> None:
     screen = (ROOT / "web/src/views/ScreenView.vue").read_text(encoding="utf-8")
     app_vue = (ROOT / "web/src/App.vue").read_text(encoding="utf-8")
     assert "选股" in screen
+    assert "尚未运行漏斗" in screen
     assert "不构成投资建议" in app_vue
     assert "今日推荐" not in screen
     assert "收益排行" not in screen
     assert "<ul" not in screen.lower()
     assert "<ol" not in screen.lower()
-    assert "<table" not in screen.lower()
 
 
 def test_scaffold_has_router_without_pinia() -> None:
@@ -120,7 +143,12 @@ def test_fastapi_hosts_spa_when_dist_exists(tmp_path: Path) -> None:
     )
     js_bytes = b"window.__WORKBENCH__=1;"
     (assets / "app.js").write_bytes(js_bytes)
-    app = create_app(db_path=tmp_path / "app.db", dist_path=dist)
+    app = create_app(
+        db_path=tmp_path / "app.db",
+        dist_path=dist,
+        quote_client=FakeQuoteClient(),
+        env_path=tmp_path / ".env",
+    )
     with TestClient(app) as client:
         home = client.get("/")
         assert home.status_code == 200
@@ -144,7 +172,12 @@ def test_fastapi_hosts_spa_when_dist_exists(tmp_path: Path) -> None:
 
 
 def test_missing_dist_root_is_envelope_404(tmp_path: Path) -> None:
-    app = create_app(db_path=tmp_path / "app.db", dist_path=tmp_path / "no-dist")
+    app = create_app(
+        db_path=tmp_path / "app.db",
+        dist_path=tmp_path / "no-dist",
+        quote_client=FakeQuoteClient(),
+        env_path=tmp_path / ".env",
+    )
     with TestClient(app) as client:
         missing = client.get("/")
         assert missing.status_code == 404
@@ -156,6 +189,11 @@ def test_missing_dist_root_is_envelope_404(tmp_path: Path) -> None:
 def test_create_app_default_db_path_seeds_user(tmp_path: Path, monkeypatch) -> None:
     db_path = tmp_path / "app.db"
     monkeypatch.setattr("app.db.DEFAULT_DB_PATH", db_path)
-    with TestClient(create_app()) as client:
+    with TestClient(
+        create_app(
+            quote_client=FakeQuoteClient(),
+            env_path=tmp_path / ".env",
+        )
+    ) as client:
         assert client.get("/api/health").status_code == 200
     _assert_single_user(db_path)

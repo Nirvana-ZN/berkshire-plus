@@ -1,0 +1,79 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+from sqlalchemy import select, update
+from sqlalchemy.orm import Session
+
+from app.models import JobLock, PortfolioReview, ResearchJob, ScreenRun
+
+JOB_TYPE_FUNNEL = "funnel"
+JOB_TYPE_REVIEW = "review"
+LOCK_ROW_ID = 1
+ACTIVE_STATUSES = ("queued", "running")
+
+
+def ensure_lock_row(session: Session) -> JobLock:
+    row = session.get(JobLock, LOCK_ROW_ID)
+    if row is None:
+        row = JobLock(id=LOCK_ROW_ID, job_id=None, job_type=None, held_at=None)
+        session.add(row)
+        session.flush()
+    return row
+
+
+def clear_stale_lock(session: Session) -> None:
+    ensure_lock_row(session)
+    leftover = session.scalars(
+        select(ScreenRun).where(ScreenRun.status.in_(ACTIVE_STATUSES))
+    ).all()
+    for run in leftover:
+        run.status = "failed"
+        run.error = "进程重启，任务中断"
+        run.updated_at = datetime.now(timezone.utc)
+    leftover_research = session.scalars(
+        select(ResearchJob).where(ResearchJob.status.in_(ACTIVE_STATUSES))
+    ).all()
+    for job in leftover_research:
+        job.status = "failed"
+        job.error = "进程重启，任务中断"
+        job.updated_at = datetime.now(timezone.utc)
+    leftover_reviews = session.scalars(
+        select(PortfolioReview).where(PortfolioReview.status.in_(ACTIVE_STATUSES))
+    ).all()
+    for review in leftover_reviews:
+        review.status = "failed"
+        review.error = "进程重启，任务中断"
+        review.updated_at = datetime.now(timezone.utc)
+    row = session.get(JobLock, LOCK_ROW_ID)
+    if row is not None:
+        row.job_id = None
+        row.job_type = None
+        row.held_at = None
+    session.commit()
+
+
+def lock_status(session: Session) -> dict[str, object] | None:
+    row = session.get(JobLock, LOCK_ROW_ID)
+    if row is None or row.job_id is None:
+        return None
+    return {"type": row.job_type, "job_id": row.job_id}
+
+
+def try_acquire(session: Session, job_id: int, job_type: str) -> bool:
+    ensure_lock_row(session)
+    now = datetime.now(timezone.utc)
+    result = session.execute(
+        update(JobLock)
+        .where(JobLock.id == LOCK_ROW_ID, JobLock.job_id.is_(None))
+        .values(job_id=job_id, job_type=job_type, held_at=now)
+    )
+    return int(result.rowcount or 0) == 1
+
+
+def release(session: Session, job_id: int) -> None:
+    session.execute(
+        update(JobLock)
+        .where(JobLock.id == LOCK_ROW_ID, JobLock.job_id == job_id)
+        .values(job_id=None, job_type=None, held_at=None)
+    )
