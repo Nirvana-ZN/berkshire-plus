@@ -39,3 +39,15 @@ class FinancialRow:
     bps: Decimal | None = None
     npl: Decimal | None = None
     eps: Decimal | None = None
+
+
+@dataclass(frozen=True)
+class ValuationPoint:
+    code: str
+    month: str
+    trade_date: str
+    pe: Decimal | None
+    pb: Decimal | None
+    price: Decimal | None = None
+    source: str = "eastmoney:RPT_VALUEANALYSIS_DET"
+    ratio_method: str = "PE_TTM/PB_MRQ"

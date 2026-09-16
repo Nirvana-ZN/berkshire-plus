@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 from threading import Event
 from typing import Protocol
 from urllib.parse import quote
 
 from market.cheap import CheapRow
-from market.types import Constituent, FinancialRow, MarketError
+from market.types import Constituent, FinancialRow, MarketError, ValuationPoint
 
 BOARD_LIST_URL = "https://push2delay.eastmoney.com/api/qt/clist/get"
 HS_A_FS = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
@@ -19,11 +20,13 @@ BREADTH_URL = (
     "https://push2delay.eastmoney.com/api/qt/ulist.np/get"
     "?fltt=2&secids=0.399317&fields=f3,f12,f104,f105,f106"
 )
-def _kline_url(limit: int) -> str:
+def _kline_url(
+    limit: int, *, end: str = "20500101", secid: str = "0.399317"
+) -> str:
     return (
         "https://push2his.eastmoney.com/api/qt/stock/kline/get"
-        "?secid=0.399317&fields1=f1,f2,f3,f4,f5,f6"
-        f"&fields2=f51,f52,f53,f54,f55,f56,f57&klt=101&fqt=1&end=20500101&lmt={limit}"
+        f"?secid={secid}&fields1=f1,f2,f3,f4,f5,f6"
+        f"&fields2=f51,f52,f53,f54,f55,f56,f57&klt=101&fqt=1&end={end}&lmt={limit}"
     )
 
 
@@ -99,6 +102,12 @@ class MarketClient(Protocol):
     def fetch_cheap_universe(self) -> list[CheapRow]:
         """沪深 A 股截面：现价 / PE / PB / 市值 / 行业。"""
 
+    def fetch_valuation_history(self, code: str) -> list[ValuationPoint]:
+        """Return one source-reported PE/PB point per month for five years."""
+
+    def fetch_trading_dates(self, end: str, limit: int = 6) -> list[str]:
+        """Return actual exchange dates ending no later than end."""
+
 
 class FakeMarketClient:
     def __init__(
@@ -115,6 +124,8 @@ class FakeMarketClient:
         breadth: Mapping[str, object] | None = None,
         cheap_universe: Sequence[CheapRow] | None = None,
         cheap_error: str | None = None,
+        valuation_history: Sequence[ValuationPoint] | None = None,
+        trading_dates: Sequence[str] | None = None,
     ) -> None:
         self.constituents = list(constituents or [])
         self.financials = list(financials or [])
@@ -141,6 +152,8 @@ class FakeMarketClient:
         }
         self.cheap_universe = list(cheap_universe or [])
         self.cheap_error = cheap_error
+        self.valuation_history = list(valuation_history or [])
+        self.trading_dates = list(trading_dates or [])
 
     def fetch_constituents(self, scope_type: str, scope_text: str) -> list[Constituent]:
         self.calls.append(("constituents", scope_type, scope_text))
@@ -178,6 +191,14 @@ class FakeMarketClient:
         if self.cheap_error is not None:
             raise MarketError(self.cheap_error)
         return list(self.cheap_universe)
+
+    def fetch_valuation_history(self, code: str) -> list[ValuationPoint]:
+        self.calls.append(("valuation_history", code))
+        return [row for row in self.valuation_history if row.code == code]
+
+    def fetch_trading_dates(self, end: str, limit: int = 6) -> list[str]:
+        self.calls.append(("trading_dates", end, str(limit)))
+        return [day for day in self.trading_dates if day <= end][-limit:]
 
     def list_boards(self, scope_type: str, query: str = "") -> list[dict[str, str]]:
         self.calls.append(("boards", scope_type, query))
@@ -247,6 +268,15 @@ def _as_decimal(value: object) -> Decimal | None:
     return number
 
 
+def _positive_decimal(value: object) -> Decimal | None:
+    number = _as_decimal(value)
+    return number if number is not None and number > 0 else None
+
+
+def _five_year_month_start(today: date) -> date:
+    return date(today.year - 5, today.month, 1)
+
+
 def _mul(left: Decimal | None, right: Decimal | None) -> Decimal | None:
     if left is None or right is None:
         return None
@@ -267,6 +297,43 @@ def _is_a_share_code(code: str) -> bool:
         and text[:6].isdigit()
         and text.endswith((".SH", ".SZ", ".BJ"))
     )
+
+
+def _is_hs_code(code: str) -> bool:
+    return _is_a_share_code(code) and code.upper().endswith((".SH", ".SZ"))
+
+
+def _secid(code: str) -> str:
+    text = code.strip().upper()
+    if not _is_hs_code(text):
+        raise ValueError(f"仅支持沪深 A 股代码: {code}")
+    return f"{'1' if text.endswith('.SH') else '0'}.{text[:6]}"
+
+
+def _compact_date(value: object) -> str | None:
+    text = str(value or "")
+    if len(text) != 8 or not text.isdigit():
+        return None
+    result = f"{text[:4]}-{text[4:6]}-{text[6:]}"
+    try:
+        date.fromisoformat(result)
+    except ValueError:
+        return None
+    return result
+
+
+def _timestamp_date(value: object) -> str | None:
+    try:
+        return datetime.fromtimestamp(int(value), tz=UTC).date().isoformat()
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+
+
+def _status_code(value: object) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _equity_from_item(item: Mapping[str, object]) -> tuple[str, str] | None:
@@ -507,6 +574,94 @@ class EastMoneyClient:
                 years[code] = year
         return years
 
+    def fetch_valuation_history(self, code: str) -> list[ValuationPoint]:
+        normalized = code.strip().upper()
+        try:
+            _secid(normalized)
+        except ValueError as exc:
+            raise MarketError(str(exc)) from exc
+        start = _five_year_month_start(date.today())
+        records: list[dict] = []
+        page = 1
+        while True:
+            filt = f'(SECURITY_CODE="{normalized[:6]}")'
+            url = (
+                f"{FINANCIALS_URL}?reportName=RPT_VALUEANALYSIS_DET"
+                f"&columns=ALL&pageSize=500&pageNumber={page}"
+                f"&sortColumns=TRADE_DATE&sortTypes=-1&filter={quote(filt)}"
+            )
+            payload = self._get_json(url)
+            if payload.get("success") is False:
+                raise MarketError(str(payload.get("message") or "估值历史接口不可用"))
+            result = payload.get("result") or {}
+            rows = result.get("data") if isinstance(result, dict) else None
+            if rows is None:
+                rows = []
+            if not isinstance(rows, list):
+                raise MarketError("估值历史接口返回格式错误")
+            valid_rows = [row for row in rows if isinstance(row, dict)]
+            records.extend(valid_rows)
+            days = [
+                str(row.get("TRADE_DATE") or "")[:10]
+                for row in valid_rows
+                if len(str(row.get("TRADE_DATE") or "")) >= 10
+            ]
+            pages = result.get("pages") if isinstance(result, dict) else None
+            if (
+                not valid_rows
+                or (days and min(days) <= start.isoformat())
+                or (isinstance(pages, int) and page >= pages)
+                or (not isinstance(pages, int) and len(valid_rows) < 500)
+            ):
+                break
+            page += 1
+
+        monthly: dict[str, tuple[str, dict]] = {}
+        for row in records:
+            trade_date = str(row.get("TRADE_DATE") or "")[:10]
+            try:
+                parsed_date = date.fromisoformat(trade_date)
+            except ValueError:
+                continue
+            if parsed_date < start:
+                continue
+            month = trade_date[:7]
+            previous = monthly.get(month)
+            if previous is None or trade_date > previous[0]:
+                monthly[month] = (trade_date, row)
+        return [
+            ValuationPoint(
+                code=normalized,
+                month=month,
+                trade_date=trade_date,
+                pe=_positive_decimal(row.get("PE_TTM")),
+                pb=_positive_decimal(row.get("PB_MRQ")),
+                price=_positive_decimal(row.get("CLOSE_PRICE")),
+            )
+            for month, (trade_date, row) in sorted(monthly.items(), reverse=True)
+        ]
+
+    def fetch_trading_dates(self, end: str, limit: int = 6) -> list[str]:
+        if limit <= 0:
+            return []
+        compact_end = end.replace("-", "")
+        if len(compact_end) != 8 or not compact_end.isdigit():
+            raise MarketError(f"不是有效日期: {end}")
+        from market.sentiment import parse_kline
+
+        try:
+            parsed = parse_kline(
+                self._get_json_direct(_kline_url(limit, end=compact_end))
+            )
+        except MarketError:
+            raise
+        except Exception as exc:
+            raise MarketError(str(exc)) from exc
+        dates = parsed.get("dates")
+        if not isinstance(dates, list):
+            raise MarketError("交易日接口返回格式错误")
+        return [str(day)[:10] for day in dates][-limit:]
+
     def fetch_notices(self, code: str) -> list[dict[str, str]]:
         from market.cninfo import fetch_notices
 
@@ -540,7 +695,7 @@ class EastMoneyClient:
         try:
             diff = self._clist_diff(
                 fs=HS_A_FS,
-                fields="f12,f13,f14,f2,f9,f23,f20,f100",
+                fields="f12,f13,f14,f2,f9,f23,f20,f26,f100,f124,f292",
                 fid="f12",
                 max_pages=80,
             )
@@ -548,6 +703,15 @@ class EastMoneyClient:
             raise
         except Exception as exc:
             raise MarketError(str(exc)) from exc
+        exchange_dates: list[str] = []
+        # ponytail: only f292=6 needs one kline call (14/5,559 at probe);
+        # batch this if the suspended set grows materially.
+        if any(_status_code(item.get("f292")) == 6 for item in diff):
+            try:
+                exchange_dates = self.fetch_trading_dates(date.today().isoformat())
+            except MarketError:
+                exchange_dates = []
+        latest_exchange_date = exchange_dates[-1] if exchange_dates else None
         rows: list[CheapRow] = []
         for item in diff:
             if not isinstance(item, dict):
@@ -558,20 +722,73 @@ class EastMoneyClient:
                 continue
             if code.endswith(".BJ"):
                 continue
+            price = _as_decimal(item.get("f2"))
+            market_status = _status_code(item.get("f292"))
+            # Probe made 2 (priced) and 6 (unpriced suspension) unambiguous.
+            # Codes 7/9 mix terminal/pre-listing states, so keep them unknown.
+            if market_status == 2 and price is not None and price > 0:
+                trading_status = "trading"
+                last_trade_date = _timestamp_date(item.get("f124"))
+            elif market_status == 6:
+                trading_status = "suspended"
+                last_trade_date = (
+                    self._last_trade_date(code, latest_exchange_date)
+                    if latest_exchange_date is not None
+                    else None
+                )
+            else:
+                trading_status = None
+                last_trade_date = None
+            if name.startswith("退市") or name.endswith("退"):
+                is_delisting: bool | None = True
+            elif market_status in {2, 6, 9}:
+                is_delisting = False
+            else:
+                is_delisting = None
             rows.append(
                 CheapRow(
                     code=code,
                     name=name,
-                    price=_as_decimal(item.get("f2")),
+                    price=price,
                     pe=_as_decimal(item.get("f9")),
                     pb=_as_decimal(item.get("f23")),
                     mcap=_as_decimal(item.get("f20")),
                     industry=str(item.get("f100") or "").strip(),
+                    exchange=code.rsplit(".", 1)[1],
+                    listing_date=_compact_date(item.get("f26")),
+                    is_st=name.upper().startswith(("ST", "*ST")),
+                    is_delisting=is_delisting,
+                    trading_status=trading_status,
+                    last_trade_date=last_trade_date,
+                    industry_version=None,
+                    industry_as_of=None,
+                    security_source="eastmoney:push2delay",
+                    market_status_code=market_status,
                 )
             )
         if not rows:
             raise MarketError("低估值榜解析不到沪深A股名单")
         return rows
+
+    def _last_trade_date(self, code: str, end: str) -> str | None:
+        from market.sentiment import parse_kline
+
+        try:
+            parsed = parse_kline(
+                self._get_json_direct(
+                    _kline_url(
+                        1,
+                        end=end.replace("-", ""),
+                        secid=_secid(code),
+                    )
+                )
+            )
+        except Exception:
+            return None
+        dates = parsed.get("dates")
+        if not isinstance(dates, list) or not dates:
+            return None
+        return str(dates[-1])[:10]
 
     def _limit_counts(self) -> tuple[int | None, int | None]:
         from datetime import datetime, timedelta

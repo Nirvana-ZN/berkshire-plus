@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 
@@ -17,7 +18,21 @@ SHOW_LIMIT = 30
 SORTS = frozenset({"pe", "pb"})
 SCOPE = "hs_a"
 SCOPE_LABEL = "沪深A股（不含北交所）"
-METHOD = "v1"
+METHOD = "v2"
+_SECURITY_FIELDS = frozenset(
+    {
+        "exchange",
+        "listing_date",
+        "is_st",
+        "is_delisting",
+        "trading_status",
+        "last_trade_date",
+        "industry_version",
+        "industry_as_of",
+        "security_source",
+        "market_status_code",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -29,6 +44,16 @@ class CheapRow:
     pb: Decimal | None
     mcap: Decimal | None
     industry: str
+    exchange: str | None = None
+    listing_date: str | None = None
+    is_st: bool | None = None
+    is_delisting: bool | None = None
+    trading_status: str | None = None
+    last_trade_date: str | None = None
+    industry_version: str | None = None
+    industry_as_of: str | None = None
+    security_source: str | None = None
+    market_status_code: int | None = None
 
 
 def _is_st(name: str) -> bool:
@@ -52,6 +77,30 @@ def eligible_cheap(rows: list[CheapRow], *, sort: str = "pe") -> list[CheapRow]:
     return kept
 
 
+def security_state_eligible(
+    row: CheapRow, frozen_trading_dates: Sequence[str]
+) -> bool:
+    if (
+        row.exchange not in {"SH", "SZ"}
+        or row.listing_date is None
+        or row.is_st is not False
+        or row.is_delisting is not False
+        or not row.industry
+        or row.industry == "-"
+        or row.industry_version is None
+        or row.industry_as_of is None
+        or row.security_source is None
+        or row.last_trade_date is None
+        or not frozen_trading_dates
+    ):
+        return False
+    if row.trading_status == "trading":
+        return row.last_trade_date == frozen_trading_dates[-1]
+    if row.trading_status == "suspended":
+        return row.last_trade_date in frozen_trading_dates[-5:]
+    return False
+
+
 def _json_number(value: Decimal | None) -> int | float | None:
     if value is None or not value.is_finite():
         return None
@@ -72,6 +121,22 @@ def row_json(row: CheapRow) -> dict[str, object]:
     }
 
 
+def _cache_json(row: CheapRow) -> dict[str, object]:
+    return {
+        **row_json(row),
+        "exchange": row.exchange,
+        "listing_date": row.listing_date,
+        "is_st": row.is_st,
+        "is_delisting": row.is_delisting,
+        "trading_status": row.trading_status,
+        "last_trade_date": row.last_trade_date,
+        "industry_version": row.industry_version,
+        "industry_as_of": row.industry_as_of,
+        "security_source": row.security_source,
+        "market_status_code": row.market_status_code,
+    }
+
+
 def _as_dec(value: object) -> Decimal | None:
     if value is None or value == "" or value == "-":
         return None
@@ -85,6 +150,13 @@ def _as_dec(value: object) -> Decimal | None:
 def _from_json(raw: object) -> CheapRow | None:
     if not isinstance(raw, dict):
         return None
+    if not _SECURITY_FIELDS.issubset(raw):
+        return None
+    if any(
+        raw.get(key) is not None and not isinstance(raw.get(key), bool)
+        for key in ("is_st", "is_delisting")
+    ):
+        return None
     name = str(raw.get("name") or "").strip()
     code = str(raw.get("code") or "").strip()
     if not name or not code:
@@ -97,6 +169,32 @@ def _from_json(raw: object) -> CheapRow | None:
         pb=_as_dec(raw.get("pb")),
         mcap=_as_dec(raw.get("mcap")),
         industry=str(raw.get("industry") or "").strip(),
+        exchange=str(raw["exchange"]) if raw["exchange"] is not None else None,
+        listing_date=(
+            str(raw["listing_date"]) if raw["listing_date"] is not None else None
+        ),
+        is_st=raw["is_st"],
+        is_delisting=raw["is_delisting"],
+        trading_status=(
+            str(raw["trading_status"]) if raw["trading_status"] is not None else None
+        ),
+        last_trade_date=(
+            str(raw["last_trade_date"]) if raw["last_trade_date"] is not None else None
+        ),
+        industry_version=(
+            str(raw["industry_version"]) if raw["industry_version"] is not None else None
+        ),
+        industry_as_of=(
+            str(raw["industry_as_of"]) if raw["industry_as_of"] is not None else None
+        ),
+        security_source=(
+            str(raw["security_source"]) if raw["security_source"] is not None else None
+        ),
+        market_status_code=(
+            int(raw["market_status_code"])
+            if isinstance(raw["market_status_code"], int)
+            else None
+        ),
     )
 
 
@@ -119,6 +217,8 @@ def _cached(
     if not isinstance(rows, list):
         return None
     parsed = [_from_json(item) for item in rows]
+    if any(item is None for item in parsed):
+        return None
     return [item for item in parsed if item is not None], float(fetched)
 
 
@@ -130,7 +230,7 @@ def _store(session: Session, rows: list[CheapRow], fetched_at: float) -> None:
                 {
                     "method": METHOD,
                     "fetched_at": fetched_at,
-                    "rows": [row_json(row) for row in rows],
+                    "rows": [_cache_json(row) for row in rows],
                 },
                 ensure_ascii=False,
             ),
