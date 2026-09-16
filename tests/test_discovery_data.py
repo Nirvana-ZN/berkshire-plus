@@ -2590,6 +2590,7 @@ def test_discovery_fill_throttles_and_stops_on_durable_daily_budget(
         untouched = session.get(DiscoveryDataCheckpoint, (fill_id, codes[2]))
         assert fill is not None and untouched is not None
         assert (fill.status, fill.daily_requests, fill.completed) == ("paused", 4, 2)
+        assert fill.last_error == "daily request budget reached"
         assert untouched.status == "pending"
         assert discovery_data_status(
             session, policy=policy, now=clock.now()
@@ -2612,6 +2613,7 @@ def test_discovery_fill_throttles_and_stops_on_durable_daily_budget(
         fill = session.get(DiscoveryDataFill, fill_id)
         assert fill is not None
         assert (fill.status, fill.daily_requests, fill.completed) == ("done", 2, 3)
+        assert fill.last_error is None
     engine.dispose()
 
 
@@ -2723,6 +2725,7 @@ def test_discovery_empty_bundle_is_success_and_max_runtime_pauses_next(
         pending = session.get(DiscoveryDataCheckpoint, (fill_id, second))
         assert fill is not None and empty_checkpoint is not None and pending is not None
         assert (fill.status, fill.completed, fill.failed) == ("paused", 1, 0)
+        assert fill.last_error == "maximum run time reached"
         assert empty_checkpoint.status == "done"
         assert empty_checkpoint.valuation_points == 0
         assert pending.status == "pending"

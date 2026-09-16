@@ -507,19 +507,20 @@ def execute_discovery_data_fill(
         fill = session.get(DiscoveryDataFill, fill_id)
         if fill is not None:
             _pause_running_checkpoints(session, fill, _aware_utc(timer.now()))
-            unresolved = session.scalars(
-                select(DiscoveryDataCheckpoint)
-                .where(
-                    DiscoveryDataCheckpoint.fill_id == fill.id,
-                    DiscoveryDataCheckpoint.status != "done",
-                    DiscoveryDataCheckpoint.error.is_not(None),
-                )
-                .order_by(
-                    DiscoveryDataCheckpoint.updated_at.desc(),
-                    DiscoveryDataCheckpoint.code,
-                )
-            ).first()
-            fill.last_error = None if unresolved is None else unresolved.error
+            if fill.status in ("done", "failed"):
+                unresolved = session.scalars(
+                    select(DiscoveryDataCheckpoint)
+                    .where(
+                        DiscoveryDataCheckpoint.fill_id == fill.id,
+                        DiscoveryDataCheckpoint.status != "done",
+                        DiscoveryDataCheckpoint.error.is_not(None),
+                    )
+                    .order_by(
+                        DiscoveryDataCheckpoint.updated_at.desc(),
+                        DiscoveryDataCheckpoint.code,
+                    )
+                ).first()
+                fill.last_error = None if unresolved is None else unresolved.error
         release(session, fill_id, JOB_TYPE_DISCOVERY_DATA)
         session.commit()
 
