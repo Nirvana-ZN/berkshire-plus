@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.envfile import TAVILY_API_KEY
 from app.models import Financial, Instrument, Quote, ResearchArtifact, ResearchJob, Setting, Thesis
-from jobs.lock import release
+from jobs.lock import JOB_TYPE_RESEARCH, release
 from ledger.positions import LOCAL_USER_ID, load_positions
 from ledger.quotes import BookSnapshot, project_book
 from market.sentiment import is_extreme_greed
@@ -286,7 +286,7 @@ def execute_research(
     job = session.get(ResearchJob, job_id)
     if job is None:
         try:
-            release(session, job_id)
+            release(session, job_id, JOB_TYPE_RESEARCH)
             session.commit()
         except Exception:
             session.rollback()
@@ -305,7 +305,7 @@ def execute_research(
         )
     finally:
         try:
-            release(session, job_id)
+            release(session, job_id, JOB_TYPE_RESEARCH)
             session.commit()
         except Exception:
             session.rollback()

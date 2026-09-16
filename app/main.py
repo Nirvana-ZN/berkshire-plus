@@ -768,10 +768,19 @@ def create_app(
 
     @app.post("/api/discovery-data/fill")
     async def post_discovery_data_fill(request: Request):
-        try:
-            payload = await request.json()
-        except Exception:
+        body = await request.body()
+        if not body.strip():
             payload = {}
+        else:
+            try:
+                payload = json.loads(body)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                return _error_json(
+                    400,
+                    error="请求无效",
+                    code="INVALID_DISCOVERY_DATA_FILL",
+                    detail="无法解析请求",
+                )
         if payload is None:
             payload = {}
         if not isinstance(payload, dict):

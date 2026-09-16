@@ -16,7 +16,7 @@ from app.models import (
     ScreenRun,
     Setting,
 )
-from jobs.lock import release
+from jobs.lock import JOB_TYPE_REVIEW, release
 from jobs.research import _run_one as run_research_one, load_book_dict, web_search_enabled
 from ledger.positions import LOCAL_USER_ID, load_positions
 from ledger.quotes import (
@@ -186,7 +186,7 @@ def execute_review(
     row = session.get(PortfolioReview, review_id)
     if row is None:
         try:
-            release(session, review_id)
+            release(session, review_id, JOB_TYPE_REVIEW)
             session.commit()
         except Exception:
             session.rollback()
@@ -202,7 +202,7 @@ def execute_review(
         )
     finally:
         try:
-            release(session, review_id)
+            release(session, review_id, JOB_TYPE_REVIEW)
             session.commit()
         except Exception:
             session.rollback()

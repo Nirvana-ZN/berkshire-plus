@@ -133,6 +133,26 @@ def _ensure_financial_columns(engine: Engine) -> None:
                 )
 
 
+def _ensure_discovery_fill_columns(engine: Engine) -> None:
+    from sqlalchemy import text
+
+    with engine.begin() as conn:
+        names = {
+            row[1]
+            for row in conn.execute(
+                text("PRAGMA table_info(discovery_data_fills)")
+            ).fetchall()
+        }
+        for column in ("run_started_at", "last_request_at"):
+            if names and column not in names:
+                conn.execute(
+                    text(
+                        "ALTER TABLE discovery_data_fills "
+                        f"ADD COLUMN {column} DATETIME"
+                    )
+                )
+
+
 def _ensure_financial_text_storage(engine: Engine) -> None:
     from sqlalchemy import MetaData, text
 
@@ -282,6 +302,7 @@ def init_db(db_path: Path | None = None) -> Engine:
     Base.metadata.create_all(engine)
     _ensure_listed_year(engine)
     _ensure_financial_columns(engine)
+    _ensure_discovery_fill_columns(engine)
     _ensure_financial_text_storage(engine)
     _ensure_valuation_series(engine)
     _reset_stale_financials(engine)

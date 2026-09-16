@@ -28,7 +28,15 @@ class DiscoveryCompanyError(MarketError):
         self.request_count = request_count
 
 
-class DiscoveryRequestBudgetExhausted(MarketError):
+class DiscoveryRequestStopped(MarketError):
+    pass
+
+
+class DiscoveryRequestBudgetExhausted(DiscoveryRequestStopped):
+    pass
+
+
+class DiscoveryRequestRuntimeExhausted(DiscoveryRequestStopped):
     pass
 
 

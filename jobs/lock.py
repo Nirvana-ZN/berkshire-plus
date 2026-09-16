@@ -64,15 +64,20 @@ def clear_stale_lock(session: Session) -> None:
         fill.status = "paused"
         fill.last_error = "进程重启，任务已暂停"
         fill.updated_at = interrupted_at
-        checkpoints = session.scalars(
-            select(DiscoveryDataCheckpoint).where(
-                DiscoveryDataCheckpoint.fill_id == fill.id,
-                DiscoveryDataCheckpoint.status == "running",
-            )
-        ).all()
-        for checkpoint in checkpoints:
-            checkpoint.status = "pending"
-            checkpoint.updated_at = interrupted_at
+    interrupted_checkpoints = session.scalars(
+        select(DiscoveryDataCheckpoint).where(
+            DiscoveryDataCheckpoint.status == "running"
+        )
+    ).all()
+    for checkpoint in interrupted_checkpoints:
+        checkpoint.status = "pending"
+        checkpoint.updated_at = interrupted_at
+        fill = session.get(DiscoveryDataFill, checkpoint.fill_id)
+        if fill is not None:
+            fill.status = "paused"
+            fill.updated_at = interrupted_at
+            if fill.last_error is None:
+                fill.last_error = "进程重启，任务已暂停"
     row = session.get(JobLock, LOCK_ROW_ID)
     if row is not None:
         row.job_id = None
@@ -99,9 +104,13 @@ def try_acquire(session: Session, job_id: int, job_type: str) -> bool:
     return int(result.rowcount or 0) == 1
 
 
-def release(session: Session, job_id: int) -> None:
+def release(session: Session, job_id: int, job_type: str) -> None:
     session.execute(
         update(JobLock)
-        .where(JobLock.id == LOCK_ROW_ID, JobLock.job_id == job_id)
+        .where(
+            JobLock.id == LOCK_ROW_ID,
+            JobLock.job_id == job_id,
+            JobLock.job_type == job_type,
+        )
         .values(job_id=None, job_type=None, held_at=None)
     )

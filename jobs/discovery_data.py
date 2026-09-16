@@ -23,6 +23,8 @@ from market.types import (
     DiscoveryCompanyData,
     DiscoveryCompanyError,
     DiscoveryRequestBudgetExhausted,
+    DiscoveryRequestRuntimeExhausted,
+    DiscoveryRequestStopped,
     FinancialRow,
     ValuationPoint,
 )
@@ -86,11 +88,31 @@ class DiscoveryRequestGate:
         self.policy = policy
         self.clock = clock
         self.attempts = 0
-        self._next_request_at: datetime | None = None
+        fill = self.session.get(DiscoveryDataFill, self.fill_id)
+        if fill is None:
+            raise RuntimeError(f"discovery fill {self.fill_id} missing")
+        run_started = fill.run_started_at or _aware_utc(self.clock.now())
+        self._deadline = run_started + timedelta(
+            seconds=self.policy.max_runtime_seconds
+        )
+        self._next_request_at = (
+            None
+            if fill.last_request_at is None
+            else _aware_utc(fill.last_request_at)
+            + timedelta(seconds=1 / self.policy.requests_per_second)
+        )
 
     def __call__(self) -> None:
+        now = _aware_utc(self.clock.now())
+        if now >= self._deadline or (
+            self._next_request_at is not None
+            and self._next_request_at >= self._deadline
+        ):
+            self._stop_for_runtime(now)
         _wait_until(self.clock, self._next_request_at)
         now = _aware_utc(self.clock.now())
+        if now >= self._deadline:
+            self._stop_for_runtime(now)
         fill = self.session.get(DiscoveryDataFill, self.fill_id)
         if fill is None:
             raise RuntimeError(f"discovery fill {self.fill_id} missing")
@@ -105,12 +127,22 @@ class DiscoveryRequestGate:
             )
         fill.daily_requests += 1
         fill.request_count += 1
+        fill.last_request_at = now
         fill.updated_at = now
         self.session.commit()
         self.attempts += 1
         self._next_request_at = now + timedelta(
             seconds=1 / self.policy.requests_per_second
         )
+
+    def _stop_for_runtime(self, now: datetime) -> None:
+        fill = self.session.get(DiscoveryDataFill, self.fill_id)
+        if fill is not None:
+            fill.status = "paused"
+            fill.last_error = "maximum run time reached"
+            fill.updated_at = now
+            self.session.commit()
+        raise DiscoveryRequestRuntimeExhausted("maximum run time reached")
 
 
 def _aware_utc(value: datetime) -> datetime:
@@ -199,7 +231,7 @@ def _initialize_checkpoints(
     try:
         fetch = getattr(market, "fetch_cheap_universe")
         rows = list(fetch(before_request=request_gate))
-    except DiscoveryRequestBudgetExhausted:
+    except DiscoveryRequestStopped:
         return False
     except Exception as exc:
         fill.status = "paused"
@@ -362,6 +394,7 @@ def execute_discovery_data_fill(
             return
         fill.status = "running"
         fill.daily_budget = policy.daily_budget
+        fill.run_started_at = run_started
         fill.updated_at = run_started
         session.commit()
         request_gate = DiscoveryRequestGate(
@@ -408,7 +441,7 @@ def execute_discovery_data_fill(
                         checkpoint.code,
                         before_request=request_gate,
                     )
-                except DiscoveryRequestBudgetExhausted:
+                except DiscoveryRequestStopped:
                     stop = True
                     break
                 except Exception as exc:
@@ -435,6 +468,8 @@ def execute_discovery_data_fill(
                                 result,
                                 _aware_utc(timer.now()),
                             )
+                            if checkpoint.attempts > 1:
+                                fill.last_error = None
                     except Exception as exc:
                         session.rollback()
                         fill = session.get(DiscoveryDataFill, fill_id)
@@ -473,20 +508,23 @@ def execute_discovery_data_fill(
         fill = session.get(DiscoveryDataFill, fill_id)
         if fill is not None:
             _pause_running_checkpoints(session, fill, _aware_utc(timer.now()))
-        release(session, fill_id)
+        release(session, fill_id, JOB_TYPE_DISCOVERY_DATA)
         session.commit()
 
 
 def _eta_seconds(
     session: Session,
-    fill_id: int,
+    fill: DiscoveryDataFill,
     remaining: int,
 ) -> int | None:
+    if fill.run_started_at is None:
+        return None
     completed = session.scalars(
         select(DiscoveryDataCheckpoint)
         .where(
-            DiscoveryDataCheckpoint.fill_id == fill_id,
+            DiscoveryDataCheckpoint.fill_id == fill.id,
             DiscoveryDataCheckpoint.status == "done",
+            DiscoveryDataCheckpoint.updated_at >= fill.run_started_at,
         )
         .order_by(DiscoveryDataCheckpoint.updated_at)
     ).all()
@@ -550,7 +588,7 @@ def discovery_data_status(
         "last_error": fill.last_error,
         **base,
         "daily_budget": fill.daily_budget,
-        "eta_seconds": _eta_seconds(session, fill.id, remaining),
+        "eta_seconds": _eta_seconds(session, fill, remaining),
     }
 
 _DISCOVERY_SHARED_FINANCIAL_FIELDS = (

@@ -220,7 +220,7 @@ def execute_funnel(
             session.commit()
     finally:
         try:
-            release(session, run_id)
+            release(session, run_id, JOB_TYPE_FUNNEL)
             session.commit()
         except Exception:
             session.rollback()

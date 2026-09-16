@@ -20,7 +20,7 @@ from market.types import (
     DiscoveryCompanyData,
     DiscoveryCompanyError,
     DiscoveryPreRequest,
-    DiscoveryRequestBudgetExhausted,
+    DiscoveryRequestStopped,
     DiscoverySourceAsOf,
     FinancialRow,
     MarketError,
@@ -826,7 +826,7 @@ class EastMoneyClient:
                     normalized, before_request=request_gate
                 )
             )
-        except DiscoveryRequestBudgetExhausted:
+        except DiscoveryRequestStopped:
             raise
         except Exception as exc:
             raise DiscoveryCompanyError(
@@ -847,7 +847,7 @@ class EastMoneyClient:
                     before_request=request_gate,
                 )
             )
-        except DiscoveryRequestBudgetExhausted:
+        except DiscoveryRequestStopped:
             raise
         except Exception as exc:
             raise DiscoveryCompanyError(
@@ -864,7 +864,7 @@ class EastMoneyClient:
                     normalized, before_request=request_gate
                 )
             )
-        except DiscoveryRequestBudgetExhausted:
+        except DiscoveryRequestStopped:
             raise
         except Exception as exc:
             raise DiscoveryCompanyError(
@@ -1302,7 +1302,7 @@ class EastMoneyClient:
                 )
             )
             parsed = parse_kline(payload)
-        except DiscoveryRequestBudgetExhausted:
+        except DiscoveryRequestStopped:
             raise
         except Exception:
             return None
@@ -1438,7 +1438,7 @@ class EastMoneyClient:
                     response = client.get(candidate)
                     response.raise_for_status()
                     payload = response.json()
-            except DiscoveryRequestBudgetExhausted:
+            except DiscoveryRequestStopped:
                 raise
             except Exception as exc:
                 last_error = exc

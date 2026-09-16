@@ -2194,7 +2194,7 @@ def test_first_run_universe_gates_pages_calendar_and_suspended_kline(
         requests_per_second=100,
         max_attempts=2,
         daily_budget=20,
-        max_runtime_seconds=0.025,
+        max_runtime_seconds=0.035,
     )
     with factory() as session:
         execute_discovery_data_fill(
@@ -2897,3 +2897,302 @@ def test_startup_pauses_interrupted_discovery_fill_and_preserves_done(
         assert [
             call for call in market.calls if call[0] == "discovery_data"
         ] == [("discovery_data", "000001.SZ")]
+
+
+def test_startup_resets_running_checkpoint_when_fill_already_paused(
+    tmp_path,
+) -> None:
+    db_path = tmp_path / "app.db"
+    engine = init_db(db_path)
+    now = datetime(2026, 9, 16, 12, tzinfo=timezone.utc)
+    with Session(engine) as session:
+        fill = _fill(
+            session, ["000001.SZ"], now=now, status="paused"
+        )
+        checkpoint = session.get(
+            DiscoveryDataCheckpoint, (fill.id, "000001.SZ")
+        )
+        assert checkpoint is not None
+        checkpoint.status = "running"
+        fill.last_error = "daily request budget reached"
+        session.commit()
+        fill_id = fill.id
+    engine.dispose()
+
+    with _discovery_client(tmp_path, FakeMarketClient()) as client:
+        assert client.get("/api/discovery-data/status").json()["status"] == "paused"
+        with client.app.state.session_factory() as session:
+            checkpoint = session.get(
+                DiscoveryDataCheckpoint, (fill_id, "000001.SZ")
+            )
+            assert checkpoint is not None
+            assert checkpoint.status == "pending"
+
+
+def test_request_deadline_stops_mid_bundle_before_second_transport(
+    tmp_path,
+) -> None:
+    from jobs.discovery_data import RequestPolicy, execute_discovery_data_fill
+
+    engine = init_db(tmp_path / "deadline.db")
+    factory = create_session_factory(engine)
+    now = datetime(2026, 9, 16, 12, tzinfo=timezone.utc)
+    code = "000001.SZ"
+    with factory() as session:
+        fill_id = _fill(session, [code], now=now).id
+    clock = FakeClock(now)
+    transports: list[datetime] = []
+
+    class MidBundleMarket(FakeMarketClient):
+        def fetch_discovery_data(
+            self, code: str, *, before_request=None
+        ) -> DiscoveryCompanyData:
+            assert before_request is not None
+            before_request()
+            transports.append(clock.now())
+            before_request()
+            transports.append(clock.now())
+            return _bundle(code, request_count=2)
+
+    policy = RequestPolicy(
+        requests_per_second=0.5,
+        max_attempts=2,
+        daily_budget=10,
+        max_runtime_seconds=1,
+    )
+    with factory() as session:
+        execute_discovery_data_fill(
+            session,
+            MidBundleMarket(),
+            fill_id,
+            policy=policy,
+            clock=clock,
+        )
+    assert transports == [now]
+    with factory() as session:
+        fill = session.get(DiscoveryDataFill, fill_id)
+        checkpoint = session.get(
+            DiscoveryDataCheckpoint, (fill_id, code)
+        )
+        assert fill is not None and checkpoint is not None
+        assert (fill.status, fill.request_count) == ("paused", 1)
+        assert fill.last_request_at == now
+        assert checkpoint.status == "pending"
+    engine.dispose()
+
+
+def test_immediate_resume_waits_from_persisted_last_request(
+    tmp_path,
+) -> None:
+    from jobs.discovery_data import RequestPolicy, execute_discovery_data_fill
+
+    engine = init_db(tmp_path / "resume-pacing.db")
+    factory = create_session_factory(engine)
+    first_request = datetime(2026, 9, 16, 12, tzinfo=timezone.utc)
+    resumed_at = first_request + timedelta(seconds=0.5)
+    code = "000001.SZ"
+    with factory() as session:
+        fill = _fill(
+            session, [code], now=first_request, status="paused"
+        )
+        fill.last_request_at = first_request
+        session.commit()
+        fill_id = fill.id
+    clock = FakeClock(resumed_at)
+    transport_times: list[datetime] = []
+
+    class ResumeMarket(FakeMarketClient):
+        def fetch_discovery_data(
+            self, code: str, *, before_request=None
+        ) -> DiscoveryCompanyData:
+            assert before_request is not None
+            before_request()
+            transport_times.append(clock.now())
+            return _bundle(code)
+
+    policy = RequestPolicy(
+        requests_per_second=0.5,
+        max_attempts=2,
+        daily_budget=10,
+        max_runtime_seconds=10,
+    )
+    with factory() as session:
+        execute_discovery_data_fill(
+            session,
+            ResumeMarket(),
+            fill_id,
+            policy=policy,
+            clock=clock,
+        )
+    assert clock.sleeps == [1.5]
+    assert transport_times == [first_request + timedelta(seconds=2)]
+    engine.dispose()
+
+
+def test_wrong_type_release_cannot_clear_colliding_job_id(tmp_path) -> None:
+    from jobs.lock import (
+        JOB_TYPE_FUNNEL,
+        JOB_TYPE_REVIEW,
+        ensure_lock_row,
+        release,
+    )
+
+    engine = init_db(tmp_path / "typed-release.db")
+    with Session(engine) as session:
+        lock = ensure_lock_row(session)
+        lock.job_id = 7
+        lock.job_type = JOB_TYPE_REVIEW
+        lock.held_at = datetime.now(timezone.utc)
+        session.commit()
+
+        release(session, 7, JOB_TYPE_FUNNEL)
+        session.commit()
+        assert session.get(JobLock, 1).job_type == JOB_TYPE_REVIEW
+
+        release(session, 7, JOB_TYPE_REVIEW)
+        session.commit()
+        assert session.get(JobLock, 1).job_id is None
+    engine.dispose()
+
+
+def test_discovery_fill_post_rejects_malformed_json_but_accepts_empty_and_object(
+    tmp_path,
+) -> None:
+    market = FakeMarketClient()
+    with _discovery_client(tmp_path, market) as client:
+        malformed = client.post(
+            "/api/discovery-data/fill",
+            content=b"{",
+            headers={"content-type": "application/json"},
+        )
+        assert malformed.status_code == 400
+        assert malformed.json()["code"] == "INVALID_DISCOVERY_DATA_FILL"
+        with client.app.state.session_factory() as session:
+            assert session.query(DiscoveryDataFill).count() == 0
+
+        empty = client.post("/api/discovery-data/fill", content=b"")
+        assert empty.status_code == 200
+        valid = client.post("/api/discovery-data/fill", json={})
+        assert valid.status_code == 200
+
+
+def test_successful_retry_clears_checkpoint_and_fill_errors(tmp_path) -> None:
+    from jobs.discovery_data import RequestPolicy, execute_discovery_data_fill
+
+    engine = init_db(tmp_path / "retry-clears-error.db")
+    factory = create_session_factory(engine)
+    now = datetime(2026, 9, 16, 12, tzinfo=timezone.utc)
+    code = "000001.SZ"
+    with factory() as session:
+        fill = _fill(session, [code], now=now, status="paused")
+        checkpoint = session.get(
+            DiscoveryDataCheckpoint, (fill.id, code)
+        )
+        assert checkpoint is not None
+        checkpoint.status = "retryable"
+        checkpoint.attempts = 1
+        checkpoint.next_retry_at = now
+        checkpoint.error = "temporary"
+        fill.last_error = "temporary"
+        session.commit()
+        fill_id = fill.id
+    policy = RequestPolicy(
+        requests_per_second=100,
+        max_attempts=2,
+        daily_budget=10,
+        max_runtime_seconds=60,
+    )
+    with factory() as session:
+        execute_discovery_data_fill(
+            session,
+            FakeMarketClient(discovery_data={code: _bundle(code)}),
+            fill_id,
+            policy=policy,
+            clock=FakeClock(now),
+        )
+    with factory() as session:
+        fill = session.get(DiscoveryDataFill, fill_id)
+        checkpoint = session.get(
+            DiscoveryDataCheckpoint, (fill_id, code)
+        )
+        assert fill is not None and checkpoint is not None
+        assert fill.last_error is None
+        assert checkpoint.error is None
+        assert checkpoint.status == "done"
+    engine.dispose()
+
+
+def test_eta_ignores_completed_checkpoints_before_current_worker_run(
+    tmp_path,
+) -> None:
+    from jobs.discovery_data import RequestPolicy, discovery_data_status
+
+    engine = init_db(tmp_path / "eta-current-run.db")
+    now = datetime(2026, 9, 16, 12, tzinfo=timezone.utc)
+    with Session(engine) as session:
+        fill = _fill(
+            session,
+            ["000001.SZ", "000002.SZ", "000003.SZ"],
+            now=now,
+            status="running",
+        )
+        fill.run_started_at = now
+        first = session.get(
+            DiscoveryDataCheckpoint, (fill.id, "000001.SZ")
+        )
+        second = session.get(
+            DiscoveryDataCheckpoint, (fill.id, "000002.SZ")
+        )
+        assert first is not None and second is not None
+        first.status = second.status = "done"
+        first.updated_at = now - timedelta(days=1, seconds=10)
+        second.updated_at = now
+        fill.completed = 2
+        session.commit()
+        status = discovery_data_status(
+            session,
+            policy=RequestPolicy(
+                requests_per_second=0.5,
+                max_attempts=2,
+                daily_budget=10,
+                max_runtime_seconds=60,
+            ),
+            now=now,
+        )
+        assert status["eta_seconds"] is None
+    engine.dispose()
+
+
+def test_init_db_adds_discovery_request_timing_columns(tmp_path) -> None:
+    db_path = tmp_path / "old-fill.db"
+    old_engine = create_engine(f"sqlite:///{db_path.resolve().as_posix()}")
+    with old_engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE discovery_data_fills (
+                    id INTEGER NOT NULL PRIMARY KEY,
+                    status VARCHAR NOT NULL,
+                    total INTEGER NOT NULL,
+                    completed INTEGER NOT NULL,
+                    failed INTEGER NOT NULL,
+                    request_count INTEGER NOT NULL,
+                    daily_budget INTEGER NOT NULL,
+                    budget_day VARCHAR,
+                    daily_requests INTEGER NOT NULL,
+                    started_at DATETIME NOT NULL,
+                    updated_at DATETIME NOT NULL,
+                    last_error TEXT
+                )
+                """
+            )
+        )
+    old_engine.dispose()
+
+    engine = init_db(db_path)
+    columns = {
+        column["name"]
+        for column in inspect(engine).get_columns("discovery_data_fills")
+    }
+    assert {"last_request_at", "run_started_at"} <= columns
+    engine.dispose()

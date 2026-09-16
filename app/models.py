@@ -325,6 +325,8 @@ class DiscoveryDataFill(Base):
     budget_day: Mapped[str | None] = mapped_column(String, nullable=True)
     daily_requests: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     started_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+    run_started_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    last_request_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
