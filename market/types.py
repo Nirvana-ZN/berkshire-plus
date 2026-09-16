@@ -110,10 +110,17 @@ class SecurityState:
 
 
 @dataclass(frozen=True)
+class DiscoverySourceAsOf:
+    security: str
+    valuation: str | None
+    financial: str | None
+
+
+@dataclass(frozen=True)
 class DiscoveryCompanyData:
     code: str
     security_state: SecurityState
     financial_rows: tuple[FinancialRow, ...]
     valuation_points: tuple[ValuationPoint, ...]
     request_count: int
-    source_as_of: str
+    source_as_of: DiscoverySourceAsOf

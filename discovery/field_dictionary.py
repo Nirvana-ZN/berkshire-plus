@@ -179,57 +179,55 @@ FIELD_DICTIONARY: Mapping[str, FieldSpec] = MappingProxyType(
             unit="CNY",
             derivation_formula="PER_EBIT * TOTAL_SHARE",
             financial_sector_substitute=None,
-            missing_policy="None unless both vendor EBIT/share and total shares exist.",
+            missing_policy=(
+                "Discovery value is None: vendor EBIT/share has not been reproduced "
+                "from the disclosed annual-report statements."
+            ),
+            trusted=False,
             **_MAIN,
         ),
         "normalized_effective_tax_rate": FieldSpec(
             "RPT_DMSK_FN_INCOME",
             ("INCOME_TAX", "TOTAL_PROFIT"),
             unit="ratio",
-            derivation_formula=(
-                "median(latest 3 annual INCOME_TAX / TOTAL_PROFIT within [0, 0.50])"
-            ),
+            derivation_formula=None,
             financial_sector_substitute=None,
-            missing_policy="None when no valid positive annual pretax-income ratio exists.",
+            missing_policy=(
+                "Discovery value is None; verified tax and pretax inputs remain "
+                "available without a look-ahead normalized rate."
+            ),
+            trusted=False,
             **_MAIN,
         ),
         "invested_capital": FieldSpec(
-            (
-                "RPT_DMSK_FN_BALANCE",
-                "RPT_F10_FINANCE_GBALANCE",
-            ),
-            ("TOTAL_EQUITY", "interest_debt", "MONETARYFUNDS"),
+            None,
+            None,
             unit="CNY",
             derivation_formula=(
-                "average(current, prior annual) of "
-                "(net_assets + interest_debt - cash), with reported "
-                "MONETARYFUNDS as the explicit cash deduction"
+                "average(net_assets + interest_debt - explicit excess_cash)"
             ),
             financial_sector_substitute=None,
             missing_policy=(
-                "None without two positive annual capital bases; bank capital is not "
-                "substituted. Reported cash may include operating/restricted cash, so "
-                "the resulting ROIC can be overstated."
+                "Always None until an explicit excess-cash source is verified; "
+                "MONETARYFUNDS is not excess cash."
             ),
+            trusted=False,
             **_MAIN,
         ),
         "roic": FieldSpec(
-            (
-                "RPT_F10_FINANCE_MAINFINADATA",
-                "RPT_DMSK_FN_INCOME",
-                "RPT_DMSK_FN_BALANCE",
-                "RPT_F10_FINANCE_GBALANCE",
-            ),
+            None,
             None,
             unit="percent",
             derivation_formula=(
-                "EBIT * (1 - normalized_effective_tax_rate) / invested_capital * 100"
+                "NOPAT / average(net_assets + interest_debt - explicit excess_cash)"
             ),
             financial_sector_substitute=None,
             missing_policy=(
-                "None for missing/nonpositive EBIT or invested capital; never use "
-                "vendor ROIC or ROE as a proxy."
+                "Always None until EBIT and explicit excess cash are verified; "
+                "financial-industry rows are explicitly ineligible. Never use vendor "
+                "ROIC or ROE as a proxy."
             ),
+            trusted=False,
             **_MAIN,
         ),
         "capital_adequacy": FieldSpec(

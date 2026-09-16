@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import replace
 from datetime import date
 from decimal import Decimal, InvalidOperation
-from statistics import median
 from threading import Event
 from typing import Protocol
 from urllib.parse import quote
 
+from discovery.field_dictionary import FIELD_DICTIONARY
 from market.cheap import (
     INDUSTRY_MAPPING_VERSION,
     CheapRow,
@@ -19,6 +18,7 @@ from market.types import (
     Constituent,
     DiscoveryCompanyData,
     DiscoveryCompanyError,
+    DiscoverySourceAsOf,
     FinancialRow,
     MarketError,
     SecurityState,
@@ -33,8 +33,6 @@ FINANCIALS_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
 ORGINFO_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
 STOCK_URL = "https://push2delay.eastmoney.com/api/qt/stock/get"
 VALUATION_PAGE_CAP = 20
-EFFECTIVE_TAX_RATE_MIN = Decimal("0")
-EFFECTIVE_TAX_RATE_MAX = Decimal("0.50")
 BREADTH_URL = (
     "https://push2delay.eastmoney.com/api/qt/ulist.np/get"
     "?fltt=2&secids=0.399317&fields=f3,f12,f104,f105,f106"
@@ -326,6 +324,17 @@ def _first_decimal(
     return None
 
 
+def _dictionary_decimal(
+    metric: str, item: Mapping[str, object]
+) -> Decimal | None:
+    spec = FIELD_DICTIONARY[metric]
+    return (
+        _as_decimal(item.get(spec.field))
+        if spec.trusted and isinstance(spec.field, str)
+        else None
+    )
+
+
 def _positive_decimal(value: object) -> Decimal | None:
     number = _as_decimal(value)
     return number if number is not None and number > 0 else None
@@ -364,10 +373,9 @@ def _source_as_of(*items: Mapping[str, object]) -> str | None:
 
 def _impairment_loss(item: Mapping[str, object]) -> Decimal | None:
     components: list[Decimal | None] = []
-    for direct, income in (
-        ("ASSET_IMPAIRMENT_LOSS", "ASSET_IMPAIRMENT_INCOME"),
-        ("CREDIT_IMPAIRMENT_LOSS", "CREDIT_IMPAIRMENT_INCOME"),
-    ):
+    fields = FIELD_DICTIONARY["impairment_loss"].field
+    assert isinstance(fields, tuple)
+    for direct, income in ((fields[0], fields[2]), (fields[1], fields[3])):
         loss = _as_decimal(item.get(direct))
         reported_income = _as_decimal(item.get(income))
         components.append(
@@ -378,6 +386,13 @@ def _impairment_loss(item: Mapping[str, object]) -> Decimal | None:
             else None
         )
     return _sum_known(*components)
+
+
+def _is_financial_industry(item: Mapping[str, object]) -> bool:
+    return any(
+        _as_decimal(item.get(field)) is not None
+        for field in ("NEWCAPITALADER", "HXYJBCZL", "NONPERLOAN")
+    )
 
 
 def _is_a_share_code(code: str) -> bool:
@@ -665,7 +680,7 @@ class EastMoneyClient:
                 request_count=self._request_count - started,
             ) from exc
         try:
-            financials = self._financials_for(normalized)
+            financials = self._discovery_financials_for(normalized)
         except Exception as exc:
             raise DiscoveryCompanyError(
                 normalized,
@@ -689,10 +704,8 @@ class EastMoneyClient:
                 "no verified statement rows",
                 request_count=self._request_count - started,
             )
-        source_dates = [
-            security.industry_as_of,
-            *(row.source_as_of for row in financials if row.source_as_of),
-            *(row.trade_date for row in valuations),
+        financial_dates = [
+            row.source_as_of for row in financials if row.source_as_of
         ]
         return DiscoveryCompanyData(
             code=normalized,
@@ -700,7 +713,13 @@ class EastMoneyClient:
             financial_rows=tuple(financials),
             valuation_points=tuple(valuations),
             request_count=self._request_count - started,
-            source_as_of=max(source_dates),
+            source_as_of=DiscoverySourceAsOf(
+                security=security.industry_as_of,
+                valuation=max(
+                    (row.trade_date for row in valuations), default=None
+                ),
+                financial=max(financial_dates, default=None),
+            ),
         )
 
     def fetch_listed_years(self, codes: Sequence[str]) -> dict[str, int]:
@@ -1305,6 +1324,14 @@ class EastMoneyClient:
         return result
 
     def _financials_for(self, code: str) -> list[FinancialRow]:
+        return self._financial_rows_for(code, strict=False)
+
+    def _discovery_financials_for(self, code: str) -> list[FinancialRow]:
+        return self._financial_rows_for(code, strict=True)
+
+    def _financial_rows_for(
+        self, code: str, *, strict: bool
+    ) -> list[FinancialRow]:
         reports = {
             "main": "RPT_F10_FINANCE_MAINFINADATA",
             "income": "RPT_DMSK_FN_INCOME",
@@ -1319,9 +1346,9 @@ class EastMoneyClient:
             try:
                 fetched[name] = self._financial_report_rows(code, report)
             except MarketError:
-                if name.endswith("_detail"):
+                if not strict and name.endswith("_detail"):
                     # Banks reject detailed balance/cashflow reports. Their
-                    # verified substitutes stay in MAINFINADATA; no guessed debt.
+                    # legacy batch rows remain usable without discovery fields.
                     fetched[name] = []
                 else:
                     raise
@@ -1353,30 +1380,50 @@ class EastMoneyClient:
             cashflow_detail = mapped["cashflow_detail"].get(
                 (period, period_type), empty
             )
-            shares = _first_decimal(
-                main, "TOTAL_SHARE", "TOTALSHARE", "TOTAL_SHARES"
+            shares = (
+                _first_decimal(
+                    main, "TOTAL_SHARE", "TOTALSHARE", "TOTAL_SHARES"
+                )
+                if not strict
+                else None
             )
-            ebit = _mul(_as_decimal(main.get("PER_EBIT")), shares)
-            if ebit is None:
+            ebit = (
+                _mul(_as_decimal(main.get("PER_EBIT")), shares)
+                if not strict
+                else None
+            )
+            if not strict and ebit is None:
                 ebit = _as_decimal(main.get("EBIT"))
-            net_income = _as_decimal(income.get("PARENT_NETPROFIT"))
-            if net_income is None:
+            net_income = _dictionary_decimal("net_income", income)
+            if not strict and net_income is None:
                 net_income = _first_decimal(
                     main, "PARENTNETPROFIT", "NETPROFIT"
                 )
-            ocf = _as_decimal(cashflow.get("NETCASH_OPERATE"))
-            if ocf is None:
+            ocf = _dictionary_decimal("ocf", cashflow)
+            if not strict and ocf is None:
                 ocf = _first_decimal(
                     main,
                     "NETCASH_OPERATE_PK",
                     "NETCASHFLOWOPERATE",
                     "OPERATECASHFLOW",
                 )
-            short_loan = _as_decimal(balance_detail.get("SHORT_LOAN"))
-            long_loan = _as_decimal(balance_detail.get("LONG_LOAN"))
-            bond_payable = _as_decimal(balance_detail.get("BOND_PAYABLE"))
-            noncurrent_liab_1year = _as_decimal(
-                balance_detail.get("NONCURRENT_LIAB_1YEAR")
+            capex = _dictionary_decimal("capex", cashflow)
+            if not strict and capex is None:
+                capex = _first_decimal(
+                    main,
+                    "PURCHASEFIXEDASSET",
+                    "CONSTRUCTCASHPAY",
+                    "CAPEX",
+                )
+            short_loan = _dictionary_decimal(
+                "short_loan", balance_detail
+            )
+            long_loan = _dictionary_decimal("long_loan", balance_detail)
+            bond_payable = _dictionary_decimal(
+                "bond_payable", balance_detail
+            )
+            noncurrent_liab_1year = _dictionary_decimal(
+                "noncurrent_liab_1year", balance_detail
             )
             # NONCURRENT_LIAB_1YEAR can include non-interest-bearing items and
             # therefore overstate debt. Keep every component visible.
@@ -1391,56 +1438,93 @@ class EastMoneyClient:
                     code=code,
                     period=period,
                     period_type=period_type,
-                    roe=_first_decimal(main, "ROEJQ", "ROE", "WEIGHTAVGROE"),
+                    roe=(
+                        _first_decimal(
+                            main, "ROEJQ", "ROE", "WEIGHTAVGROE"
+                        )
+                        if not strict
+                        else None
+                    ),
                     net_income=net_income,
                     ocf=ocf,
-                    capex=_as_decimal(cashflow.get("CONSTRUCT_LONG_ASSET")),
+                    capex=capex,
                     ebit=ebit,
-                    interest=_div(
-                        ebit, _as_decimal(main.get("INTSTCOVRATE"))
+                    interest=(
+                        _div(
+                            ebit, _as_decimal(main.get("INTSTCOVRATE"))
+                        )
+                        if not strict
+                        else None
                     ),
-                    gross_margin=_first_decimal(
-                        main, "XSMLL", "GROSSPROFITMARGIN"
+                    gross_margin=(
+                        _first_decimal(
+                            main, "XSMLL", "GROSSPROFITMARGIN"
+                        )
+                        if not strict
+                        else None
                     ),
-                    net_margin=_first_decimal(
-                        main, "XSJLL", "NETPROFITMARGIN"
+                    net_margin=(
+                        _first_decimal(
+                            main, "XSJLL", "NETPROFITMARGIN"
+                        )
+                        if not strict
+                        else None
                     ),
                     shares=shares,
                     share_change_ma=None,
-                    bps=_as_decimal(main.get("BPS")),
-                    npl=_as_decimal(main.get("NONPERLOAN")),
-                    eps=_first_decimal(main, "EPSJB", "EPSKCJB", "EPSXS"),
-                    revenue=_as_decimal(income.get("TOTAL_OPERATE_INCOME")),
-                    deducted_net_income=_as_decimal(
-                        income.get("DEDUCT_PARENT_NETPROFIT")
+                    bps=(
+                        _as_decimal(main.get("BPS"))
+                        if not strict
+                        else None
                     ),
-                    total_assets=_as_decimal(balance.get("TOTAL_ASSETS")),
-                    net_assets=_as_decimal(balance.get("TOTAL_EQUITY")),
-                    cash=_as_decimal(balance.get("MONETARYFUNDS")),
+                    npl=_dictionary_decimal("npl", main),
+                    eps=(
+                        _first_decimal(main, "EPSJB", "EPSKCJB", "EPSXS")
+                        if not strict
+                        else None
+                    ),
+                    revenue=_dictionary_decimal("revenue", income),
+                    deducted_net_income=_dictionary_decimal(
+                        "deducted_net_income", income
+                    ),
+                    total_assets=_dictionary_decimal(
+                        "total_assets", balance
+                    ),
+                    net_assets=_dictionary_decimal("net_assets", balance),
+                    cash=_dictionary_decimal("cash", balance),
                     short_loan=short_loan,
                     long_loan=long_loan,
                     bond_payable=bond_payable,
                     noncurrent_liab_1year=noncurrent_liab_1year,
                     interest_debt=interest_debt,
-                    pretax_income=_as_decimal(income.get("TOTAL_PROFIT")),
-                    income_tax=_as_decimal(income.get("INCOME_TAX")),
-                    capital_adequacy=_as_decimal(
-                        main.get("NEWCAPITALADER")
+                    pretax_income=_dictionary_decimal(
+                        "pretax_income", income
                     ),
-                    core_tier1_capital_adequacy=_as_decimal(
-                        main.get("HXYJBCZL")
+                    income_tax=_dictionary_decimal("income_tax", income),
+                    roic=(
+                        None
+                        if _is_financial_industry(main)
+                        else _dictionary_decimal("roic", main)
                     ),
-                    nonperforming_loan_balance=_as_decimal(
-                        main.get("NON_PERFORMING_LOAN")
+                    capital_adequacy=_dictionary_decimal(
+                        "capital_adequacy", main
+                    ),
+                    core_tier1_capital_adequacy=_dictionary_decimal(
+                        "core_tier1_capital_adequacy", main
+                    ),
+                    nonperforming_loan_balance=_dictionary_decimal(
+                        "nonperforming_loan_balance", main
                     ),
                     impairment_loss=_impairment_loss(income_detail),
                     government_grants=None,
-                    asset_disposal_gain=_as_decimal(
-                        income_detail.get("ASSET_DISPOSAL_INCOME")
+                    asset_disposal_gain=_dictionary_decimal(
+                        "asset_disposal_gain", income_detail
                     ),
-                    goodwill=_as_decimal(balance_detail.get("GOODWILL")),
-                    acquisition_cash_paid=_as_decimal(
-                        cashflow_detail.get("OBTAIN_SUBSIDIARY_OTHER")
+                    goodwill=_dictionary_decimal(
+                        "goodwill", balance_detail
+                    ),
+                    acquisition_cash_paid=_dictionary_decimal(
+                        "acquisition_cash_paid", cashflow_detail
                     ),
                     source_as_of=_source_as_of(
                         main,
@@ -1453,7 +1537,7 @@ class EastMoneyClient:
                     ),
                 )
             )
-        return self._derive_roic(rows)
+        return rows
 
     def _financial_report_rows(self, code: str, report: str) -> list[dict]:
         filt = f'(SECUCODE="{code}")'
@@ -1472,70 +1556,6 @@ class EastMoneyClient:
         if not isinstance(records, list):
             raise MarketError("财务接口整体不可用")
         return [item for item in records if isinstance(item, dict)]
-
-    def _derive_roic(self, rows: list[FinancialRow]) -> list[FinancialRow]:
-        annual = sorted(
-            (row for row in rows if row.period_type == "annual"),
-            key=lambda row: row.period,
-            reverse=True,
-        )
-        valid_rates = [
-            row.income_tax / row.pretax_income
-            for row in annual[:3]
-            if row.income_tax is not None
-            and row.pretax_income is not None
-            and row.pretax_income > 0
-            and EFFECTIVE_TAX_RATE_MIN
-            <= row.income_tax / row.pretax_income
-            <= EFFECTIVE_TAX_RATE_MAX
-        ]
-        tax_rate = median(valid_rates) if valid_rates else None
-        capital: dict[str, Decimal] = {}
-        for row in annual:
-            if (
-                row.net_assets is not None
-                and row.interest_debt is not None
-                and row.cash is not None
-            ):
-                value = row.net_assets + row.interest_debt - row.cash
-                if value > 0:
-                    capital[row.period] = value
-        derived: dict[tuple[str, str], tuple[Decimal | None, Decimal | None]] = {}
-        for index, row in enumerate(annual):
-            prior = annual[index + 1] if index + 1 < len(annual) else None
-            current_capital = capital.get(row.period)
-            prior_capital = capital.get(prior.period) if prior is not None else None
-            invested_capital = (
-                (current_capital + prior_capital) / 2
-                if current_capital is not None and prior_capital is not None
-                else None
-            )
-            roic = (
-                row.ebit
-                * (Decimal(1) - tax_rate)
-                / invested_capital
-                * Decimal(100)
-                if row.ebit is not None
-                and row.ebit > 0
-                and tax_rate is not None
-                and invested_capital is not None
-                and invested_capital > 0
-                else None
-            )
-            derived[(row.period, row.period_type)] = (invested_capital, roic)
-        return [
-            replace(
-                row,
-                normalized_effective_tax_rate=(
-                    tax_rate if row.period_type == "annual" else None
-                ),
-                invested_capital=derived.get(
-                    (row.period, row.period_type), (None, None)
-                )[0],
-                roic=derived.get((row.period, row.period_type), (None, None))[1],
-            )
-            for row in rows
-        ]
 
     def _listed_year_for(self, code: str) -> int | None:
         filt = f'(SECUCODE="{code}")'

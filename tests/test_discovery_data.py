@@ -24,6 +24,7 @@ from market.eastmoney import EastMoneyClient, FakeMarketClient
 from market.types import (
     DiscoveryCompanyData,
     DiscoveryCompanyError,
+    DiscoverySourceAsOf,
     FinancialRow,
     MarketError,
     SecurityState,
@@ -55,8 +56,8 @@ from market.types import (
 # bank NEWCAPITALADER/HXYJBCZL/NONPERLOAN. OTHER_INCOME was not accepted as
 # government grants because the disclosed line includes unrelated other income.
 #
-# 2025 annual-report PDF cross-check (CNY units normalized; every listed value
-# matched exactly, hence 0% difference):
+# 2025 annual-report PDF evidence used by the reproducible <=1% fixture
+# assertions in test_eastmoney.py:
 # - Industrial 美的 000333, AN202603311820893096: revenue 458,502,407,000;
 #   assets 608,791,766,000; equity 236,424,223,000; OCF 53,345,930,000;
 #   capex 11,141,889,000; all four debt components and goodwill also matched.
@@ -694,9 +695,13 @@ def test_field_dictionary_is_immutable_and_marks_unavailable_sources() -> None:
     assert grants.field is None
     assert grants.trusted is False
     assert "OTHER_INCOME" in grants.missing_policy
+    assert FIELD_DICTIONARY["ebit"].trusted is False
+    assert FIELD_DICTIONARY["invested_capital"].field is None
+    assert FIELD_DICTIONARY["roic"].trusted is False
+    assert "financial-industry" in FIELD_DICTIONARY["roic"].missing_policy
 
 
-def test_roic_uses_three_year_tax_median_and_average_invested_capital() -> None:
+def test_discovery_roic_stays_none_without_verified_excess_cash() -> None:
     class Stub(EastMoneyClient):
         def _get_json(self, url: str) -> dict:
             if "MAINFINADATA" in url:
@@ -777,12 +782,17 @@ def test_roic_uses_three_year_tax_median_and_average_invested_capital() -> None:
                 }
             return {"success": True, "result": {"data": []}}
 
-    rows = Stub().fetch_financials(["000333.SZ"])
+    rows = Stub()._discovery_financials_for("000333.SZ")
     current = next(row for row in rows if row.period == "2025")
-    assert current.normalized_effective_tax_rate == Decimal("0.1666666666666666666666666667")
-    assert current.invested_capital == Decimal("525000000")
-    assert current.roic is not None
-    assert abs(current.roic - Decimal("19.04761904761904761904761905")) < Decimal("1e-24")
+    assert current.pretax_income == Decimal("120000000")
+    assert current.income_tax == Decimal("20000000")
+    assert current.net_assets == Decimal("600000000")
+    assert current.interest_debt == Decimal("150000000")
+    assert current.cash == Decimal("200000000")
+    assert current.ebit is None
+    assert current.normalized_effective_tax_rate is None
+    assert current.invested_capital is None
+    assert current.roic is None
 
 
 def test_fake_fetch_discovery_data_returns_typed_bundle_or_error() -> None:
@@ -809,7 +819,11 @@ def test_fake_fetch_discovery_data_returns_typed_bundle_or_error() -> None:
         ),
         valuation_points=(),
         request_count=8,
-        source_as_of="2026-09-16",
+        source_as_of=DiscoverySourceAsOf(
+            security="2026-09-16",
+            valuation=None,
+            financial="2026-03-31",
+        ),
     )
     client = FakeMarketClient(
         discovery_data={"600519.SH": bundle},
@@ -843,7 +857,7 @@ def test_real_fetch_discovery_data_keeps_company_and_stage_on_error() -> None:
         def _security_state_for(self, _code: str) -> SecurityState:
             return state
 
-        def _financials_for(self, _code: str) -> list[FinancialRow]:
+        def _discovery_financials_for(self, _code: str) -> list[FinancialRow]:
             raise MarketError("income endpoint unavailable")
 
     with pytest.raises(DiscoveryCompanyError, match="income endpoint unavailable") as caught:
@@ -851,3 +865,148 @@ def test_real_fetch_discovery_data_keeps_company_and_stage_on_error() -> None:
     assert caught.value.code == "000333.SZ"
     assert caught.value.stage == "financials"
     assert caught.value.request_count == 0
+
+
+@pytest.mark.parametrize(
+    "failed_report",
+    [
+        "RPT_F10_FINANCE_GINCOME",
+        "RPT_F10_FINANCE_GBALANCE",
+        "RPT_F10_FINANCE_GCASHFLOW",
+    ],
+)
+def test_discovery_detail_source_failure_is_typed_without_partial_success(
+    failed_report: str,
+) -> None:
+    state = SecurityState(
+        code="000333.SZ",
+        name="美的集团",
+        exchange="SZ",
+        listing_date="2013-09-18",
+        is_st=False,
+        is_delisting=False,
+        trading_status="trading",
+        last_trade_date="2026-09-16",
+        industry="白色家电",
+        industry_version="eastmoney:push2delay:clist:f100:v1",
+        industry_as_of="2026-09-16",
+        source="eastmoney:stock/get:f57,f58,f107,f127,f189,f292",
+    )
+
+    class Stub(EastMoneyClient):
+        def _security_state_for(self, _code: str) -> SecurityState:
+            return state
+
+        def _get_json(self, url: str) -> dict:
+            self._request_count += 1
+            if failed_report in url:
+                return {"success": False, "message": "verified source unavailable"}
+            return {
+                "success": True,
+                "result": {
+                    "data": [
+                        {
+                            "REPORT_TYPE": "年报",
+                            "REPORT_YEAR": "2025",
+                            "REPORT_DATE": "2025-12-31",
+                            "DATE_TYPE_CODE": "001",
+                            "TOTAL_OPERATE_INCOME": "100",
+                        }
+                    ]
+                },
+            }
+
+        def fetch_valuation_history(self, _code: str) -> list[ValuationPoint]:
+            raise AssertionError("partial company bundle must not continue")
+
+    with pytest.raises(
+        DiscoveryCompanyError, match="verified source unavailable"
+    ) as caught:
+        Stub().fetch_discovery_data("000333.SZ")
+    assert caught.value.stage == "financials"
+    assert caught.value.request_count > 0
+
+
+def test_real_discovery_path_reports_per_source_dates_and_request_count() -> None:
+    latest_trade = (date.today() - timedelta(days=1)).isoformat()
+    old_trade = f"{date.today().year - 6}-01-01"
+
+    class Stub(EastMoneyClient):
+        def _get_json_direct(self, url: str) -> dict:
+            self._request_count += 1
+            if "stock/get" in url:
+                return {
+                    "data": {
+                        "f57": "000333",
+                        "f58": "美的集团",
+                        "f107": 0,
+                        "f127": "白色家电",
+                        "f189": 20130918,
+                        "f292": 5,
+                    }
+                }
+            if "secid=0.399317" in url:
+                return {
+                    "data": {
+                        "klines": [
+                            f"{latest_trade},1,2,3,4,5,6",
+                        ]
+                    }
+                }
+            return {"data": {"klines": [f"{latest_trade},1,2,3,4,5,6"]}}
+
+        def _get_json(self, url: str) -> dict:
+            self._request_count += 1
+            if "RPT_VALUEANALYSIS_DET" in url:
+                return {
+                    "success": True,
+                    "result": {
+                        "pages": 1,
+                        "data": [
+                            {
+                                "TRADE_DATE": latest_trade,
+                                "PE_TTM": "12",
+                                "PB_MRQ": "2",
+                            },
+                            {
+                                "TRADE_DATE": old_trade,
+                                "PE_TTM": "10",
+                                "PB_MRQ": "1",
+                            },
+                        ],
+                    },
+                }
+            report_date = {
+                "RPT_F10_FINANCE_MAINFINADATA": "2026-03-28",
+                "RPT_DMSK_FN_INCOME": "2026-03-31",
+                "RPT_DMSK_FN_BALANCE": "2026-03-30",
+                "RPT_DMSK_FN_CASHFLOW": "2026-03-30",
+                "RPT_F10_FINANCE_GINCOME": "2026-04-01",
+                "RPT_F10_FINANCE_GBALANCE": "2026-03-29",
+                "RPT_F10_FINANCE_GCASHFLOW": "2026-03-29",
+            }
+            report = next(name for name in report_date if name in url)
+            return {
+                "success": True,
+                "result": {
+                    "data": [
+                        {
+                            "REPORT_TYPE": "年报",
+                            "REPORT_YEAR": "2025",
+                            "REPORT_DATE": "2025-12-31",
+                            "DATE_TYPE_CODE": "001",
+                            "NOTICE_DATE": report_date[report],
+                            "UPDATE_DATE": report_date[report],
+                            "TOTAL_OPERATE_INCOME": "100",
+                        }
+                    ]
+                },
+            }
+
+    result = Stub().fetch_discovery_data("000333.SZ")
+    assert result.request_count == 11
+    assert result.source_as_of == DiscoverySourceAsOf(
+        security=date.today().isoformat(),
+        valuation=latest_trade,
+        financial="2026-04-01",
+    )
