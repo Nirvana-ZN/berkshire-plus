@@ -612,8 +612,8 @@ async function saveBook() {
   try {
     let last: Record<string, unknown> | null = null
     for (const row of positions.value) {
-      if (!rowDirty(row)) continue
       const edit = bookForm.value[row.name]
+      if (!edit || !rowDirty(row)) continue
       const response = await fetch('/api/positions/adjust', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -798,7 +798,7 @@ onBeforeUnmount(stopReviewPoll)
                 <td>
                   <input
                     v-if="bookForm[row.name]"
-                    v-model="bookForm[row.name].shares"
+                    v-model="bookForm[row.name]!.shares"
                     inputmode="decimal"
                     aria-label="股数"
                   />
@@ -806,7 +806,7 @@ onBeforeUnmount(stopReviewPoll)
                 <td>
                   <input
                     v-if="bookForm[row.name]"
-                    v-model="bookForm[row.name].unit_cost"
+                    v-model="bookForm[row.name]!.unit_cost"
                     inputmode="decimal"
                     aria-label="成本单价"
                   />

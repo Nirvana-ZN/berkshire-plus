@@ -419,8 +419,8 @@ def test_positions_view_can_edit_shares_cost_and_cash() -> None:
     assert "只读" not in source
     assert "applyBook" in source
     table = source.split('<table class="book"')[1].split("</table>")[0]
-    assert "bookForm[row.name].shares" in table
-    assert "bookForm[row.name].unit_cost" in table
+    assert "bookForm[row.name]!.shares" in table
+    assert "bookForm[row.name]!.unit_cost" in table
     assert "cashForm" in table
     assert 'v-model="form' not in table
     assert "form.shares" not in table
