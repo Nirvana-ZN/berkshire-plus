@@ -653,7 +653,7 @@ class EastMoneyClient:
             if oldest <= start:
                 break
             if pages is not None and page >= pages:
-                raise MarketError("估值历史接口不足五年")
+                break
             if pages is None and len(rows) < 500:
                 raise MarketError("估值历史接口提前结束，不足五年")
             if page >= VALUATION_PAGE_CAP:

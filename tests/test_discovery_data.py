@@ -154,6 +154,49 @@ def test_fetch_valuation_history_paginates_before_month_deduplication() -> None:
     assert any(row.pb is None for row in rows)
 
 
+def test_fetch_valuation_history_returns_declared_recent_listing_pages() -> None:
+    pages = {
+        1: [
+            {
+                "TRADE_DATE": "2026-09-16 00:00:00",
+                "PE_TTM": "20",
+                "PB_MRQ": "2",
+            },
+            {
+                "TRADE_DATE": "2026-08-31 00:00:00",
+                "PE_TTM": "21",
+                "PB_MRQ": "2.1",
+            },
+        ],
+        2: [
+            {
+                "TRADE_DATE": "2025-12-31 00:00:00",
+                "PE_TTM": "22",
+                "PB_MRQ": "2.2",
+            },
+            {
+                "TRADE_DATE": "2025-11-28 00:00:00",
+                "PE_TTM": "23",
+                "PB_MRQ": "2.3",
+            },
+        ],
+    }
+
+    class Stub(EastMoneyClient):
+        def _get_json(self, url: str) -> dict:
+            page = int(parse_qs(urlsplit(url).query)["pageNumber"][0])
+            return {"success": True, "result": {"pages": 2, "data": pages[page]}}
+
+    rows = Stub().fetch_valuation_history("001389.SZ")
+
+    assert [row.trade_date for row in rows] == [
+        "2026-09-16",
+        "2026-08-31",
+        "2025-12-31",
+        "2025-11-28",
+    ]
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -587,12 +630,12 @@ def test_old_cached_universe_without_security_metadata_is_rejected() -> None:
             Setting(
                 key="cheap_universe",
                 value=json.dumps(
-                    {"method": "v3", "fetched_at": 1000.0, "rows": [old_row]}
+                    {"method": "v4", "fetched_at": 1000.0, "rows": [old_row]}
                 ),
             )
         )
         session.commit()
-        assert METHOD == "v4"
+        assert METHOD == "v5"
         assert _cached(session, 1001.0) is None
         setting = session.get(Setting, "cheap_universe")
         assert setting is not None
