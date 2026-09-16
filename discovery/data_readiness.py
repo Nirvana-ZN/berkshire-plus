@@ -21,6 +21,7 @@ TRACKS = (QUALITY_DISCOUNT, DEEP_VALUE, GARP)
 MIN_VALUATION_MONTHS = 60
 
 _FINANCIAL_FIELDS = (
+    "roe",
     "capex",
     "revenue",
     "roic",
@@ -30,7 +31,7 @@ _FINANCIAL_FIELDS = (
 _ALLOWED_MINIMUMS = {
     QUALITY_DISCOUNT: frozenset({"pe", "pb"}),
     DEEP_VALUE: frozenset({"capex", "capital_adequacy", "npl"}),
-    GARP: frozenset({"revenue", "roic"}),
+    GARP: frozenset({"revenue", "roic", "roe"}),
 }
 _MEASUREMENT_MINIMUMS = {
     QUALITY_DISCOUNT: {"pe": MIN_VALUATION_MONTHS, "pb": MIN_VALUATION_MONTHS},
@@ -38,6 +39,7 @@ _MEASUREMENT_MINIMUMS = {
     GARP: {"revenue": 1, "roic": 1},
 }
 _VALUATION_POLICIES = frozenset({"both", "either", "pe", "pb"})
+_SECTOR_POLICIES = frozenset({"exclude_financial", "roe_fallback"})
 _OTHER_FINANCIAL_TOKENS = ("证券", "多元金融", "信托", "期货", "金融")
 _FINANCIAL_DEEP_FIELDS = tuple(
     field
@@ -81,6 +83,13 @@ class CompanyObservationCounts:
 
 
 @dataclass(frozen=True)
+class ObservationAggregate:
+    companies: int
+    observations: int
+    maximum: int
+
+
+@dataclass(frozen=True)
 class ReadinessReport:
     status: str
     evaluated_as_of: str
@@ -88,9 +97,13 @@ class ReadinessReport:
     approved_thresholds: Mapping[str, Decimal]
     minimum_observations: Mapping[str, Mapping[str, int]]
     valuation_policies: Mapping[str, str]
+    sector_policies: Mapping[str, str]
     missing_counts: Mapping[str, Mapping[str, int]]
     company_insufficient: Mapping[str, Mapping[str, int]]
     observations: Mapping[str, CompanyObservationCounts]
+    observation_aggregates: Mapping[
+        str, Mapping[str, ObservationAggregate]
+    ]
     source_as_of: Mapping[str, str | None]
 
 
@@ -119,7 +132,7 @@ def _minimums(
             raise ValueError(f"unknown discovery track: {track}")
         if not isinstance(fields, Mapping):
             raise ValueError(f"{track} observation requirements must be a mapping")
-        parsed: dict[str, int] = {}
+        parsed = dict(_MEASUREMENT_MINIMUMS[track])
         for field, minimum in fields.items():
             if field not in _ALLOWED_MINIMUMS[track]:
                 raise ValueError(f"unknown observation field: {track}.{field}")
@@ -143,6 +156,19 @@ def _policies(
             )
         if policy not in _VALUATION_POLICIES:
             raise ValueError(f"unknown valuation policy: {policy}")
+        policies[track] = policy
+    return policies
+
+
+def _sector_policies(
+    sector_policies: Mapping[str, str] | None,
+) -> dict[str, str]:
+    policies: dict[str, str] = {}
+    for track, policy in (sector_policies or {}).items():
+        if track != GARP:
+            raise ValueError(f"sector policy only supports {GARP}: {track}")
+        if policy not in _SECTOR_POLICIES:
+            raise ValueError(f"unknown sector policy: {policy}")
         policies[track] = policy
     return policies
 
@@ -232,6 +258,7 @@ def _financial_history(
         select(
             Financial.code,
             Financial.period,
+            Financial.roe,
             Financial.capex,
             Financial.revenue,
             Financial.roic,
@@ -413,11 +440,47 @@ def _effective_minimums(
     return dict(configured.get(track, _MEASUREMENT_MINIMUMS[track]))
 
 
+def _observation_aggregates(
+    observations: Mapping[str, CompanyObservationCounts],
+) -> dict[str, dict[str, ObservationAggregate]]:
+    counts: dict[str, dict[str, list[int]]] = {
+        QUALITY_DISCOUNT: {"pe": [], "pb": []},
+        DEEP_VALUE: {
+            field: [] for field in ("capex", "capital_adequacy", "npl")
+        },
+        GARP: {field: [] for field in ("revenue", "roic", "roe")},
+    }
+    for company in observations.values():
+        counts[QUALITY_DISCOUNT]["pe"].append(
+            max((row.pe for row in company.valuation.values()), default=0)
+        )
+        counts[QUALITY_DISCOUNT]["pb"].append(
+            max((row.pb for row in company.valuation.values()), default=0)
+        )
+        for track in (DEEP_VALUE, GARP):
+            for field in counts[track]:
+                counts[track][field].append(company.financial[field])
+    return {
+        track: {
+            field: ObservationAggregate(
+                companies=sum(value > 0 for value in values),
+                observations=sum(values),
+                maximum=max(values, default=0),
+            )
+            for field, values in fields.items()
+        }
+        for track, fields in counts.items()
+    }
+
+
 def _track_activated(
     track: str,
     thresholds: Mapping[str, Decimal],
     configured: Mapping[str, Mapping[str, int]],
     policies: Mapping[str, str],
+    sector_policies: Mapping[str, str],
+    *,
+    has_financial_companies: bool,
 ) -> bool:
     if track not in thresholds or track not in configured:
         return False
@@ -431,6 +494,16 @@ def _track_activated(
             else {policy}
             if policy in {"pe", "pb"}
             else {"pe", "pb"}
+        )
+        return required <= configured[track].keys()
+    if track == GARP:
+        policy = sector_policies.get(track)
+        if has_financial_companies and policy is None:
+            return False
+        required = (
+            {"revenue", "roe"}
+            if policy == "roe_fallback"
+            else {"revenue", "roic"}
         )
         return required <= configured[track].keys()
     return _ALLOWED_MINIMUMS[track] <= configured[track].keys()
@@ -485,11 +558,13 @@ def discovery_data_readiness(
     approved_thresholds: Mapping[str, Decimal] | None = None,
     minimum_observations: Mapping[str, Mapping[str, int]] | None = None,
     valuation_policies: Mapping[str, str] | None = None,
+    sector_policies: Mapping[str, str] | None = None,
 ) -> ReadinessReport:
     """Measure only information that was persisted and knowable by ``as_of``."""
     thresholds = _thresholds(approved_thresholds)
     configured_minimums = _minimums(minimum_observations)
     policies = _policies(valuation_policies)
+    sectors = _sector_policies(sector_policies)
     universe, universe_fetched_at = _persisted_universe(session, as_of)
     candidates = [row for row in universe if _base_eligible(row)]
     codes = tuple(row.code for row in candidates)
@@ -564,16 +639,31 @@ def discovery_data_readiness(
         else:
             complete[DEEP_VALUE] += 1
 
-        if branch in {"bank", "insurance", "other_financial"}:
-            insufficient[GARP]["financial_industry"] += 1
+        financial_branch = branch in {"bank", "insurance", "other_financial"}
+        garp_sector_policy = sectors.get(GARP)
+        if financial_branch and garp_sector_policy == "exclude_financial":
+            insufficient[GARP]["financial_sector_excluded"] += 1
         else:
             eligible[GARP] += 1
             if branch == "unknown":
                 garp_missing = ("industry",)
                 aligned[GARP] = 0
+            elif financial_branch and garp_sector_policy is None:
+                garp_missing = ("financial_roic_policy",)
+                aligned[GARP] = 0
+                insufficient[GARP][
+                    "financial_roic_policy_unapproved"
+                ] += 1
             else:
-                garp_fields = ("revenue", "roic")
+                garp_fields = (
+                    ("revenue", "roe")
+                    if financial_branch
+                    and garp_sector_policy == "roe_fallback"
+                    else ("revenue", "roic")
+                )
                 garp_minimums = _effective_minimums(configured_minimums, GARP)
+                if "roe" in garp_fields:
+                    garp_minimums.setdefault("roe", 1)
                 aligned[GARP] = _aligned_count(
                     financials[company.code], garp_fields
                 )
@@ -595,6 +685,11 @@ def discovery_data_readiness(
             valuation=valuations[company.code],
         )
 
+    has_financial_companies = any(
+        _industry_branch(company.industry)
+        in {"bank", "insurance", "other_financial"}
+        for company in candidates
+    )
     tracks = {
         track: _track(
             track,
@@ -607,6 +702,8 @@ def discovery_data_readiness(
                 thresholds,
                 configured_minimums,
                 policies,
+                sectors,
+                has_financial_companies=has_financial_companies,
             ),
         )
         for track in TRACKS
@@ -638,6 +735,7 @@ def discovery_data_readiness(
         approved_thresholds=thresholds,
         minimum_observations=configured_minimums,
         valuation_policies=policies,
+        sector_policies=sectors,
         missing_counts={
             track: dict(sorted(missing[track].items())) for track in TRACKS
         },
@@ -645,6 +743,7 @@ def discovery_data_readiness(
             track: dict(sorted(insufficient[track].items())) for track in TRACKS
         },
         observations=observations,
+        observation_aggregates=_observation_aggregates(observations),
         source_as_of={
             "universe": _iso_utc_timestamp(universe_fetched_at),
             "security": security_as_of,

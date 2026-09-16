@@ -154,6 +154,7 @@ def _readiness_json(report: ReadinessReport) -> dict[str, object]:
     for field_name, values in (
         ("missing_counts", report.missing_counts),
         ("company_insufficient", report.company_insufficient),
+        ("observation_aggregates", report.observation_aggregates),
     ):
         if set(values) != set(TRACKS):
             raise ValueError(f"readiness {field_name} track set is incomplete")
@@ -187,6 +188,7 @@ def _readiness_json(report: ReadinessReport) -> dict[str, object]:
             for track, fields in report.minimum_observations.items()
         },
         "valuation_policies": dict(report.valuation_policies),
+        "sector_policies": dict(report.sector_policies),
         "missing_counts": {
             track: dict(counts) for track, counts in report.missing_counts.items()
         },
@@ -194,17 +196,16 @@ def _readiness_json(report: ReadinessReport) -> dict[str, object]:
             track: dict(counts)
             for track, counts in report.company_insufficient.items()
         },
-        "observations": {
-            code: {
-                "branch": counts.branch,
-                "financial": dict(counts.financial),
-                "aligned": dict(counts.aligned),
-                "valuation": {
-                    method: {"pe": values.pe, "pb": values.pb}
-                    for method, values in counts.valuation.items()
-                },
+        "observation_aggregates": {
+            track: {
+                field: {
+                    "companies": aggregate.companies,
+                    "observations": aggregate.observations,
+                    "maximum": aggregate.maximum,
+                }
+                for field, aggregate in fields.items()
             }
-            for code, counts in report.observations.items()
+            for track, fields in report.observation_aggregates.items()
         },
         "source_as_of": dict(report.source_as_of),
     }

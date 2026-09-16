@@ -3631,14 +3631,23 @@ def test_readiness_fields_are_track_and_financial_branch_specific(tmp_path) -> N
         "industry": 1,
     }
     assert "government_grants" not in deep_value.missing_fields
-    assert garp.missing_fields == ("industry", "revenue", "roic")
+    assert garp.missing_fields == (
+        "financial_roic_policy",
+        "industry",
+        "revenue",
+        "roic",
+    )
     assert report.missing_counts["garp"] == {
+        "financial_roic_policy": 2,
         "industry": 1,
         "revenue": 1,
         "roic": 1,
     }
     assert "capex" not in garp.missing_fields
-    assert report.company_insufficient["garp"] == {"financial_industry": 2}
+    assert garp.eligible == 5
+    assert report.company_insufficient["garp"] == {
+        "financial_roic_policy_unapproved": 2
+    }
     assert all(track.ready is False for track in report.tracks.values())
     assert all(
         track.reason == "not_activated"
@@ -3970,7 +3979,9 @@ def test_readiness_uses_explicit_bank_insurance_and_financial_branches(
     assert report.company_insufficient["deep_value"] == {
         "unsupported_financial_branch": 1
     }
-    assert report.company_insufficient["garp"]["financial_industry"] == 5
+    assert report.company_insufficient["garp"] == {
+        "financial_roic_policy_unapproved": 5
+    }
     engine.dispose()
 
 
@@ -4130,3 +4141,158 @@ def test_readiness_activation_is_per_track_and_configuration_is_strict(
             replace(partial, approved_thresholds={"bogus": Decimal("1")})
         )
     engine.dispose()
+
+
+def test_partial_observation_minimums_merge_over_measurement_defaults(
+    tmp_path,
+) -> None:
+    from discovery.data_readiness import discovery_data_readiness
+
+    engine = init_db(tmp_path / "readiness-partial-minimums.db")
+    industrial = "000001.SZ"
+    bank = "600001.SH"
+    with Session(engine) as session:
+        _store_readiness_universe(
+            session,
+            [
+                _readiness_row(industrial),
+                _readiness_row(bank, industry="银行Ⅱ"),
+            ],
+        )
+        for period in ("2024", "2025"):
+            _store_readiness_financial(
+                session,
+                industrial,
+                period=period,
+                capex=Decimal("1"),
+                revenue=Decimal("1"),
+                roic=Decimal("1"),
+            )
+        _store_readiness_financial(
+            session,
+            bank,
+            capital_adequacy=Decimal("12"),
+            npl=Decimal("1"),
+        )
+        session.commit()
+
+        report = discovery_data_readiness(
+            session,
+            as_of=date(2026, 9, 16),
+            approved_thresholds={
+                "deep_value": Decimal("1"),
+                "garp": Decimal("1"),
+            },
+            minimum_observations={
+                "deep_value": {"capex": 2},
+                "garp": {"revenue": 2},
+            },
+            sector_policies={"garp": "exclude_financial"},
+        )
+
+    assert report.minimum_observations["deep_value"] == {
+        "capex": 2,
+        "capital_adequacy": 1,
+        "npl": 1,
+    }
+    assert report.minimum_observations["garp"] == {
+        "revenue": 2,
+        "roic": 1,
+    }
+    assert report.tracks["deep_value"].activated is True
+    assert report.tracks["deep_value"].complete == 2
+    assert report.tracks["garp"].activated is True
+    assert report.tracks["garp"].ready is True
+    assert report.tracks["garp"].eligible == 1
+    engine.dispose()
+
+
+def test_garp_financials_require_explicit_sector_policy(tmp_path) -> None:
+    from discovery.data_readiness import discovery_data_readiness
+
+    engine = init_db(tmp_path / "readiness-garp-sector.db")
+    industrial = "000001.SZ"
+    bank = "600001.SH"
+    with Session(engine) as session:
+        _store_readiness_universe(
+            session,
+            [
+                _readiness_row(industrial),
+                _readiness_row(bank, industry="银行Ⅱ"),
+            ],
+        )
+        _store_readiness_financial(
+            session,
+            industrial,
+            revenue=Decimal("1"),
+            roic=Decimal("1"),
+        )
+        _store_readiness_financial(
+            session,
+            bank,
+            revenue=Decimal("1"),
+            roe=Decimal("12"),
+            roic=None,
+        )
+        session.commit()
+
+        unapproved = discovery_data_readiness(
+            session,
+            as_of=date(2026, 9, 16),
+            approved_thresholds={"garp": Decimal("1")},
+            minimum_observations={"garp": {"revenue": 1}},
+        )
+        excluded = discovery_data_readiness(
+            session,
+            as_of=date(2026, 9, 16),
+            approved_thresholds={"garp": Decimal("1")},
+            minimum_observations={"garp": {"revenue": 1}},
+            sector_policies={"garp": "exclude_financial"},
+        )
+        fallback = discovery_data_readiness(
+            session,
+            as_of=date(2026, 9, 16),
+            approved_thresholds={"garp": Decimal("1")},
+            minimum_observations={"garp": {"revenue": 1, "roe": 1}},
+            sector_policies={"garp": "roe_fallback"},
+        )
+
+    garp = unapproved.tracks["garp"]
+    assert garp.eligible == 2
+    assert garp.complete == 1
+    assert garp.activated is False
+    assert "financial_roic_policy" in garp.missing_fields
+    assert unapproved.company_insufficient["garp"] == {
+        "financial_roic_policy_unapproved": 1
+    }
+    assert excluded.tracks["garp"].eligible == 1
+    assert excluded.tracks["garp"].complete == 1
+    assert excluded.tracks["garp"].activated is True
+    assert fallback.tracks["garp"].eligible == 2
+    assert fallback.tracks["garp"].complete == 2
+    assert fallback.tracks["garp"].activated is True
+    assert fallback.tracks["garp"].ready is True
+    engine.dispose()
+
+
+def test_discovery_status_omits_company_observations_and_stays_compact(
+    tmp_path,
+) -> None:
+    market = FakeMarketClient()
+    with _discovery_client(tmp_path, market) as client:
+        with client.app.state.session_factory() as session:
+            _store_readiness_universe(
+                session,
+                [
+                    _readiness_row(f"{index:06d}.SZ")
+                    for index in range(1, 201)
+                ],
+            )
+
+        response = client.get("/api/discovery-data/status")
+
+        assert response.status_code == 200
+        readiness = response.json()["readiness"]
+        assert "observations" not in readiness
+        assert "observation_aggregates" in readiness
+        assert len(response.content) < 8_000
