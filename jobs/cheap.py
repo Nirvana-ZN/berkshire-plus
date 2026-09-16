@@ -8,7 +8,7 @@ from decimal import Decimal
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import Financial, Instrument, Setting
+from app.models import Financial, FinancialFetchCompleteness, Instrument, Setting
 from jobs.funnel import persist_financials
 from market.cheap import (
     METHOD,
@@ -113,12 +113,11 @@ def _codes_with_financials(session: Session, codes: list[str]) -> set[str]:
         batch = codes[start : start + IN_CHUNK]
         have.update(
             session.scalars(
-                select(Financial.code)
+                select(FinancialFetchCompleteness.code)
                 .where(
-                    Financial.code.in_(batch),
-                    Financial.period_type == "annual",
+                    FinancialFetchCompleteness.code.in_(batch),
+                    FinancialFetchCompleteness.mode == "legacy",
                 )
-                .distinct()
             ).all()
         )
     return have
@@ -180,7 +179,7 @@ def _write_persisted_board(
 
 def _ensure_financials(session: Session, market: object | None, codes: list[str]) -> list[FinancialRow]:
     cached = _rows_from_db(session, codes)
-    have = {row.code for row in cached}
+    have = _codes_with_financials(session, codes)
     need = [code for code in codes if code not in have]
     fetch = getattr(market, "fetch_financials", None)
     if need and callable(fetch):

@@ -198,9 +198,15 @@ class Financial(Base):
     period: Mapped[str] = mapped_column(String, primary_key=True)
     period_type: Mapped[str] = mapped_column(String, primary_key=True)
     roe: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
-    net_income: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
-    ocf: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
-    capex: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
+    net_income: Mapped[Decimal | None] = mapped_column(
+        CanonicalDecimalText(), nullable=True
+    )
+    ocf: Mapped[Decimal | None] = mapped_column(
+        CanonicalDecimalText(), nullable=True
+    )
+    capex: Mapped[Decimal | None] = mapped_column(
+        CanonicalDecimalText(), nullable=True
+    )
     ebit: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
     interest: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
     gross_margin: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
@@ -274,6 +280,14 @@ class Financial(Base):
         CanonicalDecimalText(), nullable=True
     )
     source_as_of: Mapped[str | None] = mapped_column(String, nullable=True)
+
+
+class FinancialFetchCompleteness(Base):
+    __tablename__ = "financial_fetch_completeness"
+
+    code: Mapped[str] = mapped_column(String, primary_key=True)
+    mode: Mapped[str] = mapped_column(String, primary_key=True)
+    completed_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
 
 
 class ValuationSeries(Base):
@@ -355,6 +369,40 @@ class DiscoveryDataCheckpoint(Base):
     valuation_points: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+
+
+class DiscoveryUniverseSecurity(Base):
+    __tablename__ = "discovery_universe_securities"
+
+    fill_id: Mapped[int] = mapped_column(
+        ForeignKey("discovery_data_fills.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    code: Mapped[str] = mapped_column(String, primary_key=True)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    industry: Mapped[str] = mapped_column(String, nullable=False)
+    exchange: Mapped[str | None] = mapped_column(String, nullable=True)
+    listing_date: Mapped[str | None] = mapped_column(String, nullable=True)
+    is_st: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    is_delisting: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    trading_status: Mapped[str | None] = mapped_column(String, nullable=True)
+    is_suspended: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    last_trade_date: Mapped[str | None] = mapped_column(String, nullable=True)
+    industry_version: Mapped[str | None] = mapped_column(String, nullable=True)
+    source_as_of: Mapped[str | None] = mapped_column(String, nullable=True)
+    provenance: Mapped[str | None] = mapped_column(String, nullable=True)
+    market_status_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    snapshot_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+
+
+class DiscoveryFillTradingDate(Base):
+    __tablename__ = "discovery_fill_trading_dates"
+
+    fill_id: Mapped[int] = mapped_column(
+        ForeignKey("discovery_data_fills.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    trade_date: Mapped[str] = mapped_column(String, primary_key=True)
 
 
 class ResearchJob(Base):

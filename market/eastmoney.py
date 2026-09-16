@@ -246,6 +246,7 @@ class FakeMarketClient:
         self.calls.append(("cheap",))
         if self.cheap_error is not None:
             raise MarketError(self.cheap_error)
+        self._last_cheap_trading_dates = tuple(self.trading_dates[-6:])
         return list(self.cheap_universe)
 
     def fetch_valuation_history(self, code: str) -> list[ValuationPoint]:
@@ -1138,6 +1139,7 @@ class EastMoneyClient:
                 )
             )
         latest_exchange_date = exchange_dates[-1] if exchange_dates else None
+        self._last_cheap_trading_dates = tuple(exchange_dates)
         rows: list[CheapRow] = []
         for item in diff:
             if not isinstance(item, dict):

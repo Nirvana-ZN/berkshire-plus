@@ -12,6 +12,9 @@ DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "app.db"
 FIN_FETCH_KEY = "fin_fetch_version"
 FIN_FETCH_VERSION = "3"
 _DISCOVERY_CNY_COLUMNS = (
+    "net_income",
+    "ocf",
+    "capex",
     "revenue",
     "deducted_net_income",
     "total_assets",
@@ -93,6 +96,16 @@ def _ensure_financial_columns(engine: Engine) -> None:
     from sqlalchemy import text
 
     wanted = {
+        "roe": "NUMERIC(20, 8)",
+        "net_income": "TEXT",
+        "ocf": "TEXT",
+        "capex": "TEXT",
+        "ebit": "NUMERIC(20, 8)",
+        "interest": "NUMERIC(20, 8)",
+        "gross_margin": "NUMERIC(20, 8)",
+        "net_margin": "NUMERIC(20, 8)",
+        "shares": "NUMERIC(20, 8)",
+        "share_change_ma": "BOOLEAN",
         "bps": "NUMERIC(20, 8)",
         "npl": "NUMERIC(20, 8)",
         "eps": "NUMERIC(20, 8)",
@@ -286,12 +299,38 @@ def _reset_stale_financials(engine: Engine) -> None:
         if current == FIN_FETCH_VERSION:
             return
         conn.execute(text("DELETE FROM financials"))
+        conn.execute(text("DELETE FROM financial_fetch_completeness"))
         conn.execute(
             text(
                 "INSERT INTO settings (key, value) VALUES (:key, :value) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
             ),
             {"key": FIN_FETCH_KEY, "value": FIN_FETCH_VERSION},
+        )
+
+
+def _infer_legacy_financial_completeness(engine: Engine) -> None:
+    """Conservatively recognize rows that only the legacy fetch could supply."""
+    from sqlalchemy import text
+
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                INSERT OR IGNORE INTO financial_fetch_completeness (
+                    code, mode, completed_at
+                )
+                SELECT DISTINCT code, 'legacy', CURRENT_TIMESTAMP
+                FROM financials
+                WHERE period_type = 'annual'
+                  AND (
+                    roe IS NOT NULL OR ebit IS NOT NULL
+                    OR interest IS NOT NULL OR gross_margin IS NOT NULL
+                    OR net_margin IS NOT NULL OR share_change_ma IS NOT NULL
+                    OR bps IS NOT NULL OR eps IS NOT NULL
+                  )
+                """
+            )
         )
 
 
@@ -306,6 +345,7 @@ def init_db(db_path: Path | None = None) -> Engine:
     _ensure_financial_text_storage(engine)
     _ensure_valuation_series(engine)
     _reset_stale_financials(engine)
+    _infer_legacy_financial_completeness(engine)
     SessionLocal = create_session_factory(engine)
     with SessionLocal() as session:
         seed_local_user(session)

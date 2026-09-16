@@ -10,9 +10,14 @@ from decimal import Decimal
 from sqlalchemy import and_, case, func, select
 from sqlalchemy.orm import Session
 
-from app.models import Financial, ValuationHistory
+from app.models import (
+    DiscoveryFillTradingDate,
+    DiscoveryUniverseSecurity,
+    Financial,
+    ValuationHistory,
+)
 from discovery.field_dictionary import FIELD_DICTIONARY
-from market.cheap import CheapRow, _cached
+from market.cheap import CheapRow, security_state_eligible
 
 QUALITY_DISCOUNT = "quality_discount"
 DEEP_VALUE = "deep_value"
@@ -175,22 +180,67 @@ def _sector_policies(
 
 def _persisted_universe(
     session: Session, as_of: date
-) -> tuple[list[CheapRow], float | None]:
-    cached = _cached(session, 0, max_age=float("inf"))
-    if cached is None:
-        return [], None
-    rows, fetched_at = cached
-    if datetime.fromtimestamp(fetched_at, timezone.utc).date() > as_of:
-        return [], None
-    return rows, fetched_at
-
-
-def _base_eligible(row: CheapRow) -> bool:
-    return (
-        row.exchange in {"SH", "SZ"}
-        and row.is_st is False
-        and row.is_delisting is False
+) -> tuple[list[CheapRow], tuple[str, ...], datetime | None]:
+    end = datetime.combine(
+        as_of + timedelta(days=1), time.min, tzinfo=timezone.utc
     )
+    latest_fill = (
+        select(DiscoveryUniverseSecurity.fill_id)
+        .where(DiscoveryUniverseSecurity.snapshot_at < end)
+        .order_by(DiscoveryUniverseSecurity.fill_id.desc())
+        .limit(1)
+        .scalar_subquery()
+    )
+    records = session.execute(
+        select(
+            DiscoveryUniverseSecurity,
+            DiscoveryFillTradingDate.trade_date,
+        )
+        .outerjoin(
+            DiscoveryFillTradingDate,
+            DiscoveryFillTradingDate.fill_id
+            == DiscoveryUniverseSecurity.fill_id,
+        )
+        .where(DiscoveryUniverseSecurity.fill_id == latest_fill)
+        .order_by(
+            DiscoveryUniverseSecurity.code,
+            DiscoveryFillTradingDate.trade_date,
+        )
+    ).all()
+    securities: dict[str, DiscoveryUniverseSecurity] = {}
+    trading_dates: set[str] = set()
+    for security, trade_date in records:
+        securities[security.code] = security
+        if trade_date is not None:
+            trading_dates.add(trade_date)
+    rows = [
+        CheapRow(
+            code=row.code,
+            name=row.name,
+            price=None,
+            pe=None,
+            pb=None,
+            mcap=None,
+            industry=row.industry,
+            exchange=row.exchange,
+            listing_date=row.listing_date,
+            is_st=row.is_st,
+            is_delisting=row.is_delisting,
+            trading_status=row.trading_status,
+            last_trade_date=row.last_trade_date,
+            industry_version=row.industry_version,
+            industry_as_of=row.source_as_of,
+            security_source=row.provenance,
+            market_status_code=row.market_status_code,
+        )
+        for row in securities.values()
+    ]
+    snapshot_at = (
+        max((row.snapshot_at for row in securities.values()))
+        if securities
+        else None
+    )
+    return rows, tuple(sorted(trading_dates)), snapshot_at
 
 
 def _industry_branch(industry: str | None) -> str:
@@ -565,8 +615,14 @@ def discovery_data_readiness(
     configured_minimums = _minimums(minimum_observations)
     policies = _policies(valuation_policies)
     sectors = _sector_policies(sector_policies)
-    universe, universe_fetched_at = _persisted_universe(session, as_of)
-    candidates = [row for row in universe if _base_eligible(row)]
+    universe, trading_dates, universe_fetched_at = _persisted_universe(
+        session, as_of
+    )
+    candidates = [
+        row
+        for row in universe
+        if security_state_eligible(row, trading_dates)
+    ]
     codes = tuple(row.code for row in candidates)
     financials, financial_as_of = _financial_history(session, codes, as_of)
     valuations, valuation_as_of, valuation_fetched_at = _valuation_history(

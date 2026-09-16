@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from inspect import signature
 from math import ceil
 from time import sleep
 from typing import Protocol
@@ -14,7 +15,10 @@ from sqlalchemy.orm import Session
 from app.models import (
     DiscoveryDataCheckpoint,
     DiscoveryDataFill,
+    DiscoveryFillTradingDate,
+    DiscoveryUniverseSecurity,
     Financial,
+    FinancialFetchCompleteness,
     ValuationHistory,
     ValuationSeries,
 )
@@ -232,6 +236,18 @@ def _initialize_checkpoints(
     try:
         fetch = getattr(market, "fetch_cheap_universe")
         rows = list(fetch(before_request=request_gate))
+        if hasattr(market, "_last_cheap_trading_dates"):
+            trading_dates = list(market._last_cheap_trading_dates)
+        else:
+            fetch_dates = getattr(market, "fetch_trading_dates")
+            end = _aware_utc(request_gate.clock.now()).date().isoformat()
+            if "before_request" in signature(fetch_dates).parameters:
+                trading_dates = list(
+                    fetch_dates(end, limit=6, before_request=request_gate)
+                )
+            else:
+                request_gate()
+                trading_dates = list(fetch_dates(end, limit=6))
     except DiscoveryRequestStopped:
         return False
     except Exception as exc:
@@ -240,14 +256,60 @@ def _initialize_checkpoints(
         fill.updated_at = _aware_utc(request_gate.clock.now())
         session.commit()
         return False
-    codes = sorted(
-        {
-            str(getattr(row, "code", "")).strip().upper()
-            for row in rows
-            if str(getattr(row, "code", "")).strip().upper().endswith((".SH", ".SZ"))
-        }
-    )
+    universe = {
+        code: row
+        for row in rows
+        if (
+            code := str(getattr(row, "code", "")).strip().upper()
+        ).endswith((".SH", ".SZ"))
+    }
+    codes = sorted(universe)
     stamp = _aware_utc(request_gate.clock.now())
+    session.add_all(
+        [
+            DiscoveryUniverseSecurity(
+                fill_id=fill.id,
+                code=code,
+                name=str(getattr(universe[code], "name", "")),
+                industry=str(getattr(universe[code], "industry", "")),
+                exchange=getattr(universe[code], "exchange", None),
+                listing_date=getattr(universe[code], "listing_date", None),
+                is_st=getattr(universe[code], "is_st", None),
+                is_delisting=getattr(universe[code], "is_delisting", None),
+                trading_status=getattr(universe[code], "trading_status", None),
+                is_suspended=(
+                    True
+                    if getattr(universe[code], "trading_status", None)
+                    == "suspended"
+                    else False
+                    if getattr(universe[code], "trading_status", None)
+                    == "trading"
+                    else None
+                ),
+                last_trade_date=getattr(
+                    universe[code], "last_trade_date", None
+                ),
+                industry_version=getattr(
+                    universe[code], "industry_version", None
+                ),
+                source_as_of=getattr(universe[code], "industry_as_of", None),
+                provenance=getattr(
+                    universe[code], "security_source", None
+                ),
+                market_status_code=getattr(
+                    universe[code], "market_status_code", None
+                ),
+                snapshot_at=stamp,
+            )
+            for code in codes
+        ]
+    )
+    session.add_all(
+        [
+            DiscoveryFillTradingDate(fill_id=fill.id, trade_date=trade_date)
+            for trade_date in sorted(set(trading_dates))
+        ]
+    )
     session.add_all(
         [
             DiscoveryDataCheckpoint(
@@ -650,7 +712,9 @@ def persist_discovery_financials(
     session: Session,
     rows: Iterable[FinancialRow],
 ) -> None:
+    codes: set[str] = set()
     for row in rows:
+        codes.add(row.code)
         stored = session.get(
             Financial,
             (row.code, row.period, row.period_type),
@@ -663,7 +727,18 @@ def persist_discovery_financials(
             )
             session.add(stored)
         for field in _DISCOVERY_FINANCIAL_FIELDS:
-            setattr(stored, field, getattr(row, field))
+            value = getattr(row, field)
+            if field not in _DISCOVERY_SHARED_FINANCIAL_FIELDS or value is not None:
+                setattr(stored, field, value)
+    stamp = datetime.now(timezone.utc)
+    for code in codes:
+        session.merge(
+            FinancialFetchCompleteness(
+                code=code,
+                mode="discovery",
+                completed_at=stamp,
+            )
+        )
 
 
 def persist_valuation_history(

@@ -9,7 +9,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, inspect, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -18,7 +18,10 @@ from app.main import create_app
 from app.models import (
     DiscoveryDataCheckpoint,
     DiscoveryDataFill,
+    DiscoveryFillTradingDate,
+    DiscoveryUniverseSecurity,
     Financial,
+    FinancialFetchCompleteness,
     JobLock,
     Setting,
     ValuationHistory,
@@ -149,6 +152,9 @@ def test_init_db_adds_discovery_tables_and_migrates_old_financial_schema(
         "valuation_history",
         "discovery_data_fills",
         "discovery_data_checkpoints",
+        "discovery_fill_trading_dates",
+        "discovery_universe_securities",
+        "financial_fetch_completeness",
     } <= set(schema.get_table_names())
     assert {column["name"] for column in schema.get_columns("valuation_history")} == {
         "code",
@@ -172,6 +178,9 @@ def test_init_db_adds_discovery_tables_and_migrates_old_financial_schema(
         for column in schema.get_columns("financials")
     }
     for field in (
+        "net_income",
+        "ocf",
+        "capex",
         "revenue",
         "total_assets",
         "net_assets",
@@ -277,11 +286,26 @@ def test_legacy_then_discovery_updates_only_owned_financial_fields(tmp_path) -> 
 
         persist_discovery_financials(
             session,
-            [replace(discovery, government_grants=None)],
+            [
+                replace(
+                    discovery,
+                    net_income=None,
+                    government_grants=None,
+                )
+            ],
         )
         session.commit()
         session.refresh(stored)
+        assert stored.net_income == Decimal("101")
         assert stored.government_grants is None
+        assert {
+            row.mode
+            for row in session.scalars(
+                select(FinancialFetchCompleteness).where(
+                    FinancialFetchCompleteness.code == legacy.code
+                )
+            )
+        } == {"legacy", "discovery"}
     engine.dispose()
 
 
@@ -320,6 +344,115 @@ def test_discovery_then_legacy_preserves_discovery_financial_fields(tmp_path) ->
         assert stored.net_income == Decimal("102")
         assert stored.revenue == Decimal("337532000000.12")
         assert stored.government_grants == Decimal("5")
+        assert {
+            row.mode
+            for row in session.scalars(
+                select(FinancialFetchCompleteness).where(
+                    FinancialFetchCompleteness.code == legacy.code
+                )
+            )
+        } == {"legacy", "discovery"}
+    engine.dispose()
+
+
+def test_strict_only_rows_do_not_suppress_legacy_cheap_fetch(tmp_path) -> None:
+    from jobs.cheap import _codes_with_financials, execute_cheap_fill
+    from jobs.discovery_data import persist_discovery_financials
+
+    engine = init_db(tmp_path / "strict-then-cheap.db")
+    code = "600036.SH"
+    strict = FinancialRow(
+        code=code,
+        period="2025",
+        period_type="annual",
+        revenue=Decimal("337532000000.12"),
+        net_income=None,
+    )
+    legacy = replace(strict, revenue=None, net_income=Decimal("82320067101.68"))
+    market = FakeMarketClient(
+        cheap_universe=[
+            CheapRow(
+                code=code,
+                name="招商银行",
+                price=Decimal("40"),
+                pe=Decimal("6"),
+                pb=Decimal("1"),
+                mcap=Decimal("100"),
+                industry="银行",
+            )
+        ],
+        financials=[legacy],
+    )
+    with Session(engine) as session:
+        persist_discovery_financials(session, [strict])
+        session.commit()
+        assert _codes_with_financials(session, [code]) == set()
+        execute_cheap_fill(session, market)
+        assert _codes_with_financials(session, [code]) == {code}
+        stored = session.get(Financial, (code, "2025", "annual"))
+        assert stored is not None
+        assert stored.net_income == legacy.net_income
+        assert stored.revenue == strict.revenue
+    assert ("financials", code) in market.calls
+    engine.dispose()
+
+
+def test_existing_financial_rows_infer_only_safe_legacy_completeness(tmp_path) -> None:
+    from jobs.cheap import _codes_with_financials
+
+    db_path = tmp_path / "legacy-completeness.db"
+    old_engine = create_engine(f"sqlite:///{db_path.resolve().as_posix()}")
+    with old_engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE financials (
+                    code VARCHAR NOT NULL,
+                    period VARCHAR NOT NULL,
+                    period_type VARCHAR NOT NULL,
+                    roe NUMERIC(20, 8),
+                    net_income NUMERIC(20, 8),
+                    ocf NUMERIC(20, 8),
+                    capex NUMERIC(20, 8),
+                    revenue TEXT,
+                    PRIMARY KEY (code, period, period_type)
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO financials "
+                "(code, period, period_type, roe, net_income) VALUES "
+                "('000001.SZ', '2025', 'annual', 12, 100)"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO financials "
+                "(code, period, period_type, revenue) VALUES "
+                "('600036.SH', '2025', 'annual', '337532000000.12')"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE TABLE settings ("
+                "key VARCHAR NOT NULL PRIMARY KEY, value VARCHAR NOT NULL)"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO settings (key, value) "
+                "VALUES ('fin_fetch_version', '3')"
+            )
+        )
+    old_engine.dispose()
+
+    engine = init_db(db_path)
+    with Session(engine) as session:
+        assert _codes_with_financials(
+            session, ["000001.SZ", "600036.SH"]
+        ) == {"000001.SZ"}
     engine.dispose()
 
 
@@ -327,11 +460,14 @@ def test_large_cny_amount_round_trips_as_exact_text(tmp_path) -> None:
     from jobs.discovery_data import persist_discovery_financials
 
     engine = init_db(tmp_path / "large-money.db")
-    amount = Decimal("45900000000000.12")
+    amount = Decimal("45900000000000.123456789012345678")
     row = FinancialRow(
         code="600036.SH",
         period="2025",
         period_type="annual",
+        net_income=amount,
+        ocf=amount + Decimal("0.000000000000000001"),
+        capex=amount + Decimal("0.000000000000000002"),
         total_assets=amount,
     )
     with Session(engine) as session:
@@ -339,17 +475,21 @@ def test_large_cny_amount_round_trips_as_exact_text(tmp_path) -> None:
         session.commit()
         stored = session.get(Financial, (row.code, row.period, row.period_type))
         assert stored is not None
+        assert stored.net_income == row.net_income
+        assert stored.ocf == row.ocf
+        assert stored.capex == row.capex
         assert stored.total_assets == amount
     with engine.connect() as conn:
-        storage_type, raw = conn.execute(
+        storage_types = conn.execute(
             text(
-                "SELECT typeof(total_assets), total_assets FROM financials "
+                "SELECT typeof(net_income), typeof(ocf), typeof(capex), "
+                "typeof(total_assets), net_income FROM financials "
                 "WHERE code = :code"
             ),
             {"code": row.code},
         ).one()
-        assert storage_type == "text"
-        assert raw == "45900000000000.12"
+        assert storage_types[:4] == ("text", "text", "text", "text")
+        assert storage_types[4] == "45900000000000.123456789012345678"
     engine.dispose()
 
 
@@ -392,8 +532,12 @@ def test_init_db_converts_interim_discovery_money_columns_to_text(tmp_path) -> N
         )
         conn.execute(
             text(
-                "INSERT INTO financials (code, period, period_type, revenue) "
-                "VALUES ('600519.SH', '2025', 'annual', 12345.5)"
+                "INSERT INTO financials ("
+                "code, period, period_type, net_income, ocf, capex, revenue"
+                ") VALUES ("
+                "'600519.SH', '2025', 'annual', "
+                "82320067101.68, 61522204989.35, 3127594916.41, 12345.5"
+                ")"
             )
         )
         conn.execute(
@@ -417,11 +561,30 @@ def test_init_db_converts_interim_discovery_money_columns_to_text(tmp_path) -> N
             for row in conn.exec_driver_sql("PRAGMA table_info(financials)")
         }
     assert columns["revenue"] == "TEXT"
+    assert columns["net_income"] == "TEXT"
+    assert columns["ocf"] == "TEXT"
+    assert columns["capex"] == "TEXT"
     with Session(engine) as session:
         stored = session.get(Financial, ("600519.SH", "2025", "annual"))
         assert stored is not None
         assert stored.revenue == Decimal("12345.5")
+        assert stored.net_income == Decimal("82320067101.68")
+        assert stored.ocf == Decimal("61522204989.35")
+        assert stored.capex == Decimal("3127594916.41")
     engine.dispose()
+    migrated_again = init_db(db_path)
+    with migrated_again.connect() as conn:
+        assert {
+            row[1]: row[2]
+            for row in conn.exec_driver_sql("PRAGMA table_info(financials)")
+        }["net_income"] == "TEXT"
+        assert conn.execute(
+            text(
+                "SELECT net_income FROM financials "
+                "WHERE code = '600519.SH'"
+            )
+        ).scalar_one() == "82320067101.68"
+    migrated_again.dispose()
 
 
 def test_discovery_operational_models_round_trip(tmp_path) -> None:
@@ -3396,10 +3559,59 @@ def _store_readiness_universe(
     rows: list[CheapRow],
     *,
     fetched_at: float = 1789560000.0,
+    trading_dates: tuple[str, ...] = (
+        "2026-09-09",
+        "2026-09-10",
+        "2026-09-11",
+        "2026-09-14",
+        "2026-09-15",
+        "2026-09-16",
+    ),
 ) -> None:
-    from market.cheap import _store
-
-    _store(session, rows, fetched_at)
+    stamp = datetime.fromtimestamp(fetched_at, timezone.utc)
+    fill = DiscoveryDataFill(
+        status="done",
+        total=len(rows),
+        completed=len(rows),
+        failed=0,
+        request_count=0,
+        daily_budget=1000,
+        budget_day=stamp.date().isoformat(),
+        daily_requests=0,
+        started_at=stamp,
+        updated_at=stamp,
+        last_error=None,
+    )
+    session.add(fill)
+    session.flush()
+    session.add_all(
+        [
+            DiscoveryUniverseSecurity(
+                fill_id=fill.id,
+                code=row.code,
+                name=row.name,
+                industry=row.industry,
+                exchange=row.exchange,
+                listing_date=row.listing_date,
+                is_st=row.is_st,
+                is_delisting=row.is_delisting,
+                trading_status=row.trading_status,
+                last_trade_date=row.last_trade_date,
+                industry_version=row.industry_version,
+                source_as_of=row.industry_as_of,
+                provenance=row.security_source,
+                market_status_code=row.market_status_code,
+                snapshot_at=stamp,
+            )
+            for row in rows
+        ]
+    )
+    session.add_all(
+        [
+            DiscoveryFillTradingDate(fill_id=fill.id, trade_date=trade_date)
+            for trade_date in trading_dates
+        ]
+    )
     session.commit()
 
 
@@ -3456,6 +3668,94 @@ def _store_readiness_valuations(
         ],
         fetched_at=fetched_at,
     )
+
+
+def test_backfill_snapshot_drives_readiness_without_cheap_cache(tmp_path) -> None:
+    from discovery.data_readiness import discovery_data_readiness
+    from jobs.discovery_data import (
+        RequestPolicy,
+        execute_discovery_data_fill,
+        start_discovery_data_fill,
+    )
+    from market.cheap import _store
+
+    engine = init_db(tmp_path / "fill-readiness.db")
+    now = datetime(2026, 9, 16, 12, tzinfo=timezone.utc)
+    code = "000001.SZ"
+    frozen_dates = [
+        "2026-09-09",
+        "2026-09-10",
+        "2026-09-11",
+        "2026-09-14",
+        "2026-09-15",
+        "2026-09-16",
+    ]
+    market = FakeMarketClient(
+        cheap_universe=[_readiness_row(code)],
+        trading_dates=frozen_dates,
+        discovery_data={code: _bundle(code, request_count=1)},
+    )
+    policy = RequestPolicy(
+        requests_per_second=100,
+        max_attempts=1,
+        daily_budget=100,
+        max_runtime_seconds=60,
+    )
+    with Session(engine) as session:
+        fill, dispatch = start_discovery_data_fill(
+            session, policy=policy, now=now
+        )
+        assert fill is not None and dispatch
+        fill_id = fill.id
+        execute_discovery_data_fill(
+            session,
+            market,
+            fill_id,
+            policy=policy,
+            clock=FakeClock(now),
+        )
+        # An unrelated cheap-board cache must never replace the fill snapshot.
+        _store(session, [], now.timestamp())
+        session.commit()
+        report = discovery_data_readiness(session, as_of=now.date())
+        assert all(track.eligible == 1 for track in report.tracks.values())
+        snapshot = session.get(DiscoveryUniverseSecurity, (fill_id, code))
+        assert snapshot is not None
+        assert snapshot.name == code
+        assert snapshot.provenance == "fake"
+        assert session.scalars(
+            select(DiscoveryFillTradingDate.trade_date)
+            .where(DiscoveryFillTradingDate.fill_id == fill_id)
+            .order_by(DiscoveryFillTradingDate.trade_date)
+        ).all() == frozen_dates
+    engine.dispose()
+
+
+def test_readiness_uses_five_frozen_dates_for_suspension(tmp_path) -> None:
+    from discovery.data_readiness import discovery_data_readiness
+
+    engine = init_db(tmp_path / "readiness-suspension.db")
+    recent = replace(
+        _readiness_row("000001.SZ"),
+        trading_status="suspended",
+        last_trade_date="2026-09-10",
+    )
+    stale = replace(
+        _readiness_row("000002.SZ"),
+        trading_status="suspended",
+        last_trade_date="2026-09-09",
+    )
+    unknown = replace(
+        _readiness_row("000003.SZ"),
+        trading_status=None,
+        last_trade_date=None,
+    )
+    with Session(engine) as session:
+        _store_readiness_universe(session, [recent, stale, unknown])
+        report = discovery_data_readiness(session, as_of=date(2026, 9, 16))
+    assert set(report.observations) == {recent.code}
+    assert all(track.eligible == 1 for track in report.tracks.values())
+    engine.dispose()
 
 
 def test_readiness_quality_uses_eligible_denominator_and_one_ratio_method(
@@ -3618,33 +3918,29 @@ def test_readiness_fields_are_track_and_financial_branch_specific(tmp_path) -> N
     quality = report.tracks["quality_discount"]
     deep_value = report.tracks["deep_value"]
     garp = report.tracks["garp"]
-    assert quality.complete == quality.eligible == 5
+    assert quality.complete == quality.eligible == 4
     assert quality.missing_fields == ()
     assert deep_value.missing_fields == (
         "capex",
         "capital_adequacy",
-        "industry",
     )
     assert report.missing_counts["deep_value"] == {
         "capital_adequacy": 1,
         "capex": 1,
-        "industry": 1,
     }
     assert "government_grants" not in deep_value.missing_fields
     assert garp.missing_fields == (
         "financial_roic_policy",
-        "industry",
         "revenue",
         "roic",
     )
     assert report.missing_counts["garp"] == {
         "financial_roic_policy": 2,
-        "industry": 1,
         "revenue": 1,
         "roic": 1,
     }
     assert "capex" not in garp.missing_fields
-    assert garp.eligible == 5
+    assert garp.eligible == 4
     assert report.company_insufficient["garp"] == {
         "financial_roic_policy_unapproved": 2
     }
@@ -3725,7 +4021,7 @@ def test_discovery_status_serializes_decimal_readiness_without_dispatch(
 
         assert response.status_code == 200
         body = response.json()
-        assert body["status"] == "idle"
+        assert body["status"] == "done"
         assert body["readiness"]["status"] == "not_activated"
         assert body["readiness"]["evaluated_as_of"] == date.today().isoformat()
         assert body["readiness"]["tracks"]["quality_discount"]["coverage"] == 0.5
@@ -3824,8 +4120,10 @@ def test_readiness_as_of_excludes_future_records_and_future_listing_is_invalid(
     assert report.source_as_of["valuation_fetched_at"] == (
         "2026-09-16T12:00:00+00:00"
     )
-    assert future_universe.observations == {}
-    assert future_universe.source_as_of["universe"] is None
+    assert future_universe.observations.keys() == report.observations.keys()
+    assert future_universe.source_as_of["universe"] == (
+        "2026-09-16T12:00:00+00:00"
+    )
     engine.dispose()
 
 
@@ -3961,18 +4259,17 @@ def test_readiness_uses_explicit_bank_insurance_and_financial_branches(
         )
 
     deep = report.tracks["deep_value"]
-    assert deep.eligible == 7
+    assert deep.eligible == 6
     assert deep.complete == 3
     assert deep.ready is True
     assert report.observations[bank].branch == "bank"
     assert report.observations[insurance].branch == "insurance"
     assert report.observations[other_financial].branch == "other_financial"
     assert report.observations[nonfinancial].branch == "nonfinancial"
-    assert report.observations[unknown].branch == "unknown"
+    assert unknown not in report.observations
     assert report.missing_counts["deep_value"] == {
         "capital_adequacy": 1,
         "financial_branch_source": 1,
-        "industry": 1,
         "npl": 1,
     }
     assert report.observations[insurance].financial["npl"] == 0

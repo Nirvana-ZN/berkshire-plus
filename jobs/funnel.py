@@ -9,7 +9,13 @@ from pathlib import Path
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import Financial, Instrument, ScreenResult, ScreenRun
+from app.models import (
+    Financial,
+    FinancialFetchCompleteness,
+    Instrument,
+    ScreenResult,
+    ScreenRun,
+)
 from jobs.lock import JOB_TYPE_FUNNEL, release
 from jobs.research import evaluate_finalists
 from ledger.positions import load_positions
@@ -82,7 +88,9 @@ def persist_industries(session: Session, snapshots: list[Constituent]) -> None:
 
 
 def persist_financials(session: Session, rows: list[FinancialRow]) -> None:
+    codes: set[str] = set()
     for row in rows:
+        codes.add(row.code)
         stored = session.get(
             Financial,
             (row.code, row.period, row.period_type),
@@ -96,6 +104,15 @@ def persist_financials(session: Session, rows: list[FinancialRow]) -> None:
             session.add(stored)
         for field in _LEGACY_FINANCIAL_FIELDS:
             setattr(stored, field, getattr(row, field))
+    stamp = _now()
+    for code in codes:
+        session.merge(
+            FinancialFetchCompleteness(
+                code=code,
+                mode="legacy",
+                completed_at=stamp,
+            )
+        )
 
 
 def persist_listed_years(session: Session, years: dict[str, int]) -> None:
