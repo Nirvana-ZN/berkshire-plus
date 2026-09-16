@@ -1,6 +1,6 @@
 .env
 data/app.db
-portfolio/
+/portfolio/
 reports/
 web/node_modules
 web/dist
