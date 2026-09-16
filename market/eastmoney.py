@@ -123,7 +123,11 @@ class MarketClient(Protocol):
     def list_boards(self, scope_type: str, query: str = "") -> list[dict[str, str]]:
         """Return board or index names for the screen picker."""
 
-    def fetch_cheap_universe(self) -> list[CheapRow]:
+    def fetch_cheap_universe(
+        self,
+        *,
+        before_request: DiscoveryPreRequest | None = None,
+    ) -> list[CheapRow]:
         """沪深 A 股截面：现价 / PE / PB / 市值 / 行业。"""
 
     def fetch_valuation_history(self, code: str) -> list[ValuationPoint]:
@@ -231,9 +235,15 @@ class FakeMarketClient:
         self.calls.append(("breadth",))
         return dict(self.breadth)
 
-    def fetch_cheap_universe(self) -> list[CheapRow]:
-        self.calls.append(("cheap",))
+    def fetch_cheap_universe(
+        self,
+        *,
+        before_request: DiscoveryPreRequest | None = None,
+    ) -> list[CheapRow]:
+        if before_request is not None:
+            before_request()
         self._request_count += 1
+        self.calls.append(("cheap",))
         if self.cheap_error is not None:
             raise MarketError(self.cheap_error)
         return list(self.cheap_universe)
@@ -1080,15 +1090,29 @@ class EastMoneyClient:
         out["zt"], out["dt"] = self._limit_counts()
         return out
 
-    def fetch_cheap_universe(self) -> list[CheapRow]:
+    def fetch_cheap_universe(
+        self,
+        *,
+        before_request: DiscoveryPreRequest | None = None,
+    ) -> list[CheapRow]:
         # ponytail: 东财截面约 50–80 页；历史分位另存每日快照
         snapshot_date = date.today().isoformat()
         try:
-            diff = self._clist_diff(
-                fs=HS_A_FS,
-                fields="f12,f13,f14,f2,f9,f23,f20,f26,f100,f292",
-                fid="f12",
-                max_pages=80,
+            diff = (
+                self._clist_diff(
+                    fs=HS_A_FS,
+                    fields="f12,f13,f14,f2,f9,f23,f20,f26,f100,f292",
+                    fid="f12",
+                    max_pages=80,
+                )
+                if before_request is None
+                else self._clist_diff(
+                    fs=HS_A_FS,
+                    fields="f12,f13,f14,f2,f9,f23,f20,f26,f100,f292",
+                    fid="f12",
+                    max_pages=80,
+                    before_request=before_request,
+                )
             )
         except MarketError:
             raise
@@ -1105,7 +1129,14 @@ class EastMoneyClient:
             )
             for item in diff
         ):
-            exchange_dates = self.fetch_trading_dates(snapshot_date)
+            exchange_dates = (
+                self.fetch_trading_dates(snapshot_date)
+                if before_request is None
+                else self.fetch_trading_dates(
+                    snapshot_date,
+                    before_request=before_request,
+                )
+            )
         latest_exchange_date = exchange_dates[-1] if exchange_dates else None
         rows: list[CheapRow] = []
         for item in diff:
@@ -1132,6 +1163,12 @@ class EastMoneyClient:
             elif market_status == 6 and latest_exchange_date is not None:
                 probed_last_trade_date = (
                     self._last_trade_date(code, latest_exchange_date)
+                    if before_request is None
+                    else self._last_trade_date(
+                        code,
+                        latest_exchange_date,
+                        before_request=before_request,
+                    )
                 )
                 if (
                     probed_last_trade_date is not None
@@ -1419,6 +1456,7 @@ class EastMoneyClient:
         fid: str,
         encode_fs: bool = False,
         max_pages: int = 50,
+        before_request: DiscoveryPreRequest | None = None,
     ) -> list[dict]:
         rows: list[dict] = []
         seen: set[str] = set()
@@ -1428,7 +1466,13 @@ class EastMoneyClient:
                 f"{BOARD_LIST_URL}?pn={page}&pz=100&po=1&np=1&fltt=2&invt=2&fid={fid}"
                 f"&fs={encoded}&fields={fields}"
             )
-            payload = self._get_json(url)
+            payload = (
+                self._get_json(url)
+                if before_request is None
+                else self._get_json(
+                    url, before_request=before_request
+                )
+            )
             diff = (payload.get("data") or {}).get("diff") or []
             if not isinstance(diff, list) or not diff:
                 break

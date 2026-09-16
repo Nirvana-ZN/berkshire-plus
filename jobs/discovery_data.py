@@ -27,10 +27,9 @@ from market.types import (
     ValuationPoint,
 )
 
-# The universe probe used about 71 requests (56 pages, calendar, suspensions);
-# 100 keeps a crash-safe margin before discovery checkpoints exist. Discovery
-# company fetches are charged exactly at each HTTP request boundary. Task 1/2
-# probes justify the conservative 0.5 req/s, 1,000/day, and 15-minute run cap.
+# Universe and company fetches are charged exactly at each HTTP request
+# boundary. Task 1/2 probes justify the conservative 0.5 req/s, 1,000/day,
+# and 15-minute run cap without a full-market live calibration.
 FILL_CHUNK = 20
 POLICY_TIMEZONE = timezone(timedelta(hours=8))
 
@@ -42,7 +41,6 @@ class RequestPolicy:
     daily_budget: int = 1000
     max_runtime_seconds: float = 15 * 60
     retry_delay_seconds: float = 5 * 60
-    universe_request_reservation: int = 100
 
     def __post_init__(self) -> None:
         if (
@@ -51,7 +49,6 @@ class RequestPolicy:
             or self.daily_budget <= 0
             or self.max_runtime_seconds <= 0
             or self.retry_delay_seconds < 0
-            or self.universe_request_reservation <= 0
         ):
             raise ValueError("request policy values must be positive")
 
@@ -186,52 +183,11 @@ def _reset_budget_day(fill: DiscoveryDataFill, now: datetime) -> None:
         fill.daily_requests = 0
 
 
-def _reserve_requests(
-    session: Session,
-    fill: DiscoveryDataFill,
-    amount: int,
-    now: datetime,
-) -> bool:
-    _reset_budget_day(fill, now)
-    if fill.daily_requests + amount > fill.daily_budget:
-        fill.status = "paused"
-        fill.last_error = "daily request budget reached"
-        fill.updated_at = now
-        session.commit()
-        return False
-    fill.daily_requests += amount
-    fill.updated_at = now
-    session.commit()
-    return True
-
-
-def _settle_request_reservation(
-    session: Session,
-    fill: DiscoveryDataFill,
-    *,
-    reserved: int,
-    actual: int,
-    now: datetime,
-) -> int:
-    used = max(0, int(actual))
-    fill.daily_requests += used - reserved
-    fill.request_count += used
-    fill.updated_at = now
-    session.commit()
-    return used
-
-
-def _market_request_count(market: object) -> int | None:
-    value = getattr(market, "request_count", None)
-    return int(value) if isinstance(value, int) and not isinstance(value, bool) else None
-
-
 def _initialize_checkpoints(
     session: Session,
     market: object,
     fill: DiscoveryDataFill,
-    policy: RequestPolicy,
-    clock: FillClock,
+    request_gate: DiscoveryRequestGate,
 ) -> bool:
     existing = session.scalars(
         select(DiscoveryDataCheckpoint.code)
@@ -240,46 +196,17 @@ def _initialize_checkpoints(
     ).first()
     if existing is not None:
         return True
-    now = _aware_utc(clock.now())
-    reserved = policy.universe_request_reservation
-    if not _reserve_requests(session, fill, reserved, now):
-        return False
-    before = _market_request_count(market)
     try:
         fetch = getattr(market, "fetch_cheap_universe")
-        rows = list(fetch())
+        rows = list(fetch(before_request=request_gate))
+    except DiscoveryRequestBudgetExhausted:
+        return False
     except Exception as exc:
-        after = _market_request_count(market)
-        actual = (
-            max(0, after - before)
-            if before is not None and after is not None
-            else reserved
-        )
-        _settle_request_reservation(
-            session,
-            fill,
-            reserved=reserved,
-            actual=actual,
-            now=_aware_utc(clock.now()),
-        )
         fill.status = "paused"
         fill.last_error = f"universe: {exc}"
-        fill.updated_at = _aware_utc(clock.now())
+        fill.updated_at = _aware_utc(request_gate.clock.now())
         session.commit()
         return False
-    after = _market_request_count(market)
-    actual = (
-        max(0, after - before)
-        if before is not None and after is not None
-        else reserved
-    )
-    _settle_request_reservation(
-        session,
-        fill,
-        reserved=reserved,
-        actual=actual,
-        now=_aware_utc(clock.now()),
-    )
     codes = sorted(
         {
             str(getattr(row, "code", "")).strip().upper()
@@ -287,7 +214,7 @@ def _initialize_checkpoints(
             if str(getattr(row, "code", "")).strip().upper().endswith((".SH", ".SZ"))
         }
     )
-    stamp = _aware_utc(clock.now())
+    stamp = _aware_utc(request_gate.clock.now())
     session.add_all(
         [
             DiscoveryDataCheckpoint(
@@ -437,14 +364,16 @@ def execute_discovery_data_fill(
         fill.daily_budget = policy.daily_budget
         fill.updated_at = run_started
         session.commit()
-        if not _initialize_checkpoints(session, market, fill, policy, timer):
-            return
         request_gate = DiscoveryRequestGate(
             session,
             fill.id,
             policy=policy,
             clock=timer,
         )
+        if not _initialize_checkpoints(
+            session, market, fill, request_gate
+        ):
+            return
 
         while True:
             now = _aware_utc(timer.now())

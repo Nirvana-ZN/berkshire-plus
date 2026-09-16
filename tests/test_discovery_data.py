@@ -1802,11 +1802,14 @@ class FakeClock:
 
 
 class _HttpResponse:
+    def __init__(self, payload: dict | None = None) -> None:
+        self.payload = payload or {"ok": True}
+
     def raise_for_status(self) -> None:
         pass
 
     def json(self) -> dict:
-        return {"ok": True}
+        return self.payload
 
 
 def _install_http_transport(monkeypatch, get) -> None:
@@ -2127,6 +2130,250 @@ def test_discovery_worker_rejects_typed_request_count_audit_mismatch(
         assert checkpoint.status == "failed"
         assert checkpoint.error and "request_audit" in checkpoint.error
     engine.dispose()
+
+
+def _universe_row(code: str, *, suspended: bool = False) -> dict[str, object]:
+    return {
+        "f12": code,
+        "f13": 1,
+        "f14": f"公司{code}",
+        "f2": "-",
+        "f9": "10",
+        "f23": "1",
+        "f20": "100",
+        "f26": 20000101,
+        "f100": "测试",
+        "f292": 6 if suspended else None,
+    }
+
+
+def test_first_run_universe_gates_pages_calendar_and_suspended_kline(
+    tmp_path, monkeypatch
+) -> None:
+    from jobs.discovery_data import RequestPolicy, execute_discovery_data_fill
+
+    engine = init_db(tmp_path / "universe-boundary.db")
+    factory = create_session_factory(engine)
+    now = datetime(2026, 9, 16, 12, tzinfo=timezone.utc)
+    with factory() as session:
+        fill_id = _fill(session, [], now=now, daily_budget=20).id
+    clock = FakeClock(now)
+    observations: list[tuple[datetime, int]] = []
+
+    def get(url: str):
+        with factory() as observer:
+            fill = observer.get(DiscoveryDataFill, fill_id)
+            assert fill is not None
+            observations.append((clock.now(), fill.request_count))
+        if "clist/get" in url:
+            page = int(parse_qs(urlsplit(url).query)["pn"][0])
+            rows = (
+                [_universe_row(f"{600000 + index:06d}") for index in range(100)]
+                if page == 1
+                else [_universe_row("601999", suspended=True)]
+            )
+            return _HttpResponse({"data": {"diff": rows}})
+        if "secid=0.399317" in url:
+            return _HttpResponse(
+                {
+                    "data": {
+                        "klines": [
+                            "2026-09-15,1,2,3,4,5,6",
+                            "2026-09-16,1,2,3,4,5,6",
+                        ]
+                    }
+                }
+            )
+        assert "secid=1.601999" in url
+        return _HttpResponse(
+            {"data": {"klines": ["2026-09-15,1,2,3,4,5,6"]}}
+        )
+
+    _install_http_transport(monkeypatch, get)
+    policy = RequestPolicy(
+        requests_per_second=100,
+        max_attempts=2,
+        daily_budget=20,
+        max_runtime_seconds=0.025,
+    )
+    with factory() as session:
+        execute_discovery_data_fill(
+            session,
+            EastMoneyClient(),
+            fill_id,
+            policy=policy,
+            clock=clock,
+        )
+    assert observations == [
+        (now, 1),
+        (now + timedelta(seconds=0.01), 2),
+        (now + timedelta(seconds=0.02), 3),
+        (now + timedelta(seconds=0.03), 4),
+    ]
+    with factory() as session:
+        fill = session.get(DiscoveryDataFill, fill_id)
+        assert fill is not None
+        assert (fill.status, fill.total, fill.request_count) == (
+            "paused",
+            101,
+            4,
+        )
+        assert session.query(DiscoveryDataCheckpoint).filter_by(
+            fill_id=fill_id
+        ).count() == 101
+    engine.dispose()
+
+
+def test_universe_budget_exhaustion_stops_transport_and_remains_resumable(
+    tmp_path, monkeypatch
+) -> None:
+    from jobs.discovery_data import RequestPolicy, execute_discovery_data_fill
+
+    engine = init_db(tmp_path / "universe-budget.db")
+    factory = create_session_factory(engine)
+    now = datetime(2026, 9, 16, 12, tzinfo=timezone.utc)
+    with factory() as session:
+        fill_id = _fill(session, [], now=now, daily_budget=2).id
+    clock = FakeClock(now)
+    transports = 0
+
+    def get(url: str):
+        nonlocal transports
+        transports += 1
+        page = int(parse_qs(urlsplit(url).query)["pn"][0])
+        return _HttpResponse(
+            {
+                "data": {
+                    "diff": [
+                        _universe_row(f"{600000 + page * 100 + index:06d}")
+                        for index in range(100)
+                    ]
+                }
+            }
+        )
+
+    _install_http_transport(monkeypatch, get)
+    policy = RequestPolicy(
+        requests_per_second=100,
+        max_attempts=2,
+        daily_budget=2,
+        max_runtime_seconds=60,
+    )
+    with factory() as session:
+        execute_discovery_data_fill(
+            session,
+            EastMoneyClient(),
+            fill_id,
+            policy=policy,
+            clock=clock,
+        )
+    assert transports == 2
+    with factory() as session:
+        fill = session.get(DiscoveryDataFill, fill_id)
+        assert fill is not None
+        assert (fill.status, fill.total, fill.request_count) == (
+            "paused",
+            0,
+            2,
+        )
+        assert session.query(DiscoveryDataCheckpoint).filter_by(
+            fill_id=fill_id
+        ).count() == 0
+
+    # Explicit same-day resume re-enters initialization but the gate rejects
+    # before transport, preserving the empty checkpoint state for another day.
+    with factory() as session:
+        execute_discovery_data_fill(
+            session,
+            EastMoneyClient(),
+            fill_id,
+            policy=policy,
+            clock=clock,
+        )
+    assert transports == 2
+    engine.dispose()
+
+
+def test_universe_crash_after_second_transport_keeps_exact_accounting(
+    tmp_path, monkeypatch
+) -> None:
+    from jobs.discovery_data import RequestPolicy, execute_discovery_data_fill
+
+    engine = init_db(tmp_path / "universe-crash.db")
+    factory = create_session_factory(engine)
+    now = datetime(2026, 9, 16, 12, tzinfo=timezone.utc)
+    with factory() as session:
+        fill_id = _fill(session, [], now=now, daily_budget=20).id
+    clock = FakeClock(now)
+    transports = 0
+
+    def get(url: str):
+        nonlocal transports
+        transports += 1
+        if transports == 2:
+            raise KeyboardInterrupt("simulated universe crash")
+        return _HttpResponse(
+            {
+                "data": {
+                    "diff": [
+                        _universe_row(f"{600000 + index:06d}")
+                        for index in range(100)
+                    ]
+                }
+            }
+        )
+
+    _install_http_transport(monkeypatch, get)
+    policy = RequestPolicy(
+        requests_per_second=100,
+        max_attempts=2,
+        daily_budget=20,
+        max_runtime_seconds=60,
+    )
+    with factory() as session:
+        with pytest.raises(KeyboardInterrupt):
+            execute_discovery_data_fill(
+                session,
+                EastMoneyClient(),
+                fill_id,
+                policy=policy,
+                clock=clock,
+            )
+    with factory() as session:
+        fill = session.get(DiscoveryDataFill, fill_id)
+        assert fill is not None
+        assert (fill.status, fill.total, fill.request_count) == (
+            "paused",
+            0,
+            2,
+        )
+        assert fill.daily_requests == 2
+    assert transports == 2
+    engine.dispose()
+
+
+def test_legacy_cheap_universe_without_gate_keeps_old_override_contract() -> None:
+    calls = 0
+
+    class LegacyStub(EastMoneyClient):
+        def _get_json(self, _url: str) -> dict:
+            nonlocal calls
+            calls += 1
+            return {
+                "data": {
+                    "diff": [
+                        {
+                            **_universe_row("600000"),
+                            "f2": "10",
+                            "f292": None,
+                        }
+                    ]
+                }
+            }
+
+    rows = LegacyStub().fetch_cheap_universe()
+    assert [row.code for row in rows] == ["600000.SH"]
+    assert calls == 1
 
 
 def _security(code: str) -> SecurityState:
@@ -2570,7 +2817,7 @@ def test_discovery_data_duplicate_start_is_idempotent_and_lock_conflicts(
         with client.app.state.session_factory() as session:
             assert session.query(DiscoveryDataFill).count() == 1
         gate.set()
-        for _ in range(100):
+        for _ in range(400):
             if client.get("/api/discovery-data/status").json()["status"] == "done":
                 break
             time.sleep(0.01)
