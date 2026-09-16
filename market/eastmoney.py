@@ -19,6 +19,8 @@ from market.types import (
     Constituent,
     DiscoveryCompanyData,
     DiscoveryCompanyError,
+    DiscoveryPreRequest,
+    DiscoveryRequestBudgetExhausted,
     DiscoverySourceAsOf,
     FinancialRow,
     MarketError,
@@ -130,7 +132,12 @@ class MarketClient(Protocol):
     def fetch_trading_dates(self, end: str, limit: int = 6) -> list[str]:
         """Return actual exchange dates ending no later than end."""
 
-    def fetch_discovery_data(self, code: str) -> DiscoveryCompanyData:
+    def fetch_discovery_data(
+        self,
+        code: str,
+        *,
+        before_request: DiscoveryPreRequest | None = None,
+    ) -> DiscoveryCompanyData:
         """Return one verified company bundle or raise DiscoveryCompanyError."""
 
 
@@ -239,14 +246,22 @@ class FakeMarketClient:
         self.calls.append(("trading_dates", end, str(limit)))
         return [day for day in self.trading_dates if day <= end][-limit:]
 
-    def fetch_discovery_data(self, code: str) -> DiscoveryCompanyData:
-        self.calls.append(("discovery_data", code))
-        if self.discovery_gate is not None:
-            self.discovery_gate.wait(timeout=10)
+    def fetch_discovery_data(
+        self,
+        code: str,
+        *,
+        before_request: DiscoveryPreRequest | None = None,
+    ) -> DiscoveryCompanyData:
         request_count = self.discovery_request_counts.get(code)
         if code in self.discovery_errors:
             used = 0 if request_count is None else request_count
+            for _ in range(used):
+                if before_request is not None:
+                    before_request()
             self._request_count += used
+            self.calls.append(("discovery_data", code))
+            if self.discovery_gate is not None:
+                self.discovery_gate.wait(timeout=10)
             raise DiscoveryCompanyError(
                 code,
                 "fake",
@@ -257,7 +272,13 @@ class FakeMarketClient:
             result = self.discovery_data[code]
         except KeyError as exc:
             used = 0 if request_count is None else request_count
+            for _ in range(used):
+                if before_request is not None:
+                    before_request()
             self._request_count += used
+            self.calls.append(("discovery_data", code))
+            if self.discovery_gate is not None:
+                self.discovery_gate.wait(timeout=10)
             raise DiscoveryCompanyError(
                 code,
                 "fake",
@@ -265,7 +286,13 @@ class FakeMarketClient:
                 request_count=used,
             ) from exc
         used = result.request_count if request_count is None else request_count
+        for _ in range(used):
+            if before_request is not None:
+                before_request()
         self._request_count += used
+        self.calls.append(("discovery_data", code))
+        if self.discovery_gate is not None:
+            self.discovery_gate.wait(timeout=10)
         return result if used == result.request_count else replace(result, request_count=used)
 
     def list_boards(self, scope_type: str, query: str = "") -> list[dict[str, str]]:
@@ -750,48 +777,98 @@ class EastMoneyClient:
             raise last_error or MarketError("财务接口整体不可用")
         return rows
 
-    def fetch_discovery_data(self, code: str) -> DiscoveryCompanyData:
+    def fetch_discovery_data(
+        self,
+        code: str,
+        *,
+        before_request: DiscoveryPreRequest | None = None,
+    ) -> DiscoveryCompanyData:
         normalized = (code or "").strip().upper()
         started = self._request_count
+        scoped_attempts = 0
+
+        def scoped_before_request() -> None:
+            nonlocal scoped_attempts
+            assert before_request is not None
+            before_request()
+            scoped_attempts += 1
+
+        request_gate = (
+            scoped_before_request if before_request is not None else None
+        )
+
+        def request_count() -> int:
+            return (
+                scoped_attempts
+                if request_gate is not None
+                else self._request_count - started
+            )
+
         try:
             _secid(normalized)
         except ValueError as exc:
             raise DiscoveryCompanyError(normalized, "validate", str(exc)) from exc
         try:
-            security = self._security_state_for(normalized)
+            security = (
+                self._security_state_for(normalized)
+                if request_gate is None
+                else self._security_state_for(
+                    normalized, before_request=request_gate
+                )
+            )
+        except DiscoveryRequestBudgetExhausted:
+            raise
         except Exception as exc:
             raise DiscoveryCompanyError(
                 normalized,
                 "security_state",
                 str(exc),
-                request_count=self._request_count - started,
+                request_count=request_count(),
             ) from exc
         try:
-            financials = self._discovery_financials_for(
-                normalized, industry=security.industry
+            financials = (
+                self._discovery_financials_for(
+                    normalized, industry=security.industry
+                )
+                if request_gate is None
+                else self._discovery_financials_for(
+                    normalized,
+                    industry=security.industry,
+                    before_request=request_gate,
+                )
             )
+        except DiscoveryRequestBudgetExhausted:
+            raise
         except Exception as exc:
             raise DiscoveryCompanyError(
                 normalized,
                 "financials",
                 str(exc),
-                request_count=self._request_count - started,
+                request_count=request_count(),
             ) from exc
         try:
-            valuations = self.fetch_valuation_history(normalized)
+            valuations = (
+                self.fetch_valuation_history(normalized)
+                if request_gate is None
+                else self.fetch_valuation_history(
+                    normalized, before_request=request_gate
+                )
+            )
+        except DiscoveryRequestBudgetExhausted:
+            raise
         except Exception as exc:
             raise DiscoveryCompanyError(
                 normalized,
                 "valuation",
                 str(exc),
-                request_count=self._request_count - started,
+                request_count=request_count(),
             ) from exc
         if not financials:
             raise DiscoveryCompanyError(
                 normalized,
                 "financials",
                 "no verified statement rows",
-                request_count=self._request_count - started,
+                request_count=request_count(),
             )
         financial_dates = [
             row.source_as_of for row in financials if row.source_as_of
@@ -801,7 +878,7 @@ class EastMoneyClient:
             security_state=security,
             financial_rows=tuple(financials),
             valuation_points=tuple(valuations),
-            request_count=self._request_count - started,
+            request_count=request_count(),
             source_as_of=DiscoverySourceAsOf(
                 security=security.industry_as_of,
                 valuation=max(
@@ -822,7 +899,12 @@ class EastMoneyClient:
                 years[code] = year
         return years
 
-    def fetch_valuation_history(self, code: str) -> list[ValuationPoint]:
+    def fetch_valuation_history(
+        self,
+        code: str,
+        *,
+        before_request: DiscoveryPreRequest | None = None,
+    ) -> list[ValuationPoint]:
         normalized = code.strip().upper()
         try:
             _secid(normalized)
@@ -842,7 +924,11 @@ class EastMoneyClient:
                 f"&columns=ALL&pageSize=500&pageNumber={page}"
                 f"&sortColumns=TRADE_DATE&sortTypes=-1&filter={quote(filt)}"
             )
-            payload = self._get_json(url)
+            payload = (
+                self._get_json(url)
+                if before_request is None
+                else self._get_json(url, before_request=before_request)
+            )
             if payload.get("success") is not True:
                 raise MarketError(str(payload.get("message") or "估值历史接口不可用"))
             result = payload.get("result")
@@ -934,7 +1020,13 @@ class EastMoneyClient:
             for month, (trade_date, row) in sorted(monthly.items(), reverse=True)
         ]
 
-    def fetch_trading_dates(self, end: str, limit: int = 6) -> list[str]:
+    def fetch_trading_dates(
+        self,
+        end: str,
+        limit: int = 6,
+        *,
+        before_request: DiscoveryPreRequest | None = None,
+    ) -> list[str]:
         if limit <= 0:
             return []
         compact_end = end.replace("-", "")
@@ -945,6 +1037,11 @@ class EastMoneyClient:
         try:
             parsed = parse_kline(
                 self._get_json_direct(_kline_url(limit, end=compact_end))
+                if before_request is None
+                else self._get_json_direct(
+                    _kline_url(limit, end=compact_end),
+                    before_request=before_request,
+                )
             )
         except MarketError:
             raise
@@ -1075,10 +1172,20 @@ class EastMoneyClient:
             raise MarketError("低估值榜解析不到沪深A股名单")
         return rows
 
-    def _security_state_for(self, code: str) -> SecurityState:
+    def _security_state_for(
+        self,
+        code: str,
+        *,
+        before_request: DiscoveryPreRequest | None = None,
+    ) -> SecurityState:
         fields = "f57,f58,f107,f127,f189,f292"
-        payload = self._get_json_direct(
-            f"{STOCK_URL}?secid={_secid(code)}&fields={fields}"
+        url = f"{STOCK_URL}?secid={_secid(code)}&fields={fields}"
+        payload = (
+            self._get_json_direct(url)
+            if before_request is None
+            else self._get_json_direct(
+                url, before_request=before_request
+            )
         )
         item = payload.get("data")
         if not isinstance(item, dict) or str(item.get("f57") or "") != code[:6]:
@@ -1095,10 +1202,25 @@ class EastMoneyClient:
             or _status_code(item.get("f107")) != expected_market
         ):
             raise MarketError("个股状态缺少名称、行业、上市日期或交易所不匹配")
-        trading_dates = self.fetch_trading_dates(date.today().isoformat())
+        trading_dates = (
+            self.fetch_trading_dates(date.today().isoformat())
+            if before_request is None
+            else self.fetch_trading_dates(
+                date.today().isoformat(),
+                before_request=before_request,
+            )
+        )
         if not trading_dates:
             raise MarketError("交易日接口没有返回日期")
-        last_trade_date = self._last_trade_date(code, trading_dates[-1])
+        last_trade_date = (
+            self._last_trade_date(code, trading_dates[-1])
+            if before_request is None
+            else self._last_trade_date(
+                code,
+                trading_dates[-1],
+                before_request=before_request,
+            )
+        )
         if last_trade_date is None:
             raise MarketError("个股最近交易日不可用")
         trading_status = (
@@ -1120,19 +1242,31 @@ class EastMoneyClient:
             market_status_code=_status_code(item.get("f292")),
         )
 
-    def _last_trade_date(self, code: str, end: str) -> str | None:
+    def _last_trade_date(
+        self,
+        code: str,
+        end: str,
+        *,
+        before_request: DiscoveryPreRequest | None = None,
+    ) -> str | None:
         from market.sentiment import parse_kline
 
         try:
-            parsed = parse_kline(
-                self._get_json_direct(
-                    _kline_url(
-                        1,
-                        end=end.replace("-", ""),
-                        secid=_secid(code),
-                    )
+            url = _kline_url(
+                1,
+                end=end.replace("-", ""),
+                secid=_secid(code),
+            )
+            payload = (
+                self._get_json_direct(url)
+                if before_request is None
+                else self._get_json_direct(
+                    url, before_request=before_request
                 )
             )
+            parsed = parse_kline(payload)
+        except DiscoveryRequestBudgetExhausted:
+            raise
         except Exception:
             return None
         dates = parsed.get("dates")
@@ -1158,11 +1292,18 @@ class EastMoneyClient:
             day -= timedelta(days=1)
         return None, None
 
-    def _get_json_direct(self, url: str) -> dict:
+    def _get_json_direct(
+        self,
+        url: str,
+        *,
+        before_request: DiscoveryPreRequest | None = None,
+    ) -> dict:
         import httpx2
 
-        self._request_count += 1
         with httpx2.Client(timeout=self.timeout, headers=_HTTP_HEADERS) as client:
+            if before_request is not None:
+                before_request()
+            self._request_count += 1
             response = client.get(url)
             response.raise_for_status()
             payload = response.json()
@@ -1242,17 +1383,26 @@ class EastMoneyClient:
         name, code = pick_equity(text, items)
         return Constituent(code=code, name=name, mcap=None, pe=None, industry="", peg=None)
 
-    def _get_json(self, url: str) -> dict:
+    def _get_json(
+        self,
+        url: str,
+        *,
+        before_request: DiscoveryPreRequest | None = None,
+    ) -> dict:
         import httpx2
 
         last_error: Exception | None = None
         for candidate in _clist_urls(url):
             try:
-                self._request_count += 1
                 with httpx2.Client(timeout=self.timeout, headers=_HTTP_HEADERS) as client:
+                    if before_request is not None:
+                        before_request()
+                    self._request_count += 1
                     response = client.get(candidate)
                     response.raise_for_status()
                     payload = response.json()
+            except DiscoveryRequestBudgetExhausted:
+                raise
             except Exception as exc:
                 last_error = exc
                 continue
@@ -1416,10 +1566,23 @@ class EastMoneyClient:
         return self._financial_rows_for(code, strict=False)
 
     def _discovery_financials_for(
-        self, code: str, *, industry: str | None = None
+        self,
+        code: str,
+        *,
+        industry: str | None = None,
+        before_request: DiscoveryPreRequest | None = None,
     ) -> list[FinancialRow]:
-        return self._financial_rows_for(
-            code, strict=True, industry=industry
+        return (
+            self._financial_rows_for(
+                code, strict=True, industry=industry
+            )
+            if before_request is None
+            else self._financial_rows_for(
+                code,
+                strict=True,
+                industry=industry,
+                before_request=before_request,
+            )
         )
 
     def _financial_rows_for(
@@ -1428,6 +1591,7 @@ class EastMoneyClient:
         *,
         strict: bool,
         industry: str | None = None,
+        before_request: DiscoveryPreRequest | None = None,
     ) -> list[FinancialRow]:
         reports = {
             "main": "RPT_F10_FINANCE_MAINFINADATA",
@@ -1439,7 +1603,15 @@ class EastMoneyClient:
             "cashflow_detail": "RPT_F10_FINANCE_GCASHFLOW",
         }
         fetched: dict[str, list[dict]] = {
-            "main": self._financial_report_rows(code, reports["main"])
+            "main": (
+                self._financial_report_rows(code, reports["main"])
+                if before_request is None
+                else self._financial_report_rows(
+                    code,
+                    reports["main"],
+                    before_request=before_request,
+                )
+            )
         }
         financial_branch = strict and _financial_branch(
             industry, fetched["main"]
@@ -1456,7 +1628,15 @@ class EastMoneyClient:
             }:
                 fetched[name] = []
                 continue
-            fetched[name] = self._financial_report_rows(code, report)
+            fetched[name] = (
+                self._financial_report_rows(code, report)
+                if before_request is None
+                else self._financial_report_rows(
+                    code,
+                    report,
+                    before_request=before_request,
+                )
+            )
 
         mapped: dict[str, dict[tuple[str, str], dict]] = {}
         keys: set[tuple[str, str]] = set()
@@ -1655,14 +1835,24 @@ class EastMoneyClient:
             )
         return rows
 
-    def _financial_report_rows(self, code: str, report: str) -> list[dict]:
+    def _financial_report_rows(
+        self,
+        code: str,
+        report: str,
+        *,
+        before_request: DiscoveryPreRequest | None = None,
+    ) -> list[dict]:
         filt = f'(SECUCODE="{code}")'
         url = (
             f"{FINANCIALS_URL}?reportName={report}"
             f"&columns=ALL&pageNumber=1&pageSize=50&sortColumns=REPORT_DATE"
             f"&sortTypes=-1&filter={quote(filt)}"
         )
-        payload = self._get_json(url)
+        payload = (
+            self._get_json(url)
+            if before_request is None
+            else self._get_json(url, before_request=before_request)
+        )
         if payload.get("success") is False:
             raise MarketError(str(payload.get("message") or "财务接口整体不可用"))
         data = payload.get("result") or payload.get("data") or {}

@@ -34,7 +34,7 @@ from market.cheap import (
     load_cheap_universe,
     security_state_eligible,
 )
-from market.eastmoney import EastMoneyClient, FakeMarketClient
+from market.eastmoney import BOARD_LIST_URL, EastMoneyClient, FakeMarketClient
 from market.types import (
     DiscoveryCompanyData,
     DiscoveryCompanyError,
@@ -1801,6 +1801,334 @@ class FakeClock:
         self.current += timedelta(**kwargs)
 
 
+class _HttpResponse:
+    def raise_for_status(self) -> None:
+        pass
+
+    def json(self) -> dict:
+        return {"ok": True}
+
+
+def _install_http_transport(monkeypatch, get) -> None:
+    import httpx2
+
+    class Client:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            pass
+
+        def get(self, url: str):
+            return get(url)
+
+    monkeypatch.setattr(httpx2, "Client", Client)
+
+
+def test_discovery_request_gate_persists_and_spaces_every_fallback_attempt(
+    tmp_path, monkeypatch
+) -> None:
+    from jobs.discovery_data import DiscoveryRequestGate, RequestPolicy
+
+    engine = init_db(tmp_path / "request-boundary.db")
+    factory = create_session_factory(engine)
+    now = datetime(2026, 9, 16, 12, tzinfo=timezone.utc)
+    with factory() as session:
+        fill_id = _fill(session, [], now=now, daily_budget=10).id
+    clock = FakeClock(now)
+    observations: list[tuple[datetime, int, int]] = []
+
+    def get(_url: str):
+        with factory() as observer:
+            fill = observer.get(DiscoveryDataFill, fill_id)
+            assert fill is not None
+            observations.append(
+                (clock.now(), fill.daily_requests, fill.request_count)
+            )
+        if len(observations) < 3:
+            raise RuntimeError("try fallback host")
+        return _HttpResponse()
+
+    _install_http_transport(monkeypatch, get)
+    policy = RequestPolicy(
+        requests_per_second=0.5,
+        max_attempts=2,
+        daily_budget=10,
+        max_runtime_seconds=60,
+    )
+    with factory() as session:
+        gate = DiscoveryRequestGate(
+            session, fill_id, policy=policy, clock=clock
+        )
+        assert EastMoneyClient()._get_json(
+            BOARD_LIST_URL, before_request=gate
+        ) == {"ok": True}
+
+    assert observations == [
+        (now, 1, 1),
+        (now + timedelta(seconds=2), 2, 2),
+        (now + timedelta(seconds=4), 3, 3),
+    ]
+    assert clock.sleeps == [2.0, 2.0]
+    engine.dispose()
+
+
+def test_discovery_request_gate_resets_at_midnight_between_fallbacks(
+    tmp_path, monkeypatch
+) -> None:
+    from jobs.discovery_data import DiscoveryRequestGate, RequestPolicy
+
+    engine = init_db(tmp_path / "request-midnight.db")
+    factory = create_session_factory(engine)
+    now = datetime(2026, 9, 16, 15, 59, 59, tzinfo=timezone.utc)
+    with factory() as session:
+        fill_id = _fill(session, [], now=now, daily_budget=1).id
+    clock = FakeClock(now)
+    calls = 0
+
+    def get(_url: str):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("cross midnight")
+        return _HttpResponse()
+
+    _install_http_transport(monkeypatch, get)
+    policy = RequestPolicy(
+        requests_per_second=0.5,
+        max_attempts=2,
+        daily_budget=1,
+        max_runtime_seconds=60,
+    )
+    with factory() as session:
+        gate = DiscoveryRequestGate(
+            session, fill_id, policy=policy, clock=clock
+        )
+        EastMoneyClient()._get_json(BOARD_LIST_URL, before_request=gate)
+    with factory() as session:
+        fill = session.get(DiscoveryDataFill, fill_id)
+        assert fill is not None
+        assert fill.budget_day == "2026-09-17"
+        assert fill.daily_requests == 1
+        assert fill.request_count == 2
+    assert calls == 2
+    engine.dispose()
+
+
+def test_discovery_company_bundle_resets_budget_between_midnight_requests(
+    tmp_path,
+) -> None:
+    from jobs.discovery_data import RequestPolicy, execute_discovery_data_fill
+
+    engine = init_db(tmp_path / "company-midnight.db")
+    factory = create_session_factory(engine)
+    now = datetime(2026, 9, 16, 15, 59, 59, tzinfo=timezone.utc)
+    code = "000001.SZ"
+    with factory() as session:
+        fill_id = _fill(session, [code], now=now, daily_budget=1).id
+    clock = FakeClock(now)
+    policy = RequestPolicy(
+        requests_per_second=0.5,
+        max_attempts=2,
+        daily_budget=1,
+        max_runtime_seconds=60,
+    )
+    with factory() as session:
+        execute_discovery_data_fill(
+            session,
+            FakeMarketClient(
+                discovery_data={code: _bundle(code, request_count=2)}
+            ),
+            fill_id,
+            policy=policy,
+            clock=clock,
+        )
+    with factory() as session:
+        fill = session.get(DiscoveryDataFill, fill_id)
+        checkpoint = session.get(
+            DiscoveryDataCheckpoint, (fill_id, code)
+        )
+        assert fill is not None and checkpoint is not None
+        assert (fill.status, fill.request_count) == ("done", 2)
+        assert (fill.budget_day, fill.daily_requests) == ("2026-09-17", 1)
+        assert checkpoint.status == "done"
+    engine.dispose()
+
+
+def test_discovery_request_gate_charges_crash_before_transport_returns(
+    tmp_path, monkeypatch
+) -> None:
+    from jobs.discovery_data import DiscoveryRequestGate, RequestPolicy
+
+    engine = init_db(tmp_path / "request-crash.db")
+    factory = create_session_factory(engine)
+    now = datetime(2026, 9, 16, 12, tzinfo=timezone.utc)
+    with factory() as session:
+        fill_id = _fill(session, [], now=now, daily_budget=10).id
+    clock = FakeClock(now)
+    calls = 0
+
+    def get(_url: str):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("fallback")
+        raise KeyboardInterrupt("simulated process crash")
+
+    _install_http_transport(monkeypatch, get)
+    policy = RequestPolicy(
+        requests_per_second=100,
+        max_attempts=2,
+        daily_budget=10,
+        max_runtime_seconds=60,
+    )
+    with factory() as session:
+        gate = DiscoveryRequestGate(
+            session, fill_id, policy=policy, clock=clock
+        )
+        with pytest.raises(KeyboardInterrupt):
+            EastMoneyClient()._get_json(
+                BOARD_LIST_URL, before_request=gate
+            )
+    with factory() as session:
+        fill = session.get(DiscoveryDataFill, fill_id)
+        assert fill is not None
+        assert (fill.daily_requests, fill.request_count) == (2, 2)
+    engine.dispose()
+
+
+def test_discovery_request_gate_stops_before_transport_when_budget_exhausted(
+    tmp_path, monkeypatch
+) -> None:
+    from jobs.discovery_data import (
+        DiscoveryRequestBudgetExhausted,
+        DiscoveryRequestGate,
+        RequestPolicy,
+    )
+
+    engine = init_db(tmp_path / "request-budget-stop.db")
+    factory = create_session_factory(engine)
+    now = datetime(2026, 9, 16, 12, tzinfo=timezone.utc)
+    with factory() as session:
+        fill = _fill(session, [], now=now, daily_budget=1)
+        fill.daily_requests = 1
+        session.commit()
+        fill_id = fill.id
+    transported = False
+
+    def get(_url: str):
+        nonlocal transported
+        transported = True
+        return _HttpResponse()
+
+    _install_http_transport(monkeypatch, get)
+    policy = RequestPolicy(
+        requests_per_second=100,
+        max_attempts=2,
+        daily_budget=1,
+        max_runtime_seconds=60,
+    )
+    with factory() as session:
+        gate = DiscoveryRequestGate(
+            session, fill_id, policy=policy, clock=FakeClock(now)
+        )
+        with pytest.raises(DiscoveryRequestBudgetExhausted):
+            EastMoneyClient()._get_json_direct(
+                "https://example.test/data", before_request=gate
+            )
+    assert transported is False
+    with factory() as session:
+        fill = session.get(DiscoveryDataFill, fill_id)
+        assert fill is not None
+        assert (fill.daily_requests, fill.request_count) == (1, 0)
+        assert fill.status == "paused"
+    engine.dispose()
+
+
+def test_fetch_discovery_data_scopes_gate_into_http_boundary(
+    monkeypatch,
+) -> None:
+    callbacks = 0
+    transports = 0
+
+    def before_request() -> None:
+        nonlocal callbacks
+        callbacks += 1
+
+    def get(_url: str):
+        nonlocal transports
+        transports += 1
+        return _HttpResponse()
+
+    _install_http_transport(monkeypatch, get)
+
+    class Stub(EastMoneyClient):
+        def _security_state_for(
+            self, _code: str, *, before_request=None
+        ) -> SecurityState:
+            assert before_request is not None
+            self._get_json_direct(
+                "https://example.test/security",
+                before_request=before_request,
+            )
+            raise MarketError("stop after boundary probe")
+
+    with pytest.raises(DiscoveryCompanyError, match="boundary probe") as caught:
+        Stub().fetch_discovery_data(
+            "600519.SH", before_request=before_request
+        )
+    assert callbacks == transports == caught.value.request_count == 1
+
+
+def test_discovery_worker_rejects_typed_request_count_audit_mismatch(
+    tmp_path,
+) -> None:
+    from jobs.discovery_data import RequestPolicy, execute_discovery_data_fill
+
+    engine = init_db(tmp_path / "request-audit.db")
+    factory = create_session_factory(engine)
+    now = datetime(2026, 9, 16, 12, tzinfo=timezone.utc)
+    code = "000001.SZ"
+    with factory() as session:
+        fill_id = _fill(session, [code], now=now).id
+
+    class BadAuditFake(FakeMarketClient):
+        def fetch_discovery_data(
+            self, code: str, *, before_request=None
+        ) -> DiscoveryCompanyData:
+            assert before_request is not None
+            before_request()
+            return _bundle(code, request_count=2)
+
+    policy = RequestPolicy(
+        requests_per_second=100,
+        max_attempts=1,
+        daily_budget=10,
+        max_runtime_seconds=60,
+    )
+    with factory() as session:
+        execute_discovery_data_fill(
+            session,
+            BadAuditFake(),
+            fill_id,
+            policy=policy,
+            clock=FakeClock(now),
+        )
+    with factory() as session:
+        fill = session.get(DiscoveryDataFill, fill_id)
+        checkpoint = session.get(
+            DiscoveryDataCheckpoint, (fill_id, code)
+        )
+        assert fill is not None and checkpoint is not None
+        assert (fill.request_count, fill.failed) == (1, 1)
+        assert checkpoint.status == "failed"
+        assert checkpoint.error and "request_audit" in checkpoint.error
+    engine.dispose()
+
+
 def _security(code: str) -> SecurityState:
     return SecurityState(
         code=code,
@@ -1901,7 +2229,6 @@ def test_discovery_fill_commits_success_before_later_company_failure(tmp_path) -
         max_attempts=1,
         daily_budget=100,
         max_runtime_seconds=60,
-        company_request_reservation=3,
     )
     with factory() as session:
         execute_discovery_data_fill(
@@ -1964,7 +2291,6 @@ def test_discovery_fill_resume_skips_completed_and_retries_due_checkpoint(
         max_attempts=3,
         daily_budget=100,
         max_runtime_seconds=60,
-        company_request_reservation=2,
     )
     with factory() as session:
         execute_discovery_data_fill(
@@ -2005,13 +2331,12 @@ def test_discovery_fill_throttles_and_stops_on_durable_daily_budget(
         max_attempts=2,
         daily_budget=4,
         max_runtime_seconds=60,
-        company_request_reservation=2,
     )
     with factory() as session:
         execute_discovery_data_fill(
             session, market, fill_id, policy=policy, clock=clock
         )
-    assert clock.sleeps == [1.0]
+    assert clock.sleeps == [0.5, 0.5, 0.5, 0.5]
     assert [call[1] for call in market.calls if call[0] == "discovery_data"] == codes[:2]
     with factory() as session:
         fill = session.get(DiscoveryDataFill, fill_id)
@@ -2069,7 +2394,6 @@ def test_discovery_failure_retries_to_cap_and_status_eta_needs_two_samples(
         daily_budget=100,
         max_runtime_seconds=60,
         retry_delay_seconds=10,
-        company_request_reservation=2,
     )
     with factory() as session:
         execute_discovery_data_fill(
@@ -2119,8 +2443,12 @@ def test_discovery_empty_bundle_is_success_and_max_runtime_pauses_next(
     )
 
     class SlowFake(FakeMarketClient):
-        def fetch_discovery_data(self, code: str) -> DiscoveryCompanyData:
-            result = super().fetch_discovery_data(code)
+        def fetch_discovery_data(
+            self, code: str, *, before_request=None
+        ) -> DiscoveryCompanyData:
+            result = super().fetch_discovery_data(
+                code, before_request=before_request
+            )
             clock.advance(seconds=61)
             return result
 
@@ -2135,7 +2463,6 @@ def test_discovery_empty_bundle_is_success_and_max_runtime_pauses_next(
         max_attempts=2,
         daily_budget=100,
         max_runtime_seconds=60,
-        company_request_reservation=2,
     )
     with factory() as session:
         execute_discovery_data_fill(

@@ -22,18 +22,15 @@ from jobs.lock import JOB_TYPE_DISCOVERY_DATA, lock_status, release, try_acquire
 from market.types import (
     DiscoveryCompanyData,
     DiscoveryCompanyError,
+    DiscoveryRequestBudgetExhausted,
     FinancialRow,
     ValuationPoint,
 )
 
-# Task 1/2 probes observed 11 requests for an industrial company with one
-# valuation page, and three valuation pages on representative five-year
-# histories. Twenty reserves the observed 13-request high-water mark plus 54%.
 # The universe probe used about 71 requests (56 pages, calendar, suspensions);
-# 100 keeps the same crash-safe margin. We intentionally run at 0.5 req/s and
-# cap a process slice at 15 minutes; no full-market live calibration is needed.
-# ponytail: atomic pacing assumes <=20 requests/company; add a per-request
-# client hook if endpoint fan-out grows beyond that measured safety margin.
+# 100 keeps a crash-safe margin before discovery checkpoints exist. Discovery
+# company fetches are charged exactly at each HTTP request boundary. Task 1/2
+# probes justify the conservative 0.5 req/s, 1,000/day, and 15-minute run cap.
 FILL_CHUNK = 20
 POLICY_TIMEZONE = timezone(timedelta(hours=8))
 
@@ -45,7 +42,6 @@ class RequestPolicy:
     daily_budget: int = 1000
     max_runtime_seconds: float = 15 * 60
     retry_delay_seconds: float = 5 * 60
-    company_request_reservation: int = 20
     universe_request_reservation: int = 100
 
     def __post_init__(self) -> None:
@@ -55,7 +51,6 @@ class RequestPolicy:
             or self.daily_budget <= 0
             or self.max_runtime_seconds <= 0
             or self.retry_delay_seconds < 0
-            or self.company_request_reservation <= 0
             or self.universe_request_reservation <= 0
         ):
             raise ValueError("request policy values must be positive")
@@ -76,6 +71,49 @@ class SystemClock:
 
     def sleep(self, seconds: float) -> None:
         sleep(seconds)
+
+
+class DiscoveryRequestGate:
+    """Durably charge one scoped discovery HTTP attempt before transport."""
+
+    def __init__(
+        self,
+        session: Session,
+        fill_id: int,
+        *,
+        policy: RequestPolicy,
+        clock: FillClock,
+    ) -> None:
+        self.session = session
+        self.fill_id = fill_id
+        self.policy = policy
+        self.clock = clock
+        self.attempts = 0
+        self._next_request_at: datetime | None = None
+
+    def __call__(self) -> None:
+        _wait_until(self.clock, self._next_request_at)
+        now = _aware_utc(self.clock.now())
+        fill = self.session.get(DiscoveryDataFill, self.fill_id)
+        if fill is None:
+            raise RuntimeError(f"discovery fill {self.fill_id} missing")
+        _reset_budget_day(fill, now)
+        if fill.daily_requests >= fill.daily_budget:
+            fill.status = "paused"
+            fill.last_error = "daily request budget reached"
+            fill.updated_at = now
+            self.session.commit()
+            raise DiscoveryRequestBudgetExhausted(
+                "daily request budget reached"
+            )
+        fill.daily_requests += 1
+        fill.request_count += 1
+        fill.updated_at = now
+        self.session.commit()
+        self.attempts += 1
+        self._next_request_at = now + timedelta(
+            seconds=1 / self.policy.requests_per_second
+        )
 
 
 def _aware_utc(value: datetime) -> datetime:
@@ -165,23 +203,6 @@ def _reserve_requests(
     fill.updated_at = now
     session.commit()
     return True
-
-
-def _has_request_budget(
-    session: Session,
-    fill: DiscoveryDataFill,
-    amount: int,
-    now: datetime,
-) -> bool:
-    _reset_budget_day(fill, now)
-    if fill.daily_requests + amount <= fill.daily_budget:
-        session.commit()
-        return True
-    fill.status = "paused"
-    fill.last_error = "daily request budget reached"
-    fill.updated_at = now
-    session.commit()
-    return False
 
 
 def _settle_request_reservation(
@@ -408,7 +429,6 @@ def execute_discovery_data_fill(
 ) -> None:
     timer = clock or SystemClock()
     run_started = _aware_utc(timer.now())
-    next_request_at: datetime | None = None
     try:
         fill = session.get(DiscoveryDataFill, fill_id)
         if fill is None:
@@ -419,6 +439,12 @@ def execute_discovery_data_fill(
         session.commit()
         if not _initialize_checkpoints(session, market, fill, policy, timer):
             return
+        request_gate = DiscoveryRequestGate(
+            session,
+            fill.id,
+            policy=policy,
+            clock=timer,
+        )
 
         while True:
             now = _aware_utc(timer.now())
@@ -439,16 +465,6 @@ def execute_discovery_data_fill(
 
             stop = False
             for checkpoint in claimed:
-                reserved = policy.company_request_reservation
-                if not _has_request_budget(
-                    session,
-                    fill,
-                    reserved,
-                    _aware_utc(timer.now()),
-                ):
-                    stop = True
-                    break
-                _wait_until(timer, next_request_at)
                 now = _aware_utc(timer.now())
                 if (now - run_started).total_seconds() >= policy.max_runtime_seconds:
                     fill.status = "paused"
@@ -456,45 +472,40 @@ def execute_discovery_data_fill(
                     session.commit()
                     stop = True
                     break
-                if not _reserve_requests(session, fill, reserved, now):
-                    stop = True
-                    break
-                checkpoint.attempts += 1
-                checkpoint.updated_at = now
-                session.commit()
-                request_started = now
+                attempts_before = request_gate.attempts
                 failure: Exception | None = None
                 try:
-                    result = market.fetch_discovery_data(checkpoint.code)
-                    actual = _settle_request_reservation(
-                        session,
-                        fill,
-                        reserved=reserved,
-                        actual=result.request_count,
-                        now=_aware_utc(timer.now()),
+                    result = market.fetch_discovery_data(
+                        checkpoint.code,
+                        before_request=request_gate,
                     )
+                except DiscoveryRequestBudgetExhausted:
+                    stop = True
+                    break
                 except Exception as exc:
-                    actual_count = (
-                        exc.request_count
-                        if isinstance(exc, DiscoveryCompanyError)
-                        else reserved
-                    )
-                    actual = _settle_request_reservation(
-                        session,
-                        fill,
-                        reserved=reserved,
-                        actual=actual_count,
-                        now=_aware_utc(timer.now()),
-                    )
+                    checkpoint.attempts += 1
                     failure = exc
                 else:
-                    try:
-                        _persist_company(
-                            session,
-                            checkpoint,
-                            result,
-                            _aware_utc(timer.now()),
+                    checkpoint.attempts += 1
+                    actual = request_gate.attempts - attempts_before
+                    if result.request_count != actual:
+                        failure = DiscoveryCompanyError(
+                            checkpoint.code,
+                            "request_audit",
+                            (
+                                f"reported {result.request_count} requests, "
+                                f"observed {actual}"
+                            ),
+                            request_count=actual,
                         )
+                    try:
+                        if failure is None:
+                            _persist_company(
+                                session,
+                                checkpoint,
+                                result,
+                                _aware_utc(timer.now()),
+                            )
                     except Exception as exc:
                         session.rollback()
                         fill = session.get(DiscoveryDataFill, fill_id)
@@ -517,9 +528,6 @@ def execute_discovery_data_fill(
                     else:
                         checkpoint.status = "failed"
                         checkpoint.next_retry_at = None
-                next_request_at = request_started + timedelta(
-                    seconds=actual / policy.requests_per_second
-                )
                 _sync_fill_counts(session, fill, _aware_utc(timer.now()))
                 session.commit()
             if stop:

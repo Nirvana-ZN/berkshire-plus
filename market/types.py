@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
+from typing import Callable
+
+DiscoveryPreRequest = Callable[[], None]
 
 
 class MarketError(Exception):
@@ -23,6 +26,10 @@ class DiscoveryCompanyError(MarketError):
         self.code = code
         self.stage = stage
         self.request_count = request_count
+
+
+class DiscoveryRequestBudgetExhausted(MarketError):
+    pass
 
 
 @dataclass(frozen=True)
