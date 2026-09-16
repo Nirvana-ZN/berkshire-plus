@@ -3406,12 +3406,14 @@ def _store_readiness_universe(
 def _store_readiness_financial(
     session: Session,
     code: str,
+    *,
+    period: str = "2025",
     **fields: Decimal | str | None,
 ) -> None:
     session.add(
         Financial(
             code=code,
-            period="2025",
+            period=period,
             period_type="annual",
             source_as_of=str(fields.pop("source_as_of", "2026-03-31")),
             **fields,
@@ -3426,6 +3428,10 @@ def _store_readiness_valuations(
     count: int = 60,
     ratio_method: str = "PE_TTM/PB_MRQ",
     fetched_at: datetime = datetime(2026, 9, 16, 12, tzinfo=timezone.utc),
+    start_year: int = 2021,
+    start_month: int = 10,
+    pe: Decimal | None = Decimal("10"),
+    pb: Decimal | None = Decimal("1"),
 ) -> None:
     from jobs.discovery_data import persist_valuation_history
 
@@ -3434,10 +3440,16 @@ def _store_readiness_valuations(
         [
             ValuationPoint(
                 code=code,
-                month=f"{2020 + index // 12:04d}-{index % 12 + 1:02d}",
-                trade_date=f"{2020 + index // 12:04d}-{index % 12 + 1:02d}-28",
-                pe=Decimal("10"),
-                pb=Decimal("1"),
+                month=(
+                    f"{start_year + (start_month - 1 + index) // 12:04d}-"
+                    f"{(start_month - 1 + index) % 12 + 1:02d}"
+                ),
+                trade_date=(
+                    f"{start_year + (start_month - 1 + index) // 12:04d}-"
+                    f"{(start_month - 1 + index) % 12 + 1:02d}-01"
+                ),
+                pe=pe,
+                pb=pb,
                 ratio_method=ratio_method,
             )
             for index in range(count)
@@ -3470,7 +3482,8 @@ def test_readiness_quality_uses_eligible_denominator_and_one_ratio_method(
     with engine.begin() as conn:
         conn.exec_driver_sql("PRAGMA foreign_keys=OFF")
         for index in range(60):
-            year, month = 2010 + index // 12, index % 12 + 1
+            year = 2021 + (9 + index) // 12
+            month = (9 + index) % 12 + 1
             conn.execute(
                 text(
                     """
@@ -3495,30 +3508,39 @@ def test_readiness_quality_uses_eligible_denominator_and_one_ratio_method(
             session,
             as_of=date(2026, 9, 16),
             approved_thresholds={"quality_discount": Decimal("0.75")},
+            minimum_observations={
+                "quality_discount": {"pe": 60, "pb": 60}
+            },
+            valuation_policies={"quality_discount": "both"},
         )
         approved = discovery_data_readiness(
             session,
             as_of=date(2026, 9, 16),
             approved_thresholds={"quality_discount": Decimal("0.5")},
+            minimum_observations={
+                "quality_discount": {"pe": 60, "pb": 60}
+            },
+            valuation_policies={"quality_discount": "both"},
         )
 
-    quality = report["tracks"]["quality_discount"]
+    quality = report.tracks["quality_discount"]
     assert quality.eligible == 2
     assert quality.complete == 1
     assert quality.coverage == Decimal("0.5")
     assert quality.ready is False
     assert quality.reason == "data_not_ready"
-    assert quality.missing_fields == ("valuation_history",)
-    assert report["missing_counts"]["quality_discount"] == {
-        "valuation_history": 1
+    assert quality.missing_fields == ("valuation_pb", "valuation_pe")
+    assert report.missing_counts["quality_discount"] == {
+        "valuation_pb": 1,
+        "valuation_pe": 1,
     }
-    assert report["company_insufficient"]["quality_discount"] == {
+    assert report.company_insufficient["quality_discount"] == {
         "recent_listing": 1
     }
-    assert report["status"] == "data_not_ready"
-    assert approved["tracks"]["quality_discount"].ready is True
-    assert approved["tracks"]["quality_discount"].reason == "ready"
-    assert approved["status"] == "threshold_not_activated"
+    assert report.status == "data_not_ready"
+    assert approved.tracks["quality_discount"].ready is True
+    assert approved.tracks["quality_discount"].reason == "ready"
+    assert approved.status == "partially_activated"
     engine.dispose()
 
 
@@ -3593,33 +3615,36 @@ def test_readiness_fields_are_track_and_financial_branch_specific(tmp_path) -> N
 
         report = discovery_data_readiness(session, as_of=date(2026, 9, 16))
 
-    quality = report["tracks"]["quality_discount"]
-    deep_value = report["tracks"]["deep_value"]
-    garp = report["tracks"]["garp"]
+    quality = report.tracks["quality_discount"]
+    deep_value = report.tracks["deep_value"]
+    garp = report.tracks["garp"]
     assert quality.complete == quality.eligible == 5
     assert quality.missing_fields == ()
     assert deep_value.missing_fields == (
         "capex",
         "capital_adequacy",
         "industry",
-        "npl",
     )
-    assert report["missing_counts"]["deep_value"] == {
+    assert report.missing_counts["deep_value"] == {
         "capital_adequacy": 1,
         "capex": 1,
         "industry": 1,
-        "npl": 1,
     }
     assert "government_grants" not in deep_value.missing_fields
-    assert garp.missing_fields == ("revenue", "roic")
-    assert report["missing_counts"]["garp"] == {"revenue": 1, "roic": 3}
+    assert garp.missing_fields == ("industry", "revenue", "roic")
+    assert report.missing_counts["garp"] == {
+        "industry": 1,
+        "revenue": 1,
+        "roic": 1,
+    }
     assert "capex" not in garp.missing_fields
-    assert all(track.ready is False for track in report["tracks"].values())
+    assert report.company_insufficient["garp"] == {"financial_industry": 2}
+    assert all(track.ready is False for track in report.tracks.values())
     assert all(
-        track.reason == "threshold_not_activated"
-        for track in report["tracks"].values()
+        track.reason == "not_activated"
+        for track in report.tracks.values()
     )
-    assert report["status"] == "threshold_not_activated"
+    assert report.status == "not_activated"
     engine.dispose()
 
 
@@ -3630,19 +3655,21 @@ def test_readiness_zero_eligible_has_exact_zero_coverage(tmp_path) -> None:
     with Session(engine) as session:
         report = discovery_data_readiness(session, as_of=date(2026, 9, 16))
 
-    for track in report["tracks"].values():
+    for track in report.tracks.values():
         assert track.eligible == 0
         assert track.complete == 0
         assert track.coverage == Decimal("0")
         assert track.ready is False
-        assert track.reason == "threshold_not_activated"
-    assert report["status"] == "threshold_not_activated"
+        assert track.reason == "not_activated"
+    assert report.status == "not_activated"
     engine.dispose()
 
 
 def test_discovery_status_serializes_decimal_readiness_without_dispatch(
     tmp_path,
 ) -> None:
+    from sqlalchemy import event
+
     market = FakeMarketClient()
     with _discovery_client(tmp_path, market) as client:
         first, second = "000001.SZ", "000002.SZ"
@@ -3667,20 +3694,439 @@ def test_discovery_status_serializes_decimal_readiness_without_dispatch(
             )
             session.commit()
         before = list(market.calls)
+        selects: list[str] = []
 
-        response = client.get("/api/discovery-data/status")
+        def count_selects(_conn, _cursor, statement, _parameters, _context, _many):
+            if statement.lstrip().upper().startswith("SELECT"):
+                selects.append(statement)
+
+        event.listen(
+            client.app.state.engine,
+            "before_cursor_execute",
+            count_selects,
+        )
+        try:
+            response = client.get("/api/discovery-data/status")
+        finally:
+            event.remove(
+                client.app.state.engine,
+                "before_cursor_execute",
+                count_selects,
+            )
 
         assert response.status_code == 200
         body = response.json()
         assert body["status"] == "idle"
-        assert body["readiness"]["status"] == "threshold_not_activated"
+        assert body["readiness"]["status"] == "not_activated"
+        assert body["readiness"]["evaluated_as_of"] == date.today().isoformat()
         assert body["readiness"]["tracks"]["quality_discount"]["coverage"] == 0.5
         assert body["readiness"]["tracks"]["quality_discount"]["ready"] is False
+        assert all(
+            track["activated"] is False
+            for track in body["readiness"]["tracks"].values()
+        )
         assert body["readiness"]["source_as_of"] == {
             "universe": "2026-09-16T12:00:00+00:00",
             "security": "2026-09-16",
             "financial": "2026-03-31",
-            "valuation": "2024-12-28",
+            "valuation": "2026-09-01",
             "valuation_fetched_at": "2026-09-16T12:00:00+00:00",
         }
+        assert len(selects) <= 5
         assert market.calls == before
+
+
+def test_readiness_as_of_excludes_future_records_and_future_listing_is_invalid(
+    tmp_path,
+) -> None:
+    from discovery.data_readiness import discovery_data_readiness
+
+    engine = init_db(tmp_path / "readiness-as-of.db")
+    past = "000001.SZ"
+    future_data = "000002.SZ"
+    future_listing = "000003.SZ"
+    with Session(engine) as session:
+        _store_readiness_universe(
+            session,
+            [
+                _readiness_row(past),
+                _readiness_row(future_data),
+                _readiness_row(future_listing, listing_date="2027-01-01"),
+            ],
+        )
+        _store_readiness_financial(
+            session,
+            past,
+            capex=Decimal("1"),
+            revenue=Decimal("1"),
+            roic=Decimal("1"),
+            source_as_of="2026-03-31",
+        )
+        _store_readiness_financial(
+            session,
+            future_data,
+            period="2027",
+            capex=Decimal("1"),
+            revenue=Decimal("1"),
+            roic=Decimal("1"),
+            source_as_of="2027-03-31",
+        )
+        _store_readiness_valuations(session, past)
+        _store_readiness_valuations(
+            session,
+            past,
+            count=1,
+            start_year=2021,
+            start_month=9,
+        )
+        _store_readiness_valuations(
+            session,
+            future_data,
+            count=1,
+            start_year=2027,
+            start_month=1,
+            fetched_at=datetime(2027, 1, 2, tzinfo=timezone.utc),
+        )
+        session.commit()
+
+        report = discovery_data_readiness(session, as_of=date(2026, 9, 16))
+        _store_readiness_universe(
+            session,
+            [_readiness_row(past)],
+            fetched_at=datetime(
+                2027, 1, 1, tzinfo=timezone.utc
+            ).timestamp(),
+        )
+        future_universe = discovery_data_readiness(
+            session, as_of=date(2026, 9, 16)
+        )
+
+    assert report.evaluated_as_of == "2026-09-16"
+    assert report.observations[past].valuation["PE_TTM/PB_MRQ"].pe == 60
+    assert report.observations[future_data].financial["capex"] == 0
+    assert report.observations[future_data].valuation == {}
+    assert report.company_insufficient["quality_discount"] == {
+        "invalid_listing_date": 1
+    }
+    assert "recent_listing" not in report.company_insufficient["quality_discount"]
+    assert report.missing_counts["quality_discount"]["listing_date"] == 1
+    assert report.source_as_of["financial"] == "2026-03-31"
+    assert report.source_as_of["valuation"] == "2026-09-01"
+    assert report.source_as_of["valuation_fetched_at"] == (
+        "2026-09-16T12:00:00+00:00"
+    )
+    assert future_universe.observations == {}
+    assert future_universe.source_as_of["universe"] is None
+    engine.dispose()
+
+
+def test_readiness_counts_aligned_financial_history_without_row_stitching(
+    tmp_path,
+) -> None:
+    from discovery.data_readiness import discovery_data_readiness
+
+    engine = init_db(tmp_path / "readiness-aligned.db")
+    aligned = "000001.SZ"
+    single = "000002.SZ"
+    split = "000003.SZ"
+    missing = "000004.SZ"
+    with Session(engine) as session:
+        _store_readiness_universe(
+            session,
+            [
+                _readiness_row(aligned),
+                _readiness_row(single),
+                _readiness_row(split),
+                _readiness_row(missing),
+            ],
+        )
+        for period in ("2024", "2025"):
+            _store_readiness_financial(
+                session,
+                aligned,
+                period=period,
+                revenue=Decimal("1"),
+                roic=Decimal("1"),
+            )
+        _store_readiness_financial(
+            session,
+            single,
+            revenue=Decimal("1"),
+            roic=Decimal("1"),
+        )
+        for period in ("2022", "2023"):
+            _store_readiness_financial(
+                session, split, period=period, revenue=Decimal("1")
+            )
+        for period in ("2024", "2025"):
+            _store_readiness_financial(
+                session, split, period=period, roic=Decimal("1")
+            )
+        session.commit()
+
+        report = discovery_data_readiness(
+            session,
+            as_of=date(2026, 9, 16),
+            approved_thresholds={"garp": Decimal("0.2")},
+            minimum_observations={"garp": {"revenue": 2, "roic": 2}},
+        )
+
+    assert report.observations[aligned].financial["revenue"] == 2
+    assert report.observations[single].financial["revenue"] == 1
+    assert report.observations[split].financial["revenue"] == 2
+    assert report.observations[split].financial["roic"] == 2
+    assert report.observations[split].aligned["garp"] == 0
+    assert report.observations[missing].financial["revenue"] == 0
+    assert report.tracks["garp"].complete == 1
+    assert report.tracks["garp"].coverage == Decimal("0.25")
+    assert report.tracks["garp"].activated is True
+    assert report.tracks["garp"].ready is True
+    engine.dispose()
+
+
+def test_readiness_uses_explicit_bank_insurance_and_financial_branches(
+    tmp_path,
+) -> None:
+    from discovery.data_readiness import discovery_data_readiness
+
+    engine = init_db(tmp_path / "readiness-branches.db")
+    bank = "600001.SH"
+    bank_missing_npl = "600005.SH"
+    insurance = "600002.SH"
+    insurance_missing = "600003.SH"
+    other_financial = "600004.SH"
+    nonfinancial = "000001.SZ"
+    unknown = "000002.SZ"
+    with Session(engine) as session:
+        _store_readiness_universe(
+            session,
+            [
+                _readiness_row(bank, industry="银行Ⅱ"),
+                _readiness_row(bank_missing_npl, industry="银行Ⅱ"),
+                _readiness_row(insurance, industry="保险Ⅱ"),
+                _readiness_row(insurance_missing, industry="保险Ⅱ"),
+                _readiness_row(other_financial, industry="证券Ⅱ"),
+                _readiness_row(nonfinancial),
+                _readiness_row(unknown, industry="-"),
+            ],
+        )
+        _store_readiness_financial(
+            session,
+            bank,
+            capital_adequacy=Decimal("12"),
+            npl=Decimal("1"),
+        )
+        _store_readiness_financial(
+            session,
+            bank_missing_npl,
+            capital_adequacy=Decimal("12"),
+            npl=None,
+        )
+        _store_readiness_financial(
+            session,
+            insurance,
+            capital_adequacy=Decimal("12"),
+            npl=None,
+        )
+        _store_readiness_financial(session, insurance_missing, npl=None)
+        _store_readiness_financial(
+            session,
+            nonfinancial,
+            capex=Decimal("1"),
+            revenue=Decimal("1"),
+            roic=Decimal("1"),
+        )
+        session.commit()
+
+        report = discovery_data_readiness(
+            session,
+            as_of=date(2026, 9, 16),
+            approved_thresholds={"deep_value": Decimal("0.4")},
+            minimum_observations={
+                "deep_value": {
+                    "capex": 1,
+                    "capital_adequacy": 1,
+                    "npl": 1,
+                }
+            },
+        )
+
+    deep = report.tracks["deep_value"]
+    assert deep.eligible == 7
+    assert deep.complete == 3
+    assert deep.ready is True
+    assert report.observations[bank].branch == "bank"
+    assert report.observations[insurance].branch == "insurance"
+    assert report.observations[other_financial].branch == "other_financial"
+    assert report.observations[nonfinancial].branch == "nonfinancial"
+    assert report.observations[unknown].branch == "unknown"
+    assert report.missing_counts["deep_value"] == {
+        "capital_adequacy": 1,
+        "financial_branch_source": 1,
+        "industry": 1,
+        "npl": 1,
+    }
+    assert report.observations[insurance].financial["npl"] == 0
+    assert report.company_insufficient["deep_value"] == {
+        "unsupported_financial_branch": 1
+    }
+    assert report.company_insufficient["garp"]["financial_industry"] == 5
+    engine.dispose()
+
+
+def test_quality_counts_pe_pb_separately_and_applies_declared_policy(
+    tmp_path,
+) -> None:
+    from discovery.data_readiness import discovery_data_readiness
+
+    engine = init_db(tmp_path / "readiness-valuation-policy.db")
+    both = "000001.SZ"
+    pb_only = "000002.SZ"
+    split_methods = "000003.SZ"
+    with Session(engine) as session:
+        _store_readiness_universe(
+            session,
+            [
+                _readiness_row(both),
+                _readiness_row(pb_only),
+                _readiness_row(split_methods),
+            ],
+        )
+        _store_readiness_valuations(session, both)
+        _store_readiness_valuations(session, pb_only, pe=None)
+        session.commit()
+    # Corrupt legacy data proves method counts are never stitched together.
+    with engine.begin() as conn:
+        conn.exec_driver_sql("PRAGMA foreign_keys=OFF")
+        for index in range(60):
+            year = 2021 + (9 + index) // 12
+            month = (9 + index) % 12 + 1
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO valuation_history (
+                        code, month, trade_date, pe, pb, price, source,
+                        ratio_method, fetched_at
+                    ) VALUES (
+                        :code, :month, :trade_date, :pe, :pb, 10, 'legacy',
+                        :ratio_method, '2026-09-16 12:00:00'
+                    )
+                    """
+                ),
+                {
+                    "code": split_methods,
+                    "month": f"{year:04d}-{month:02d}",
+                    "trade_date": f"{year:04d}-{month:02d}-01",
+                    "pe": "10" if index < 30 else None,
+                    "pb": None if index < 30 else "1",
+                    "ratio_method": "method-a" if index < 30 else "method-b",
+                },
+            )
+    with Session(engine) as session:
+        pb_report = discovery_data_readiness(
+            session,
+            as_of=date(2026, 9, 16),
+            approved_thresholds={"quality_discount": Decimal("0.6")},
+            minimum_observations={"quality_discount": {"pb": 60}},
+            valuation_policies={"quality_discount": "pb"},
+        )
+        both_report = discovery_data_readiness(
+            session,
+            as_of=date(2026, 9, 16),
+            approved_thresholds={"quality_discount": Decimal("0.3")},
+            minimum_observations={
+                "quality_discount": {"pe": 30, "pb": 30}
+            },
+            valuation_policies={"quality_discount": "both"},
+        )
+
+    pb_counts = pb_report.observations[pb_only].valuation["PE_TTM/PB_MRQ"]
+    assert pb_counts.pe == 0
+    assert pb_counts.pb == 60
+    assert pb_report.tracks["quality_discount"].complete == 2
+    assert pb_report.tracks["quality_discount"].ready is True
+    assert both_report.tracks["quality_discount"].complete == 1
+    assert both_report.missing_counts["quality_discount"] == {
+        "valuation_method_alignment": 1,
+        "valuation_pe": 1,
+    }
+    engine.dispose()
+
+
+def test_readiness_activation_is_per_track_and_configuration_is_strict(
+    tmp_path,
+) -> None:
+    from app.main import _readiness_json
+    from discovery.data_readiness import discovery_data_readiness
+
+    engine = init_db(tmp_path / "readiness-activation.db")
+    code = "000001.SZ"
+    with Session(engine) as session:
+        _store_readiness_universe(session, [_readiness_row(code)])
+        _store_readiness_valuations(session, code)
+        _store_readiness_financial(
+            session,
+            code,
+            capex=Decimal("1"),
+            revenue=Decimal("1"),
+            roic=Decimal("1"),
+        )
+        session.commit()
+        partial = discovery_data_readiness(
+            session,
+            as_of=date(2026, 9, 16),
+            approved_thresholds={"quality_discount": Decimal("1")},
+            minimum_observations={
+                "quality_discount": {"pe": 60, "pb": 60}
+            },
+            valuation_policies={"quality_discount": "both"},
+        )
+        threshold_only = discovery_data_readiness(
+            session,
+            as_of=date(2026, 9, 16),
+            approved_thresholds={"quality_discount": Decimal("1")},
+        )
+        with pytest.raises(ValueError, match="unknown discovery track"):
+            discovery_data_readiness(
+                session,
+                as_of=date(2026, 9, 16),
+                approved_thresholds={"bogus": Decimal("1")},
+            )
+        with pytest.raises(ValueError, match="must be a Decimal"):
+            discovery_data_readiness(
+                session,
+                as_of=date(2026, 9, 16),
+                approved_thresholds={"garp": "0.5"},  # type: ignore[dict-item]
+            )
+        with pytest.raises(ValueError, match="unknown observation field"):
+            discovery_data_readiness(
+                session,
+                as_of=date(2026, 9, 16),
+                minimum_observations={"garp": {"profit": 2}},
+            )
+        with pytest.raises(ValueError, match="valuation policy"):
+            discovery_data_readiness(
+                session,
+                as_of=date(2026, 9, 16),
+                valuation_policies={"deep_value": "pb"},
+            )
+
+    assert partial.tracks["quality_discount"].activated is True
+    assert partial.tracks["quality_discount"].ready is True
+    assert partial.tracks["deep_value"].activated is False
+    assert partial.tracks["garp"].activated is False
+    assert partial.status == "partially_activated"
+    assert threshold_only.tracks["quality_discount"].activated is False
+    assert threshold_only.status == "not_activated"
+    body = _readiness_json(partial)
+    assert "threshold_activated" not in body
+    assert body["tracks"]["quality_discount"]["activated"] is True
+    with pytest.raises(ValueError, match="track set"):
+        _readiness_json(
+            replace(partial, tracks={"quality_discount": partial.tracks["quality_discount"]})
+        )
+    with pytest.raises(ValueError, match="threshold track key"):
+        _readiness_json(
+            replace(partial, approved_thresholds={"bogus": Decimal("1")})
+        )
+    engine.dispose()

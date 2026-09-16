@@ -37,7 +37,12 @@ from app.models import (
     Thesis,
     Watchlist,
 )
-from discovery.data_readiness import TrackReadiness, discovery_data_readiness
+from discovery.data_readiness import (
+    TRACKS,
+    ReadinessReport,
+    TrackReadiness,
+    discovery_data_readiness,
+)
 from jobs.cheap import (
     begin_cheap_fill,
     cheap_fill_running,
@@ -131,31 +136,78 @@ def _json_optional(value: Decimal | None) -> int | float | None:
     return _json_number(quantized)
 
 
-def _readiness_json(report: dict[str, object]) -> dict[str, object]:
-    body = dict(report)
-    tracks = report["tracks"]
-    assert isinstance(tracks, dict)
-    body["tracks"] = {
-        name: {
-            "track": row.track,
-            "ready": row.ready,
-            "eligible": row.eligible,
-            "complete": row.complete,
-            "coverage": _json_number(row.coverage),
-            "missing_fields": list(row.missing_fields),
-            "reason": row.reason,
-        }
-        for name, row in tracks.items()
-        if isinstance(row, TrackReadiness)
+def _readiness_json(report: ReadinessReport) -> dict[str, object]:
+    if set(report.tracks) != set(TRACKS):
+        raise ValueError("readiness track set is incomplete")
+    if not set(report.approved_thresholds) <= set(TRACKS):
+        raise ValueError("readiness threshold track key is invalid")
+    if any(
+        not isinstance(value, Decimal)
+        for value in report.approved_thresholds.values()
+    ):
+        raise TypeError("readiness thresholds must be Decimal values")
+    if any(
+        not isinstance(row, TrackReadiness) or row.track != name
+        for name, row in report.tracks.items()
+    ):
+        raise TypeError("readiness tracks must contain matching TrackReadiness rows")
+    for field_name, values in (
+        ("missing_counts", report.missing_counts),
+        ("company_insufficient", report.company_insufficient),
+    ):
+        if set(values) != set(TRACKS):
+            raise ValueError(f"readiness {field_name} track set is incomplete")
+    return {
+        "status": report.status,
+        "evaluated_as_of": report.evaluated_as_of,
+        "tracks": {
+            name: {
+                "track": row.track,
+                "ready": row.ready,
+                "eligible": row.eligible,
+                "complete": row.complete,
+                "coverage": _json_number(row.coverage),
+                "missing_fields": list(row.missing_fields),
+                "reason": row.reason,
+                "activated": row.activated,
+                "threshold": (
+                    _json_number(row.threshold)
+                    if row.threshold is not None
+                    else None
+                ),
+            }
+            for name, row in report.tracks.items()
+        },
+        "approved_thresholds": {
+            name: _json_number(value)
+            for name, value in report.approved_thresholds.items()
+        },
+        "minimum_observations": {
+            track: dict(fields)
+            for track, fields in report.minimum_observations.items()
+        },
+        "valuation_policies": dict(report.valuation_policies),
+        "missing_counts": {
+            track: dict(counts) for track, counts in report.missing_counts.items()
+        },
+        "company_insufficient": {
+            track: dict(counts)
+            for track, counts in report.company_insufficient.items()
+        },
+        "observations": {
+            code: {
+                "branch": counts.branch,
+                "financial": dict(counts.financial),
+                "aligned": dict(counts.aligned),
+                "valuation": {
+                    method: {"pe": values.pe, "pb": values.pb}
+                    for method, values in counts.valuation.items()
+                },
+            }
+            for code, counts in report.observations.items()
+        },
+        "source_as_of": dict(report.source_as_of),
     }
-    thresholds = report["approved_thresholds"]
-    assert isinstance(thresholds, dict)
-    body["approved_thresholds"] = {
-        name: _json_number(value)
-        for name, value in thresholds.items()
-        if isinstance(value, Decimal)
-    }
-    return body
 
 
 def _resolve_research_target(session, market, name: str, code: str, query: str) -> tuple[str, str]:
