@@ -6,12 +6,14 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.db import init_db
 from app.models import (
     DiscoveryDataCheckpoint,
     DiscoveryDataFill,
+    Financial,
     Setting,
     ValuationHistory,
 )
@@ -97,6 +99,38 @@ def test_init_db_adds_discovery_tables_and_migrates_old_financial_schema(
                 """
             )
         )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE valuation_history (
+                    code VARCHAR NOT NULL,
+                    month VARCHAR NOT NULL,
+                    trade_date VARCHAR NOT NULL,
+                    pe NUMERIC(20, 8),
+                    pb NUMERIC(20, 8),
+                    price NUMERIC(20, 8),
+                    source VARCHAR NOT NULL,
+                    ratio_method VARCHAR NOT NULL,
+                    fetched_at DATETIME NOT NULL,
+                    PRIMARY KEY (code, month)
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                INSERT INTO valuation_history (
+                    code, month, trade_date, pe, pb, price, source,
+                    ratio_method, fetched_at
+                ) VALUES (
+                    '600519.SH', '2026-08', '2026-08-31', 19.2, 7.1, 1460,
+                    'eastmoney:RPT_VALUEANALYSIS_DET', 'PE_TTM/PB_MRQ',
+                    '2026-09-16 08:00:00'
+                )
+                """
+            )
+        )
     old_engine.dispose()
 
     engine = init_db(db_path)
@@ -105,6 +139,7 @@ def test_init_db_adds_discovery_tables_and_migrates_old_financial_schema(
         column["name"] for column in schema.get_columns("financials")
     }
     assert {
+        "valuation_series",
         "valuation_history",
         "discovery_data_fills",
         "discovery_data_checkpoints",
@@ -120,6 +155,27 @@ def test_init_db_adds_discovery_tables_and_migrates_old_financial_schema(
         "ratio_method",
         "fetched_at",
     }
+    valuation_fks = schema.get_foreign_keys("valuation_history")
+    assert any(
+        fk["referred_table"] == "valuation_series"
+        and fk["constrained_columns"] == ["code", "ratio_method"]
+        for fk in valuation_fks
+    )
+    financial_types = {
+        column["name"]: str(column["type"])
+        for column in schema.get_columns("financials")
+    }
+    for field in (
+        "revenue",
+        "total_assets",
+        "net_assets",
+        "cash",
+        "interest_debt",
+        "pretax_income",
+        "income_tax",
+        "goodwill",
+    ):
+        assert financial_types[field] == "TEXT"
     checkpoint_unique = {
         tuple(item["column_names"])
         for item in schema.get_unique_constraints("discovery_data_checkpoints")
@@ -135,12 +191,18 @@ def test_init_db_adds_discovery_tables_and_migrates_old_financial_schema(
         fk["referred_table"] == "discovery_data_fills"
         for fk in schema.get_foreign_keys("discovery_data_checkpoints")
     )
+    from app.models import ValuationSeries
+
+    with Session(engine) as session:
+        series = session.get(ValuationSeries, "600519.SH")
+        assert series is not None
+        assert series.ratio_method == "PE_TTM/PB_MRQ"
     engine.dispose()
 
 
 def test_financial_new_fields_round_trip_through_db_and_snapshot(tmp_path) -> None:
     from jobs.cheap import _rows_from_db
-    from jobs.funnel import persist_financials
+    from jobs.discovery_data import persist_discovery_financials
     from screen.replay import _to_financial, dump_snapshot
 
     engine = init_db(tmp_path / "round-trip.db")
@@ -151,7 +213,7 @@ def test_financial_new_fields_round_trip_through_db_and_snapshot(tmp_path) -> No
         **NEW_FINANCIAL_VALUES,
     )
     with Session(engine) as session:
-        persist_financials(session, [row])
+        persist_discovery_financials(session, [row])
         session.commit()
         loaded = _rows_from_db(session, [row.code])[0]
     for field, expected in NEW_FINANCIAL_VALUES.items():
@@ -168,9 +230,200 @@ def test_financial_new_fields_round_trip_through_db_and_snapshot(tmp_path) -> No
     engine.dispose()
 
 
+def test_legacy_then_discovery_updates_only_owned_financial_fields(tmp_path) -> None:
+    from jobs.discovery_data import persist_discovery_financials
+    from jobs.funnel import persist_financials
+
+    engine = init_db(tmp_path / "legacy-discovery.db")
+    legacy = FinancialRow(
+        code="000333.SZ",
+        period="2025",
+        period_type="annual",
+        roe=Decimal("15"),
+        net_income=Decimal("100"),
+        revenue=Decimal("999"),
+    )
+    discovery = FinancialRow(
+        code=legacy.code,
+        period=legacy.period,
+        period_type=legacy.period_type,
+        roe=None,
+        net_income=Decimal("101"),
+        revenue=Decimal("1000.01"),
+        government_grants=Decimal("5"),
+    )
+    with Session(engine) as session:
+        persist_financials(session, [legacy])
+        session.commit()
+        stored = session.get(
+            Financial, (legacy.code, legacy.period, legacy.period_type)
+        )
+        assert stored is not None
+        assert stored.revenue is None
+
+        persist_discovery_financials(session, [discovery])
+        session.commit()
+        session.refresh(stored)
+        assert stored.roe == Decimal("15")
+        assert stored.net_income == Decimal("101")
+        assert stored.revenue == Decimal("1000.01")
+        assert stored.government_grants == Decimal("5")
+
+        persist_discovery_financials(
+            session,
+            [replace(discovery, government_grants=None)],
+        )
+        session.commit()
+        session.refresh(stored)
+        assert stored.government_grants is None
+    engine.dispose()
+
+
+def test_discovery_then_legacy_preserves_discovery_financial_fields(tmp_path) -> None:
+    from jobs.discovery_data import persist_discovery_financials
+    from jobs.funnel import persist_financials
+
+    engine = init_db(tmp_path / "discovery-legacy.db")
+    discovery = FinancialRow(
+        code="600036.SH",
+        period="2025",
+        period_type="annual",
+        roe=Decimal("99"),
+        net_income=Decimal("100"),
+        revenue=Decimal("337532000000.12"),
+        government_grants=Decimal("5"),
+    )
+    legacy = FinancialRow(
+        code=discovery.code,
+        period=discovery.period,
+        period_type=discovery.period_type,
+        roe=Decimal("18"),
+        net_income=Decimal("102"),
+        revenue=Decimal("999"),
+    )
+    with Session(engine) as session:
+        persist_discovery_financials(session, [discovery])
+        session.commit()
+        persist_financials(session, [legacy])
+        session.commit()
+        stored = session.get(
+            Financial, (legacy.code, legacy.period, legacy.period_type)
+        )
+        assert stored is not None
+        assert stored.roe == Decimal("18")
+        assert stored.net_income == Decimal("102")
+        assert stored.revenue == Decimal("337532000000.12")
+        assert stored.government_grants == Decimal("5")
+    engine.dispose()
+
+
+def test_large_cny_amount_round_trips_as_exact_text(tmp_path) -> None:
+    from jobs.discovery_data import persist_discovery_financials
+
+    engine = init_db(tmp_path / "large-money.db")
+    amount = Decimal("45900000000000.12")
+    row = FinancialRow(
+        code="600036.SH",
+        period="2025",
+        period_type="annual",
+        total_assets=amount,
+    )
+    with Session(engine) as session:
+        persist_discovery_financials(session, [row])
+        session.commit()
+        stored = session.get(Financial, (row.code, row.period, row.period_type))
+        assert stored is not None
+        assert stored.total_assets == amount
+    with engine.connect() as conn:
+        storage_type, raw = conn.execute(
+            text(
+                "SELECT typeof(total_assets), total_assets FROM financials "
+                "WHERE code = :code"
+            ),
+            {"code": row.code},
+        ).one()
+        assert storage_type == "text"
+        assert raw == "45900000000000.12"
+    engine.dispose()
+
+
+def test_decimal_text_accepts_legacy_numeric_reads() -> None:
+    from app.models import CanonicalDecimalText
+
+    converter = CanonicalDecimalText()
+    assert converter.process_result_value(12345.5, None) == Decimal("12345.5")
+
+
+def test_init_db_converts_interim_discovery_money_columns_to_text(tmp_path) -> None:
+    db_path = tmp_path / "numeric-money.db"
+    old_engine = create_engine(f"sqlite:///{db_path.resolve().as_posix()}")
+    with old_engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE financials (
+                    code VARCHAR NOT NULL,
+                    period VARCHAR NOT NULL,
+                    period_type VARCHAR NOT NULL,
+                    roe NUMERIC(20, 8),
+                    net_income NUMERIC(20, 8),
+                    ocf NUMERIC(20, 8),
+                    capex NUMERIC(20, 8),
+                    ebit NUMERIC(20, 8),
+                    interest NUMERIC(20, 8),
+                    gross_margin NUMERIC(20, 8),
+                    net_margin NUMERIC(20, 8),
+                    shares NUMERIC(20, 8),
+                    share_change_ma BOOLEAN,
+                    bps NUMERIC(20, 8),
+                    npl NUMERIC(20, 8),
+                    eps NUMERIC(20, 8),
+                    revenue NUMERIC(20, 8),
+                    PRIMARY KEY (code, period, period_type)
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO financials (code, period, period_type, revenue) "
+                "VALUES ('600519.SH', '2025', 'annual', 12345.5)"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE TABLE settings ("
+                "key VARCHAR NOT NULL PRIMARY KEY, value VARCHAR NOT NULL)"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO settings (key, value) "
+                "VALUES ('fin_fetch_version', '3')"
+            )
+        )
+    old_engine.dispose()
+
+    engine = init_db(db_path)
+    with engine.connect() as conn:
+        columns = {
+            row[1]: row[2]
+            for row in conn.exec_driver_sql("PRAGMA table_info(financials)")
+        }
+    assert columns["revenue"] == "TEXT"
+    with Session(engine) as session:
+        stored = session.get(Financial, ("600519.SH", "2025", "annual"))
+        assert stored is not None
+        assert stored.revenue == Decimal("12345.5")
+    engine.dispose()
+
+
 def test_discovery_operational_models_round_trip(tmp_path) -> None:
     engine = init_db(tmp_path / "operations.db")
-    now = datetime.now(timezone.utc)
+    plus_eight = timezone(timedelta(hours=8))
+    now = datetime(2026, 9, 16, 20, tzinfo=plus_eight)
+    retry = now + timedelta(hours=2)
+    naive_updated = datetime(2026, 9, 16, 13)
     with Session(engine) as session:
         fill = DiscoveryDataFill(
             status="running",
@@ -182,7 +435,7 @@ def test_discovery_operational_models_round_trip(tmp_path) -> None:
             budget_day="2026-09-16",
             daily_requests=7,
             started_at=now,
-            updated_at=now,
+            updated_at=naive_updated,
             last_error=None,
         )
         session.add(fill)
@@ -192,7 +445,7 @@ def test_discovery_operational_models_round_trip(tmp_path) -> None:
             code="600519.SH",
             status="done",
             attempts=1,
-            next_retry_at=None,
+            next_retry_at=retry,
             valuation_points=61,
             error=None,
             updated_at=now,
@@ -200,9 +453,72 @@ def test_discovery_operational_models_round_trip(tmp_path) -> None:
         session.add(checkpoint)
         session.commit()
         session.expire_all()
-        assert session.get(
-            DiscoveryDataCheckpoint, (fill.id, "600519.SH")
-        ).valuation_points == 61
+        loaded_fill = session.get(DiscoveryDataFill, fill.id)
+        loaded = session.get(DiscoveryDataCheckpoint, (fill.id, "600519.SH"))
+        assert loaded_fill is not None
+        assert loaded is not None
+        assert loaded.valuation_points == 61
+        assert loaded_fill.started_at == now.astimezone(timezone.utc)
+        assert loaded_fill.updated_at == naive_updated.replace(tzinfo=timezone.utc)
+        assert loaded.next_retry_at == retry.astimezone(timezone.utc)
+        assert loaded.next_retry_at > loaded_fill.started_at
+    engine.dispose()
+
+
+def test_sqlite_foreign_keys_reject_orphans_and_cascade_checkpoints(tmp_path) -> None:
+    engine = init_db(tmp_path / "foreign-keys.db")
+    now = datetime.now(timezone.utc)
+    with engine.connect() as conn:
+        assert conn.exec_driver_sql("PRAGMA foreign_keys").scalar_one() == 1
+    with Session(engine) as session:
+        session.add(
+            DiscoveryDataCheckpoint(
+                fill_id=999,
+                code="600519.SH",
+                status="pending",
+                attempts=0,
+                next_retry_at=None,
+                valuation_points=0,
+                error=None,
+                updated_at=now,
+            )
+        )
+        with pytest.raises(IntegrityError):
+            session.commit()
+        session.rollback()
+
+        fill = DiscoveryDataFill(
+            status="running",
+            total=1,
+            completed=0,
+            failed=0,
+            request_count=0,
+            daily_budget=100,
+            budget_day="2026-09-16",
+            daily_requests=0,
+            started_at=now,
+            updated_at=now,
+            last_error=None,
+        )
+        session.add(fill)
+        session.flush()
+        key = (fill.id, "600519.SH")
+        session.add(
+            DiscoveryDataCheckpoint(
+                fill_id=fill.id,
+                code=key[1],
+                status="pending",
+                attempts=0,
+                next_retry_at=None,
+                valuation_points=0,
+                error=None,
+                updated_at=now,
+            )
+        )
+        session.commit()
+        session.delete(fill)
+        session.commit()
+        assert session.get(DiscoveryDataCheckpoint, key) is None
     engine.dispose()
 
 
@@ -211,7 +527,9 @@ def test_persist_valuation_history_updates_same_method(tmp_path) -> None:
 
     engine = init_db(tmp_path / "valuation.db")
     first_fetch = datetime(2026, 9, 16, 8, tzinfo=timezone.utc)
-    second_fetch = datetime(2026, 9, 16, 9, tzinfo=timezone.utc)
+    second_fetch = datetime(
+        2026, 9, 16, 17, tzinfo=timezone(timedelta(hours=8))
+    )
     first = ValuationPoint(
         code="600519.SH",
         month="2026-08",
@@ -251,7 +569,7 @@ def test_persist_valuation_history_updates_same_method(tmp_path) -> None:
             updated.source,
             updated.ratio_method,
         )
-        assert stored.fetched_at == second_fetch.replace(tzinfo=None)
+        assert stored.fetched_at == second_fetch.astimezone(timezone.utc)
     engine.dispose()
 
 
@@ -288,6 +606,53 @@ def test_persist_valuation_history_rejects_mixed_method_without_partial_write(
         stored = session.get(ValuationHistory, (existing.code, existing.month))
         assert stored is not None
         assert stored.ratio_method == existing.ratio_method
+    engine.dispose()
+
+
+def test_ratio_method_claim_is_atomic_across_sessions(tmp_path) -> None:
+    from jobs.discovery_data import persist_valuation_history
+    from app.models import ValuationSeries
+
+    engine = init_db(tmp_path / "valuation-concurrent.db")
+    now = datetime.now(timezone.utc)
+    first = ValuationPoint(
+        code="600519.SH",
+        month="2026-08",
+        trade_date="2026-08-31",
+        pe=Decimal("19.2"),
+        pb=Decimal("7.1"),
+        ratio_method="PE_TTM/PB_MRQ",
+    )
+    different = replace(
+        first,
+        month="2026-07",
+        trade_date="2026-07-31",
+        ratio_method="PE_STATIC/PB_LF",
+    )
+    with Session(engine) as winner, Session(engine) as loser:
+        assert loser.get(ValuationSeries, first.code) is None
+        persist_valuation_history(winner, [first], fetched_at=now)
+        winner.commit()
+        with pytest.raises(ValueError, match="ratio_method"):
+            persist_valuation_history(loser, [different], fetched_at=now)
+        loser.rollback()
+    with Session(engine) as session:
+        session.add(
+            ValuationHistory(
+                code=first.code,
+                month="2026-06",
+                trade_date="2026-06-30",
+                pe=Decimal("18"),
+                pb=Decimal("6"),
+                price=None,
+                source=first.source,
+                ratio_method=different.ratio_method,
+                fetched_at=now,
+            )
+        )
+        with pytest.raises(IntegrityError):
+            session.commit()
+        session.rollback()
     engine.dispose()
 
 

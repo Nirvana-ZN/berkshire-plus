@@ -1,10 +1,11 @@
-from datetime import datetime
-from decimal import Decimal
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 
 from sqlalchemy import (
     Boolean,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     Numeric,
@@ -13,8 +14,56 @@ from sqlalchemy import (
     UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.types import TypeDecorator
 
 from app.db import Base
+
+
+class CanonicalDecimalText(TypeDecorator[Decimal]):
+    """Store exact decimals as canonical, non-exponent TEXT."""
+
+    impl = Text
+    cache_ok = True
+
+    def process_bind_param(self, value: Decimal | None, _dialect) -> str | None:
+        if value is None:
+            return None
+        try:
+            amount = value if isinstance(value, Decimal) else Decimal(str(value))
+        except (InvalidOperation, ValueError) as exc:
+            raise ValueError(f"invalid decimal: {value}") from exc
+        if not amount.is_finite():
+            raise ValueError(f"non-finite decimal: {value}")
+        if amount == 0:
+            return "0"
+        text = format(amount, "f")
+        return text.rstrip("0").rstrip(".") if "." in text else text
+
+    def process_result_value(self, value: object, _dialect) -> Decimal | None:
+        if value is None:
+            return None
+        return value if isinstance(value, Decimal) else Decimal(str(value))
+
+
+class UTCDateTime(TypeDecorator[datetime]):
+    """Store naive UTC; treat legacy naive inputs as UTC and return aware UTC."""
+
+    impl = DateTime
+    cache_ok = True
+
+    def process_bind_param(self, value: datetime | None, _dialect) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+    def process_result_value(self, value: datetime | None, _dialect) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
 
 
 class User(Base):
@@ -161,56 +210,95 @@ class Financial(Base):
     bps: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
     npl: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
     eps: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
-    revenue: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
+    revenue: Mapped[Decimal | None] = mapped_column(CanonicalDecimalText(), nullable=True)
     deducted_net_income: Mapped[Decimal | None] = mapped_column(
-        Numeric(20, 8), nullable=True
+        CanonicalDecimalText(), nullable=True
     )
-    total_assets: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
-    net_assets: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
-    cash: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
-    short_loan: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
-    long_loan: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
-    bond_payable: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
+    total_assets: Mapped[Decimal | None] = mapped_column(
+        CanonicalDecimalText(), nullable=True
+    )
+    net_assets: Mapped[Decimal | None] = mapped_column(
+        CanonicalDecimalText(), nullable=True
+    )
+    cash: Mapped[Decimal | None] = mapped_column(CanonicalDecimalText(), nullable=True)
+    short_loan: Mapped[Decimal | None] = mapped_column(
+        CanonicalDecimalText(), nullable=True
+    )
+    long_loan: Mapped[Decimal | None] = mapped_column(
+        CanonicalDecimalText(), nullable=True
+    )
+    bond_payable: Mapped[Decimal | None] = mapped_column(
+        CanonicalDecimalText(), nullable=True
+    )
     noncurrent_liab_1year: Mapped[Decimal | None] = mapped_column(
-        Numeric(20, 8), nullable=True
+        CanonicalDecimalText(), nullable=True
     )
-    interest_debt: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
-    pretax_income: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
-    income_tax: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
+    interest_debt: Mapped[Decimal | None] = mapped_column(
+        CanonicalDecimalText(), nullable=True
+    )
+    pretax_income: Mapped[Decimal | None] = mapped_column(
+        CanonicalDecimalText(), nullable=True
+    )
+    income_tax: Mapped[Decimal | None] = mapped_column(
+        CanonicalDecimalText(), nullable=True
+    )
     normalized_effective_tax_rate: Mapped[Decimal | None] = mapped_column(
-        Numeric(20, 8), nullable=True
+        Numeric(30, 8), nullable=True
     )
     invested_capital: Mapped[Decimal | None] = mapped_column(
-        Numeric(20, 8), nullable=True
+        CanonicalDecimalText(), nullable=True
     )
-    roic: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
+    roic: Mapped[Decimal | None] = mapped_column(Numeric(30, 8), nullable=True)
     capital_adequacy: Mapped[Decimal | None] = mapped_column(
-        Numeric(20, 8), nullable=True
+        Numeric(30, 8), nullable=True
     )
     core_tier1_capital_adequacy: Mapped[Decimal | None] = mapped_column(
-        Numeric(20, 8), nullable=True
+        Numeric(30, 8), nullable=True
     )
     nonperforming_loan_balance: Mapped[Decimal | None] = mapped_column(
-        Numeric(20, 8), nullable=True
+        CanonicalDecimalText(), nullable=True
     )
     impairment_loss: Mapped[Decimal | None] = mapped_column(
-        Numeric(20, 8), nullable=True
+        CanonicalDecimalText(), nullable=True
     )
     government_grants: Mapped[Decimal | None] = mapped_column(
-        Numeric(20, 8), nullable=True
+        CanonicalDecimalText(), nullable=True
     )
     asset_disposal_gain: Mapped[Decimal | None] = mapped_column(
-        Numeric(20, 8), nullable=True
+        CanonicalDecimalText(), nullable=True
     )
-    goodwill: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
+    goodwill: Mapped[Decimal | None] = mapped_column(
+        CanonicalDecimalText(), nullable=True
+    )
     acquisition_cash_paid: Mapped[Decimal | None] = mapped_column(
-        Numeric(20, 8), nullable=True
+        CanonicalDecimalText(), nullable=True
     )
     source_as_of: Mapped[str | None] = mapped_column(String, nullable=True)
 
 
+class ValuationSeries(Base):
+    __tablename__ = "valuation_series"
+    __table_args__ = (
+        UniqueConstraint(
+            "code",
+            "ratio_method",
+            name="uq_valuation_series_code_ratio_method",
+        ),
+    )
+
+    code: Mapped[str] = mapped_column(String, primary_key=True)
+    ratio_method: Mapped[str] = mapped_column(String, nullable=False)
+
+
 class ValuationHistory(Base):
     __tablename__ = "valuation_history"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["code", "ratio_method"],
+            ["valuation_series.code", "valuation_series.ratio_method"],
+            name="fk_valuation_history_series_method",
+        ),
+    )
 
     code: Mapped[str] = mapped_column(String, primary_key=True)
     month: Mapped[str] = mapped_column(String, primary_key=True)
@@ -220,7 +308,7 @@ class ValuationHistory(Base):
     price: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
     source: Mapped[str] = mapped_column(String, nullable=False)
     ratio_method: Mapped[str] = mapped_column(String, nullable=False)
-    fetched_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    fetched_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
 
 
 class DiscoveryDataFill(Base):
@@ -236,8 +324,8 @@ class DiscoveryDataFill(Base):
     daily_budget: Mapped[int] = mapped_column(Integer, nullable=False)
     budget_day: Mapped[str | None] = mapped_column(String, nullable=True)
     daily_requests: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    started_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
@@ -259,10 +347,12 @@ class DiscoveryDataCheckpoint(Base):
     code: Mapped[str] = mapped_column(String, primary_key=True)
     status: Mapped[str] = mapped_column(String, nullable=False)
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    next_retry_at: Mapped[datetime | None] = mapped_column(
+        UTCDateTime(), nullable=True
+    )
     valuation_points: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
 
 
 class ResearchJob(Base):

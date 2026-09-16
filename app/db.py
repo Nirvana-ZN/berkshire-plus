@@ -11,6 +11,27 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "app.db"
 FIN_FETCH_KEY = "fin_fetch_version"
 FIN_FETCH_VERSION = "3"
+_DISCOVERY_CNY_COLUMNS = (
+    "revenue",
+    "deducted_net_income",
+    "total_assets",
+    "net_assets",
+    "cash",
+    "short_loan",
+    "long_loan",
+    "bond_payable",
+    "noncurrent_liab_1year",
+    "interest_debt",
+    "pretax_income",
+    "income_tax",
+    "invested_capital",
+    "nonperforming_loan_balance",
+    "impairment_loss",
+    "government_grants",
+    "asset_disposal_gain",
+    "goodwill",
+    "acquisition_cash_paid",
+)
 
 
 class Base(DeclarativeBase):
@@ -26,6 +47,7 @@ def _attach_busy_timeout(engine: Engine) -> None:
     def _set_busy_timeout(dbapi_connection, _connection_record) -> None:  # type: ignore[no-untyped-def]
         cursor = dbapi_connection.cursor()
         cursor.execute("PRAGMA busy_timeout=5000")
+        cursor.execute("PRAGMA foreign_keys=ON")
         cursor.close()
 
 
@@ -74,29 +96,29 @@ def _ensure_financial_columns(engine: Engine) -> None:
         "bps": "NUMERIC(20, 8)",
         "npl": "NUMERIC(20, 8)",
         "eps": "NUMERIC(20, 8)",
-        "revenue": "NUMERIC(20, 8)",
-        "deducted_net_income": "NUMERIC(20, 8)",
-        "total_assets": "NUMERIC(20, 8)",
-        "net_assets": "NUMERIC(20, 8)",
-        "cash": "NUMERIC(20, 8)",
-        "short_loan": "NUMERIC(20, 8)",
-        "long_loan": "NUMERIC(20, 8)",
-        "bond_payable": "NUMERIC(20, 8)",
-        "noncurrent_liab_1year": "NUMERIC(20, 8)",
-        "interest_debt": "NUMERIC(20, 8)",
-        "pretax_income": "NUMERIC(20, 8)",
-        "income_tax": "NUMERIC(20, 8)",
-        "normalized_effective_tax_rate": "NUMERIC(20, 8)",
-        "invested_capital": "NUMERIC(20, 8)",
-        "roic": "NUMERIC(20, 8)",
-        "capital_adequacy": "NUMERIC(20, 8)",
-        "core_tier1_capital_adequacy": "NUMERIC(20, 8)",
-        "nonperforming_loan_balance": "NUMERIC(20, 8)",
-        "impairment_loss": "NUMERIC(20, 8)",
-        "government_grants": "NUMERIC(20, 8)",
-        "asset_disposal_gain": "NUMERIC(20, 8)",
-        "goodwill": "NUMERIC(20, 8)",
-        "acquisition_cash_paid": "NUMERIC(20, 8)",
+        "revenue": "TEXT",
+        "deducted_net_income": "TEXT",
+        "total_assets": "TEXT",
+        "net_assets": "TEXT",
+        "cash": "TEXT",
+        "short_loan": "TEXT",
+        "long_loan": "TEXT",
+        "bond_payable": "TEXT",
+        "noncurrent_liab_1year": "TEXT",
+        "interest_debt": "TEXT",
+        "pretax_income": "TEXT",
+        "income_tax": "TEXT",
+        "normalized_effective_tax_rate": "NUMERIC(30, 8)",
+        "invested_capital": "TEXT",
+        "roic": "NUMERIC(30, 8)",
+        "capital_adequacy": "NUMERIC(30, 8)",
+        "core_tier1_capital_adequacy": "NUMERIC(30, 8)",
+        "nonperforming_loan_balance": "TEXT",
+        "impairment_loss": "TEXT",
+        "government_grants": "TEXT",
+        "asset_disposal_gain": "TEXT",
+        "goodwill": "TEXT",
+        "acquisition_cash_paid": "TEXT",
         "source_as_of": "VARCHAR",
     }
     with engine.begin() as conn:
@@ -109,6 +131,127 @@ def _ensure_financial_columns(engine: Engine) -> None:
                 conn.execute(
                     text(f"ALTER TABLE financials ADD COLUMN {column} {sql_type}")
                 )
+
+
+def _ensure_financial_text_storage(engine: Engine) -> None:
+    from sqlalchemy import MetaData, text
+
+    from app.models import Financial
+
+    with engine.begin() as conn:
+        rows = conn.execute(text("PRAGMA table_info(financials)")).all()
+        types = {row[1]: str(row[2]).upper() for row in rows}
+        if all(types.get(column) == "TEXT" for column in _DISCOVERY_CNY_COLUMNS):
+            return
+
+        replacement = Financial.__table__.to_metadata(
+            MetaData(),
+            name="financials_text_migration",
+        )
+        replacement.drop(conn, checkfirst=True)
+        replacement.create(conn)
+        columns = [column.name for column in Financial.__table__.columns]
+        names = ", ".join(f'"{column}"' for column in columns)
+        values = ", ".join(
+            (
+                f'CAST("{column}" AS TEXT)'
+                if column in _DISCOVERY_CNY_COLUMNS
+                else f'"{column}"'
+            )
+            for column in columns
+        )
+        conn.execute(
+            text(
+                f"INSERT INTO financials_text_migration ({names}) "
+                f"SELECT {values} FROM financials"
+            )
+        )
+        conn.execute(text("DROP TABLE financials"))
+        conn.execute(
+            text(
+                "ALTER TABLE financials_text_migration "
+                "RENAME TO financials"
+            )
+        )
+
+
+def _ensure_valuation_series(engine: Engine) -> None:
+    from sqlalchemy import text
+
+    with engine.begin() as conn:
+        methods = conn.execute(
+            text(
+                "SELECT code, MIN(ratio_method), MAX(ratio_method) "
+                "FROM valuation_history GROUP BY code"
+            )
+        ).all()
+        for code, first, last in methods:
+            if first != last:
+                raise ValueError(f"{code} has mixed valuation ratio_method values")
+            claimed = conn.execute(
+                text("SELECT ratio_method FROM valuation_series WHERE code = :code"),
+                {"code": code},
+            ).scalar()
+            if claimed is not None and claimed != first:
+                raise ValueError(
+                    f"{code} ratio_method mismatch: {claimed} != {first}"
+                )
+            conn.execute(
+                text(
+                    "INSERT INTO valuation_series (code, ratio_method) "
+                    "VALUES (:code, :ratio_method) ON CONFLICT(code) DO NOTHING"
+                ),
+                {"code": code, "ratio_method": first},
+            )
+
+        foreign_keys = conn.execute(
+            text("PRAGMA foreign_key_list(valuation_history)")
+        ).all()
+        has_series_fk = {
+            (row[2], row[3], row[4]) for row in foreign_keys
+        } >= {
+            ("valuation_series", "code", "code"),
+            ("valuation_series", "ratio_method", "ratio_method"),
+        }
+        if has_series_fk:
+            return
+
+        conn.execute(
+            text(
+                """
+                CREATE TABLE valuation_history_new (
+                    code VARCHAR NOT NULL,
+                    month VARCHAR NOT NULL,
+                    trade_date VARCHAR NOT NULL,
+                    pe NUMERIC(20, 8),
+                    pb NUMERIC(20, 8),
+                    price NUMERIC(20, 8),
+                    source VARCHAR NOT NULL,
+                    ratio_method VARCHAR NOT NULL,
+                    fetched_at DATETIME NOT NULL,
+                    PRIMARY KEY (code, month),
+                    CONSTRAINT fk_valuation_history_series_method
+                        FOREIGN KEY (code, ratio_method)
+                        REFERENCES valuation_series (code, ratio_method)
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                INSERT INTO valuation_history_new (
+                    code, month, trade_date, pe, pb, price, source,
+                    ratio_method, fetched_at
+                )
+                SELECT code, month, trade_date, pe, pb, price, source,
+                       ratio_method, fetched_at
+                FROM valuation_history
+                """
+            )
+        )
+        conn.execute(text("DROP TABLE valuation_history"))
+        conn.execute(text("ALTER TABLE valuation_history_new RENAME TO valuation_history"))
 
 
 def _reset_stale_financials(engine: Engine) -> None:
@@ -139,6 +282,8 @@ def init_db(db_path: Path | None = None) -> Engine:
     Base.metadata.create_all(engine)
     _ensure_listed_year(engine)
     _ensure_financial_columns(engine)
+    _ensure_financial_text_storage(engine)
+    _ensure_valuation_series(engine)
     _reset_stale_financials(engine)
     SessionLocal = create_session_factory(engine)
     with SessionLocal() as session:

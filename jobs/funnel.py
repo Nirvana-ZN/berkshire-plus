@@ -19,6 +19,22 @@ from screen.replay import dump_snapshot, gate_is_open, last_finalist_count, snap
 
 logger = logging.getLogger(__name__)
 
+_LEGACY_FINANCIAL_FIELDS = (
+    "roe",
+    "net_income",
+    "ocf",
+    "capex",
+    "ebit",
+    "interest",
+    "gross_margin",
+    "net_margin",
+    "shares",
+    "share_change_ma",
+    "bps",
+    "npl",
+    "eps",
+)
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
@@ -67,50 +83,19 @@ def persist_industries(session: Session, snapshots: list[Constituent]) -> None:
 
 def persist_financials(session: Session, rows: list[FinancialRow]) -> None:
     for row in rows:
-        session.merge(
-            Financial(
+        stored = session.get(
+            Financial,
+            (row.code, row.period, row.period_type),
+        )
+        if stored is None:
+            stored = Financial(
                 code=row.code,
                 period=row.period,
                 period_type=row.period_type,
-                roe=row.roe,
-                net_income=row.net_income,
-                ocf=row.ocf,
-                capex=row.capex,
-                ebit=row.ebit,
-                interest=row.interest,
-                gross_margin=row.gross_margin,
-                net_margin=row.net_margin,
-                shares=row.shares,
-                share_change_ma=row.share_change_ma,
-                bps=row.bps,
-                npl=row.npl,
-                eps=row.eps,
-                revenue=row.revenue,
-                deducted_net_income=row.deducted_net_income,
-                total_assets=row.total_assets,
-                net_assets=row.net_assets,
-                cash=row.cash,
-                short_loan=row.short_loan,
-                long_loan=row.long_loan,
-                bond_payable=row.bond_payable,
-                noncurrent_liab_1year=row.noncurrent_liab_1year,
-                interest_debt=row.interest_debt,
-                pretax_income=row.pretax_income,
-                income_tax=row.income_tax,
-                normalized_effective_tax_rate=row.normalized_effective_tax_rate,
-                invested_capital=row.invested_capital,
-                roic=row.roic,
-                capital_adequacy=row.capital_adequacy,
-                core_tier1_capital_adequacy=row.core_tier1_capital_adequacy,
-                nonperforming_loan_balance=row.nonperforming_loan_balance,
-                impairment_loss=row.impairment_loss,
-                government_grants=row.government_grants,
-                asset_disposal_gain=row.asset_disposal_gain,
-                goodwill=row.goodwill,
-                acquisition_cash_paid=row.acquisition_cash_paid,
-                source_as_of=row.source_as_of,
             )
-        )
+            session.add(stored)
+        for field in _LEGACY_FINANCIAL_FIELDS:
+            setattr(stored, field, getattr(row, field))
 
 
 def persist_listed_years(session: Session, years: dict[str, int]) -> None:
