@@ -7,7 +7,12 @@ from threading import Event
 from typing import Protocol
 from urllib.parse import quote
 
-from market.cheap import INDUSTRY_MAPPING_VERSION, CheapRow, delisting_name_state
+from market.cheap import (
+    INDUSTRY_MAPPING_VERSION,
+    CheapRow,
+    delisting_name_state,
+    is_st_name,
+)
 from market.types import Constituent, FinancialRow, MarketError, ValuationPoint
 
 BOARD_LIST_URL = "https://push2delay.eastmoney.com/api/qt/clist/get"
@@ -16,6 +21,7 @@ SUGGEST_URL = "https://searchapi.eastmoney.com/api/suggest/get"
 CODETABLE_URL = "https://search-codetable.eastmoney.com/codetable/search"
 FINANCIALS_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
 ORGINFO_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
+VALUATION_PAGE_CAP = 20
 BREADTH_URL = (
     "https://push2delay.eastmoney.com/api/qt/ulist.np/get"
     "?fltt=2&secids=0.399317&fields=f3,f12,f104,f105,f106"
@@ -575,6 +581,10 @@ class EastMoneyClient:
             raise MarketError(str(exc)) from exc
         start = _five_year_month_start(date.today())
         records: list[dict] = []
+        seen_pages: set[tuple[tuple[str, str, str, str], ...]] = set()
+        previous_oldest: date | None = None
+        expected_pages: int | None = None
+        pages_seen = False
         page = 1
         while True:
             filt = f'(SECURITY_CODE="{normalized[:6]}")'
@@ -584,29 +594,70 @@ class EastMoneyClient:
                 f"&sortColumns=TRADE_DATE&sortTypes=-1&filter={quote(filt)}"
             )
             payload = self._get_json(url)
-            if payload.get("success") is False:
+            if payload.get("success") is not True:
                 raise MarketError(str(payload.get("message") or "估值历史接口不可用"))
-            result = payload.get("result") or {}
-            rows = result.get("data") if isinstance(result, dict) else None
-            if rows is None:
-                rows = []
+            result = payload.get("result")
+            if not isinstance(result, dict) or "data" not in result:
+                raise MarketError("估值历史接口返回格式错误")
+            rows = result["data"]
             if not isinstance(rows, list):
                 raise MarketError("估值历史接口返回格式错误")
-            valid_rows = [row for row in rows if isinstance(row, dict)]
-            records.extend(valid_rows)
-            days = [
-                str(row.get("TRADE_DATE") or "")[:10]
-                for row in valid_rows
-                if len(str(row.get("TRADE_DATE") or "")) >= 10
-            ]
-            pages = result.get("pages") if isinstance(result, dict) else None
-            if (
-                not valid_rows
-                or (days and min(days) <= start.isoformat())
-                or (isinstance(pages, int) and page >= pages)
-                or (not isinstance(pages, int) and len(valid_rows) < 500)
+            raw_pages = result.get("pages")
+            if raw_pages is not None and (
+                isinstance(raw_pages, bool)
+                or not isinstance(raw_pages, int)
+                or raw_pages < 0
             ):
+                raise MarketError("估值历史接口分页信息无效")
+            pages = raw_pages if isinstance(raw_pages, int) else None
+            if not pages_seen:
+                expected_pages = pages
+                pages_seen = True
+            elif pages != expected_pages:
+                raise MarketError("估值历史接口分页信息前后不一致")
+            if pages is not None and page > pages:
+                raise MarketError("估值历史接口返回了超出总页数的中间页")
+            if not rows:
+                if page == 1 and pages in {None, 0}:
+                    return []
+                raise MarketError("估值历史接口中间页为空")
+
+            parsed_rows: list[tuple[dict, str, date]] = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    raise MarketError("估值历史接口包含无效记录")
+                trade_date = str(row.get("TRADE_DATE") or "")[:10]
+                try:
+                    parsed_date = date.fromisoformat(trade_date)
+                except ValueError as exc:
+                    raise MarketError("估值历史接口包含无效交易日期") from exc
+                parsed_rows.append((row, trade_date, parsed_date))
+            signature = tuple(
+                (
+                    trade_date,
+                    str(row.get("PE_TTM")),
+                    str(row.get("PB_MRQ")),
+                    str(row.get("CLOSE_PRICE")),
+                )
+                for row, trade_date, _parsed_date in parsed_rows
+            )
+            if signature in seen_pages:
+                raise MarketError("估值历史接口重复分页，无进展")
+            seen_pages.add(signature)
+            oldest = min(parsed_date for _row, _trade_date, parsed_date in parsed_rows)
+            if previous_oldest is not None and oldest >= previous_oldest:
+                raise MarketError("估值历史接口分页无进展")
+            previous_oldest = oldest
+            records.extend(row for row, _trade_date, _parsed_date in parsed_rows)
+
+            if oldest <= start:
                 break
+            if pages is not None and page >= pages:
+                raise MarketError("估值历史接口不足五年")
+            if pages is None and len(rows) < 500:
+                raise MarketError("估值历史接口提前结束，不足五年")
+            if page >= VALUATION_PAGE_CAP:
+                raise MarketError("估值历史接口超过分页安全上限")
             page += 1
 
         monthly: dict[str, tuple[str, dict]] = {}
@@ -651,7 +702,7 @@ class EastMoneyClient:
         except Exception as exc:
             raise MarketError(str(exc)) from exc
         dates = parsed.get("dates")
-        if not isinstance(dates, list):
+        if not isinstance(dates, list) or not dates:
             raise MarketError("交易日接口返回格式错误")
         return [str(day)[:10] for day in dates][-limit:]
 
@@ -708,10 +759,7 @@ class EastMoneyClient:
             )
             for item in diff
         ):
-            try:
-                exchange_dates = self.fetch_trading_dates(snapshot_date)
-            except MarketError:
-                exchange_dates = []
+            exchange_dates = self.fetch_trading_dates(snapshot_date)
         latest_exchange_date = exchange_dates[-1] if exchange_dates else None
         rows: list[CheapRow] = []
         for item in diff:
@@ -762,7 +810,7 @@ class EastMoneyClient:
                     industry=str(item.get("f100") or "").strip(),
                     exchange=code.rsplit(".", 1)[1],
                     listing_date=_compact_date(item.get("f26")),
-                    is_st=name.upper().startswith(("ST", "*ST")),
+                    is_st=is_st_name(name),
                     is_delisting=delisting_name_state(code, name),
                     trading_status=trading_status,
                     last_trade_date=last_trade_date,

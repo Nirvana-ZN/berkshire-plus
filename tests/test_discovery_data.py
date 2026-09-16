@@ -1,22 +1,27 @@
 import json
 from dataclasses import replace
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from urllib.parse import parse_qs, urlsplit
 
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from app.models import Setting
 from market.cheap import (
+    CACHE_KEY,
     DELISTING_NAME_METHOD,
     METHOD,
     CheapRow,
     _cached,
+    eligible_cheap,
+    is_st_name,
+    load_cheap_universe,
     security_state_eligible,
 )
 from market.eastmoney import EastMoneyClient, FakeMarketClient
-from market.types import ValuationPoint
+from market.types import MarketError, ValuationPoint
 
 
 # Live probe 2026-09-16, RPT_VALUEANALYSIS_DET, pageSize=500:
@@ -38,6 +43,10 @@ from market.types import ValuationPoint
 
 
 def test_fetch_valuation_history_maps_monthly_pe_pb() -> None:
+    cutoff = (
+        date(date.today().year - 5, date.today().month, 1) - timedelta(days=1)
+    ).isoformat()
+
     class Stub(EastMoneyClient):
         def _get_json(self, url: str) -> dict:
             assert "RPT_VALUEANALYSIS_DET" in url
@@ -64,6 +73,12 @@ def test_fetch_valuation_history_maps_monthly_pe_pb() -> None:
                             "PE_TTM": "-1",
                             "PB_MRQ": "7.0",
                             "CLOSE_PRICE": "1440.0",
+                        },
+                        {
+                            "TRADE_DATE": cutoff,
+                            "PE_TTM": "18",
+                            "PB_MRQ": "6",
+                            "CLOSE_PRICE": "1400",
                         },
                     ],
                 },
@@ -137,6 +152,77 @@ def test_fetch_valuation_history_paginates_before_month_deduplication() -> None:
     assert august.pb == Decimal("4")
     assert any(row.pe == Decimal("123456.789") for row in rows)
     assert any(row.pb is None for row in rows)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"success": True, "result": []},
+        {"success": True, "result": {"data": {}}},
+        {"success": True, "result": {"pages": "2", "data": []}},
+        {"success": True, "result": {"pages": 1, "data": [None]}},
+    ],
+)
+def test_fetch_valuation_history_rejects_malformed_pages(payload: dict) -> None:
+    class Stub(EastMoneyClient):
+        def _get_json(self, _url: str) -> dict:
+            return payload
+
+    with pytest.raises(MarketError):
+        Stub().fetch_valuation_history("600519.SH")
+
+
+def test_fetch_valuation_history_rejects_repeated_full_page() -> None:
+    calls = 0
+    page = [
+        {
+            "TRADE_DATE": "2026-09-15 00:00:00",
+            "PE_TTM": "20",
+            "PB_MRQ": "7",
+            "CLOSE_PRICE": str(index + 1),
+        }
+        for index in range(500)
+    ]
+
+    class Stub(EastMoneyClient):
+        def _get_json(self, _url: str) -> dict:
+            nonlocal calls
+            calls += 1
+            return {"success": True, "result": {"data": page}}
+
+    with pytest.raises(MarketError, match="重复|进展"):
+        Stub().fetch_valuation_history("600519.SH")
+    assert calls == 2
+
+
+def test_fetch_valuation_history_stops_at_conservative_page_cap() -> None:
+    calls = 0
+
+    class Stub(EastMoneyClient):
+        def _get_json(self, _url: str) -> dict:
+            nonlocal calls
+            calls += 1
+            if calls > 25:
+                raise AssertionError("valuation pagination did not stop")
+            day = (date.today() - timedelta(days=calls)).isoformat()
+            return {
+                "success": True,
+                "result": {
+                    "data": [
+                        {
+                            "TRADE_DATE": day,
+                            "PE_TTM": "20",
+                            "PB_MRQ": "7",
+                            "CLOSE_PRICE": str(index + 1),
+                        }
+                        for index in range(500)
+                    ]
+                },
+            }
+
+    with pytest.raises(MarketError, match="上限"):
+        Stub().fetch_valuation_history("600519.SH")
+    assert calls <= 25
 
 
 def test_fake_market_exposes_valuation_history_and_trading_dates() -> None:
@@ -217,6 +303,18 @@ def test_cheap_universe_freezes_fields_and_live_row_is_eligible() -> None:
                             "f100": "基础建设",
                             "f124": 1789518620,
                             "f292": 6,
+                        },
+                        {
+                            "f12": "600001",
+                            "f13": 1,
+                            "f14": "S*ST公司",
+                            "f2": "10",
+                            "f9": "5",
+                            "f23": "1",
+                            "f20": "50",
+                            "f26": 20000101,
+                            "f100": "化工",
+                            "f292": 2,
                         },
                         {
                             "f12": "603056",
@@ -336,6 +434,7 @@ def test_cheap_universe_freezes_fields_and_live_row_is_eligible() -> None:
         "601238.SH",
         "601091.SH",
         "000004.SZ",
+        "600001.SH",
     }
     normal = by_code["600036.SH"]
     assert normal.exchange == "SH"
@@ -348,6 +447,8 @@ def test_cheap_universe_freezes_fields_and_live_row_is_eligible() -> None:
     assert normal.industry_version == "eastmoney:push2delay:clist:f100:v1"
     assert normal.industry_as_of == date.today().isoformat()
     assert security_state_eligible(normal, frozen_dates)
+    assert by_code["600001.SH"].is_st is True
+    assert not security_state_eligible(by_code["600001.SH"], frozen_dates)
     suspended = by_code["605303.SH"]
     assert suspended.trading_status == "suspended"
     assert suspended.last_trade_date == "2026-09-10"
@@ -405,6 +506,68 @@ def test_suspended_security_uses_latest_five_frozen_exchange_dates() -> None:
     assert not security_state_eligible(
         replace(row, industry_version=None, industry_as_of=None), dates
     )
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("ST化工", True),
+        ("*ST假药", True),
+        ("S*ST公司", True),
+        ("SST公司", True),
+        ("招商银行", False),
+        ("BEST股份", False),
+        ("FIRST服务", False),
+    ],
+)
+def test_st_classifier_is_shared_without_false_positives(
+    name: str, expected: bool
+) -> None:
+    row = CheapRow(
+        code="600000.SH",
+        name=name,
+        price=Decimal("10"),
+        pe=Decimal("5"),
+        pb=Decimal("1"),
+        mcap=Decimal("100"),
+        industry="化工",
+    )
+
+    assert is_st_name(name) is expected
+    assert (eligible_cheap([row]) == []) is expected
+
+
+def test_calendar_failure_does_not_store_degraded_universe() -> None:
+    class Stub(EastMoneyClient):
+        def _get_json(self, _url: str) -> dict:
+            return {
+                "data": {
+                    "diff": [
+                        {
+                            "f12": "600036",
+                            "f13": 1,
+                            "f14": "招商银行",
+                            "f2": "42",
+                            "f9": "6",
+                            "f23": "0.8",
+                            "f20": "100",
+                            "f26": 20020409,
+                            "f100": "银行Ⅱ",
+                            "f292": 2,
+                        }
+                    ]
+                }
+            }
+
+        def _get_json_direct(self, _url: str) -> dict:
+            raise RuntimeError("calendar unavailable")
+
+    engine = create_engine("sqlite://")
+    Setting.__table__.create(engine)
+    with Session(engine) as session:
+        with pytest.raises(MarketError, match="calendar unavailable"):
+            load_cheap_universe(session, Stub())
+        assert session.get(Setting, CACHE_KEY) is None
 
 
 def test_old_cached_universe_without_security_metadata_is_rejected() -> None:

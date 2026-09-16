@@ -58,8 +58,8 @@ class CheapRow:
     market_status_code: int | None = None
 
 
-def _is_st(name: str) -> bool:
-    return "ST" in (name or "").upper()
+def is_st_name(name: str) -> bool:
+    return (name or "").strip().upper().startswith(("ST", "*ST", "S*ST", "SST"))
 
 
 def delisting_name_state(code: str, name: str) -> bool | None:
@@ -85,7 +85,7 @@ def _metric(row: CheapRow, sort: str) -> Decimal | None:
 def eligible_cheap(rows: list[CheapRow], *, sort: str = "pe") -> list[CheapRow]:
     kept: list[CheapRow] = []
     for row in rows:
-        if _is_st(row.name):
+        if is_st_name(row.name):
             continue
         metric = _metric(row, sort)
         if metric is None or metric <= 0:
