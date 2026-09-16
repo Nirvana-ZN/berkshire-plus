@@ -18,7 +18,8 @@ SHOW_LIMIT = 30
 SORTS = frozenset({"pe", "pb"})
 SCOPE = "hs_a"
 SCOPE_LABEL = "沪深A股（不含北交所）"
-METHOD = "v2"
+METHOD = "v3"
+INDUSTRY_MAPPING_VERSION = "eastmoney:push2delay:clist:f100:v1"
 _SECURITY_FIELDS = frozenset(
     {
         "exchange",

@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from datetime import UTC, date, datetime
+from datetime import date
 from decimal import Decimal, InvalidOperation
 from threading import Event
 from typing import Protocol
 from urllib.parse import quote
 
-from market.cheap import CheapRow
+from market.cheap import INDUSTRY_MAPPING_VERSION, CheapRow
 from market.types import Constituent, FinancialRow, MarketError, ValuationPoint
 
 BOARD_LIST_URL = "https://push2delay.eastmoney.com/api/qt/clist/get"
@@ -320,13 +320,6 @@ def _compact_date(value: object) -> str | None:
     except ValueError:
         return None
     return result
-
-
-def _timestamp_date(value: object) -> str | None:
-    try:
-        return datetime.fromtimestamp(int(value), tz=UTC).date().isoformat()
-    except (TypeError, ValueError, OSError, OverflowError):
-        return None
 
 
 def _status_code(value: object) -> int | None:
@@ -692,10 +685,11 @@ class EastMoneyClient:
 
     def fetch_cheap_universe(self) -> list[CheapRow]:
         # ponytail: 东财截面约 50–80 页；历史分位另存每日快照
+        snapshot_date = date.today().isoformat()
         try:
             diff = self._clist_diff(
                 fs=HS_A_FS,
-                fields="f12,f13,f14,f2,f9,f23,f20,f26,f100,f124,f292",
+                fields="f12,f13,f14,f2,f9,f23,f20,f26,f100,f292",
                 fid="f12",
                 max_pages=80,
             )
@@ -704,11 +698,18 @@ class EastMoneyClient:
         except Exception as exc:
             raise MarketError(str(exc)) from exc
         exchange_dates: list[str] = []
-        # ponytail: only f292=6 needs one kline call (14/5,559 at probe);
+        # ponytail: only f292=6 needs one stock-kline call (14/5,559 at probe);
         # batch this if the suspended set grows materially.
-        if any(_status_code(item.get("f292")) == 6 for item in diff):
+        if any(
+            item.get("f292") is not None
+            and (
+                _positive_decimal(item.get("f2")) is not None
+                or _status_code(item.get("f292")) == 6
+            )
+            for item in diff
+        ):
             try:
-                exchange_dates = self.fetch_trading_dates(date.today().isoformat())
+                exchange_dates = self.fetch_trading_dates(snapshot_date)
             except MarketError:
                 exchange_dates = []
         latest_exchange_date = exchange_dates[-1] if exchange_dates else None
@@ -724,24 +725,35 @@ class EastMoneyClient:
                 continue
             price = _as_decimal(item.get("f2"))
             market_status = _status_code(item.get("f292"))
-            # Probe made 2 (priced) and 6 (unpriced suspension) unambiguous.
-            # Codes 7/9 mix terminal/pre-listing states, so keep them unknown.
-            if market_status == 2 and price is not None and price > 0:
+            # f292=6 only selects suspension candidates. A priced row plus the
+            # frozen exchange date verifies active trading; a lagging stock kline
+            # verifies suspension. Other raw status values remain uninterpreted.
+            if (
+                price is not None
+                and price > 0
+                and latest_exchange_date is not None
+            ):
                 trading_status = "trading"
-                last_trade_date = _timestamp_date(item.get("f124"))
-            elif market_status == 6:
-                trading_status = "suspended"
-                last_trade_date = (
+                last_trade_date = latest_exchange_date
+            elif market_status == 6 and latest_exchange_date is not None:
+                probed_last_trade_date = (
                     self._last_trade_date(code, latest_exchange_date)
-                    if latest_exchange_date is not None
-                    else None
                 )
+                if (
+                    probed_last_trade_date is not None
+                    and probed_last_trade_date < latest_exchange_date
+                ):
+                    trading_status = "suspended"
+                    last_trade_date = probed_last_trade_date
+                else:
+                    trading_status = None
+                    last_trade_date = None
             else:
                 trading_status = None
                 last_trade_date = None
             if name.startswith("退市") or name.endswith("退"):
                 is_delisting: bool | None = True
-            elif market_status in {2, 6, 9}:
+            elif trading_status == "trading":
                 is_delisting = False
             else:
                 is_delisting = None
@@ -760,8 +772,10 @@ class EastMoneyClient:
                     is_delisting=is_delisting,
                     trading_status=trading_status,
                     last_trade_date=last_trade_date,
-                    industry_version=None,
-                    industry_as_of=None,
+                    # Our mapping revision and retrieval snapshot, not an East
+                    # Money taxonomy edition or classification publication date.
+                    industry_version=INDUSTRY_MAPPING_VERSION,
+                    industry_as_of=snapshot_date,
                     security_source="eastmoney:push2delay",
                     market_status_code=market_status,
                 )

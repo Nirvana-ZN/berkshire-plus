@@ -23,10 +23,12 @@ from market.types import ValuationPoint
 # f13 market, f14 name, f2 price, f26 listing date, f100 industry, f124
 # quote timestamp, and f292 market status. f26 matched ORGINFO LISTING_DATE
 # for 600036 (2002-04-09), 600519 (2001-08-27), and 000333 (2013-09-18).
-# Observed f292 counts were 2=5,206 priced rows, 6=14 unpriced suspended
-# rows, 7=334 inactive/delisted rows, and 9=5 unpriced pre-listing rows.
-# ST/*ST is explicit in f14. No explicit industry-classification version or
-# classification as-of field was returned, so both stay unknown.
+# Observed raw f292 counts were 2=5,206, 6=14, 7=334, and 9=5.
+# Those codes are preserved but not treated as a status dictionary: f292=6
+# only selects 14 K-line probes, and the returned dates determine suspension.
+# ST/*ST is explicit in f14. East Money returns no taxonomy edition; the
+# stored industry version names our f100 mapping, and industry_as_of records
+# our universe snapshot date rather than claiming an East Money edition.
 
 
 def test_fetch_valuation_history_maps_monthly_pe_pb() -> None:
@@ -176,7 +178,7 @@ def test_fetch_trading_dates_reuses_existing_index_kline_parser() -> None:
     ]
 
 
-def test_cheap_universe_freezes_verified_security_fields() -> None:
+def test_cheap_universe_freezes_fields_and_live_row_is_eligible() -> None:
     class Stub(EastMoneyClient):
         def _get_json(self, _url: str) -> dict:
             return {
@@ -192,7 +194,9 @@ def test_cheap_universe_freezes_verified_security_fields() -> None:
                             "f20": "100",
                             "f26": 20020409,
                             "f100": "银行Ⅱ",
-                            "f124": 1789516800,
+                            # Quote timestamp is deliberately one day older
+                            # than the frozen exchange date below.
+                            "f124": 1789430400,
                             "f292": 2,
                         },
                         {
@@ -222,6 +226,19 @@ def test_cheap_universe_freezes_verified_security_fields() -> None:
                             "f292": 7,
                         },
                         {
+                            "f12": "601238",
+                            "f13": 1,
+                            "f14": "广汽集团",
+                            "f2": "-",
+                            "f9": "10",
+                            "f23": "1",
+                            "f20": "50",
+                            "f26": 20120329,
+                            "f100": "乘用车",
+                            "f124": 1789518616,
+                            "f292": 6,
+                        },
+                        {
                             "f12": "688555",
                             "f13": 1,
                             "f14": "退市泽达",
@@ -233,6 +250,19 @@ def test_cheap_universe_freezes_verified_security_fields() -> None:
                             "f100": "-",
                             "f124": 1789516800,
                             "f292": 7,
+                        },
+                        {
+                            "f12": "601091",
+                            "f13": 1,
+                            "f14": "沈鼓集团",
+                            "f2": "-",
+                            "f9": "-",
+                            "f23": "-",
+                            "f20": "-",
+                            "f26": 20260917,
+                            "f100": "通用设备",
+                            "f124": 1789516800,
+                            "f292": 9,
                         },
                         {
                             "f12": "430047",
@@ -262,12 +292,21 @@ def test_cheap_universe_freezes_verified_security_fields() -> None:
                         ]
                     }
                 }
+            if "secid=1.601238" in url:
+                raise RuntimeError("stock kline unavailable")
             assert "secid=1.605303" in url
             return {"data": {"klines": ["2026-09-10,23,24,25,26,27,28"]}}
 
     by_code = {row.code: row for row in Stub().fetch_cheap_universe()}
 
-    assert set(by_code) == {"600036.SH", "605303.SH", "603056.SH", "688555.SH"}
+    assert set(by_code) == {
+        "600036.SH",
+        "605303.SH",
+        "603056.SH",
+        "688555.SH",
+        "601238.SH",
+        "601091.SH",
+    }
     normal = by_code["600036.SH"]
     assert normal.exchange == "SH"
     assert normal.listing_date == "2002-04-09"
@@ -276,13 +315,30 @@ def test_cheap_universe_freezes_verified_security_fields() -> None:
     assert normal.trading_status == "trading"
     assert normal.last_trade_date == "2026-09-16"
     assert normal.industry == "银行Ⅱ"
-    assert normal.industry_version is None
-    assert normal.industry_as_of is None
+    assert normal.industry_version == "eastmoney:push2delay:clist:f100:v1"
+    assert normal.industry_as_of == date.today().isoformat()
+    assert security_state_eligible(
+        normal,
+        [
+            "2026-09-09",
+            "2026-09-10",
+            "2026-09-11",
+            "2026-09-14",
+            "2026-09-15",
+            "2026-09-16",
+        ],
+    )
     suspended = by_code["605303.SH"]
     assert suspended.trading_status == "suspended"
     assert suspended.last_trade_date == "2026-09-10"
+    assert suspended.is_delisting is None
+    unavailable = by_code["601238.SH"]
+    assert unavailable.trading_status is None
+    assert unavailable.last_trade_date is None
     assert by_code["603056.SH"].is_delisting is None
     assert by_code["688555.SH"].is_delisting is True
+    assert by_code["601091.SH"].is_delisting is None
+    assert by_code["601091.SH"].trading_status is None
 
 
 def test_suspended_security_uses_latest_five_frozen_exchange_dates() -> None:
@@ -338,12 +394,12 @@ def test_old_cached_universe_without_security_metadata_is_rejected() -> None:
             Setting(
                 key="cheap_universe",
                 value=json.dumps(
-                    {"method": "v1", "fetched_at": 1000.0, "rows": [old_row]}
+                    {"method": "v2", "fetched_at": 1000.0, "rows": [old_row]}
                 ),
             )
         )
         session.commit()
-        assert METHOD == "v2"
+        assert METHOD == "v3"
         assert _cached(session, 1001.0) is None
         setting = session.get(Setting, "cheap_universe")
         assert setting is not None
