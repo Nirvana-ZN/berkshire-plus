@@ -22,6 +22,7 @@ from app.models import (
     DiscoveryUniverseSecurity,
     Financial,
     FinancialFetchCompleteness,
+    FinancialFieldProvenance,
     JobLock,
     Setting,
     ValuationHistory,
@@ -155,6 +156,7 @@ def test_init_db_adds_discovery_tables_and_migrates_old_financial_schema(
         "discovery_fill_trading_dates",
         "discovery_universe_securities",
         "financial_fetch_completeness",
+        "financial_field_provenance",
     } <= set(schema.get_table_names())
     assert {column["name"] for column in schema.get_columns("valuation_history")} == {
         "code",
@@ -206,6 +208,11 @@ def test_init_db_adds_discovery_tables_and_migrates_old_financial_schema(
         fk["referred_table"] == "discovery_data_fills"
         for fk in schema.get_foreign_keys("discovery_data_checkpoints")
     )
+    assert tuple(
+        schema.get_pk_constraint("financial_field_provenance")[
+            "constrained_columns"
+        ]
+    ) == ("code", "period", "period_type", "field", "source")
     from app.models import ValuationSeries
 
     with Session(engine) as session:
@@ -352,6 +359,68 @@ def test_discovery_then_legacy_preserves_discovery_financial_fields(tmp_path) ->
                 )
             )
         } == {"legacy", "discovery"}
+    engine.dispose()
+
+
+@pytest.mark.parametrize("strict_first", [False, True])
+@pytest.mark.parametrize(
+    ("strict_capex", "expected_complete"),
+    [(None, 0), (Decimal("7"), 1)],
+)
+def test_readiness_requires_strict_field_provenance_in_both_write_orders(
+    tmp_path,
+    strict_first: bool,
+    strict_capex: Decimal | None,
+    expected_complete: int,
+) -> None:
+    from discovery.data_readiness import discovery_data_readiness
+    from jobs.discovery_data import persist_discovery_financials
+    from jobs.funnel import persist_financials
+
+    engine = init_db(
+        tmp_path / f"provenance-{strict_first}-{strict_capex}.db"
+    )
+    code = "000333.SZ"
+    legacy = FinancialRow(
+        code=code,
+        period="2025",
+        period_type="annual",
+        capex=Decimal("9"),
+    )
+    strict = FinancialRow(
+        code=code,
+        period="2025",
+        period_type="annual",
+        capex=strict_capex,
+        source_as_of="2026-03-31",
+    )
+    with Session(engine) as session:
+        _store_readiness_universe(session, [_readiness_row(code)])
+        writers = (
+            (persist_discovery_financials, [strict]),
+            (persist_financials, [legacy]),
+        )
+        if not strict_first:
+            writers = tuple(reversed(writers))
+        for writer, rows in writers:
+            writer(session, rows)
+            session.flush()
+        session.commit()
+
+        stored = session.get(Financial, (code, "2025", "annual"))
+        assert stored is not None
+        assert stored.capex is not None
+        if strict_capex is None:
+            assert stored.capex == legacy.capex
+        provenance = session.get(
+            FinancialFieldProvenance,
+            (code, "2025", "annual", "capex", "discovery"),
+        )
+        assert (provenance is not None) is (strict_capex is not None)
+        report = discovery_data_readiness(
+            session, as_of=date(2026, 9, 16)
+        )
+        assert report.tracks["deep_value"].complete == expected_complete
     engine.dispose()
 
 
@@ -2585,6 +2654,7 @@ def _fill(
     now: datetime,
     status: str = "running",
     daily_budget: int = 100,
+    with_snapshot: bool = True,
 ) -> DiscoveryDataFill:
     fill = DiscoveryDataFill(
         status=status,
@@ -2616,6 +2686,45 @@ def _fill(
             for code in codes
         ]
     )
+    if codes and with_snapshot:
+        session.add_all(
+            [
+                DiscoveryUniverseSecurity(
+                    fill_id=fill.id,
+                    code=state.code,
+                    name=state.name,
+                    industry=state.industry,
+                    exchange=state.exchange,
+                    listing_date=state.listing_date,
+                    is_st=state.is_st,
+                    is_delisting=state.is_delisting,
+                    trading_status=state.trading_status,
+                    is_suspended=state.trading_status == "suspended",
+                    last_trade_date=state.last_trade_date,
+                    industry_version=state.industry_version,
+                    source_as_of=state.industry_as_of,
+                    provenance=state.source,
+                    market_status_code=state.market_status_code,
+                    snapshot_at=now,
+                )
+                for state in (_security(code) for code in codes)
+            ]
+        )
+        session.add_all(
+            [
+                DiscoveryFillTradingDate(
+                    fill_id=fill.id, trade_date=trade_date
+                )
+                for trade_date in (
+                    "2026-09-09",
+                    "2026-09-10",
+                    "2026-09-11",
+                    "2026-09-14",
+                    "2026-09-15",
+                    "2026-09-16",
+                )
+            ]
+        )
     session.commit()
     return fill
 
@@ -2714,6 +2823,116 @@ def test_discovery_fill_resume_skips_completed_and_retries_due_checkpoint(
         fill = session.get(DiscoveryDataFill, fill_id)
         assert fill is not None
         assert (fill.status, fill.completed, fill.failed) == ("done", 3, 0)
+    engine.dispose()
+
+
+def test_resumable_fill_hydrates_missing_snapshot_without_resetting_checkpoints(
+    tmp_path,
+) -> None:
+    from jobs.discovery_data import RequestPolicy, execute_discovery_data_fill
+
+    engine = init_db(tmp_path / "fill-hydrate-snapshot.db")
+    factory = create_session_factory(engine)
+    now = datetime(2026, 9, 16, 12, tzinfo=timezone.utc)
+    done_code, pending_code = "000001.SZ", "000002.SZ"
+    with factory() as session:
+        fill = _fill(
+            session,
+            [done_code, pending_code],
+            now=now,
+            status="paused",
+            daily_budget=1,
+            with_snapshot=False,
+        )
+        fill_id = fill.id
+        done = session.get(
+            DiscoveryDataCheckpoint, (fill_id, done_code)
+        )
+        assert done is not None
+        done.status = "done"
+        done.attempts = 2
+        done.valuation_points = 60
+        fill.completed = 1
+        session.commit()
+
+    frozen_dates = [
+        "2026-09-09",
+        "2026-09-10",
+        "2026-09-11",
+        "2026-09-14",
+        "2026-09-15",
+        "2026-09-16",
+    ]
+    market = FakeMarketClient(
+        cheap_universe=[
+            _readiness_row(done_code),
+            _readiness_row(pending_code),
+        ],
+        trading_dates=frozen_dates,
+        discovery_data={pending_code: _bundle(pending_code)},
+    )
+    policy = RequestPolicy(
+        requests_per_second=100,
+        max_attempts=3,
+        daily_budget=1,
+        max_runtime_seconds=60,
+    )
+    clock = FakeClock(now)
+    with factory() as session:
+        execute_discovery_data_fill(
+            session, market, fill_id, policy=policy, clock=clock
+        )
+    with factory() as session:
+        done = session.get(
+            DiscoveryDataCheckpoint, (fill_id, done_code)
+        )
+        pending = session.get(
+            DiscoveryDataCheckpoint, (fill_id, pending_code)
+        )
+        assert done is not None and pending is not None
+        assert (
+            done.status,
+            done.attempts,
+            done.valuation_points,
+        ) == ("done", 2, 60)
+        assert pending.status == "pending"
+        assert session.query(DiscoveryUniverseSecurity).filter_by(
+            fill_id=fill_id
+        ).count() == 2
+        assert session.scalars(
+            select(DiscoveryFillTradingDate.trade_date)
+            .where(DiscoveryFillTradingDate.fill_id == fill_id)
+            .order_by(DiscoveryFillTradingDate.trade_date)
+        ).all() == frozen_dates
+    assert market.calls.count(("cheap",)) == 1
+    assert not any(call[0] == "discovery_data" for call in market.calls)
+
+    clock.advance(days=1)
+    with factory() as session:
+        execute_discovery_data_fill(
+            session, market, fill_id, policy=policy, clock=clock
+        )
+    with factory() as session:
+        fill = session.get(DiscoveryDataFill, fill_id)
+        done = session.get(
+            DiscoveryDataCheckpoint, (fill_id, done_code)
+        )
+        pending = session.get(
+            DiscoveryDataCheckpoint, (fill_id, pending_code)
+        )
+        assert fill is not None and done is not None and pending is not None
+        assert (fill.status, fill.completed) == ("done", 2)
+        assert (done.status, done.attempts) == ("done", 2)
+        assert (pending.status, pending.attempts) == ("done", 1)
+    assert market.calls.count(("cheap",)) == 1
+    assert (
+        "discovery_data",
+        pending_code,
+    ) in market.calls
+    assert (
+        "discovery_data",
+        done_code,
+    ) not in market.calls
     engine.dispose()
 
 
@@ -3512,7 +3731,10 @@ def test_init_db_adds_discovery_request_timing_columns(tmp_path) -> None:
     with factory() as session:
         execute_discovery_data_fill(
             session,
-            MigratedFillMarket(),
+            MigratedFillMarket(
+                cheap_universe=[_readiness_row(code)],
+                trading_dates=["2026-09-15", "2026-09-16"],
+            ),
             42,
             policy=RequestPolicy(
                 requests_per_second=0.5,
@@ -3522,8 +3744,8 @@ def test_init_db_adds_discovery_request_timing_columns(tmp_path) -> None:
             ),
             clock=clock,
         )
-    assert clock.sleeps == [2]
-    assert transports == [now + timedelta(seconds=2)]
+    assert clock.sleeps == [2, 2]
+    assert transports == [now + timedelta(seconds=4)]
     engine.dispose()
 
 
@@ -3622,14 +3844,35 @@ def _store_readiness_financial(
     period: str = "2025",
     **fields: Decimal | str | None,
 ) -> None:
+    source_as_of = str(fields.pop("source_as_of", "2026-03-31"))
     session.add(
         Financial(
             code=code,
             period=period,
             period_type="annual",
-            source_as_of=str(fields.pop("source_as_of", "2026-03-31")),
+            source_as_of=source_as_of,
             **fields,
         )
+    )
+    session.add_all(
+        [
+            FinancialFieldProvenance(
+                code=code,
+                period=period,
+                period_type="annual",
+                field=field,
+                source="discovery",
+            )
+            for field in (
+                "roe",
+                "capex",
+                "revenue",
+                "roic",
+                "capital_adequacy",
+                "npl",
+            )
+            if fields.get(field) is not None
+        ]
     )
 
 

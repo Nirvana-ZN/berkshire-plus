@@ -14,6 +14,7 @@ from app.models import (
     DiscoveryFillTradingDate,
     DiscoveryUniverseSecurity,
     Financial,
+    FinancialFieldProvenance,
     ValuationHistory,
 )
 from discovery.field_dictionary import FIELD_DICTIONARY
@@ -306,23 +307,28 @@ def _financial_history(
     source_dates: list[str] = []
     rows = session.execute(
         select(
-            Financial.code,
-            Financial.period,
-            Financial.roe,
-            Financial.capex,
-            Financial.revenue,
-            Financial.roic,
-            Financial.capital_adequacy,
-            Financial.npl,
-            Financial.source_as_of,
-        ).where(
+            Financial,
+            FinancialFieldProvenance.field,
+        )
+        .outerjoin(
+            FinancialFieldProvenance,
+            and_(
+                FinancialFieldProvenance.code == Financial.code,
+                FinancialFieldProvenance.period == Financial.period,
+                FinancialFieldProvenance.period_type
+                == Financial.period_type,
+                FinancialFieldProvenance.source == "discovery",
+                FinancialFieldProvenance.field.in_(_FINANCIAL_FIELDS),
+            ),
+        )
+        .where(
             Financial.period_type == "annual",
             Financial.code.in_(codes),
         )
     )
-    for row in rows:
-        period_end = _period_end(row.period)
-        source_date = _source_date(row.source_as_of)
+    for financial, strict_field in rows:
+        period_end = _period_end(financial.period)
+        source_date = _source_date(financial.source_as_of)
         if (
             period_end is None
             or source_date is None
@@ -330,10 +336,13 @@ def _financial_history(
             or source_date > as_of
         ):
             continue
-        histories[row.code][row.period] = {
-            field: getattr(row, field) for field in _FINANCIAL_FIELDS
-        }
-        source_dates.append(row.source_as_of)
+        period = histories[financial.code].setdefault(
+            financial.period,
+            {field: None for field in _FINANCIAL_FIELDS},
+        )
+        if strict_field is not None:
+            period[strict_field] = getattr(financial, strict_field)
+        source_dates.append(financial.source_as_of)
     return histories, max(source_dates, default=None)
 
 

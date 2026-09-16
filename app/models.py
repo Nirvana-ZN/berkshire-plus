@@ -290,6 +290,16 @@ class FinancialFetchCompleteness(Base):
     completed_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
 
 
+class FinancialFieldProvenance(Base):
+    __tablename__ = "financial_field_provenance"
+
+    code: Mapped[str] = mapped_column(String, primary_key=True)
+    period: Mapped[str] = mapped_column(String, primary_key=True)
+    period_type: Mapped[str] = mapped_column(String, primary_key=True)
+    field: Mapped[str] = mapped_column(String, primary_key=True)
+    source: Mapped[str] = mapped_column(String, primary_key=True)
+
+
 class ValuationSeries(Base):
     __tablename__ = "valuation_series"
     __table_args__ = (

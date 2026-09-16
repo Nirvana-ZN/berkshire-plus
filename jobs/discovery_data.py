@@ -8,7 +8,7 @@ from math import ceil
 from time import sleep
 from typing import Protocol
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import delete, or_, select, update
 from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.orm import Session
 
@@ -19,6 +19,7 @@ from app.models import (
     DiscoveryUniverseSecurity,
     Financial,
     FinancialFetchCompleteness,
+    FinancialFieldProvenance,
     ValuationHistory,
     ValuationSeries,
 )
@@ -226,19 +227,36 @@ def _initialize_checkpoints(
     fill: DiscoveryDataFill,
     request_gate: DiscoveryRequestGate,
 ) -> bool:
-    existing = session.scalars(
+    existing_checkpoint = session.scalars(
         select(DiscoveryDataCheckpoint.code)
         .where(DiscoveryDataCheckpoint.fill_id == fill.id)
         .limit(1)
     ).first()
-    if existing is not None:
+    existing_snapshot = session.scalars(
+        select(DiscoveryUniverseSecurity.code)
+        .where(DiscoveryUniverseSecurity.fill_id == fill.id)
+        .limit(1)
+    ).first()
+    existing_trading_date = session.scalars(
+        select(DiscoveryFillTradingDate.trade_date)
+        .where(DiscoveryFillTradingDate.fill_id == fill.id)
+        .limit(1)
+    ).first()
+    if (
+        existing_checkpoint is not None
+        and existing_snapshot is not None
+        and existing_trading_date is not None
+    ):
         return True
+    rows: list[object] = []
+    trading_dates: list[str] = []
     try:
-        fetch = getattr(market, "fetch_cheap_universe")
-        rows = list(fetch(before_request=request_gate))
-        if hasattr(market, "_last_cheap_trading_dates"):
-            trading_dates = list(market._last_cheap_trading_dates)
-        else:
+        if existing_snapshot is None:
+            fetch = getattr(market, "fetch_cheap_universe")
+            rows = list(fetch(before_request=request_gate))
+            if hasattr(market, "_last_cheap_trading_dates"):
+                trading_dates = list(market._last_cheap_trading_dates)
+        if existing_trading_date is None and not trading_dates:
             fetch_dates = getattr(market, "fetch_trading_dates")
             end = _aware_utc(request_gate.clock.now()).date().isoformat()
             if "before_request" in signature(fetch_dates).parameters:
@@ -248,6 +266,11 @@ def _initialize_checkpoints(
             else:
                 request_gate()
                 trading_dates = list(fetch_dates(end, limit=6))
+        if existing_checkpoint is not None:
+            if existing_snapshot is None and not rows:
+                raise RuntimeError("universe snapshot returned no rows")
+            if existing_trading_date is None and not trading_dates:
+                raise RuntimeError("trading date snapshot returned no dates")
     except DiscoveryRequestStopped:
         return False
     except Exception as exc:
@@ -256,60 +279,90 @@ def _initialize_checkpoints(
         fill.updated_at = _aware_utc(request_gate.clock.now())
         session.commit()
         return False
-    universe = {
-        code: row
-        for row in rows
-        if (
-            code := str(getattr(row, "code", "")).strip().upper()
-        ).endswith((".SH", ".SZ"))
-    }
-    codes = sorted(universe)
+    universe: dict[str, object] = {}
+    if existing_snapshot is None:
+        universe = {
+            code: row
+            for row in rows
+            if (
+                code := str(getattr(row, "code", "")).strip().upper()
+            ).endswith((".SH", ".SZ"))
+        }
+    codes = (
+        sorted(universe)
+        if existing_snapshot is None
+        else session.scalars(
+            select(DiscoveryUniverseSecurity.code)
+            .where(DiscoveryUniverseSecurity.fill_id == fill.id)
+            .order_by(DiscoveryUniverseSecurity.code)
+        ).all()
+    )
     stamp = _aware_utc(request_gate.clock.now())
-    session.add_all(
-        [
-            DiscoveryUniverseSecurity(
-                fill_id=fill.id,
-                code=code,
-                name=str(getattr(universe[code], "name", "")),
-                industry=str(getattr(universe[code], "industry", "")),
-                exchange=getattr(universe[code], "exchange", None),
-                listing_date=getattr(universe[code], "listing_date", None),
-                is_st=getattr(universe[code], "is_st", None),
-                is_delisting=getattr(universe[code], "is_delisting", None),
-                trading_status=getattr(universe[code], "trading_status", None),
-                is_suspended=(
-                    True
-                    if getattr(universe[code], "trading_status", None)
-                    == "suspended"
-                    else False
-                    if getattr(universe[code], "trading_status", None)
-                    == "trading"
-                    else None
-                ),
-                last_trade_date=getattr(
-                    universe[code], "last_trade_date", None
-                ),
-                industry_version=getattr(
-                    universe[code], "industry_version", None
-                ),
-                source_as_of=getattr(universe[code], "industry_as_of", None),
-                provenance=getattr(
-                    universe[code], "security_source", None
-                ),
-                market_status_code=getattr(
-                    universe[code], "market_status_code", None
-                ),
-                snapshot_at=stamp,
-            )
-            for code in codes
-        ]
-    )
-    session.add_all(
-        [
-            DiscoveryFillTradingDate(fill_id=fill.id, trade_date=trade_date)
-            for trade_date in sorted(set(trading_dates))
-        ]
-    )
+    if existing_snapshot is None:
+        session.add_all(
+            [
+                DiscoveryUniverseSecurity(
+                    fill_id=fill.id,
+                    code=code,
+                    name=str(getattr(universe[code], "name", "")),
+                    industry=str(getattr(universe[code], "industry", "")),
+                    exchange=getattr(universe[code], "exchange", None),
+                    listing_date=getattr(
+                        universe[code], "listing_date", None
+                    ),
+                    is_st=getattr(universe[code], "is_st", None),
+                    is_delisting=getattr(
+                        universe[code], "is_delisting", None
+                    ),
+                    trading_status=getattr(
+                        universe[code], "trading_status", None
+                    ),
+                    is_suspended=(
+                        True
+                        if getattr(
+                            universe[code], "trading_status", None
+                        )
+                        == "suspended"
+                        else False
+                        if getattr(
+                            universe[code], "trading_status", None
+                        )
+                        == "trading"
+                        else None
+                    ),
+                    last_trade_date=getattr(
+                        universe[code], "last_trade_date", None
+                    ),
+                    industry_version=getattr(
+                        universe[code], "industry_version", None
+                    ),
+                    source_as_of=getattr(
+                        universe[code], "industry_as_of", None
+                    ),
+                    provenance=getattr(
+                        universe[code], "security_source", None
+                    ),
+                    market_status_code=getattr(
+                        universe[code], "market_status_code", None
+                    ),
+                    snapshot_at=stamp,
+                )
+                for code in codes
+            ]
+        )
+    if existing_trading_date is None:
+        session.add_all(
+            [
+                DiscoveryFillTradingDate(
+                    fill_id=fill.id, trade_date=trade_date
+                )
+                for trade_date in sorted(set(trading_dates))
+            ]
+        )
+    if existing_checkpoint is not None:
+        fill.updated_at = stamp
+        session.commit()
+        return True
     session.add_all(
         [
             DiscoveryDataCheckpoint(
@@ -702,6 +755,7 @@ _DISCOVERY_ONLY_FINANCIAL_FIELDS = (
 _DISCOVERY_FINANCIAL_FIELDS = (
     _DISCOVERY_SHARED_FINANCIAL_FIELDS + _DISCOVERY_ONLY_FINANCIAL_FIELDS
 )
+_DISCOVERY_FINANCIAL_SOURCE = "discovery"
 
 
 class ValuationMethodMismatchError(ValueError):
@@ -715,6 +769,11 @@ def persist_discovery_financials(
     codes: set[str] = set()
     for row in rows:
         codes.add(row.code)
+        key = {
+            "code": row.code,
+            "period": row.period,
+            "period_type": row.period_type,
+        }
         stored = session.get(
             Financial,
             (row.code, row.period, row.period_type),
@@ -730,6 +789,29 @@ def persist_discovery_financials(
             value = getattr(row, field)
             if field not in _DISCOVERY_SHARED_FINANCIAL_FIELDS or value is not None:
                 setattr(stored, field, value)
+        session.execute(
+            delete(FinancialFieldProvenance).where(
+                FinancialFieldProvenance.code == row.code,
+                FinancialFieldProvenance.period == row.period,
+                FinancialFieldProvenance.period_type == row.period_type,
+                FinancialFieldProvenance.source
+                == _DISCOVERY_FINANCIAL_SOURCE,
+                FinancialFieldProvenance.field.in_(
+                    _DISCOVERY_FINANCIAL_FIELDS
+                ),
+            )
+        )
+        session.add_all(
+            [
+                FinancialFieldProvenance(
+                    **key,
+                    field=field,
+                    source=_DISCOVERY_FINANCIAL_SOURCE,
+                )
+                for field in _DISCOVERY_FINANCIAL_FIELDS
+                if getattr(row, field) is not None
+            ]
+        )
     stamp = datetime.now(timezone.utc)
     for code in codes:
         session.merge(

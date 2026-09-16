@@ -300,6 +300,7 @@ def _reset_stale_financials(engine: Engine) -> None:
             return
         conn.execute(text("DELETE FROM financials"))
         conn.execute(text("DELETE FROM financial_fetch_completeness"))
+        conn.execute(text("DELETE FROM financial_field_provenance"))
         conn.execute(
             text(
                 "INSERT INTO settings (key, value) VALUES (:key, :value) "
