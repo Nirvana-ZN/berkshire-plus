@@ -268,7 +268,9 @@ def _is_annual_report(item: Mapping[str, object]) -> bool:
     return kind is not None and kind[1] == "annual"
 
 
-def _report_kind(item: Mapping[str, object]) -> tuple[str, str] | None:
+def _report_kind(
+    item: Mapping[str, object], *, strict: bool = False
+) -> tuple[str, str] | None:
     year = str(item.get("REPORT_YEAR") or item.get("REPORT_DATE") or "")[:4]
     if len(year) != 4 or not year.isdigit():
         return None
@@ -296,6 +298,8 @@ def _report_kind(item: Mapping[str, object]) -> tuple[str, str] | None:
             return f"{year}H1", "interim"
         if month == "09":
             return f"{year}Q3", "quarterly"
+        return None
+    if strict and not report:
         return None
     if report and "年" not in report and report not in {"年报", "annual"}:
         return None
@@ -368,14 +372,45 @@ def _sum_known(*values: Decimal | None) -> Decimal | None:
     return sum(known, Decimal(0)) if known else None
 
 
+def _validated_date(value: object) -> str | None:
+    text = str(value or "")[:10]
+    try:
+        return date.fromisoformat(text).isoformat()
+    except ValueError:
+        return None
+
+
 def _source_as_of(*items: Mapping[str, object]) -> str | None:
     dates = [
-        str(item.get(field) or "")[:10]
+        parsed
         for item in items
         for field in ("UPDATE_DATE", "NOTICE_DATE")
-        if str(item.get(field) or "")[:10]
+        if (parsed := _validated_date(item.get(field))) is not None
     ]
     return max(dates) if dates else None
+
+
+def _record_precedence(
+    item: Mapping[str, object],
+) -> tuple[str, tuple[tuple[str, str], ...]]:
+    return (
+        _source_as_of(item) or "",
+        tuple(sorted((str(key), str(value)) for key, value in item.items())),
+    )
+
+
+def _period_sort_key(kind: tuple[str, str]) -> tuple[int, int]:
+    period, _period_type = kind
+    rank = (
+        1
+        if period.endswith("Q1")
+        else 2
+        if period.endswith("H1")
+        else 3
+        if period.endswith("Q3")
+        else 4
+    )
+    return int(period[:4]), rank
 
 
 def _impairment_loss(item: Mapping[str, object]) -> Decimal | None:
@@ -1377,35 +1412,39 @@ class EastMoneyClient:
         for name, report in reports.items():
             if name == "main":
                 continue
+            if not strict:
+                fetched[name] = []
+                continue
             if financial_branch and name in {
                 "balance_detail",
                 "cashflow_detail",
             }:
                 fetched[name] = []
                 continue
-            try:
-                fetched[name] = self._financial_report_rows(code, report)
-            except MarketError:
-                if not strict and name.endswith("_detail"):
-                    # Banks reject detailed balance/cashflow reports. Their
-                    # legacy batch rows remain usable without discovery fields.
-                    fetched[name] = []
-                else:
-                    raise
+            fetched[name] = self._financial_report_rows(code, report)
 
         mapped: dict[str, dict[tuple[str, str], dict]] = {}
         keys: set[tuple[str, str]] = set()
         for name, records in fetched.items():
             by_period: dict[tuple[str, str], dict] = {}
             for item in records:
-                kind = _report_kind(item)
-                if kind is not None and kind not in by_period:
+                kind = _report_kind(item, strict=strict)
+                if kind is None:
+                    continue
+                current = by_period.get(kind)
+                if current is None or (
+                    strict
+                    and _record_precedence(item)
+                    > _record_precedence(current)
+                ):
                     by_period[kind] = item
-                    keys.add(kind)
+                keys.add(kind)
             mapped[name] = by_period
 
         rows: list[FinancialRow] = []
-        for period, period_type in sorted(keys, reverse=True):
+        for period, period_type in sorted(
+            keys, key=_period_sort_key, reverse=True
+        ):
             empty: dict[str, object] = {}
             main = mapped["main"].get((period, period_type), empty)
             income = mapped["income"].get((period, period_type), empty)

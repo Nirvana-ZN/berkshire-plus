@@ -324,6 +324,28 @@ def test_financials_keep_interim_beside_annual() -> None:
     assert ("2025", "annual", Decimal("2.54")) in kinds
 
 
+def test_legacy_financials_use_one_main_request_without_discovery_sources() -> None:
+    seen: list[str] = []
+
+    class Stub(EastMoneyClient):
+        def _get_json(self, url: str) -> dict:
+            seen.append(url)
+            if "MAINFINADATA" not in url:
+                raise MarketError("discovery statement source unavailable")
+            return _statement_payload(
+                {
+                    "REPORT_TYPE": "年报",
+                    "REPORT_YEAR": "2025",
+                    "PARENTNETPROFIT": "10",
+                }
+            )
+
+    row = Stub().fetch_financials(["000333.SZ"])[0]
+    assert row.net_income == Decimal("10")
+    assert len(seen) == 1
+    assert "RPT_F10_FINANCE_MAINFINADATA" in seen[0]
+
+
 def test_fetch_valuation_maps_bank_fields() -> None:
     from decimal import Decimal
 
@@ -629,6 +651,68 @@ def test_discovery_strict_parser_rejects_legacy_aliases() -> None:
     assert legacy.net_income is not None
     assert legacy.ocf is not None
     assert legacy.ebit is not None
+
+
+def test_discovery_missing_report_type_does_not_become_annual() -> None:
+    class Stub(EastMoneyClient):
+        def _get_json(self, url: str) -> dict:
+            if "RPT_DMSK_FN_INCOME" in url:
+                return _statement_payload(
+                    {
+                        "REPORT_DATE": "2026-09-30",
+                        "TOTAL_OPERATE_INCOME": "99",
+                    }
+                )
+            return _statement_payload()
+
+    assert Stub()._discovery_financials_for("000333.SZ") == []
+
+
+def test_discovery_duplicate_period_uses_newest_valid_source_date() -> None:
+    class Stub(EastMoneyClient):
+        def _get_json(self, url: str) -> dict:
+            if "RPT_DMSK_FN_INCOME" in url:
+                return _statement_payload(
+                    {
+                        "REPORT_DATE": "2025-12-31",
+                        "DATE_TYPE_CODE": "001",
+                        "UPDATE_DATE": "2026-03-01",
+                        "TOTAL_OPERATE_INCOME": "10",
+                    },
+                    {
+                        "REPORT_DATE": "2025-12-31",
+                        "DATE_TYPE_CODE": "001",
+                        "UPDATE_DATE": "2026-03-20",
+                        "TOTAL_OPERATE_INCOME": "20",
+                    },
+                )
+            return _statement_payload()
+
+    row = Stub()._discovery_financials_for("000333.SZ")[0]
+    assert row.revenue == Decimal("20")
+    assert row.source_as_of == "2026-03-20"
+
+
+def test_discovery_periods_sort_by_report_end_chronology() -> None:
+    class Stub(EastMoneyClient):
+        def _get_json(self, url: str) -> dict:
+            if "RPT_DMSK_FN_INCOME" in url:
+                return _statement_payload(
+                    {
+                        "REPORT_DATE": "2026-03-31",
+                        "DATE_TYPE_CODE": "003",
+                        "TOTAL_OPERATE_INCOME": "10",
+                    },
+                    {
+                        "REPORT_DATE": "2026-06-30",
+                        "DATE_TYPE_CODE": "002",
+                        "TOTAL_OPERATE_INCOME": "20",
+                    },
+                )
+            return _statement_payload()
+
+    rows = Stub()._discovery_financials_for("000333.SZ")
+    assert [row.period for row in rows] == ["2026H1", "2026Q1"]
 
 
 def _assert_within_one_percent(
