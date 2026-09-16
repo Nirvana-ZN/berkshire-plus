@@ -47,6 +47,7 @@ class ScreenRow:
     pe: Decimal | None = None
     peg: Decimal | None = None
     roe_mean: Decimal | None = None
+    roe10: Decimal | None = None
     ocf_ni: Decimal | None = None
     metrics: dict[str, object] = field(default_factory=dict)
 
@@ -104,6 +105,10 @@ def _bank_or_insurance(industry: str) -> bool:
     if "非银行" in industry:
         return "保险" in industry
     return "银行" in industry or "保险" in industry
+
+
+def _thin_model(snap: Constituent) -> bool:
+    return (snap.business_model or "") in THIN_MODELS
 
 
 def _elastic_industry(industry: str) -> bool:
@@ -235,6 +240,7 @@ def _classify(
         return base
 
     roe10 = _mean(_values(annual, "roe", 10))
+    base.roe10 = roe10
     gm5 = _mean(_values(annual, "gross_margin", 5))
     nm10 = _mean(_values(annual, "net_margin", 10))
     fcf5 = _fcf_sum(annual, 5)
@@ -245,7 +251,7 @@ def _classify(
         and roe_mean > EXEMPT_C_ROE
         and ocf_ni is not None
         and ocf_ni > EXEMPT_C_OCF_NI
-        and (snap.business_model or "") in THIN_MODELS
+        and _thin_model(snap)
     )
     exempt_a = (
         _listed_under_10(listed_year, as_of_year)
@@ -263,11 +269,12 @@ def _classify(
         base.verdict = VERDICT_DROP
         base.reason = "10年平均ROE低于8%"
         return base
+    finance = _bank_or_insurance(base.industry)
     if fcf5 is not None and fcf5 < 0:
         base.verdict = VERDICT_DROP
         base.reason = "5年累计自由现金流为负"
         return base
-    if not _bank_or_insurance(base.industry):
+    if not finance:
         if cover is not None and cover < INTEREST_COVER_MIN:
             base.verdict = VERDICT_DROP
             base.reason = "利息覆盖低于2"
@@ -284,16 +291,15 @@ def _classify(
         base.verdict = VERDICT_DROP
         base.reason = "近10年平均净利率低于5%"
         return base
-    if share_growth is not None and share_growth > SHARE_GROWTH_MAX:
-        if share_ma is False:
-            base.verdict = VERDICT_DROP
-            base.reason = "5年总股本膨胀超过20%"
-            return base
+    if share_growth is not None and share_growth > SHARE_GROWTH_MAX and share_ma is False:
+        base.verdict = VERDICT_DROP
+        base.reason = "5年总股本膨胀超过20%"
+        return base
 
     gaps: list[str] = []
     if fcf5 is None:
         gaps.append("5年累计自由现金流")
-    if not _bank_or_insurance(base.industry) and cover is None:
+    if not finance and cover is None:
         gaps.append("利息覆盖")
     if gm5 is None:
         gaps.append("近5年平均毛利率")
@@ -303,8 +309,8 @@ def _classify(
         gaps.append("近10年平均净利率")
     if share_growth is None:
         gaps.append("5年总股本")
-    elif share_growth > SHARE_GROWTH_MAX and share_ma is not False:
-        gaps.append("5年总股本膨胀是否并购无法识别")
+    elif share_growth > SHARE_GROWTH_MAX and share_ma is not True:
+        gaps.append("无法识别股本膨胀是否并购")
 
     base.metrics = {
         "roe_mean": str(roe_mean) if roe_mean is not None else None,
@@ -358,8 +364,12 @@ def _full_order_key(row: ScreenRow, held: set[str]) -> tuple:
     return (-mcap, -roe, -ocf_ni, 1 if row.industry in held else 0, row.name)
 
 
-def _pick_finalists(keep: list[ScreenRow], held: set[str] | None = None) -> None:
-    if not keep:
+def _pick_finalists(
+    keep: list[ScreenRow],
+    held: set[str] | None = None,
+    limit: int = FINALIST_LIMIT,
+) -> None:
+    if not keep or limit <= 0:
         return
     held_set = held or set()
     ordered = list(keep)
@@ -372,14 +382,14 @@ def _pick_finalists(keep: list[ScreenRow], held: set[str] | None = None) -> None
             row.finalist = True
             names.add(row.name)
             picked += 1
-            if picked >= FINALIST_LIMIT:
+            if picked >= limit:
                 break
         return
 
     selected: list[ScreenRow] = []
     selected_names: set[str] = set()
     for bucket in (ROLE_HIGH_CERTAINTY, ROLE_HIGH_ELASTICITY, ROLE_MID_ELASTICITY):
-        if len(selected) >= FINALIST_LIMIT:
+        if len(selected) >= limit:
             break
         bucket_rows = [
             row
@@ -407,21 +417,18 @@ def _pick_finalists(keep: list[ScreenRow], held: set[str] | None = None) -> None
             selected_names.add(chosen.name)
 
 
-def run_funnel(
+def _classify_all(
     snapshots: Sequence[Constituent],
     financials: Iterable[FinancialRow],
     listed_years: dict[str, int] | None = None,
-    held_industries: Iterable[str] | None = None,
     *,
     as_of_year: int | None = None,
-) -> FunnelResult:
+) -> list[ScreenRow]:
     year = as_of_year if as_of_year is not None else date.today().year
-    held = {item for item in (held_industries or []) if item}
     listed = listed_years or {}
     by_code: dict[str, list[FinancialRow]] = {}
     for row in financials:
         by_code.setdefault(row.code, []).append(row)
-
     classified: list[ScreenRow] = []
     seen_codes: set[str] = set()
     for snap in snapshots:
@@ -436,6 +443,38 @@ def run_funnel(
                 as_of_year=year,
             )
         )
+    return classified
+
+
+def screen_keep(
+    snapshots: Sequence[Constituent],
+    financials: Iterable[FinancialRow],
+    listed_years: dict[str, int] | None = None,
+    *,
+    as_of_year: int | None = None,
+) -> list[ScreenRow]:
+    return [
+        row
+        for row in _classify_all(
+            snapshots, financials, listed_years, as_of_year=as_of_year
+        )
+        if row.verdict == VERDICT_KEEP
+    ]
+
+
+def run_funnel(
+    snapshots: Sequence[Constituent],
+    financials: Iterable[FinancialRow],
+    listed_years: dict[str, int] | None = None,
+    held_industries: Iterable[str] | None = None,
+    *,
+    as_of_year: int | None = None,
+    finalist_limit: int | None = None,
+) -> FunnelResult:
+    held = {item for item in (held_industries or []) if item}
+    classified = _classify_all(
+        snapshots, financials, listed_years, as_of_year=as_of_year
+    )
 
     candidates = [row for row in classified if row.verdict == VERDICT_KEEP]
     insufficient = [row for row in classified if row.verdict == VERDICT_INSUFFICIENT]
@@ -449,7 +488,8 @@ def run_funnel(
         dropped.append(row)
 
     _assign_roles(keep)
-    _pick_finalists(keep, held)
+    cap = FINALIST_LIMIT if finalist_limit is None else min(FINALIST_LIMIT, max(0, finalist_limit))
+    _pick_finalists(keep, held, cap)
 
     return FunnelResult(
         keep=keep,

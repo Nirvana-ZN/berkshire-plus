@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from research.llm import LLMClient
+from research.thesis import is_overvalued
 
 ACTIONS = frozenset({"hold", "add", "cut", "sell", "unknown"})
 ACTION_ALIASES = {
@@ -29,7 +30,7 @@ ACTION_ZH = {
     "sell": "卖出",
     "unknown": "无法判断",
 }
-RULE_LIGHT_ZH = {"hit": "触及", "clear": "未触及", "none": "无规则"}
+RULE_LIGHT_ZH = {"hit": "触及", "clear": "未触及", "none": "无规则", "unknown": "无现价"}
 SHORT_EXAM_MARK = "短体检，非六关"
 NO_THESIS_MARK = "无论文"
 STALE_THESIS_MARK = "论文过期"
@@ -305,7 +306,7 @@ def _ensure_thesis_phrase(
 
 def _rule_light(row: dict[str, Any]) -> str:
     light = str(row.get("rule_light") or "none").strip()
-    if light not in {"hit", "clear", "none"}:
+    if light not in {"hit", "clear", "none", "unknown"}:
         return "none"
     return light
 
@@ -339,6 +340,14 @@ def _normalize_position(
         unknown=unknown,
         stale=False,
     )
+    structured = evaluation.get("structured") if isinstance(evaluation, dict) else None
+    usable = not _price_unusable(row) and not bool(row.get("stale"))
+    if action in {"hold", "add"} and is_overvalued(
+        structured, current_price=row.get("price"), price_usable=usable
+    ):
+        action = "cut"
+        if "高估" not in reason:
+            reason = f"现价高估，结论改为不通过。{reason}"
     return action, reason
 
 
@@ -534,8 +543,15 @@ def _parse_model_json(text: str) -> object:
         stripped = re.sub(r"\s*```$", "", stripped)
     try:
         return json.loads(stripped)
-    except json.JSONDecodeError as exc:
-        raise ReviewError("模型输出不是 JSON") from exc
+    except json.JSONDecodeError:
+        start = stripped.find("{")
+        end = stripped.rfind("}")
+        if start != -1 and end > start:
+            try:
+                return json.loads(stripped[start : end + 1])
+            except json.JSONDecodeError:
+                pass
+        raise ReviewError("模型输出不是 JSON")
 
 
 def _write_report(payload: ReviewInput, markdown: str) -> Path:

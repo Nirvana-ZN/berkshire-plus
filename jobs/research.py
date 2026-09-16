@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -9,13 +11,16 @@ from pathlib import Path
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import Financial, ResearchArtifact, ResearchJob, Setting
+from app.envfile import TAVILY_API_KEY
+from app.models import Financial, Instrument, Quote, ResearchArtifact, ResearchJob, Setting, Thesis
 from jobs.lock import release
 from ledger.positions import LOCAL_USER_ID, load_positions
 from ledger.quotes import BookSnapshot, project_book
-from research.evaluate import EvalInput, has_min_financials, run_checklist
-from research.thesis import clear_on_fail, eligible, upsert
+from market.sentiment import is_extreme_greed
+from research.evaluate import EvalInput, has_min_financials, render_markdown, run_checklist
+from research.thesis import eligible, upsert
 from screen.funnel import ScreenRow
+from screen.replay import apply_credibility_gate, gate_is_open
 
 logger = logging.getLogger(__name__)
 
@@ -78,15 +83,29 @@ def load_financials(session: Session, code: str) -> list[dict[str, object]]:
             "interest": _json_optional(row.interest),
             "gross_margin": _json_optional(row.gross_margin),
             "net_margin": _json_optional(row.net_margin),
+            "shares": _json_optional(row.shares),
+            "bps": _json_optional(row.bps),
+            "npl_pct": _json_optional(row.npl),
+            "eps": _json_optional(row.eps),
         }
         for row in rows
     ]
 
 
+def _has_bps(rows: list[dict[str, object]]) -> bool:
+    return any(row.get("bps") is not None for row in rows)
+
+
+def _has_interim(rows: list[dict[str, object]]) -> bool:
+    return any(str(row.get("period_type") or "annual") != "annual" for row in rows)
+
+
 def ensure_financials(session: Session, code: str, market) -> None:
     if not code:
         return
-    if has_min_financials(load_financials(session, code)):
+    cached = load_financials(session, code)
+    # annual-only cache is from before interim rows; refetch so H1 lands
+    if has_min_financials(cached) and _has_bps(cached) and _has_interim(cached):
         return
     if market is None:
         return
@@ -95,6 +114,97 @@ def ensure_financials(session: Session, code: str, market) -> None:
 
     persist_financials(session, rows)
     session.commit()
+
+
+def fetch_valuation(market, code: str, financials: list[dict[str, object]] | None = None) -> dict[str, object]:
+    raw: dict[str, object] = {}
+    if market is not None and code and hasattr(market, "fetch_valuation"):
+        try:
+            fetched = market.fetch_valuation(code)
+        except Exception:
+            fetched = {}
+        if isinstance(fetched, dict):
+            raw.update(fetched)
+    if not any(raw.get(key) is not None for key in ("bps", "npl_pct", "eps")):
+        raw.update(_valuation_from_financials(financials or []))
+    out: dict[str, object] = {}
+    for key in ("bps", "npl_pct", "eps", "pb", "pe"):
+        if key in raw:
+            number = _json_optional(_as_decimal(raw.get(key)))
+            if number is not None:
+                out[key] = number
+    period = raw.get("period")
+    if period is not None and str(period).strip():
+        out["period"] = str(period).strip()[:4]
+    eps_period = raw.get("eps_period")
+    if eps_period is not None and str(eps_period).strip():
+        out["eps_period"] = str(eps_period).strip()[:4]
+    return out
+
+
+def _valuation_from_financials(rows: list[dict[str, object]]) -> dict[str, object]:
+    best: dict[str, object] | None = None
+    for row in rows:
+        if row.get("bps") is None and row.get("npl_pct") is None and row.get("eps") is None:
+            continue
+        if best is None or str(row.get("period") or "") > str(best.get("period") or ""):
+            best = row
+    if best is None:
+        return {}
+    out: dict[str, object] = {}
+    for key in ("bps", "npl_pct", "eps"):
+        if best.get(key) is not None:
+            out[key] = best[key]
+    if best.get("period") is not None:
+        out["period"] = best["period"]
+    return out
+
+
+def _fetch_notices(market, code: str) -> list[dict[str, str]]:
+    if market is None or not code or not hasattr(market, "fetch_notices"):
+        return []
+    try:
+        rows = market.fetch_notices(code)
+    except Exception:
+        return []
+    if not isinstance(rows, list):
+        return []
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _as_decimal(value: object) -> Decimal | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, Decimal):
+        return value if value.is_finite() else None
+    try:
+        number = Decimal(str(value))
+    except Exception:
+        return None
+    return number if number.is_finite() else None
+
+
+def _saved_price(session: Session, *, name: str, code: str) -> Decimal | None:
+    row = session.get(Quote, (LOCAL_USER_ID, name))
+    if row is None and code:
+        row = session.scalars(
+            select(Quote).where(Quote.user_id == LOCAL_USER_ID, Quote.code == code)
+        ).first()
+    if row is None:
+        return None
+    price = Decimal(row.price)
+    if not price.is_finite() or price <= 0:
+        return None
+    return price
+
+
+def _price_for_eval(session: Session, quote_client, *, name: str, code: str) -> Decimal | None:
+    price = fetch_price(quote_client, code)
+    if price is None:
+        price = fetch_price(quote_client, code)
+    if price is not None:
+        return price
+    return _saved_price(session, name=name, code=code)
 
 
 def fetch_price(quote_client, code: str) -> Decimal | None:
@@ -119,7 +229,9 @@ def fetch_price(quote_client, code: str) -> Decimal | None:
 
 def web_search_enabled(session: Session) -> bool:
     row = session.get(Setting, WEB_SEARCH_KEY)
-    return bool(row is not None and row.value == "true")
+    if row is None or (row.value or "").strip().lower() not in {"1", "true", "yes", "on"}:
+        return False
+    return bool((os.environ.get(TAVILY_API_KEY) or "").strip())
 
 
 def evaluate_finalists(
@@ -158,6 +270,7 @@ def evaluate_finalists(
             web_search=search,
             as_of_date=as_of,
             market=market,
+            industry=row.industry,
         )
 
 
@@ -199,6 +312,13 @@ def execute_research(
             logger.exception("释放任务锁失败")
 
 
+def _industry_of(session: Session, code: str, industry: str = "") -> str:
+    if industry:
+        return industry
+    inst = session.get(Instrument, code)
+    return (inst.industry or "") if inst is not None else ""
+
+
 def _run_one(
     session: Session,
     job: ResearchJob,
@@ -210,6 +330,7 @@ def _run_one(
     web_search: bool,
     as_of_date: str,
     market=None,
+    industry: str = "",
 ) -> None:
     job.status = "running"
     job.updated_at = _now()
@@ -220,20 +341,32 @@ def _run_one(
         llm.model = model
     try:
         ensure_financials(session, job.code, market)
+        rows = load_financials(session, job.code)
         output = run_checklist(
             llm,
             EvalInput(
                 name=job.name,
                 code=job.code,
-                financials=tuple(load_financials(session, job.code)),
-                price=fetch_price(quote_client, job.code),
+                financials=tuple(rows),
+                price=_price_for_eval(session, quote_client, name=job.name, code=job.code),
                 book=book,
                 web_search=web_search,
                 as_of_date=as_of_date,
                 job_id=job.id,
                 reports_dir=reports_dir,
+                valuation=fetch_valuation(market, job.code, rows),
+                industry=_industry_of(session, job.code, industry),
+                notices=tuple(_fetch_notices(market, job.code)),
             ),
         )
+        if gate_is_open(session) or is_extreme_greed(session, market):
+            apply_credibility_gate(output.structured)
+            output = replace(
+                output,
+                markdown=render_markdown(
+                    job.name, output.structured, web_search=web_search
+                ),
+            )
         session.add(
             ResearchArtifact(
                 research_job_id=job.id,
@@ -242,8 +375,13 @@ def _run_one(
                 report_path=output.report_path,
             )
         )
-        verdict = str(output.structured.get("verdict") or "").strip().lower()
-        if eligible(output.structured):
+        existing = session.scalars(
+            select(Thesis).where(
+                Thesis.user_id == job.user_id,
+                Thesis.name == job.name,
+            )
+        ).first()
+        if eligible(output.structured, replacing=existing is not None):
             upsert(
                 session,
                 user_id=job.user_id,
@@ -251,8 +389,6 @@ def _run_one(
                 research_job_id=job.id,
                 structured=output.structured,
             )
-        elif verdict == "fail":
-            clear_on_fail(session, user_id=job.user_id, name=job.name)
         job.status = "done"
         job.error = None
         job.updated_at = _now()

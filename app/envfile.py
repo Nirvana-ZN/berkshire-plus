@@ -8,6 +8,7 @@ from app.db import PROJECT_ROOT
 DEFAULT_ENV_PATH = PROJECT_ROOT / ".env"
 OPENAI_API_KEY = "OPENAI_API_KEY"
 OPENAI_BASE_URL = "OPENAI_BASE_URL"
+TAVILY_API_KEY = "TAVILY_API_KEY"
 
 
 def resolve_env_path(env_path: Path | str | None = None) -> Path:

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { RouterLink, useRoute } from 'vue-router'
 
 interface Gate {
@@ -37,6 +37,19 @@ const JOB_STATUS: Record<string, string> = {
 }
 const THESIS_ESTABLISHED = '已立为论文'
 const THESIS_UPDATED = '已更新论文'
+const VALUATION_ZH: Record<string, string> = {
+  price: '现价',
+  bps: '每股净资产',
+  pb: '市净率',
+  pe: '静态市盈率',
+  pe_basis: '市盈率口径',
+  eps_mid: '中周期每股收益',
+  pe_mid: '中周期对照市盈率',
+  pe_mid_basis: '中周期市盈率口径',
+  npl_pct: '不良率',
+  eps: '每股收益',
+  period: '报告期',
+}
 
 const route = useRoute()
 const errorText = ref('')
@@ -56,6 +69,7 @@ const overlap = ref('')
 const dataGrade = ref('')
 const asOfDate = ref('')
 const asOfPrice = ref<string | number | null>(null)
+const valuation = ref<Record<string, string | number>>({})
 const thesisMark = ref('')
 const watching = ref(false)
 const joined = ref(false)
@@ -118,6 +132,15 @@ function applyResearch(data: Record<string, unknown>) {
     const row = asOf as Record<string, unknown>
     asOfDate.value = typeof row.date === 'string' ? row.date : ''
     asOfPrice.value = (row.price as string | number | null) ?? null
+  }
+  const snap = data.valuation
+  valuation.value = {}
+  if (snap && typeof snap === 'object') {
+    for (const [key, value] of Object.entries(snap as Record<string, unknown>)) {
+      if (value !== null && value !== undefined && value !== '') {
+        valuation.value[key] = value as string | number
+      }
+    }
   }
   if (data.thesis_mark === THESIS_UPDATED) {
     thesisMark.value = THESIS_UPDATED
@@ -185,6 +208,19 @@ onMounted(async () => {
   }
 })
 
+watch(
+  () => route.params.id,
+  async () => {
+    stopPoll()
+    await loadResearch()
+    if (status.value !== 'done' && status.value !== 'failed') {
+      timer = window.setInterval(() => {
+        void loadResearch()
+      }, 800)
+    }
+  },
+)
+
 onBeforeUnmount(stopPoll)
 </script>
 
@@ -200,7 +236,7 @@ onBeforeUnmount(stopPoll)
       </template>
     </div>
     <p v-if="status">状态：{{ JOB_STATUS[status] || status }}</p>
-    <p v-if="thesisMark">{{ thesisMark }}</p>
+    <p v-if="thesisMark" :class="{ 'thesis-pass': verdict === 'pass', 'thesis-fail': verdict === 'fail' }">{{ thesisMark }}</p>
     <p v-if="errorText">{{ errorText }}</p>
     <p v-if="watchMessage">{{ watchMessage }}</p>
 
@@ -210,7 +246,7 @@ onBeforeUnmount(stopPoll)
         <tbody>
           <tr>
             <th>结论</th>
-            <td>{{ VERDICT_ZH[verdict] || verdict }}</td>
+            <td :class="{ 'thesis-pass': verdict === 'pass', 'thesis-fail': verdict === 'fail' }">{{ VERDICT_ZH[verdict] || verdict }}</td>
           </tr>
           <tr>
             <th>价格带</th>
@@ -231,6 +267,10 @@ onBeforeUnmount(stopPoll)
           <tr>
             <th>所用股价</th>
             <td>{{ asOfPrice == null ? '无现价' : asOfPrice }}</td>
+          </tr>
+          <tr v-for="(value, key) in valuation" :key="'v-' + key">
+            <th>{{ VALUATION_ZH[key] || key }}</th>
+            <td>{{ value }}</td>
           </tr>
         </tbody>
       </table>

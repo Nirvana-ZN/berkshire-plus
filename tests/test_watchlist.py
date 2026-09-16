@@ -338,6 +338,8 @@ def test_views_prefill_and_watchlist_without_direct_book_write() -> None:
     assert "thesis_status" in home
     assert "thesis_research_id != null" in home
     assert "无论文" in home
+    assert "thesis-fail" in home
+    assert "不通过" in home
     assert "任务锁" in home
     assert "最近任务" in home
     assert "预填记账" in home

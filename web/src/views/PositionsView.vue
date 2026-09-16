@@ -7,6 +7,10 @@ interface PositionRow {
   shares: number
   cost: number
   price?: number | null
+  overvalued?: boolean
+  cheap_bound?: number | null
+  rich_bound?: number | null
+  live_verdict?: string | null
   market_value?: number | null
   pnl?: number | null
   weight?: number | null
@@ -19,6 +23,7 @@ interface PositionRow {
   rule_light?: string | null
   thesis_status?: 'current' | 'stale' | 'none' | null
   thesis_research_id?: number | null
+  thesis_verdict?: 'pass' | 'fail' | 'gray' | null
 }
 
 interface RuleRow {
@@ -93,9 +98,11 @@ const researchError = ref('')
 const review = ref<ReviewRow | null>(null)
 let reviewTimer: number | undefined
 const targetForm = ref<Record<string, string>>({ __CASH__: '' })
-const shareDraft = ref<Record<string, string>>({})
-const unitCostDraft = ref<Record<string, string>>({})
-const savingCell = ref<string | null>(null)
+const bookForm = ref<Record<string, { shares: string; unit_cost: string }>>({})
+const cashForm = ref('')
+const bookError = ref('')
+const savingBook = ref(false)
+const reviewDepth = ref<'reuse' | 'eval_first'>('reuse')
 const rules = ref<RuleRow[]>([])
 const ruleForm = ref({
   name: '',
@@ -164,20 +171,18 @@ function applyBook(data: {
     return `${label}${item.detail || item.error || '刷新失败'}`
   })
   const next: Record<string, string> = {}
+  const book: Record<string, { shares: string; unit_cost: string }> = {}
   for (const row of positions.value) {
     next[row.name] = row.no_target ? '' : String(row.target ?? '')
+    book[row.name] = {
+      shares: String(row.shares),
+      unit_cost: formatUnitCost(row.cost, row.shares),
+    }
   }
   next.__CASH__ = cashNoTarget.value ? '' : String(cashTarget.value ?? '')
   targetForm.value = next
-  const shares: Record<string, string> = {}
-  const units: Record<string, string> = {}
-  for (const row of positions.value) {
-    shares[row.name] = String(row.shares)
-    const unit = formatUnitCost(row.cost, row.shares)
-    units[row.name] = unit === '—' ? '' : unit
-  }
-  shareDraft.value = shares
-  unitCostDraft.value = units
+  bookForm.value = book
+  cashForm.value = cash.value == null ? '' : String(cash.value)
 }
 
 function formatNumber(value: number | null | undefined): string {
@@ -195,10 +200,20 @@ function formatUnitCost(cost: number, shares: number): string {
   return String(Number(unit.toFixed(4)))
 }
 
-function thesisLabel(status?: string | null): string {
-  if (status === 'current') return '有效'
-  if (status === 'stale') return '过期'
-  return '无论文'
+function thesisLabel(row: PositionRow): string {
+  const verdict = row.thesis_verdict
+  let text = '论文'
+  if (verdict === 'pass') text = '通过'
+  else if (verdict === 'fail') text = '不通过'
+  else if (verdict === 'gray') text = '灰色地带'
+  if (row.thesis_status === 'stale') return `${text}·过期`
+  return text
+}
+
+function thesisClass(row: PositionRow): string {
+  if (row.thesis_verdict === 'fail') return 'thesis-fail'
+  if (row.thesis_verdict === 'pass') return 'thesis-pass'
+  return ''
 }
 
 function openThesis(row: PositionRow) {
@@ -211,15 +226,14 @@ function formatWeight(value: number | null | undefined): string {
   return `${(value * 100).toFixed(2)}%`
 }
 
-function sourceLabel(source: string | null | undefined): string {
-  if (source === 'manual') return '手工'
-  if (source === 'auto') return '自动'
-  return '—'
+function isManualQuote(source: string | null | undefined): boolean {
+  return source === 'manual'
 }
 
 function ruleLightLabel(light: string | null | undefined): string {
   if (light === 'hit') return '触及'
   if (light === 'clear') return '未触及'
+  if (light === 'unknown') return '无现价'
   return '无规则'
 }
 
@@ -313,7 +327,7 @@ async function loadLatestReview() {
       }, 800)
     }
   } catch {
-    /* 无最近审视时保持空白 */
+    reviewError.value = '无法读取审视'
   }
 }
 
@@ -359,7 +373,7 @@ async function startReview() {
     const response = await fetch('/api/reviews', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({}),
+      body: JSON.stringify({ depth: reviewDepth.value }),
     })
     const data = await response.json()
     if (!response.ok) {
@@ -553,139 +567,6 @@ async function submitCode() {
   }
 }
 
-function parseAmount(raw: string): number | null {
-  const text = raw.trim()
-  if (!text) return null
-  const value = Number(text)
-  if (!Number.isFinite(value)) return null
-  return value
-}
-
-function amountsEqual(left: number, right: number): boolean {
-  return Math.abs(left - right) < 1e-8
-}
-
-function currentUnitCost(row: PositionRow): number | null {
-  if (!row.shares) return null
-  const unit = row.cost / row.shares
-  return Number.isFinite(unit) && unit > 0 ? unit : null
-}
-
-function draftSharesOf(row: PositionRow): number {
-  return parseAmount(shareDraft.value[row.name] ?? '') ?? row.shares
-}
-
-function draftUnitOf(row: PositionRow): number {
-  return parseAmount(unitCostDraft.value[row.name] ?? '') ?? currentUnitCost(row) ?? 0
-}
-
-function draftCostOf(row: PositionRow): number {
-  return draftSharesOf(row) * draftUnitOf(row)
-}
-
-function draftCashBalance(): number {
-  let delta = 0
-  for (const row of positions.value) {
-    delta += row.cost - draftCostOf(row)
-  }
-  return (cash.value ?? 0) + delta
-}
-
-function draftMarketOf(row: PositionRow): number | null {
-  if (row.price == null || !Number.isFinite(row.price)) return null
-  return draftSharesOf(row) * row.price
-}
-
-function draftPnlOf(row: PositionRow): number | null {
-  const market = draftMarketOf(row)
-  if (market == null) return null
-  return market - draftCostOf(row)
-}
-
-function draftEquity(): number {
-  let equity = draftCashBalance()
-  for (const row of positions.value) {
-    const market = draftMarketOf(row)
-    if (market != null) equity += market
-  }
-  return equity
-}
-
-function draftWeightOf(row: PositionRow): number | null {
-  const equity = draftEquity()
-  const market = draftMarketOf(row)
-  return market != null && equity ? market / equity : null
-}
-
-function draftCashWeight(): number | null {
-  const equity = draftEquity()
-  return equity ? draftCashBalance() / equity : null
-}
-
-function draftDeviationOf(row: PositionRow): number | null {
-  if (row.no_target) return null
-  const weight = draftWeightOf(row)
-  if (weight == null || row.target == null) return null
-  return weight - row.target
-}
-
-function draftCashDeviation(): number | null {
-  if (cashNoTarget.value || cashTarget.value == null) return null
-  const weight = draftCashWeight()
-  if (weight == null) return null
-  return weight - cashTarget.value
-}
-
-async function commitBasis(row: PositionRow) {
-  if (savingCell.value) return
-  const parsedShares = parseAmount(shareDraft.value[row.name] ?? '')
-  if (parsedShares == null || parsedShares < 0) {
-    shareDraft.value[row.name] = String(row.shares)
-    formError.value = '股数无效'
-    return
-  }
-  const currentUnit = currentUnitCost(row)
-  const parsedUnit = parseAmount(unitCostDraft.value[row.name] ?? '')
-  if (parsedShares > 0 && (parsedUnit == null || parsedUnit <= 0)) {
-    unitCostDraft.value[row.name] = currentUnit == null ? '' : formatUnitCost(row.cost, row.shares)
-    formError.value = '成本单价必须大于 0'
-    return
-  }
-  const unitUnchanged =
-    parsedShares === 0 ||
-    (currentUnit != null && parsedUnit != null && amountsEqual(parsedUnit, currentUnit))
-  if (amountsEqual(parsedShares, row.shares) && unitUnchanged) return
-  formError.value = ''
-  warning.value = ''
-  savingCell.value = `basis:${row.name}`
-  try {
-    const response = await fetch('/api/positions/adjust', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        name: row.name,
-        shares: parsedShares,
-        unit_cost: parsedShares === 0 ? undefined : parsedUnit,
-        date: todayIso(),
-      }),
-    })
-    const data = await response.json()
-    if (!response.ok) {
-      formError.value = data.detail || data.error || '改成本失败'
-      shareDraft.value[row.name] = String(row.shares)
-      unitCostDraft.value[row.name] = formatUnitCost(row.cost, row.shares)
-      return
-    }
-    applyBook(data)
-  } catch {
-    formError.value = '改成本失败'
-    shareDraft.value[row.name] = String(row.shares)
-    unitCostDraft.value[row.name] = formatUnitCost(row.cost, row.shares)
-  } finally {
-    savingCell.value = null
-  }
-}
-
 async function submitManual() {
   if (savingManual.value) return
   quoteError.value = ''
@@ -710,6 +591,63 @@ async function submitManual() {
     quoteError.value = '手工价失败'
   } finally {
     savingManual.value = false
+  }
+}
+
+function rowDirty(row: PositionRow): boolean {
+  const edit = bookForm.value[row.name]
+  if (!edit) return false
+  return edit.shares.trim() !== String(row.shares)
+    || edit.unit_cost.trim() !== formatUnitCost(row.cost, row.shares)
+}
+
+function cashDirty(): boolean {
+  return cashForm.value.trim() !== (cash.value == null ? '' : String(cash.value))
+}
+
+async function saveBook() {
+  if (savingBook.value) return
+  bookError.value = ''
+  savingBook.value = true
+  try {
+    let last: Record<string, unknown> | null = null
+    for (const row of positions.value) {
+      if (!rowDirty(row)) continue
+      const edit = bookForm.value[row.name]
+      const response = await fetch('/api/positions/adjust', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: row.name,
+          shares: edit.shares,
+          unit_cost: edit.unit_cost,
+        }),
+      })
+      const data = await response.json()
+      if (!response.ok) {
+        bookError.value = data.detail || data.error || '保存账面失败'
+        return
+      }
+      last = data
+    }
+    if (cashDirty()) {
+      const response = await fetch('/api/positions/cash', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ balance: cashForm.value }),
+      })
+      const data = await response.json()
+      if (!response.ok) {
+        bookError.value = data.detail || data.error || '保存现金失败'
+        return
+      }
+      last = data
+    }
+    if (last) applyBook(last as Parameters<typeof applyBook>[0])
+  } catch {
+    bookError.value = '保存账面失败'
+  } finally {
+    savingBook.value = false
   }
 }
 
@@ -803,6 +741,10 @@ onBeforeUnmount(stopReviewPoll)
     <div class="toolbar">
       <h1>看仓</h1>
       <button type="button" :disabled="refreshing" @click="refreshQuotes">刷新现价</button>
+      <select v-model="reviewDepth" aria-label="审视深度">
+        <option value="reuse">引用论文，无则短体检</option>
+        <option value="eval_first">缺论文先评估再审视</option>
+      </select>
       <button type="button" :disabled="reviewing" @click="startReview">一键审视</button>
     </div>
     <p v-if="loadError">{{ loadError }}</p>
@@ -812,7 +754,7 @@ onBeforeUnmount(stopReviewPoll)
       <p v-if="researchError">{{ researchError }}</p>
       <p v-if="quoteError">{{ quoteError }}</p>
       <p v-for="item in refreshErrors" :key="item">{{ item }}</p>
-      <p class="hint">股数与成本单价可在表内改，成本总额、市值、浮盈亏跟着算。现价只读，要改行情用刷新或手工价。目标改完后点保存。</p>
+      <p class="hint">股数、成本单价、现金可直接改，只改账面不记买卖。分红除权也可手记一笔。收益率是现价相对成本单价。现价要改用刷新或手工价。评估在单独一列。账面改完点保存账面，目标改完点保存目标。</p>
       <p v-if="rebalance.length">
         再平衡：{{ rebalance.map(rebalanceLabel).join('、') }}（仅提示，不下单）
       </p>
@@ -824,10 +766,12 @@ onBeforeUnmount(stopReviewPoll)
               <tr>
                 <th>名称</th>
                 <th>论文</th>
+                <th>评估</th>
                 <th>股数</th>
                 <th>成本单价</th>
                 <th>成本总额</th>
                 <th>现价</th>
+                <th>收益率</th>
                 <th>市值</th>
                 <th>占比</th>
                 <th>目标仓位</th>
@@ -843,44 +787,49 @@ onBeforeUnmount(stopReviewPoll)
                   <span
                     v-if="row.thesis_status === 'current' || row.thesis_status === 'stale'"
                     class="name-cell"
+                    :class="thesisClass(row)"
                     @click.stop="openThesis(row)"
-                  >{{ thesisLabel(row.thesis_status) }}</span>
+                  >{{ thesisLabel(row) }}</span>
                   <span v-else>无论文</span>
                 </td>
                 <td>
+                  <span class="name-cell" @click.stop="startResearch(row)">评估</span>
+                </td>
+                <td>
                   <input
-                    v-model="shareDraft[row.name]"
+                    v-if="bookForm[row.name]"
+                    v-model="bookForm[row.name].shares"
                     inputmode="decimal"
                     aria-label="股数"
-                    @click.stop
-                    @keydown.enter.prevent="commitBasis(row)"
-                    @blur="commitBasis(row)"
                   />
                 </td>
                 <td>
                   <input
-                    v-model="unitCostDraft[row.name]"
+                    v-if="bookForm[row.name]"
+                    v-model="bookForm[row.name].unit_cost"
                     inputmode="decimal"
                     aria-label="成本单价"
-                    @click.stop
-                    @keydown.enter.prevent="commitBasis(row)"
-                    @blur="commitBasis(row)"
                   />
                 </td>
-                <td>{{ formatNumber(draftCostOf(row)) }}</td>
-                <td>
+                <td>{{ formatNumber(row.cost) }}</td>
+                <td :class="{ overvalued: row.overvalued }">
                   {{ formatNumber(row.price) }}
+                  <span v-if="row.overvalued">高估</span>
+                  <span
+                    v-if="row.overvalued && (row.cheap_bound != null || row.rich_bound != null)"
+                    class="muted"
+                  >低估 {{ formatNumber(row.cheap_bound) }} / 高估 {{ formatNumber(row.rich_bound) }}</span>
                   <span v-if="row.stale">过期</span>
-                  <span class="muted">{{ sourceLabel(row.source) }}</span>
+                  <span v-if="isManualQuote(row.source)" class="muted">手工</span>
                   <span
                     v-if="!row.code"
                     class="name-cell"
                     @click.stop="prefillCode(row.name)"
                   >无代码</span>
-                  <span class="name-cell" @click.stop="startResearch(row)">评估</span>
                 </td>
-                <td>{{ formatNumber(draftMarketOf(row)) }}</td>
-                <td>{{ formatWeight(draftWeightOf(row)) }}</td>
+                <td>{{ formatWeight(row.price != null && row.cost ? ((row.price * row.shares) - row.cost) / row.cost : null) }}</td>
+                <td>{{ formatNumber(row.market_value) }}</td>
+                <td>{{ formatWeight(row.weight) }}</td>
                 <td>
                   <input
                     v-model="targetForm[row.name]"
@@ -889,9 +838,9 @@ onBeforeUnmount(stopReviewPoll)
                     aria-label="目标仓位"
                   />
                 </td>
-                <td>{{ row.no_target ? '—' : formatWeight(draftDeviationOf(row)) }}</td>
+                <td>{{ row.no_target ? '—' : formatWeight(row.deviation) }}</td>
                 <td>{{ ruleLightLabel(row.rule_light) }}</td>
-                <td>{{ formatNumber(draftPnlOf(row)) }}</td>
+                <td>{{ formatNumber(row.pnl) }}</td>
               </tr>
               <tr class="cash-row">
                 <td>现金</td>
@@ -900,8 +849,12 @@ onBeforeUnmount(stopReviewPoll)
                 <td>—</td>
                 <td>—</td>
                 <td>—</td>
-                <td>{{ formatNumber(draftCashBalance()) }}</td>
-                <td>{{ formatWeight(draftCashWeight()) }}</td>
+                <td>—</td>
+                <td>—</td>
+                <td>
+                  <input v-model="cashForm" inputmode="decimal" aria-label="现金余额" />
+                </td>
+                <td>{{ formatWeight(cashWeight) }}</td>
                 <td>
                   <input
                     v-model="targetForm.__CASH__"
@@ -910,7 +863,7 @@ onBeforeUnmount(stopReviewPoll)
                     aria-label="现金目标"
                   />
                 </td>
-                <td>{{ cashNoTarget ? '—' : formatWeight(draftCashDeviation()) }}</td>
+                <td>{{ cashNoTarget ? '—' : formatWeight(cashDeviation) }}</td>
                 <td>—</td>
                 <td>—</td>
               </tr>
@@ -918,7 +871,9 @@ onBeforeUnmount(stopReviewPoll)
           </table>
         </div>
         <p>目标填写 0 到 1 的小数，例如 0.20；空着表示无目标。保存为整表替换。</p>
+        <button type="button" :disabled="savingBook" @click="saveBook">保存账面</button>
         <button type="submit" :disabled="savingTargets">保存目标</button>
+        <p v-if="bookError">{{ bookError }}</p>
         <p v-if="targetError">{{ targetError }}</p>
       </form>
       <details class="fold" :open="tradeOpen">

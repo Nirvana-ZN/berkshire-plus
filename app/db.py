@@ -9,6 +9,8 @@ from sqlalchemy.pool import NullPool
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "app.db"
+FIN_FETCH_KEY = "fin_fetch_version"
+FIN_FETCH_VERSION = "2"
 
 
 class Base(DeclarativeBase):
@@ -61,6 +63,43 @@ def _ensure_listed_year(engine: Engine) -> None:
         names = {row[1] for row in rows}
         if "listed_year" not in names:
             conn.execute(text("ALTER TABLE instruments ADD COLUMN listed_year INTEGER"))
+        if "industry" not in names:
+            conn.execute(text("ALTER TABLE instruments ADD COLUMN industry VARCHAR"))
+
+
+def _ensure_financial_columns(engine: Engine) -> None:
+    from sqlalchemy import text
+
+    wanted = ("bps", "npl", "eps")
+    with engine.begin() as conn:
+        rows = conn.execute(text("PRAGMA table_info(financials)")).fetchall()
+        names = {row[1] for row in rows}
+        if not names:
+            return
+        for column in wanted:
+            if column not in names:
+                conn.execute(text(f"ALTER TABLE financials ADD COLUMN {column} NUMERIC(20, 8)"))
+
+
+def _reset_stale_financials(engine: Engine) -> None:
+    """财务只是东财的缓存；取数口径改了就整体丢掉，按需重拉。"""
+    from sqlalchemy import text
+
+    with engine.begin() as conn:
+        current = conn.execute(
+            text("SELECT value FROM settings WHERE key = :key"),
+            {"key": FIN_FETCH_KEY},
+        ).scalar()
+        if current == FIN_FETCH_VERSION:
+            return
+        conn.execute(text("DELETE FROM financials"))
+        conn.execute(
+            text(
+                "INSERT INTO settings (key, value) VALUES (:key, :value) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+            ),
+            {"key": FIN_FETCH_KEY, "value": FIN_FETCH_VERSION},
+        )
 
 
 def init_db(db_path: Path | None = None) -> Engine:
@@ -69,7 +108,12 @@ def init_db(db_path: Path | None = None) -> Engine:
     engine = create_db_engine(db_path)
     Base.metadata.create_all(engine)
     _ensure_listed_year(engine)
+    _ensure_financial_columns(engine)
+    _reset_stale_financials(engine)
     SessionLocal = create_session_factory(engine)
     with SessionLocal() as session:
         seed_local_user(session)
+        from screen.ruler import seed_if_empty
+
+        seed_if_empty(session)
     return engine

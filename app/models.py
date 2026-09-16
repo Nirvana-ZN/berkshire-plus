@@ -56,6 +56,7 @@ class Instrument(Base):
     name: Mapped[str] = mapped_column(String, nullable=False, unique=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
     listed_year: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    industry: Mapped[str | None] = mapped_column(String, nullable=True)
 
 
 class Quote(Base):
@@ -83,6 +84,17 @@ class Setting(Base):
 
     key: Mapped[str] = mapped_column(String, primary_key=True)
     value: Mapped[str] = mapped_column(String, nullable=False)
+
+
+class RulerVersion(Base):
+    __tablename__ = "ruler_versions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    digest: Mapped[str] = mapped_column(String, nullable=False)
+    reason: Mapped[str] = mapped_column(String, nullable=False)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    activated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 
 
 class JobLock(Base):
@@ -136,6 +148,9 @@ class Financial(Base):
     net_margin: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
     shares: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
     share_change_ma: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    bps: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
+    npl: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
+    eps: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
 
 
 class ResearchJob(Base):

@@ -27,8 +27,16 @@ def load_positions(
         .order_by(Trade.date, Trade.id)
     ).all()
 
+    origin: dict[str, tuple[str, int]] = {}
+    for trade in trades:
+        if trade.direction == "set":
+            origin[trade.name] = (trade.date, trade.id)
+
     books: dict[str, tuple[Decimal, Decimal]] = {}
     for trade in trades:
+        start = origin.get(trade.name)
+        if start is not None and (trade.date, trade.id) < start:
+            continue
         shares, cost = books.get(trade.name, (Decimal("0"), Decimal("0")))
         qty = Decimal(trade.shares)
         price = Decimal(trade.price)
@@ -36,6 +44,8 @@ def load_positions(
             shares += qty
             cost += qty * price
         elif trade.direction == "sell":
+            if qty > shares:
+                continue
             if shares == 0:
                 continue
             avg = cost / shares
@@ -43,6 +53,11 @@ def load_positions(
             cost -= avg * qty
             if shares == 0:
                 cost = Decimal("0")
+        elif trade.direction == "set":
+            shares = qty
+            cost = qty * price
+        else:
+            continue
         if shares == 0:
             books.pop(trade.name, None)
         else:

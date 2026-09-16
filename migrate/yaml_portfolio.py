@@ -10,6 +10,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.models import Cash, Instrument, Rule, Setting, Trade
+from ledger.quotes import is_a_share_code
 
 LOCAL_USER_ID = 1
 MIGRATED_KEY = "yaml_migrated"
@@ -98,9 +99,12 @@ def _load_yaml(path: Path, label: str) -> object:
 
 def _require_decimal(value: object, label: str) -> Decimal:
     try:
-        return Decimal(str(value))
+        number = Decimal(str(value))
     except (InvalidOperation, ValueError, TypeError) as exc:
         raise MigrateError(f"{label}不是有效数字") from exc
+    if not number.is_finite():
+        raise MigrateError(f"{label}不是有效数字")
+    return number
 
 
 def _parse_trade_date(raw: object) -> str:
@@ -134,13 +138,15 @@ def _parse_trades(data: object) -> list[dict[str, object]]:
             direction = DIRECTION_MAP.get(raw_direction)
             if direction is None:
                 raise MigrateError(f"未知成交方向: {raw_direction}")
-            name = str(item["名称"])
+            name = str(item["名称"]).strip()
+            if not name:
+                raise MigrateError("成交名称不能为空")
             shares = _require_decimal(item["股数"], "股数")
             price = _require_decimal(item["价格"], "价格")
             if shares <= 0:
                 raise MigrateError("股数必须大于 0")
-            if price < 0:
-                raise MigrateError("价格不能为负")
+            if price <= 0:
+                raise MigrateError("价格必须大于 0")
             trade_date = _parse_trade_date(item["日期"])
             if direction == "sell":
                 held = accumulated.get(name, Decimal("0"))
@@ -211,5 +217,7 @@ def _parse_symbols(data: object) -> list[dict[str, object]]:
         code_text = str(code).strip()
         if not code_text:
             raise MigrateError(f"代码不能为空: {name}")
+        if not is_a_share_code(code_text):
+            raise MigrateError(f"不是有效的 A 股代码: {code_text}")
         rows.append({"code": code_text, "name": str(name)})
     return rows

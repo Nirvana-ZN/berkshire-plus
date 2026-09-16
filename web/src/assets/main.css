@@ -22,7 +22,7 @@ body {
   min-height: 100vh;
   display: flex;
   flex-direction: column;
-  max-width: 88rem;
+  max-width: 60rem;
   margin: 0 auto;
   padding: 1.25rem 1.5rem 2rem;
 }
@@ -34,6 +34,17 @@ footer {
   align-items: center;
   justify-content: space-between;
   gap: 0.75rem;
+}
+
+header {
+  border-bottom: 1px solid #d8d2c4;
+  padding-bottom: 0.85rem;
+}
+
+footer {
+  border-top: 1px solid #d8d2c4;
+  padding-top: 0.85rem;
+  margin-top: 0.5rem;
 }
 
 .brand {
@@ -54,12 +65,17 @@ nav a {
 
 nav a.router-link-active {
   font-weight: 700;
-  text-decoration: underline;
+  text-decoration: none;
+  box-shadow: inset 0 -2px 0 #1a1a1a;
+}
+
+a {
+  color: #1a4a7a;
 }
 
 main {
   flex: 1;
-  padding: 1.5rem 0;
+  padding: 1.25rem 0;
 }
 
 h1,
@@ -67,20 +83,42 @@ h2 {
   margin-top: 0;
 }
 
+main > section > h2,
+.panel > h2 {
+  margin: 1.5rem 0 0.55rem;
+  font-size: 1.15rem;
+}
+
 .entries {
   display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 1rem;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 0.85rem;
+  margin: 0 0 0.5rem;
 }
 
 .entries article {
   border: 1px solid #d8d2c4;
   background: #fff;
-  padding: 1.25rem;
+  padding: 1.1rem 1.2rem;
+}
+
+.entries article:hover {
+  background: #faf8f3;
 }
 
 .entries a {
   color: inherit;
+}
+
+.panel {
+  background: #fff;
+  border: 1px solid #d8d2c4;
+  padding: 0.85rem 1.1rem 1rem;
+  margin: 0.85rem 0;
+}
+
+.panel > h2:first-child {
+  margin-top: 0.15rem;
 }
 
 table {
@@ -91,9 +129,16 @@ table {
 
 th,
 td {
-  border: 1px solid #d8d2c4;
-  padding: 0.5rem 0.75rem;
+  border: none;
+  border-bottom: 1px solid #e4ddd0;
+  padding: 0.55rem 0.7rem;
   text-align: left;
+}
+
+th {
+  color: #5c564c;
+  font-size: 0.85rem;
+  font-weight: 600;
 }
 
 .toolbar {
@@ -164,9 +209,54 @@ td {
   gap: 0.4rem;
 }
 
+.combo {
+  position: relative;
+}
+
+.combo input {
+  min-width: 14rem;
+}
+
+.suggest {
+  position: absolute;
+  z-index: 8;
+  left: 0;
+  right: 0;
+  top: calc(100% + 0.15rem);
+  margin: 0;
+  padding: 0.15rem 0;
+  list-style: none;
+  max-height: 16rem;
+  overflow: auto;
+  background: #fff;
+  border: 1px solid #d8d2c4;
+}
+
+.suggest li {
+  padding: 0.35rem 0.55rem;
+  cursor: pointer;
+}
+
+.suggest li.active,
+.suggest li:hover {
+  background: #efe8d8;
+}
+
 button {
   padding: 0.35rem 0.75rem;
   cursor: pointer;
+  border: 1px solid #c4bba8;
+  background: #fff;
+  color: inherit;
+}
+
+button:hover:not(:disabled) {
+  background: #efe8d8;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
 }
 
 input,
@@ -233,8 +323,110 @@ footer p {
   color: #5c564c;
 }
 
+.overvalued,
+.thesis-fail {
+  color: #b00020;
+}
+
+.thesis-pass {
+  color: #1b5e4a;
+}
+
+.sentiment {
+  display: grid;
+  grid-template-columns: auto auto 1fr;
+  grid-template-rows: auto auto;
+  align-items: end;
+  column-gap: 1.15rem;
+  row-gap: 0.35rem;
+  background: #fff;
+  border: 1px solid #d8d2c4;
+  padding: 1rem 1.25rem 1.15rem;
+  margin: 0 0 1.1rem;
+}
+
+.sentiment-copy {
+  grid-column: 1;
+  grid-row: 1 / span 2;
+  align-self: center;
+}
+
+.sentiment-copy h2 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.sentiment-copy .muted {
+  margin: 0.1rem 0 0;
+}
+
+.sentiment-score {
+  margin: 0;
+  font-size: 2.6rem;
+  font-weight: 700;
+  line-height: 0.95;
+  font-variant-numeric: tabular-nums;
+  grid-column: 2;
+  grid-row: 1;
+}
+
+.sentiment-label {
+  margin: 0;
+  font-weight: 600;
+  grid-column: 2;
+  grid-row: 2;
+}
+
+.sentiment:has(.sentiment-meter) .sentiment-score,
+.sentiment:has(.sentiment-meter) .sentiment-label {
+  color: hsl(calc(210 - 2.1 * var(--n, 50)), 72%, 36%);
+}
+
+.sentiment-meter {
+  position: relative;
+  grid-column: 3;
+  grid-row: 1 / span 2;
+  align-self: center;
+  height: 0.7rem;
+  background: linear-gradient(
+    90deg,
+    #2563eb 0%,
+    #06b6d4 20%,
+    #22c55e 40%,
+    #eab308 60%,
+    #f97316 80%,
+    #dc2626 100%
+  );
+}
+
+.sentiment-meter > i {
+  position: absolute;
+  top: -0.15rem;
+  left: var(--p, 0%);
+  width: 0.2rem;
+  height: calc(100% + 0.3rem);
+  background: #1a1a1a;
+  box-shadow: 0 0 0 2px #fff;
+  transform: translateX(-50%);
+}
+
+.sentiment-warn {
+  grid-column: 1 / -1;
+  margin: 0.35rem 0 0;
+  color: #b00020;
+}
+
 @media (max-width: 640px) {
   .entries {
     grid-template-columns: 1fr;
+  }
+
+  .sentiment {
+    grid-template-columns: 1fr auto;
+  }
+
+  .sentiment-meter {
+    grid-column: 1 / -1;
+    grid-row: 3;
   }
 }

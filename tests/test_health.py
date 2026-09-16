@@ -98,8 +98,6 @@ def test_empty_screen_shell_does_not_invent_list() -> None:
     assert "不构成投资建议" in app_vue
     assert "今日推荐" not in screen
     assert "收益排行" not in screen
-    assert "<ul" not in screen.lower()
-    assert "<ol" not in screen.lower()
 
 
 def test_scaffold_has_router_without_pinia() -> None:

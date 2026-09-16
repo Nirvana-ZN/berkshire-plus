@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { RouterLink } from 'vue-router'
+import SentimentPanel from '../components/SentimentPanel.vue'
 
 interface LockState {
   type?: string
@@ -23,6 +24,7 @@ interface WatchItem {
   research_id: number
   thesis_status?: 'current' | 'stale' | 'none' | null
   thesis_research_id?: number | null
+  thesis_verdict?: 'pass' | 'fail' | 'gray' | null
 }
 
 interface ReviewSummary {
@@ -33,10 +35,29 @@ interface ReviewSummary {
   positions?: { name: string; action: string; short_exam?: boolean }[]
 }
 
+interface SentimentState {
+  score: number | null
+  zone?: string
+  label: string
+}
+
+interface AftermathItem {
+  research_id: number
+  name: string
+  as_of?: string | null
+  then_verdict?: 'pass' | 'fail' | 'gray' | null
+  then_price?: number | null
+  current_price?: number | null
+  paper?: 'current' | 'updated' | 'gone' | null
+  in_band?: boolean | null
+  live_verdict?: 'pass' | 'fail' | 'gray' | null
+}
+
 const LOCK_ZH: Record<string, string> = {
   funnel: '漏斗',
   research: '评估',
   review: '审视',
+  cheap: '低估值',
 }
 const JOB_STATUS: Record<string, string> = {
   queued: '排队',
@@ -44,11 +65,28 @@ const JOB_STATUS: Record<string, string> = {
   done: '完成',
   failed: '失败',
 }
+const PAPER_ZH: Record<string, string> = {
+  current: '现行',
+  updated: '已更新',
+  gone: '已无',
+}
+const VERDICT_ZH: Record<string, string> = {
+  pass: '通过',
+  fail: '不通过',
+  gray: '灰色地带',
+}
+const LIVE_ZH: Record<string, string> = {
+  pass: '现价仍像通过',
+  fail: '现价不像通过',
+  gray: '现价仍灰色',
+}
 
 const lock = ref<LockState | null>(null)
 const jobs = ref<JobRow[]>([])
 const watchlist = ref<WatchItem[]>([])
 const latestReview = ref<ReviewSummary | null>(null)
+const aftermath = ref<AftermathItem[]>([])
+const sentiment = ref<SentimentState | null>(null)
 const errorText = ref('')
 const removing = ref<number | null>(null)
 
@@ -61,11 +99,56 @@ const ACTION_ZH: Record<string, string> = {
 }
 
 const recentJobs = computed(() => jobs.value.slice(0, 8))
+let pollTimer: number | undefined
 
-function thesisLabel(status?: string | null): string {
-  if (status === 'current') return '有效'
-  if (status === 'stale') return '过期'
-  return '无论文'
+function jobLink(job: JobRow): string | null {
+  if (job.type === 'research') return `/research/${job.id}`
+  if (job.type === 'funnel') return '/screen'
+  if (job.type === 'review') return '/positions'
+  return null
+}
+
+function thesisLabel(item: WatchItem): string {
+  const verdict = item.thesis_verdict
+  let text = '论文'
+  if (verdict === 'pass') text = '通过'
+  else if (verdict === 'fail') text = '不通过'
+  else if (verdict === 'gray') text = '灰色地带'
+  if (item.thesis_status === 'stale') return `${text}·过期`
+  return text
+}
+
+function thesisClass(item: WatchItem): string {
+  if (item.thesis_verdict === 'fail') return 'thesis-fail'
+  if (item.thesis_verdict === 'pass') return 'thesis-pass'
+  return ''
+}
+
+function fmtNum(value?: number | null): string {
+  return value == null ? '—' : String(value)
+}
+
+function verdictText(value?: string | null): string {
+  return (value && VERDICT_ZH[value]) || value || '—'
+}
+
+function paperText(value?: string | null): string {
+  return (value && PAPER_ZH[value]) || '—'
+}
+
+function bandText(value?: boolean | null): string {
+  if (value == null) return '—'
+  return value ? '在' : '不在'
+}
+
+function liveText(value?: string | null): string {
+  return (value && LIVE_ZH[value]) || '无法对照'
+}
+
+function verdictClass(value?: string | null): string {
+  if (value === 'fail') return 'thesis-fail'
+  if (value === 'pass') return 'thesis-pass'
+  return ''
 }
 
 function lockLabel(): string {
@@ -83,11 +166,13 @@ async function loadWorkbench() {
   errorText.value = ''
   const messages: string[] = []
   try {
-    const [healthRes, jobsRes, watchRes, reviewRes] = await Promise.all([
+    const [healthRes, jobsRes, watchRes, reviewRes, sentRes, afterRes] = await Promise.all([
       fetch('/api/health'),
       fetch('/api/jobs'),
       fetch('/api/watchlist'),
       fetch('/api/reviews/latest'),
+      fetch('/api/sentiment'),
+      fetch('/api/aftermath'),
     ])
     const health = await healthRes.json()
     const jobsBody = await jobsRes.json()
@@ -96,6 +181,13 @@ async function loadWorkbench() {
       latestReview.value = await reviewRes.json()
     } else if (reviewRes.status === 404) {
       latestReview.value = null
+    } else {
+      const reviewBody = await reviewRes.json().catch(() => ({}))
+      messages.push(
+        (reviewBody as { detail?: string }).detail
+          || (reviewBody as { error?: string }).error
+          || '无法读取审视',
+      )
     }
     if (healthRes.ok) {
       lock.value = (health.lock as LockState | null) ?? null
@@ -111,6 +203,22 @@ async function loadWorkbench() {
       watchlist.value = watchBody.items ?? []
     } else {
       messages.push(watchBody.detail || watchBody.error || '无法读取观察池')
+    }
+    if (sentRes.ok) {
+      sentiment.value = await sentRes.json()
+    } else {
+      sentiment.value = { score: null, label: '情绪不可用' }
+    }
+    if (afterRes.ok) {
+      const afterBody = await afterRes.json()
+      aftermath.value = afterBody.items ?? []
+    } else {
+      const afterBody = await afterRes.json().catch(() => ({}))
+      messages.push(
+        (afterBody as { detail?: string }).detail
+          || (afterBody as { error?: string }).error
+          || '无法读取事后簿',
+      )
     }
     errorText.value = messages[0] || ''
   } catch {
@@ -140,6 +248,13 @@ async function removeWatch(id: number) {
 
 onMounted(() => {
   void loadWorkbench()
+  pollTimer = window.setInterval(() => {
+    void loadWorkbench()
+  }, 3000)
+})
+
+onBeforeUnmount(() => {
+  if (pollTimer != null) window.clearInterval(pollTimer)
 })
 </script>
 
@@ -150,6 +265,7 @@ onMounted(() => {
       <p class="muted">任务锁：{{ lockLabel() }}</p>
     </div>
     <p v-if="errorText">{{ errorText }}</p>
+    <SentimentPanel :sentiment="sentiment" />
     <div class="entries">
       <article>
         <h2><RouterLink to="/positions">看仓</RouterLink></h2>
@@ -159,18 +275,23 @@ onMounted(() => {
         <h2><RouterLink to="/screen">选股</RouterLink></h2>
         <p>漏斗、评估与观察池。</p>
       </article>
+      <article>
+        <h2><RouterLink to="/cheap">低估值</RouterLink></h2>
+        <p>沪深 A 股截面便宜榜，点进 Checklist。</p>
+      </article>
     </div>
 
-    <h2>观察池待办</h2>
-    <p v-if="watchlist.length === 0">暂无观察池待办</p>
-    <table v-else>
+    <section class="panel">
+      <h2>观察池待办</h2>
+      <p v-if="watchlist.length === 0">暂无观察池待办</p>
+      <table v-else>
       <thead>
-        <tr>
-          <th>名称</th>
-          <th>代码</th>
-          <th>论文</th>
-          <th>操作</th>
-        </tr>
+          <tr>
+            <th>名称</th>
+            <th>代码</th>
+            <th>论文</th>
+            <th>操作</th>
+          </tr>
       </thead>
       <tbody>
         <tr v-for="item in watchlist" :key="item.id">
@@ -179,8 +300,9 @@ onMounted(() => {
           <td>
             <RouterLink
               v-if="(item.thesis_status === 'current' || item.thesis_status === 'stale') && item.thesis_research_id != null"
+              :class="thesisClass(item)"
               :to="`/research/${item.thesis_research_id}`"
-            >{{ thesisLabel(item.thesis_status) }}</RouterLink>
+            >{{ thesisLabel(item) }}</RouterLink>
             <span v-else>无论文</span>
           </td>
           <td>
@@ -192,7 +314,9 @@ onMounted(() => {
         </tr>
       </tbody>
     </table>
+    </section>
 
+    <section class="panel">
     <h2>最近审视</h2>
     <p v-if="!latestReview">暂无审视</p>
     <template v-else>
@@ -211,6 +335,41 @@ onMounted(() => {
       <p v-if="latestReview.positions?.some((row) => row.short_exam)">短体检，非六关</p>
       <p><RouterLink to="/positions">查看持仓页审视</RouterLink></p>
     </template>
+    </section>
+
+    <section class="panel">
+      <h2>事后簿</h2>
+      <p class="muted">对照是把当时带子套在现价上，不是收益回测。</p>
+      <p v-if="aftermath.length === 0">暂无论文可对照</p>
+      <table v-else>
+        <thead>
+          <tr>
+            <th>名称</th>
+            <th>当时</th>
+            <th>结论</th>
+            <th>当时价</th>
+            <th>现价</th>
+            <th>论文</th>
+            <th>价在带内</th>
+            <th>对照</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="item in aftermath" :key="item.research_id">
+            <td>
+              <RouterLink :to="`/research/${item.research_id}`">{{ item.name }}</RouterLink>
+            </td>
+            <td>{{ item.as_of || '—' }}</td>
+            <td :class="verdictClass(item.then_verdict)">{{ verdictText(item.then_verdict) }}</td>
+            <td>{{ fmtNum(item.then_price) }}</td>
+            <td>{{ fmtNum(item.current_price) }}</td>
+            <td>{{ paperText(item.paper) }}</td>
+            <td>{{ bandText(item.in_band) }}</td>
+            <td :class="verdictClass(item.live_verdict)">{{ liveText(item.live_verdict) }}</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
 
     <details class="fold">
       <summary>最近任务</summary>
@@ -229,7 +388,10 @@ onMounted(() => {
           <tr v-for="job in recentJobs" :key="`${job.type}-${job.id}`">
             <td>{{ LOCK_ZH[job.type] || job.type }}</td>
             <td>{{ JOB_STATUS[job.status] || job.status }}</td>
-            <td>{{ job.name || '—' }}</td>
+            <td>
+              <RouterLink v-if="jobLink(job)" :to="jobLink(job)!">{{ job.name || LOCK_ZH[job.type] || job.type }}</RouterLink>
+              <span v-else>{{ job.name || '—' }}</span>
+            </td>
             <td>{{ jobDate(job.updated_at) }}</td>
             <td>{{ job.error || '' }}</td>
           </tr>

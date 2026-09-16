@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from app.models import JobLock, PortfolioReview, ResearchJob, ScreenRun
 
 JOB_TYPE_FUNNEL = "funnel"
+JOB_TYPE_RESEARCH = "research"
 JOB_TYPE_REVIEW = "review"
 LOCK_ROW_ID = 1
 ACTIVE_STATUSES = ("queued", "running")

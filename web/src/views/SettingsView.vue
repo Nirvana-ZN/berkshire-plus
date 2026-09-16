@@ -9,10 +9,12 @@ const loadError = ref('')
 const formError = ref('')
 const message = ref('')
 const hasApiKey = ref(false)
+const hasSearchKey = ref(false)
+const webSearch = ref(false)
 const model = ref('')
 const baseUrl = ref('')
-const webSearch = ref(false)
 const apiKey = ref('')
+const searchKey = ref('')
 const saving = ref(false)
 const ready = ref(false)
 
@@ -22,9 +24,10 @@ function applySettings(data: Record<string, unknown>) {
   yamlDir.value = (data.yaml_dir as string | null) ?? null
   migrated.value = Boolean(data.migrated)
   hasApiKey.value = Boolean(data.has_api_key)
+  hasSearchKey.value = Boolean(data.has_search_key)
+  webSearch.value = Boolean(data.web_search)
   model.value = typeof data.llm_model === 'string' ? data.llm_model : ''
   baseUrl.value = typeof data.llm_base_url === 'string' ? data.llm_base_url : ''
-  webSearch.value = Boolean(data.web_search)
   error.value = typeof data.error === 'string' ? data.error : ''
   detail.value = typeof data.detail === 'string' ? data.detail : ''
 }
@@ -53,6 +56,10 @@ async function saveSettings() {
     if (typed) {
       body.api_key = typed
     }
+    const typedSearch = searchKey.value.trim()
+    if (typedSearch) {
+      body.search_api_key = typedSearch
+    }
     const typedUrl = baseUrl.value.trim()
     if (typedUrl) {
       body.base_url = typedUrl
@@ -70,6 +77,7 @@ async function saveSettings() {
     applySettings(data)
     message.value = typeof data.message === 'string' ? data.message : '已保存'
     apiKey.value = ''
+    searchKey.value = ''
   } catch {
     formError.value = '保存失败'
   } finally {
@@ -110,10 +118,18 @@ onMounted(async () => {
           />
         </label>
         <p class="muted">智谱 Coding Plan 用 /api/coding/paas/v4；按量计费用 /api/paas/v4</p>
-        <label class="check-inline">
+        <label>
+          Tavily 密钥
+          <input v-model="searchKey" type="password" autocomplete="off" />
+        </label>
+        <p v-if="hasSearchKey" class="muted">搜索密钥已保存</p>
+        <label>
           <input v-model="webSearch" type="checkbox" />
           网页搜索
         </label>
+        <p class="muted">
+          评估前用 Tavily 检索中报、分红与股权结构。无密钥时即使打开也不搜索。财务数字仍以已抓取年报为准。
+        </p>
         <button type="submit" :disabled="saving || !ready">保存</button>
       </form>
       <p v-if="formError">{{ formError }}</p>

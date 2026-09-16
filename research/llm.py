@@ -39,9 +39,11 @@ class FakeLLM:
         self.raw = raw
         self.gate = gate
         self.calls: list[str] = []
+        self.prompts: list[str] = []
 
     def complete(self, prompt: str, *, name: str = "") -> str:
         self.calls.append(name or prompt[:40])
+        self.prompts.append(prompt)
         if self.gate is not None:
             wait = getattr(self.gate, "wait", None)
             if callable(wait):
@@ -212,7 +214,8 @@ def _default_payload() -> dict[str, object]:
             "mode": "steady",
             "aggressive": "激进买入带",
             "steady": "稳健买入带",
-            "conservative": "保守买入带",
+            "conservative": "44",
+            "overvalued": "52",
         },
         "memo": {
             "essence": "主业清晰，能用已抓取财务理解。",

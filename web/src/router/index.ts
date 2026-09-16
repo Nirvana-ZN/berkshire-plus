@@ -3,6 +3,7 @@ import HomeView from '../views/HomeView.vue'
 import PositionsView from '../views/PositionsView.vue'
 import ScreenView from '../views/ScreenView.vue'
 import ResearchView from '../views/ResearchView.vue'
+import CheapView from '../views/CheapView.vue'
 import SettingsView from '../views/SettingsView.vue'
 import NotFoundView from '../views/NotFoundView.vue'
 
@@ -23,6 +24,11 @@ const router = createRouter({
       path: '/screen',
       name: 'screen',
       component: ScreenView,
+    },
+    {
+      path: '/cheap',
+      name: 'cheap',
+      component: CheapView,
     },
     {
       path: '/research/:id',

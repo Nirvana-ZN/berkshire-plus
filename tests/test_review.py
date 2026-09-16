@@ -110,7 +110,7 @@ def _assert_position_keys(row: dict) -> None:
         "short_exam",
     }
     assert row["action"] in {"hold", "add", "cut", "sell", "unknown"}
-    assert row["rule_light"] in {"hit", "clear", "none"}
+    assert row["rule_light"] in {"hit", "clear", "none", "unknown"}
     assert isinstance(row["reason"], str) and row["reason"]
     assert "买入论文还在吗" in row["reason"]
     assert "今天此价格还会买吗" in row["reason"]
@@ -238,7 +238,7 @@ def _eligible_thesis_payload(**overrides) -> dict:
             "mode": "steady",
             "aggressive": "",
             "steady": "",
-            "conservative": "10 到 20",
+            "conservative": "30 到 50",
         },
         "as_of": {"date": "2026-08-29", "price": 40},
         "memo": {"essence": "假论文"},
@@ -292,6 +292,38 @@ def test_review_cites_current_thesis(tmp_path: Path) -> None:
         assert "论文过期" not in cmb["reason"]
         assert by_name["贵州茅台"]["short_exam"] is True
         assert "无论文" in by_name["贵州茅台"]["reason"]
+
+
+def test_overvalued_holding_changes_review_action(tmp_path: Path) -> None:
+    _write_key(tmp_path)
+    db_path = tmp_path / "app.db"
+    with _client(tmp_path) as client:
+        assert client.get("/api/health").status_code == 200
+        eval_id = _seed_research(db_path, name="招商银行", verdict="pass")
+        _seed_thesis(
+            db_path,
+            name="招商银行",
+            research_job_id=eval_id,
+            structured=_eligible_thesis_payload(
+                price_bands={
+                    "mode": "steady",
+                    "aggressive": "20",
+                    "steady": "25",
+                    "conservative": "20 到 30",
+                },
+                as_of={"date": "2026-08-29", "price": 25},
+            ),
+        )
+        created = client.post("/api/reviews", json={"sync": True})
+        assert created.status_code == 200
+        data = client.get(f"/api/reviews/{created.json()['id']}").json()
+        cmb = next(row for row in data["positions"] if row["name"] == "招商银行")
+        assert cmb["action"] == "cut"
+        assert "高估" in cmb["reason"]
+        book = client.get("/api/positions").json()
+        pos = next(row for row in book["positions"] if row["name"] == "招商银行")
+        assert pos["overvalued"] is True
+        assert pos["live_verdict"] == "fail"
 
 
 def test_latest_evaluation_is_not_thesis(tmp_path: Path) -> None:
@@ -349,7 +381,7 @@ def test_stale_thesis_is_short_exam_with_action(tmp_path: Path) -> None:
         assert "短体检，非六关" in cmb["reason"]
 
 
-def test_review_stale_when_conservative_floor_breached(tmp_path: Path) -> None:
+def test_review_stale_when_conservative_ceiling_breached(tmp_path: Path) -> None:
     _write_key(tmp_path)
     db_path = tmp_path / "app.db"
     with _client(tmp_path) as client:
@@ -360,12 +392,12 @@ def test_review_stale_when_conservative_floor_breached(tmp_path: Path) -> None:
             name="招商银行",
             research_job_id=eval_id,
             structured=_eligible_thesis_payload(
-                as_of={"date": "2026-08-29", "price": 40},
+                as_of={"date": "2026-08-29", "price": 28},
                 price_bands={
                     "mode": "steady",
                     "aggressive": "",
                     "steady": "",
-                    "conservative": "50 到 60",
+                    "conservative": "20 到 30",
                 },
             ),
         )
@@ -373,10 +405,10 @@ def test_review_stale_when_conservative_floor_breached(tmp_path: Path) -> None:
         assert created.status_code == 200
         data = client.get(f"/api/reviews/{created.json()['id']}").json()
         cmb = next(row for row in data["positions"] if row["name"] == "招商银行")
-        assert cmb["short_exam"] is True
-        assert "论文过期" in cmb["reason"]
-        assert cmb["action"] in {"hold", "add", "cut", "sell"}
-        assert cmb["action"] != "unknown"
+        assert cmb["short_exam"] is False
+        assert "论文过期" not in cmb["reason"]
+        assert cmb["action"] == "cut"
+        assert "高估" in cmb["reason"]
 
 
 def test_review_stale_when_watch_price_deviates(tmp_path: Path) -> None:
@@ -719,6 +751,7 @@ def test_review_module_does_not_import_ledger() -> None:
 def test_positions_and_home_have_review_entry_without_apply() -> None:
     positions = (ROOT / "web/src/views/PositionsView.vue").read_text(encoding="utf-8")
     home = (ROOT / "web/src/views/HomeView.vue").read_text(encoding="utf-8")
+    assert "高估" in positions
     assert "一键审视" in positions
     assert "/api/reviews" in positions
     assert "/api/reviews/latest" in positions
@@ -734,6 +767,45 @@ def test_positions_and_home_have_review_entry_without_apply() -> None:
     assert "一键应用" not in home
     assert "今日推荐" not in positions
     assert "收益排行" not in positions
+
+
+def test_startup_clears_leftover_review(tmp_path: Path) -> None:
+    _write_key(tmp_path)
+    db_path = tmp_path / "app.db"
+    with _client(tmp_path) as client:
+        assert client.get("/api/health").status_code == 200
+    engine = _engine(db_path)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO portfolio_reviews "
+                "(user_id, status, has_stale, created_at, updated_at) "
+                "VALUES (1, 'running', 0, '2026-01-01', '2026-01-01')"
+            )
+        )
+        conn.execute(
+            text("UPDATE job_lock SET job_id = 99, job_type = 'review' WHERE id = 1")
+        )
+    with _client(tmp_path) as client:
+        assert client.get("/api/health").json()["lock"] is None
+        leftover = _scalar(
+            db_path,
+            "SELECT status || '|' || error FROM portfolio_reviews ORDER BY id DESC LIMIT 1",
+        )
+        assert leftover == "failed|进程重启，任务中断"
+
+
+def test_review_marks_no_target_holding(tmp_path: Path) -> None:
+    _write_key(tmp_path)
+    with _client(tmp_path) as client:
+        assert client.get("/api/health").status_code == 200
+        saved = client.post("/api/targets", json={"targets": {"__CASH__": 1}})
+        assert 200 <= saved.status_code < 300
+        created = client.post("/api/reviews", json={"sync": True})
+        assert created.status_code == 200
+        review_id = created.json()["id"]
+        data = client.get(f"/api/reviews/{review_id}").json()
+        assert any("无目标" in row.get("reason", "") for row in data["positions"])
 
 
 def test_review_invalid_json_is_400(tmp_path: Path) -> None:

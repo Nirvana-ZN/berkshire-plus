@@ -36,3 +36,6 @@ class FinancialRow:
     net_margin: Decimal | None = None
     shares: Decimal | None = None
     share_change_ma: bool | None = None
+    bps: Decimal | None = None
+    npl: Decimal | None = None
+    eps: Decimal | None = None

@@ -157,7 +157,7 @@ def test_none_without_ceiling_or_quote(tmp_path: Path) -> None:
         by_before = {row["name"]: row for row in before["positions"]}
         assert by_before["招商银行"]["rule_light"] == "hit"
         assert by_before["贵州茅台"]["price"] is None
-        assert by_before["贵州茅台"]["rule_light"] == "none"
+        assert by_before["贵州茅台"]["rule_light"] == "unknown"
         traded = client.post("/api/trades", json=_trade_payload())
         assert 200 <= traded.status_code < 300
         by_name = {row["name"]: row for row in traded.json()["positions"]}

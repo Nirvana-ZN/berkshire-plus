@@ -18,6 +18,7 @@ from app.db import PROJECT_ROOT, create_session_factory, init_db
 from app.envfile import (
     OPENAI_API_KEY,
     OPENAI_BASE_URL,
+    TAVILY_API_KEY,
     has_env_value,
     hot_load,
     load_env_key,
@@ -36,9 +37,17 @@ from app.models import (
     Thesis,
     Watchlist,
 )
+from jobs.cheap import (
+    begin_cheap_fill,
+    cheap_fill_running,
+    clear_cheap_fill,
+    execute_cheap_fill,
+    load_cheap_board,
+)
 from jobs.funnel import execute_funnel
 from jobs.lock import (
     JOB_TYPE_FUNNEL,
+    JOB_TYPE_RESEARCH,
     JOB_TYPE_REVIEW,
     clear_stale_lock,
     lock_status,
@@ -53,6 +62,7 @@ from ledger.quotes import (
     apply_refresh,
     instrument_code_by_name,
     is_a_share_code,
+    lookup_saved_instrument,
     project_book,
     rebalance_alerts,
     save_instrument,
@@ -60,11 +70,24 @@ from ledger.quotes import (
 )
 from ledger.rules import RuleError, RuleRow, delete_rule, list_rules, save_rule
 from ledger.targets import TargetError, reclaim_orphan_targets, save_targets, seed_targets_if_empty
-from ledger.trades import TradeError, adjust_holding, record_trade
+from ledger.trades import TradeError, record_trade, set_cash, set_position
 from market.eastmoney import EastMoneyClient, MarketClient
+from market.sentiment import load_sentiment
+from market.types import MarketError
 from market.quotes import QuoteClient, TencentQuoteClient
 from research.llm import OpenAICompatClient
-from research.thesis import api_fields, load_by_names, price_usable, thesis_mark, utc_today
+from screen.ruler import RulerError, activate as activate_ruler, require_matched, status as ruler_status
+from research.thesis import (
+    api_fields,
+    expected_price,
+    gap_pct,
+    list_aftermath,
+    load_by_names,
+    parse_structured,
+    price_usable,
+    thesis_mark,
+    utc_today,
+)
 from migrate.yaml_portfolio import is_migrated, migrate_yaml_portfolio, stored_yaml_dir
 
 DEFAULT_DIST_PATH = PROJECT_ROOT / "web" / "dist"
@@ -98,6 +121,19 @@ def _json_optional(value: Decimal | None) -> int | float | None:
     if not quantized.is_finite():
         return None
     return _json_number(quantized)
+
+
+def _resolve_research_target(session, market, name: str, code: str, query: str) -> tuple[str, str]:
+    if name and code:
+        if not is_a_share_code(code):
+            raise MarketError(f"不是有效的 A 股代码: {code}")
+        return name, code
+    text = query or name or code
+    saved = lookup_saved_instrument(session, text)
+    if saved is not None:
+        return saved
+    found = market.lookup_equity(text)
+    return found.name, found.code
 
 
 def _positions_payload(
@@ -144,6 +180,11 @@ def _position_json(row: QuotedPosition, thesis: Thesis | None = None) -> dict[st
         "rule_light": row.rule_light,
         "thesis_status": extra["thesis_status"],
         "thesis_research_id": extra["thesis_research_id"],
+        "thesis_verdict": extra["thesis_verdict"],
+        "overvalued": extra["overvalued"],
+        "cheap_bound": extra["cheap_bound"],
+        "rich_bound": extra["rich_bound"],
+        "live_verdict": extra["live_verdict"],
     }
 
 
@@ -172,6 +213,7 @@ def _fetch_prices(client: QuoteClient, codes: list[str]) -> dict[str, Decimal]:
     try:
         return client.fetch_prices(codes)
     except Exception:
+        logger.exception("行情客户端失败")
         return {}
 
 
@@ -234,15 +276,34 @@ def _setting_value(session, key: str) -> str:
     return row.value
 
 
+def _truthy(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _secret_from_payload(payload: dict, field: str, *, code: str, detail: str):
+    if field not in payload:
+        return False, "", None
+    raw = payload.get(field)
+    if raw is None or not isinstance(raw, str):
+        return True, "", _error_json(400, error="请求无效", code=code, detail=detail)
+    secret = raw.strip()
+    if not secret or "\n" in secret or "\r" in secret:
+        return True, "", _error_json(400, error="请求无效", code=code, detail=detail)
+    return True, secret, None
+
+
 def _settings_body(request: Request, session) -> dict[str, object]:
     persisted_dir = stored_yaml_dir(session)
     body: dict[str, object] = {
         "yaml_dir": persisted_dir or request.app.state.yaml_dir,
         "migrated": is_migrated(session),
         "has_api_key": has_env_value(request.app.state.env_path, OPENAI_API_KEY),
+        "has_search_key": has_env_value(request.app.state.env_path, TAVILY_API_KEY),
         "llm_model": _setting_value(session, LLM_MODEL_KEY),
         "llm_base_url": read_env_value(request.app.state.env_path, OPENAI_BASE_URL) or "",
-        "web_search": _setting_value(session, WEB_SEARCH_KEY) == "true",
+        "web_search": _truthy(_setting_value(session, WEB_SEARCH_KEY)),
     }
     migrate_error = request.app.state.migrate_error
     if migrate_error:
@@ -271,6 +332,48 @@ def _screen_row_json(row: ScreenResult) -> dict[str, object]:
     }
 
 
+def _attach_keep_gaps(session, screen_run_id: int, keep: list[dict[str, object]]) -> None:
+    if not keep:
+        return
+    names = [str(row.get("name") or "") for row in keep if row.get("name")]
+    quotes = {
+        row.name: row
+        for row in session.scalars(
+            select(Quote).where(Quote.user_id == LOCAL_USER_ID, Quote.name.in_(names))
+        ).all()
+    }
+    bands: dict[str, dict] = {}
+    for name, thesis in load_by_names(session, LOCAL_USER_ID, names).items():
+        structured = parse_structured(thesis)
+        if structured:
+            bands[name] = structured
+    jobs = session.scalars(
+        select(ResearchJob).where(ResearchJob.screen_run_id == screen_run_id)
+    ).all()
+    for job in jobs:
+        artifact = session.scalars(
+            select(ResearchArtifact)
+            .where(ResearchArtifact.research_job_id == job.id)
+            .order_by(ResearchArtifact.id.desc())
+        ).first()
+        if artifact is None:
+            continue
+        try:
+            parsed = json.loads(artifact.structured_json)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            bands[job.name] = parsed
+    for row in keep:
+        name = str(row.get("name") or "")
+        quote = quotes.get(name)
+        price = quote.price if quote is not None else None
+        expected = expected_price(bands.get(name))
+        row["price"] = _json_optional(price)
+        row["expected_price"] = _json_optional(expected)
+        row["gap_pct"] = _json_optional(gap_pct(price, expected))
+
+
 def _screen_payload(session, run: ScreenRun) -> dict[str, object]:
     rows = session.scalars(
         select(ScreenResult)
@@ -280,6 +383,7 @@ def _screen_payload(session, run: ScreenRun) -> dict[str, object]:
     keep = [_screen_row_json(row) for row in rows if row.verdict == "keep"]
     drop = [_screen_row_json(row) for row in rows if row.verdict == "drop"]
     insufficient = [_screen_row_json(row) for row in rows if row.verdict == "insufficient"]
+    _attach_keep_gaps(session, run.id, keep)
     finalists = [row for row in keep if row.get("finalist")]
     return {
         "id": run.id,
@@ -353,6 +457,7 @@ def _artifact_payload(session, job: ResearchJob) -> dict[str, object]:
         body["data_grade"] = structured.get("data_grade")
         body["as_of"] = structured.get("as_of")
         body["portfolio_fit"] = structured.get("portfolio_fit")
+        body["valuation"] = structured.get("valuation") or {}
     thesis = session.scalars(
         select(Thesis).where(Thesis.user_id == job.user_id, Thesis.name == job.name)
     ).first()
@@ -407,6 +512,7 @@ def _watchlist_json(
         "research_id": row.research_id,
         "thesis_status": extra["thesis_status"],
         "thesis_research_id": extra["thesis_research_id"],
+        "thesis_verdict": extra["thesis_verdict"],
     }
 
 
@@ -485,7 +591,7 @@ def _review_job_payload(row: PortfolioReview) -> dict[str, object]:
     }
 
 
-_JOB_TYPE_NAMES = frozenset({JOB_TYPE_FUNNEL, "research", JOB_TYPE_REVIEW})
+_JOB_TYPE_NAMES = frozenset({JOB_TYPE_FUNNEL, JOB_TYPE_RESEARCH, JOB_TYPE_REVIEW})
 
 
 def _jobs_with_id(session, job_id: int) -> list[dict[str, object]]:
@@ -558,6 +664,7 @@ def create_app(
     resolved_env = resolve_env_path(env_path)
     load_env_key(resolved_env, OPENAI_API_KEY)
     load_env_key(resolved_env, OPENAI_BASE_URL)
+    load_env_key(resolved_env, TAVILY_API_KEY)
     resolved_llm = llm_client if llm_client is not None else OpenAICompatClient()
     resolved_reports = (
         Path(reports_dir) if reports_dir is not None else PROJECT_ROOT / "reports"
@@ -577,6 +684,7 @@ def create_app(
         app.state.allow_sync = allow_sync
         load_env_key(resolved_env, OPENAI_API_KEY)
         load_env_key(resolved_env, OPENAI_BASE_URL)
+        load_env_key(resolved_env, TAVILY_API_KEY)
         resolved_yaml = _resolve_yaml_dir(yaml_dir)
         app.state.yaml_dir = str(resolved_yaml) if resolved_yaml is not None else None
         app.state.migrate_error = None
@@ -604,6 +712,8 @@ def create_app(
                 logger.exception("初始目标写入失败")
             try:
                 clear_stale_lock(session)
+                clear_cheap_fill(session)
+                session.commit()
             except Exception:
                 session.rollback()
                 logger.exception("启动清理任务锁失败")
@@ -617,6 +727,62 @@ def create_app(
         factory = request.app.state.session_factory
         with factory() as session:
             return {"status": "ok", "lock": lock_status(session)}
+
+    @app.get("/api/sentiment")
+    def sentiment(request: Request) -> dict[str, object]:
+        factory = request.app.state.session_factory
+        with factory() as session:
+            body = load_sentiment(session, request.app.state.market_client)
+            session.commit()
+            return body
+
+    def _run_cheap_fill() -> None:
+        factory = app.state.session_factory
+        market = app.state.market_client
+        with factory() as session:
+            execute_cheap_fill(session, market)
+
+    @app.get("/api/cheap")
+    def cheap(request: Request, sort: str = Query("pe")):
+        wanted = (sort or "pe").strip().lower()
+        if wanted not in {"pe", "pb"}:
+            return _error_json(
+                400,
+                error="请求无效",
+                code="INVALID_CHEAP",
+                detail="sort 只能是 pe 或 pb",
+            )
+        fill = _as_bool(request.query_params.get("sync")) and bool(
+            getattr(request.app.state, "allow_sync", False)
+        )
+        started = False
+        factory = request.app.state.session_factory
+        with factory() as session:
+            try:
+                body = load_cheap_board(
+                    session,
+                    request.app.state.market_client,
+                    sort=wanted,
+                    fill=fill,
+                )
+            except MarketError as exc:
+                return _error_json(
+                    502,
+                    error="行情失败",
+                    code="CHEAP_UNAVAILABLE",
+                    detail=exc.message,
+                )
+            pending = int(body.get("pending") or 0)
+            filling = cheap_fill_running(session)
+            if pending and not fill and not filling:
+                if begin_cheap_fill(session):
+                    started = True
+                    filling = True
+            session.commit()
+            body["filling"] = filling
+        if started:
+            threading.Thread(target=_run_cheap_fill, daemon=True).start()
+        return body
 
     @app.get("/api/positions")
     def positions(request: Request) -> dict[str, object]:
@@ -674,7 +840,11 @@ def create_app(
                     code="TRADE_FAILED",
                     detail=str(exc),
                 )
-            rows, cash = _sync_targets_after_book(session)
+            try:
+                rows, cash = _sync_targets_after_book(session)
+            except Exception:
+                logger.exception("记账后同步目标仓位失败")
+                rows, cash = load_positions(session)
             body = _positions_payload(session, rows, cash)
         if recorded.warning:
             body["warning"] = recorded.warning
@@ -704,12 +874,11 @@ def create_app(
         factory = request.app.state.session_factory
         with factory() as session:
             try:
-                recorded = adjust_holding(
+                set_position(
                     session,
                     name=payload.get("name"),
                     shares=payload.get("shares"),
                     unit_cost=payload.get("unit_cost"),
-                    date=payload.get("date"),
                 )
             except TradeError as exc:
                 return _error_json(
@@ -718,18 +887,52 @@ def create_app(
                     code=exc.code,
                     detail=exc.detail,
                 )
-            except Exception as exc:
-                logger.exception("改成本失败")
-                return _error_json(
-                    500,
-                    error="改成本失败",
-                    code="TRADE_FAILED",
-                    detail=str(exc),
-                )
-            rows, cash = _sync_targets_after_book(session)
+            try:
+                rows, cash = _sync_targets_after_book(session)
+            except Exception:
+                logger.exception("账面调整后同步目标仓位失败")
+                rows, cash = load_positions(session)
             body = _positions_payload(session, rows, cash)
-        if recorded.warning:
-            body["warning"] = recorded.warning
+        migrate_error = request.app.state.migrate_error
+        if migrate_error:
+            body.update(migrate_error)
+        return body
+
+    @app.post("/api/positions/cash")
+    async def adjust_cash(request: Request):
+        try:
+            payload = await request.json()
+        except Exception:
+            return _error_json(
+                400,
+                error="请求无效",
+                code="INVALID_TRADE",
+                detail="无法解析请求",
+            )
+        if not isinstance(payload, dict):
+            return _error_json(
+                400,
+                error="请求无效",
+                code="INVALID_TRADE",
+                detail="请求体必须是对象",
+            )
+        factory = request.app.state.session_factory
+        with factory() as session:
+            try:
+                set_cash(session, balance=payload.get("balance"))
+            except TradeError as exc:
+                return _error_json(
+                    400,
+                    error=exc.error,
+                    code=exc.code,
+                    detail=exc.detail,
+                )
+            try:
+                rows, cash = _sync_targets_after_book(session)
+            except Exception:
+                logger.exception("现金调整后同步目标仓位失败")
+                rows, cash = load_positions(session)
+            body = _positions_payload(session, rows, cash)
         migrate_error = request.app.state.migrate_error
         if migrate_error:
             body.update(migrate_error)
@@ -1103,32 +1306,16 @@ def create_app(
                 detail="请求体必须是对象",
             )
 
-        key_provided = "api_key" in payload
-        api_key = ""
-        if key_provided:
-            raw_key = payload.get("api_key")
-            if raw_key is None:
-                return _error_json(
-                    400,
-                    error="请求无效",
-                    code="EMPTY_API_KEY",
-                    detail="密钥不能为空",
-                )
-            if not isinstance(raw_key, str):
-                return _error_json(
-                    400,
-                    error="请求无效",
-                    code="EMPTY_API_KEY",
-                    detail="密钥不能为空",
-                )
-            api_key = raw_key.strip()
-            if not api_key or "\n" in api_key or "\r" in api_key:
-                return _error_json(
-                    400,
-                    error="请求无效",
-                    code="EMPTY_API_KEY",
-                    detail="密钥不能为空",
-                )
+        key_provided, api_key, key_error = _secret_from_payload(
+            payload, "api_key", code="EMPTY_API_KEY", detail="密钥不能为空"
+        )
+        if key_error is not None:
+            return key_error
+        search_provided, search_key, search_error = _secret_from_payload(
+            payload, "search_api_key", code="EMPTY_SEARCH_KEY", detail="搜索密钥不能为空"
+        )
+        if search_error is not None:
+            return search_error
 
         url_provided = "base_url" in payload
         base_url = ""
@@ -1158,8 +1345,12 @@ def create_app(
                 model = "" if raw_model is None else str(raw_model).strip()
                 session.merge(Setting(key=LLM_MODEL_KEY, value=model))
             if "web_search" in payload:
-                flag = "true" if _as_bool(payload.get("web_search")) else "false"
-                session.merge(Setting(key=WEB_SEARCH_KEY, value=flag))
+                session.merge(
+                    Setting(
+                        key=WEB_SEARCH_KEY,
+                        value="true" if _truthy(payload.get("web_search")) else "false",
+                    )
+                )
             try:
                 session.commit()
             except Exception as exc:
@@ -1175,6 +1366,9 @@ def create_app(
                 if key_provided:
                     write_env_value(env_file, OPENAI_API_KEY, api_key)
                     hot_load(OPENAI_API_KEY, api_key)
+                if search_provided:
+                    write_env_value(env_file, TAVILY_API_KEY, search_key)
+                    hot_load(TAVILY_API_KEY, search_key)
                 if url_provided:
                     write_env_value(env_file, OPENAI_BASE_URL, base_url)
                     hot_load(OPENAI_BASE_URL, base_url)
@@ -1187,7 +1381,7 @@ def create_app(
                     detail=str(exc),
                 )
             body = _settings_body(request, session)
-        if key_provided or url_provided:
+        if key_provided or search_provided or url_provided:
             body["message"] = "已热加载"
         else:
             body["message"] = "已保存"
@@ -1228,7 +1422,31 @@ def create_app(
                 llm=app.state.llm_client,
                 quote_client=app.state.quote_client,
                 reports_dir=app.state.reports_dir,
+                market=app.state.market_client,
             )
+
+    @app.get("/api/ruler")
+    def get_ruler(request: Request) -> dict[str, object]:
+        factory = request.app.state.session_factory
+        with factory() as session:
+            return ruler_status(session)
+
+    @app.post("/api/ruler")
+    async def post_ruler(request: Request):
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        factory = request.app.state.session_factory
+        with factory() as session:
+            try:
+                activate_ruler(session, payload.get("reason"))
+                session.commit()
+            except RulerError as exc:
+                return _error_json(400, error=exc.error, code=exc.code, detail=exc.detail)
+            return ruler_status(session)
 
     @app.post("/api/screens/funnel")
     async def create_funnel(request: Request):
@@ -1272,6 +1490,10 @@ def create_app(
         )
         factory = request.app.state.session_factory
         with factory() as session:
+            try:
+                require_matched(session)
+            except RulerError as exc:
+                return _error_json(400, error=exc.error, code=exc.code, detail=exc.detail)
             now = datetime.now(timezone.utc)
             run = ScreenRun(
                 user_id=LOCAL_USER_ID,
@@ -1300,6 +1522,31 @@ def create_app(
             run = session.get(ScreenRun, run_id)
             assert run is not None
             return {"id": run.id, "status": run.status, "type": JOB_TYPE_FUNNEL}
+
+    @app.get("/api/screens/boards")
+    def list_screen_boards(
+        request: Request,
+        scope_type: str = Query(""),
+        q: str = Query(""),
+    ):
+        kind = scope_type.strip()
+        if kind not in SCOPE_TYPES:
+            return _error_json(
+                400,
+                error="请求无效",
+                code="INVALID_SCREEN",
+                detail="范围类型仅行业 / 指数 / 主题",
+            )
+        try:
+            boards = request.app.state.market_client.list_boards(kind, q)
+        except MarketError as exc:
+            return _error_json(
+                502,
+                error="行情不可用",
+                code="MARKET_UNAVAILABLE",
+                detail=str(exc),
+            )
+        return {"boards": boards}
 
     @app.get("/api/screens/latest")
     def latest_screen(request: Request):
@@ -1411,12 +1658,13 @@ def create_app(
             return _missing_key_error()
         name = str(payload.get("name") or "").strip()
         code = str(payload.get("code") or "").strip()
-        if not name or not code:
+        query = str(payload.get("query") or "").strip()
+        if not name and not code and not query:
             return _error_json(
                 400,
                 error="请求无效",
                 code="INVALID_RESEARCH",
-                detail="名称和代码不能为空",
+                detail="名称或代码不能为空",
             )
         raw_screen = payload.get("screen_run_id")
         screen_run_id = None
@@ -1434,7 +1682,17 @@ def create_app(
             getattr(request.app.state, "allow_sync", False)
         )
         factory = request.app.state.session_factory
+        market = request.app.state.market_client
         with factory() as session:
+            try:
+                name, code = _resolve_research_target(session, market, name, code, query)
+            except MarketError as exc:
+                return _error_json(
+                    400,
+                    error="解析失败",
+                    code="INVALID_RESEARCH",
+                    detail=str(exc),
+                )
             now = datetime.now(timezone.utc)
             job = ResearchJob(
                 user_id=LOCAL_USER_ID,
@@ -1448,7 +1706,7 @@ def create_app(
             )
             session.add(job)
             session.flush()
-            if not try_acquire(session, job.id, JOB_TYPE_FUNNEL):
+            if not try_acquire(session, job.id, JOB_TYPE_RESEARCH):
                 session.rollback()
                 return _conflict_locked(session)
             session.commit()
@@ -1462,7 +1720,7 @@ def create_app(
         with factory() as session:
             job = session.get(ResearchJob, job_id)
             assert job is not None
-            return {"id": job.id, "status": job.status, "type": JOB_TYPE_FUNNEL}
+            return {"id": job.id, "status": job.status, "type": JOB_TYPE_RESEARCH}
 
     @app.get("/api/research/{research_id}")
     def get_research(request: Request, research_id: int):
@@ -1477,6 +1735,28 @@ def create_app(
                     detail=f"没有评估 {research_id}",
                 )
             return _artifact_payload(session, job)
+
+    @app.get("/api/aftermath")
+    def get_aftermath(request: Request) -> dict[str, object]:
+        factory = request.app.state.session_factory
+        with factory() as session:
+            names = list(
+                {
+                    job.name
+                    for job in session.scalars(
+                        select(ResearchJob).where(
+                            ResearchJob.user_id == LOCAL_USER_ID,
+                            ResearchJob.status == "done",
+                        )
+                    ).all()
+                }
+            )
+            quotes = _quote_map(session, names)
+            prices = {
+                name: (quote.price, price_usable(quote.price, stale=quote.stale))
+                for name, quote in quotes.items()
+            }
+            return {"items": list_aftermath(session, LOCAL_USER_ID, prices=prices)}
 
     @app.get("/api/watchlist")
     def list_watchlist(request: Request) -> dict[str, object]:
@@ -1635,6 +1915,10 @@ def create_app(
                 created_at=now,
                 updated_at=now,
             )
+            depth = str(payload.get("depth") or "reuse").strip()
+            if depth not in {"reuse", "eval_first"}:
+                depth = "reuse"
+            row.structured_json = json.dumps({"depth": depth}, ensure_ascii=False)
             session.add(row)
             session.flush()
             if not try_acquire(session, row.id, JOB_TYPE_REVIEW):
@@ -1673,9 +1957,7 @@ def create_app(
         factory = request.app.state.session_factory
         with factory() as session:
             row = session.scalars(
-                select(PortfolioReview)
-                .where(PortfolioReview.status == "done")
-                .order_by(PortfolioReview.id.desc())
+                select(PortfolioReview).order_by(PortfolioReview.id.desc())
             ).first()
             if row is None:
                 return _error_json(

@@ -38,7 +38,7 @@ def seed_targets_if_empty(
         (row.market_value for row in priced_rows if row.market_value is not None),
         Decimal("0"),
     )
-    cash_dec = Decimal(cash)
+    cash_dec = max(Decimal(cash), Decimal("0"))
     denominator = priced_total + cash_dec
     if denominator <= 0:
         return False
@@ -111,6 +111,12 @@ def save_targets(
     user_id: int = LOCAL_USER_ID,
 ) -> None:
     parsed = _parse_targets(targets)
+    if CASH_NAME not in parsed:
+        raise TargetError(
+            error="目标合计无效",
+            code="INVALID_TARGETS",
+            detail="必须包含 __CASH__",
+        )
     total = sum(parsed.values(), Decimal("0"))
     if abs(total - 1) > SUM_TOLERANCE:
         raise TargetError(

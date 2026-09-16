@@ -107,7 +107,8 @@ def project_positions(
         priced.append((row, quote, price))
         market_values.append(market_value)
 
-    priced_total = sum((mv for mv in market_values if mv is not None), Decimal("0"))
+    weight_values = [mv for mv in market_values if mv is not None]
+    priced_total = sum(weight_values, Decimal("0"))
     denominator = priced_total + Decimal(cash)
     lights = lights_for(
         session,
@@ -121,8 +122,8 @@ def project_positions(
         pnl = None
         if market_value is not None:
             pnl = market_value - row.cost
-            if denominator > 0:
-                weight = market_value / denominator
+        if market_value is not None and denominator > 0:
+            weight = market_value / denominator
         instrument = instruments.get(row.name)
         code = None
         if quote is not None and quote.code:
@@ -199,6 +200,8 @@ def project_book(
 
 
 def rebalance_alerts(quoted: Sequence[QuotedPosition], cash: QuotedCash) -> list[str]:
+    if any(row.market_value is None for row in quoted):
+        return []
     names: list[str] = []
     for row in quoted:
         if row.no_target or row.weight is None or row.target is None:
@@ -316,6 +319,10 @@ def apply_refresh(
     errors: list[RefreshError] = []
     for name, code in targets:
         if code is None or not is_a_share_code(code):
+            existing = session.get(Quote, (user_id, name))
+            if existing is not None and existing.code and is_a_share_code(existing.code):
+                code = existing.code
+        if code is None or not is_a_share_code(code):
             if single:
                 raise QuoteError(
                     error="无法解析代码",
@@ -374,6 +381,33 @@ def instrument_code_by_name(
         select(Instrument).where(Instrument.user_id == user_id)
     ).all()
     return {row.name: row.code for row in rows}
+
+
+def lookup_saved_instrument(
+    session: Session, query: str, *, user_id: int = LOCAL_USER_ID
+) -> tuple[str, str] | None:
+    text = (query or "").strip()
+    if not text:
+        return None
+    by_name = session.scalars(
+        select(Instrument).where(Instrument.user_id == user_id, Instrument.name == text)
+    ).first()
+    if by_name is not None:
+        return by_name.name, by_name.code
+    upper = text.upper()
+    if is_a_share_code(upper):
+        by_code = session.get(Instrument, upper)
+        if by_code is not None and by_code.user_id == user_id:
+            return by_code.name, by_code.code
+    if text.isdigit() and len(text) == 6:
+        rows = session.scalars(
+            select(Instrument).where(
+                Instrument.user_id == user_id, Instrument.code.like(f"{text}.%")
+            )
+        ).all()
+        if len(rows) == 1:
+            return rows[0].name, rows[0].code
+    return None
 
 
 def _upsert_quote(

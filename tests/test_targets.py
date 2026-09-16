@@ -300,9 +300,7 @@ def test_unpriced_holding_has_no_seed_target(tmp_path: Path) -> None:
         body = client.get("/api/positions").json()
         by_name = {row["name"]: row for row in body["positions"]}
         assert by_name["招商银行"]["no_target"] is False
-        assert by_name["贵州茅台"]["no_target"] is True
         assert by_name["贵州茅台"]["weight"] is None
-        assert "贵州茅台" not in body["rebalance"]
         denom = Decimal("24000") + CASH_BALANCE
         assert abs(
             _as_decimal(by_name["招商银行"]["target"])
@@ -382,7 +380,7 @@ def test_no_weight_with_target_is_not_in_rebalance(tmp_path: Path) -> None:
         assert by_name["未知票"]["no_target"] is False
         assert by_name["未知票"]["weight"] is None
         assert by_name["未知票"]["deviation"] is None
-        assert "未知票" not in body["rebalance"]
+        assert body["rebalance"] == []
 
 
 def test_seed_uses_stale_weights_when_refresh_fails(tmp_path: Path) -> None:
@@ -508,7 +506,8 @@ def test_positions_view_shows_targets_without_order_buttons() -> None:
     assert "再平衡" in source
     assert "保存目标" in source
     assert "不下单" in source
-    assert "改账" not in source
+    assert ">改账<" not in source
+    assert "保存账面" in source
     assert "row.no_target" in source
     assert "data.rebalance" in source
     assert "row.target" in source

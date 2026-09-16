@@ -103,7 +103,17 @@ def test_buy_writes_trade_updates_cost_and_cash(tmp_path: Path) -> None:
     assert _as_decimal(_scalar(db_path, "SELECT balance FROM cash")) == Decimal("9000")
 
 
-def test_adjust_unit_cost_keeps_shares_and_rewrites_cash(tmp_path: Path) -> None:
+def test_chinese_buy_direction_is_accepted(tmp_path: Path) -> None:
+    db_path = tmp_path / "app.db"
+    with _client(tmp_path) as client:
+        assert client.get("/api/health").status_code == 200
+        _seed_cash(db_path, "10000")
+        response = client.post("/api/trades", json=_trade_payload(direction="买"))
+        assert 200 <= response.status_code < 300
+    assert _scalar(db_path, "SELECT direction FROM trades") == "buy"
+
+
+def test_adjust_shares_cost_does_not_move_cash(tmp_path: Path) -> None:
     db_path = tmp_path / "app.db"
     with _client(tmp_path) as client:
         assert client.get("/api/health").status_code == 200
@@ -111,50 +121,58 @@ def test_adjust_unit_cost_keeps_shares_and_rewrites_cash(tmp_path: Path) -> None
         assert client.post("/api/trades", json=_trade_payload()).status_code == 200
         response = client.post(
             "/api/positions/adjust",
-            json={"name": "招商银行", "shares": 100, "unit_cost": 12, "date": "2026-08-31"},
+            json={"name": "招商银行", "shares": 80, "unit_cost": 12},
         )
         assert response.status_code == 200
         body = response.json()
         by_name = {row["name"]: row for row in body["positions"]}
-        assert _as_decimal(by_name["招商银行"]["shares"]) == Decimal("100")
-        assert _as_decimal(by_name["招商银行"]["cost"]) == Decimal("1200")
-        assert _as_decimal(body["cash"]["balance"]) == Decimal("8800")
-        notes = _rows(db_path, "SELECT note FROM trades ORDER BY id")
-        assert [row["note"] for row in notes[1:]] == ["表内改成本", "表内改成本"]
+        assert _as_decimal(by_name["招商银行"]["shares"]) == Decimal("80")
+        assert _as_decimal(by_name["招商银行"]["cost"]) == Decimal("960")
+        assert _as_decimal(body["cash"]["balance"]) == Decimal("9000")
+        sell = client.post(
+            "/api/trades",
+            json=_trade_payload(date="2099-01-01", direction="sell", shares=90, price=12),
+        )
+        assert sell.status_code == 400
+        assert sell.json()["code"] == "SELL_EXCEEDS"
+        cash = client.post("/api/positions/cash", json={"balance": 50000})
+        assert cash.status_code == 200
+        assert _as_decimal(cash.json()["cash"]["balance"]) == Decimal("50000")
+        assert _as_decimal(cash.json()["positions"][0]["shares"]) == Decimal("80")
+    assert _scalar(db_path, "SELECT direction FROM trades ORDER BY id DESC LIMIT 1") == "set"
 
 
-def test_adjust_shares_keeps_unit_cost(tmp_path: Path) -> None:
+def test_buy_before_latest_set_is_rejected(tmp_path: Path) -> None:
     db_path = tmp_path / "app.db"
     with _client(tmp_path) as client:
         assert client.get("/api/health").status_code == 200
         _seed_cash(db_path, "10000")
         assert client.post("/api/trades", json=_trade_payload()).status_code == 200
-        response = client.post(
-            "/api/positions/adjust",
-            json={"name": "招商银行", "shares": 150, "unit_cost": 10, "date": "2026-08-31"},
+        assert (
+            client.post(
+                "/api/positions/adjust",
+                json={"name": "招商银行", "shares": 120, "unit_cost": 10},
+            ).status_code
+            == 200
         )
-        assert response.status_code == 200
-        body = response.json()
-        by_name = {row["name"]: row for row in body["positions"]}
-        assert _as_decimal(by_name["招商银行"]["shares"]) == Decimal("150")
-        assert _as_decimal(by_name["招商银行"]["cost"]) == Decimal("1500")
-        assert _as_decimal(body["cash"]["balance"]) == Decimal("8500")
-
-
-def test_adjust_zero_shares_removes_holding(tmp_path: Path) -> None:
-    db_path = tmp_path / "app.db"
-    with _client(tmp_path) as client:
-        assert client.get("/api/health").status_code == 200
-        _seed_cash(db_path, "10000")
-        assert client.post("/api/trades", json=_trade_payload()).status_code == 200
-        response = client.post(
-            "/api/positions/adjust",
-            json={"name": "招商银行", "shares": 0, "date": "2026-08-31"},
+        before = client.get("/api/positions").json()
+        backfill = client.post(
+            "/api/trades",
+            json=_trade_payload(date="2026-06-01", shares=50, price=9),
         )
-        assert response.status_code == 200
-        body = response.json()
-        assert "招商银行" not in {row["name"] for row in body["positions"]}
-        assert _as_decimal(body["cash"]["balance"]) == Decimal("10000")
+        assert backfill.status_code == 400
+        assert backfill.json()["code"] == "BEFORE_SET"
+        after = client.get("/api/positions").json()
+        by_name = {row["name"]: row for row in after["positions"]}
+        assert _as_decimal(by_name["招商银行"]["shares"]) == Decimal("120")
+        assert after["cash"] == before["cash"]
+        later = client.post(
+            "/api/trades",
+            json=_trade_payload(date="2099-01-01", shares=50, price=10),
+        )
+        assert later.status_code == 200
+        by_name = {row["name"]: row for row in later.json()["positions"]}
+        assert _as_decimal(by_name["招商银行"]["shares"]) == Decimal("170")
 
 
 def test_sell_reduces_average_cost_and_adds_cash(tmp_path: Path) -> None:
@@ -288,7 +306,7 @@ def test_invalid_trade_payload_returns_400_envelope(tmp_path: Path) -> None:
         _trade_payload(price="Infinity"),
         _trade_payload(date="2026/08/28"),
         _trade_payload(date="not-a-date"),
-        _trade_payload(direction="买"),
+        _trade_payload(direction="hold"),
     ]
     with _client(tmp_path) as client:
         assert client.get("/api/health").status_code == 200
@@ -391,25 +409,18 @@ def test_buy_after_migrate_moves_yaml_cash_not_replay(tmp_path: Path) -> None:
     )
 
 
-def test_positions_view_has_buy_sell_form_without_editable_shares() -> None:
+def test_positions_view_can_edit_shares_cost_and_cash() -> None:
     source = (ROOT / "web/src/views/PositionsView.vue").read_text(encoding="utf-8")
     assert "/api/trades" in source
-    assert "买" in source
-    assert "卖" in source
-    assert '"buy"' in source
-    assert '"sell"' in source
-    assert "row.shares" in source
-    assert "shareDraft" in source
-    assert "unitCostDraft" in source
-    assert "commitBasis" in source
     assert "/api/positions/adjust" in source
-    assert "draftCashBalance" in source
-    assert "draftCostOf" in source
-    assert "表内改成本" in source or "commitBasis" in source
+    assert "/api/positions/cash" in source
+    assert "保存账面" in source
+    assert "股数、成本单价、现金可直接改" in source
+    assert "只读" not in source
     assert "applyBook" in source
-    assert "formError" in source
-    assert "data.detail" in source
     table = source.split('<table class="book"')[1].split("</table>")[0]
+    assert "bookForm[row.name].shares" in table
+    assert "bookForm[row.name].unit_cost" in table
+    assert "cashForm" in table
     assert 'v-model="form' not in table
     assert "form.shares" not in table
-    assert "contenteditable" not in table.lower()

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import time
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from threading import Event
@@ -9,6 +11,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 
 from app.main import create_app
+from app.models import Quote, ResearchJob, Thesis
 from market.eastmoney import FakeMarketClient
 from market.quotes import FakeQuoteClient
 from market.types import Constituent, FinancialRow
@@ -127,7 +130,18 @@ def _success_market() -> FakeMarketClient:
         + _annual("600001.SH", roe="16")
         + _annual("BAD", roe="16")
     )
-    return FakeMarketClient(snaps, rows, listed_years={"600036.SH": 2002})
+    return FakeMarketClient(
+        snaps,
+        rows,
+        listed_years={"600036.SH": 2002},
+        valuations={
+            "600036.SH": {
+                "bps": Decimal("45.4"),
+                "npl_pct": Decimal("0.94"),
+                "eps": Decimal("2.98"),
+            }
+        },
+    )
 
 
 def test_screen_success_three_states_no_api_key(tmp_path: Path, monkeypatch) -> None:
@@ -174,6 +188,10 @@ def test_screen_success_three_states_no_api_key(tmp_path: Path, monkeypatch) -> 
         assert roles["优质大盘"] == "high_certainty"
         assert roles["优质中盘"] == "mid_elasticity"
         assert roles["弹性小盘"] == "high_elasticity"
+        big = next(row for row in data["keep"] if row["name"] == "优质大盘")
+        assert "price" in big
+        assert "expected_price" in big
+        assert "gap_pct" in big
         job = client.get(f"/api/jobs/{screen_id}")
         assert job.status_code == 200
         assert job.json()["status"] == "done"
@@ -184,6 +202,81 @@ def test_screen_success_three_states_no_api_key(tmp_path: Path, monkeypatch) -> 
 
     assert _scalar(db_path, "SELECT COUNT(*) FROM screen_results") >= 6
     assert _scalar(db_path, "SELECT COUNT(*) FROM screen_runs") == 1
+
+
+def test_keep_list_includes_price_expected_and_gap(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    with _client(tmp_path, market=_success_market()) as client:
+        created = client.post(
+            "/api/screens/funnel",
+            json={"scope_type": "行业", "scope_text": "银行", "evaluate": False, "sync": True},
+        )
+        assert created.status_code == 200
+        screen_id = created.json()["id"]
+        factory = client.app.state.session_factory
+        with factory() as session:
+            now = datetime.now(timezone.utc)
+            job = ResearchJob(
+                user_id=1,
+                name="优质大盘",
+                code="600036.SH",
+                status="done",
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(job)
+            session.flush()
+            session.add(
+                Quote(
+                    user_id=1,
+                    name="优质大盘",
+                    code="600036.SH",
+                    price=Decimal("40"),
+                    source="auto",
+                    updated_at=now,
+                    stale=False,
+                )
+            )
+            session.add(
+                Thesis(
+                    user_id=1,
+                    name="优质大盘",
+                    research_job_id=job.id,
+                    verdict="pass",
+                    structured_json=json.dumps(
+                        {
+                            "verdict": "pass",
+                            "price_bands": {
+                                "mode": "steady",
+                                "aggressive": "30",
+                                "steady": "50",
+                                "conservative": "60",
+                            },
+                        },
+                        ensure_ascii=False,
+                    ),
+                    last_event="established",
+                )
+            )
+            session.commit()
+        data = client.get(f"/api/screens/{screen_id}").json()
+        big = next(row for row in data["keep"] if row["name"] == "优质大盘")
+        assert big["price"] == 40
+        assert big["expected_price"] == 50
+        assert big["gap_pct"] == 25
+
+
+def test_list_screen_boards(tmp_path: Path) -> None:
+    with _client(tmp_path) as client:
+        missing = client.get("/api/screens/boards")
+        assert missing.status_code == 400
+        _assert_error_envelope(missing.json())
+        listed = client.get("/api/screens/boards", params={"scope_type": "行业", "q": "机械"})
+        assert listed.status_code == 200
+        names = [row["name"] for row in listed.json()["boards"]]
+        assert "机械设备" in names
+        assert "机械重工" in names
 
 
 def test_latest_screen_404_when_empty(tmp_path: Path) -> None:
@@ -427,6 +520,114 @@ def test_funnel_fcf_drop_and_held_industry_sort() -> None:
     assert any(row.name == "负FCF" and "自由现金流" in (row.reason or "") for row in result.drop)
 
 
+def test_funnel_share_expansion_unknown_ma_is_insufficient() -> None:
+    snaps = [_snap("600036.SH", "扩股", "200")]
+    common = dict(
+        code="600036.SH",
+        period_type="annual",
+        roe=Decimal("18"),
+        net_income=Decimal("100"),
+        ocf=Decimal("100"),
+        capex=Decimal("20"),
+        ebit=Decimal("40"),
+        interest=Decimal("5"),
+        gross_margin=Decimal("40"),
+        net_margin=Decimal("10"),
+        share_change_ma=None,
+    )
+    rows = [
+        FinancialRow(**common, period="2025", shares=Decimal("130")),
+        FinancialRow(**common, period="2021", shares=Decimal("100")),
+    ]
+    result = run_funnel(snaps, rows, as_of_year=2026)
+    assert result.drop == []
+    assert any(row.name == "扩股" and row.verdict == "keep" for row in result.keep)
+    gaps = (result.keep[0].metrics or {}).get("gaps") or []
+    assert "无法识别股本膨胀是否并购" in gaps
+
+
+def test_funnel_bank_skips_interest_only() -> None:
+    snaps = [_snap("600036.SH", "银行", "200", industry="银行")]
+    rows = _annual("600036.SH", roe="18", ocf="100", capex="20", gm="40", ebit="1", interest="10")
+    result = run_funnel(snaps, rows, as_of_year=2026)
+    assert any(row.name == "银行" and row.verdict == "keep" for row in result.keep)
+    bad_fcf = _annual("600036.SH", roe="18", ocf="10", capex="40", gm="40")
+    dropped = run_funnel(snaps, bad_fcf, as_of_year=2026)
+    assert any(row.name == "银行" and "自由现金流" in (row.reason or "") for row in dropped.drop)
+
+
+def test_funnel_retail_industry_does_not_exempt() -> None:
+    snaps = [_snap("000001.SZ", "零售", "200", industry="互联网零售")]
+    rows = _annual("000001.SZ", roe="25", ocf="120", ni="100", gm="8")
+    result = run_funnel(snaps, rows, as_of_year=2026)
+    assert any(row.name == "零售" and row.verdict == "drop" for row in result.drop)
+
+
+def test_funnel_thin_model_exempts_gross_margin() -> None:
+    snaps = [
+        Constituent(
+            code="000001.SZ",
+            name="平台",
+            mcap=Decimal("200"),
+            pe=Decimal("8"),
+            industry="互联网零售",
+            business_model="平台佣金",
+        )
+    ]
+    rows = _annual("000001.SZ", roe="25", ocf="120", ni="100", gm="8")
+    result = run_funnel(snaps, rows, as_of_year=2026)
+    assert any(row.name == "平台" and row.verdict == "keep" for row in result.keep)
+
+
+def test_funnel_exemption_a_and_b_keep() -> None:
+    snaps = [
+        _snap("600036.SH", "豁免A", "200"),
+        _snap("600519.SH", "豁免B", "180"),
+    ]
+    common_b = dict(
+        code="600519.SH",
+        period_type="annual",
+        roe=Decimal("18"),
+        net_income=Decimal("100"),
+        ocf=Decimal("100"),
+        capex=Decimal("20"),
+        ebit=Decimal("40"),
+        interest=Decimal("5"),
+        gross_margin=Decimal("35"),
+        shares=Decimal("100"),
+    )
+    rows = _annual("600036.SH", roe="5", gm="35", start=2022, years=4) + [
+        FinancialRow(**common_b, period="2025", net_margin=Decimal("6")),
+        FinancialRow(**common_b, period="2024", net_margin=Decimal("3")),
+    ]
+    result = run_funnel(
+        snaps,
+        rows,
+        listed_years={"600036.SH": 2020, "600519.SH": 2002},
+        as_of_year=2026,
+    )
+    names = {row.name for row in result.keep}
+    assert "豁免A" in names
+    assert "豁免B" in names
+
+
+def test_funnel_empty_bucket_fills_from_mcap() -> None:
+    snaps = [
+        _snap("600036.SH", "甲", "300"),
+        _snap("600519.SH", "乙", "200"),
+        _snap("000001.SZ", "丙", "100"),
+    ]
+    rows = (
+        _annual("600036.SH", roe="12")
+        + _annual("600519.SH", roe="12")
+        + _annual("000001.SZ", roe="12")
+    )
+    result = run_funnel(snaps, rows, as_of_year=2026)
+    assert len(result.keep) == 3
+    assert len(result.finalists) == 3
+    assert {row.name for row in result.finalists} == {"甲", "乙", "丙"}
+
+
 def test_funnel_share_expansion_non_ma_drops() -> None:
     snaps = [_snap("600036.SH", "扩股", "200")]
     common = dict(
@@ -467,11 +668,21 @@ def test_screen_view_has_three_chinese_tables_not_json() -> None:
     assert "数据不足" in source
     assert "终选" in source
     assert "/api/screens/funnel" in source
+    assert "现价" in source
+    assert "预期价格" in source
+    assert "差距" in source
+    assert "/api/ruler" in source
     assert "/api/screens/" in source
     assert "/api/screens/latest" in source
+    assert "/api/screens/boards" in source
+    assert "loadBoards" in source
+    assert "suggest" in source
     assert "loadLatest" in source
     assert "activeId" in source
     assert "评估终选" in source
+    assert "评估 Checklist" in source
+    assert "/api/research" in source
+    assert "startSingle" in source
     assert "今日推荐" not in source
     assert "收益排行" not in source
     assert "<pre" not in source.lower()

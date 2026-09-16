@@ -17,6 +17,7 @@ from app.models import (
     Setting,
 )
 from jobs.lock import release
+from jobs.research import _run_one as run_research_one, load_book_dict, web_search_enabled
 from ledger.positions import LOCAL_USER_ID, load_positions
 from ledger.quotes import (
     BookSnapshot,
@@ -180,6 +181,7 @@ def execute_review(
     llm,
     quote_client,
     reports_dir: Path,
+    market=None,
 ) -> None:
     row = session.get(PortfolioReview, review_id)
     if row is None:
@@ -196,6 +198,7 @@ def execute_review(
             llm=llm,
             quote_client=quote_client,
             reports_dir=reports_dir,
+            market=market,
         )
     finally:
         try:
@@ -206,6 +209,60 @@ def execute_review(
             logger.exception("释放任务锁失败")
 
 
+def _review_depth(row: PortfolioReview) -> str:
+    try:
+        payload = json.loads(row.structured_json or "")
+    except json.JSONDecodeError:
+        return "reuse"
+    if isinstance(payload, dict) and payload.get("depth") == "eval_first":
+        return "eval_first"
+    return "reuse"
+
+
+def _evaluate_missing_theses(
+    session: Session,
+    names: list[str],
+    *,
+    llm,
+    quote_client,
+    reports_dir: Path,
+    market,
+) -> None:
+    have = load_by_names(session, LOCAL_USER_ID, names)
+    mapping = instrument_code_by_name(session)
+    book = load_book_dict(session)
+    as_of = _now().date().isoformat()
+    for name in names:
+        if name in have:
+            continue
+        code = mapping.get(name)
+        if not code or not is_a_share_code(code):
+            continue
+        job = ResearchJob(
+            user_id=LOCAL_USER_ID,
+            screen_run_id=None,
+            name=name,
+            code=code,
+            status="queued",
+            error=None,
+            created_at=_now(),
+            updated_at=_now(),
+        )
+        session.add(job)
+        session.commit()
+        run_research_one(
+            session,
+            job,
+            llm=llm,
+            quote_client=quote_client,
+            reports_dir=reports_dir,
+            book=book,
+            web_search=web_search_enabled(session),
+            as_of_date=as_of,
+            market=market,
+        )
+
+
 def _run_one(
     session: Session,
     row: PortfolioReview,
@@ -213,6 +270,7 @@ def _run_one(
     llm,
     quote_client,
     reports_dir: Path,
+    market=None,
 ) -> None:
     row.status = "running"
     row.updated_at = _now()
@@ -230,6 +288,15 @@ def _run_one(
             for item in snapshot.get("positions", [])
             if isinstance(item, dict) and item.get("name")
         ]
+        if _review_depth(row) == "eval_first":
+            _evaluate_missing_theses(
+                session,
+                names,
+                llm=llm,
+                quote_client=quote_client,
+                reports_dir=reports_dir,
+                market=market,
+            )
         evaluations = load_current_theses(
             session,
             names,

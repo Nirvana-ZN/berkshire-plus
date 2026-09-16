@@ -14,6 +14,7 @@ ADD_CEILING_TYPE = "加仓上限价"
 LIGHT_HIT = "hit"
 LIGHT_CLEAR = "clear"
 LIGHT_NONE = "none"
+LIGHT_UNKNOWN = "unknown"
 
 
 def _finite_price(value: object) -> Decimal | None:
@@ -131,8 +132,11 @@ def lights_for(
     lights: dict[str, str] = {}
     for name, price in named_prices.items():
         caps = ceilings.get(name)
-        if not caps or price is None or not price.is_finite() or price <= 0:
+        if not caps:
             lights[name] = LIGHT_NONE
+            continue
+        if price is None or not price.is_finite() or price <= 0:
+            lights[name] = LIGHT_UNKNOWN
             continue
         if any(price >= cap for cap in caps):
             lights[name] = LIGHT_HIT

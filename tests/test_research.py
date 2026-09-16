@@ -8,7 +8,7 @@ from threading import Event
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 
-from app.envfile import OPENAI_API_KEY, write_env_value
+from app.envfile import OPENAI_API_KEY, TAVILY_API_KEY, write_env_value
 from app.main import create_app
 from market.eastmoney import FakeMarketClient
 from market.quotes import FakeQuoteClient
@@ -225,6 +225,45 @@ def test_missing_quote_is_gray_without_invented_numbers(tmp_path: Path) -> None:
         assert INVENTED not in got["markdown"]
 
 
+def test_eval_uses_saved_quote_when_live_price_misses(tmp_path: Path) -> None:
+    _write_key(tmp_path)
+    db_path = tmp_path / "app.db"
+    with _client(tmp_path, quote=FakeQuoteClient(failures=["000999.SZ"])) as client:
+        assert client.get("/api/health").status_code == 200
+        assert client.post(
+            "/api/instruments", json={"name": "华润三九", "code": "000999.SZ"}
+        ).status_code == 200
+        assert client.post(
+            "/api/quotes/manual", json={"name": "华润三九", "price": "24.67"}
+        ).status_code == 200
+        engine = _engine(db_path)
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO financials "
+                    "(code, period, period_type, roe, net_income, bps) "
+                    "VALUES ('000999.SZ', '2025', 'annual', 16, 1, 13)"
+                )
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO financials "
+                    "(code, period, period_type, roe, net_income, bps) "
+                    "VALUES ('000999.SZ', '2026H1', 'interim', 7, 1, 13)"
+                )
+            )
+        created = client.post(
+            "/api/research",
+            json={"name": "华润三九", "code": "000999.SZ", "sync": True},
+        )
+        assert created.status_code == 200
+        body = client.get(f"/api/research/{created.json()['id']}").json()
+        assert body["status"] == "done"
+        assert body["as_of"]["price"] == 24.67
+        reasons = [row["reason"] for row in body["gates"]]
+        assert "财务或行情不足，不编造数字。" not in reasons
+
+
 def test_no_web_search_does_not_say_no_financials(tmp_path: Path) -> None:
     _write_key(tmp_path)
     with _client(tmp_path) as client:
@@ -239,6 +278,57 @@ def test_no_web_search_does_not_say_no_financials(tmp_path: Path) -> None:
         assert body["status"] == "done"
         assert "无财务" not in body["markdown"]
         assert "已抓取财务" in body["markdown"]
+
+
+def test_web_search_injects_hits_into_prompt(tmp_path: Path, monkeypatch) -> None:
+    _write_key(tmp_path)
+    write_env_value(tmp_path / ".env", TAVILY_API_KEY, "tvly-test")
+    monkeypatch.setenv(TAVILY_API_KEY, "tvly-test")
+    monkeypatch.setattr(
+        "research.evaluate.fetch_hits",
+        lambda *_args, **_kwargs: [
+            {"title": "中报", "url": "https://example.com/h1", "content": "销量下降 2.87%"}
+        ],
+    )
+    llm = FakeLLM()
+    with _client(tmp_path, llm=llm) as client:
+        client.post("/api/settings", json={"web_search": True})
+        created = client.post(
+            "/api/screens/funnel",
+            json={"scope_type": "行业", "scope_text": "银行", "evaluate": True, "sync": True},
+        )
+        job_id = client.get(f"/api/screens/{created.json()['id']}").json()["jobs"][0]["id"]
+        body = client.get(f"/api/research/{job_id}").json()
+        assert body["status"] == "done"
+        assert llm.prompts
+        assert "销量下降 2.87%" in llm.prompts[0]
+        assert "禁止用摘要改写已抓取财务或估值快照里的数字" in llm.prompts[0]
+        assert "已开启网页搜索" in body["markdown"]
+        assert "无财务" not in body["markdown"]
+
+
+def test_cninfo_notices_reach_research_prompt(tmp_path: Path) -> None:
+    _write_key(tmp_path)
+    llm = FakeLLM()
+    market = _success_market()
+    market.notices = [
+        {
+            "date": "2026-08-20",
+            "title": "2026年半年度报告：不分配不转增",
+            "url": "https://www.cninfo.com.cn/x",
+        }
+    ]
+    with _client(tmp_path, llm=llm, market=market) as client:
+        created = client.post(
+            "/api/screens/funnel",
+            json={"scope_type": "行业", "scope_text": "银行", "evaluate": True, "sync": True},
+        )
+        job_id = client.get(f"/api/screens/{created.json()['id']}").json()["jobs"][0]["id"]
+        body = client.get(f"/api/research/{job_id}").json()
+        assert body["status"] == "done"
+        assert llm.prompts
+        assert "不分配不转增" in llm.prompts[0]
+        assert "巨潮公告" in body["markdown"]
 
 
 def test_one_child_failure_keeps_funnel_list(tmp_path: Path) -> None:
@@ -326,7 +416,7 @@ def test_standalone_research_uses_same_lock(tmp_path: Path) -> None:
                 break
             time.sleep(0.05)
         assert lock is not None
-        assert lock["type"] == "funnel"
+        assert lock["type"] == "research"
         second = client.post(
             "/api/screens/funnel",
             json={"scope_type": "行业", "scope_text": "银行", "evaluate": False},
@@ -362,10 +452,20 @@ def test_screen_and_research_views_are_not_json() -> None:
     research = (ROOT / "web/src/views/ResearchView.vue").read_text(encoding="utf-8")
     router = (ROOT / "web/src/router/index.ts").read_text(encoding="utf-8")
     assert "评估终选" in screen
+    assert "评估 Checklist" in screen
+    assert "名称或代码" in screen
+    assert "startSingle" in screen
+    assert "single_query" in screen
     assert "evaluate" in screen
     assert "评估子任务" in screen
     assert "/research/" in screen
+    assert "激进" in research
+    assert "稳健" in research
+    assert "保守" in research
+    assert "观望" in research
+    assert "便宜买" not in research
     assert "结论条" in research
+    assert "中周期对照市盈率" in research
     assert "已立为论文" in research
     assert "已更新论文" in research
     assert "镜子测试" in research
@@ -386,15 +486,26 @@ def test_positions_view_has_per_holding_research_entry() -> None:
     assert "useRouter" in source
     table = source.split('<table class="book"')[1].split("</table>")[0]
     assert "评估" in table
+    assert "<th>评估</th>" in table
+    assert "<th>收益率</th>" in table
     assert "论文" in table
+    assert table.index("<th>评估</th>") < table.index("<th>现价</th>")
+    assert table.index("<th>现价</th>") < table.index("<th>收益率</th>")
+    price_cell = table.split("formatNumber(row.price)")[1].split("draftReturnOf")[0]
+    assert "startResearch" not in price_cell
+    assert "评估" not in price_cell
     assert "openThesis" in source
     assert "thesis_status" in source
+    assert "thesis-fail" in source
+    assert "不通过" in source
     assert "<button" not in table.lower()
     assert "<a " not in table.lower()
     assert "form.shares" not in table
     cash = table.split('class="cash-row"')[1]
     assert "评估" not in cash
+    assert "收益率" not in cash
     assert "startResearch" not in cash
+    assert "draftReturnOf" not in cash
     assert "openThesis" not in cash
     assert "无论文" not in cash
     assert "一键审视" in source
@@ -426,20 +537,17 @@ def test_evaluate_holds_lock_until_children_finish(tmp_path: Path) -> None:
         )
         assert first.status_code == 200
         first_id = first.json()["id"]
+        jobs = []
         screen_status = ""
         for _ in range(80):
-            screen_status = client.get(f"/api/screens/{first_id}").json()["status"]
-            if screen_status == "done":
-                break
-            time.sleep(0.05)
-        assert screen_status == "done"
-        jobs = []
-        for _ in range(40):
-            jobs = client.get(f"/api/screens/{first_id}").json()["jobs"]
-            if jobs:
+            body = client.get(f"/api/screens/{first_id}").json()
+            screen_status = body["status"]
+            jobs = body.get("jobs") or []
+            if jobs and any(job["status"] in {"queued", "running"} for job in jobs):
                 break
             time.sleep(0.05)
         assert jobs
+        assert screen_status == "running"
         assert any(job["status"] in {"queued", "running"} for job in jobs)
         lock = client.get("/api/health").json()["lock"]
         assert lock is not None
@@ -550,6 +658,25 @@ def test_startup_clears_leftover_research_jobs(tmp_path: Path) -> None:
         assert leftover == "failed|进程重启，任务中断"
 
 
+def test_research_prompt_includes_valuation_snapshot(tmp_path: Path) -> None:
+    _write_key(tmp_path)
+    llm = FakeLLM()
+    with _client(tmp_path, llm=llm) as client:
+        created = client.post(
+            "/api/research",
+            json={"name": "优质大盘", "code": "600036.SH", "sync": True},
+        )
+        assert created.status_code == 200
+        body = client.get(f"/api/research/{created.json()['id']}").json()
+        assert body.get("valuation", {}).get("bps") == 45.4
+        assert llm.prompts
+        prompt = llm.prompts[0]
+        assert "估值快照" in prompt
+        assert "每股净资产" in prompt
+        assert "45.4" in prompt
+        assert "0.94" in prompt
+
+
 def test_standalone_research_fetches_financials_when_cache_empty(tmp_path: Path) -> None:
     _write_key(tmp_path)
     db_path = tmp_path / "app.db"
@@ -606,4 +733,34 @@ def test_gray_portfolio_fit_names_current_holding(tmp_path: Path) -> None:
         assert "招商银行" in fit["overlap"]
         assert "空仓" not in fit["should_enter"]
         assert "招商银行" in body["markdown"]
+
+
+def test_research_accepts_name_or_code_only(tmp_path: Path) -> None:
+    _write_key(tmp_path)
+    with _client(tmp_path) as client:
+        by_name = client.post("/api/research", json={"query": "优质大盘", "sync": True})
+        assert by_name.status_code == 200
+        named = client.get(f"/api/research/{by_name.json()['id']}").json()
+        assert named["name"] == "优质大盘"
+        assert named["code"] == "600036.SH"
+        assert named["status"] == "done"
+
+        by_code = client.post("/api/research", json={"query": "600036.SH", "sync": True})
+        assert by_code.status_code == 200
+        coded = client.get(f"/api/research/{by_code.json()['id']}").json()
+        assert coded["name"] == "优质大盘"
+        assert coded["code"] == "600036.SH"
+
+        digits = client.post("/api/research", json={"name": "600036", "sync": True})
+        assert digits.status_code == 200
+        assert client.get(f"/api/research/{digits.json()['id']}").json()["code"] == "600036.SH"
+
+        missing = client.post("/api/research", json={"query": "火星矿业", "sync": True})
+        assert missing.status_code == 400
+        _assert_error_envelope(missing.json())
+        assert "解析不到明确个股" in missing.json()["detail"]
+
+        empty = client.post("/api/research", json={"query": "  ", "sync": True})
+        assert empty.status_code == 400
+        assert "名称或代码不能为空" in empty.json()["detail"]
 

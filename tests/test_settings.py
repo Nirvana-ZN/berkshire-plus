@@ -6,7 +6,13 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 
-from app.envfile import OPENAI_API_KEY, OPENAI_BASE_URL, read_env_value, write_env_value
+from app.envfile import (
+    OPENAI_API_KEY,
+    OPENAI_BASE_URL,
+    TAVILY_API_KEY,
+    read_env_value,
+    write_env_value,
+)
 from app.main import create_app
 from market.quotes import FakeQuoteClient
 
@@ -51,7 +57,7 @@ def _assert_settings_table_has_no_secret(db_path: Path, secret: str = SECRET) ->
     for row in rows:
         assert secret not in str(row["key"])
         assert secret not in str(row["value"])
-        assert row["key"] not in {"OPENAI_API_KEY", "api_key"}
+        assert row["key"] not in {"OPENAI_API_KEY", "api_key", "TAVILY_API_KEY", "search_api_key"}
 
 
 def test_save_key_and_model_writes_env_not_table(tmp_path: Path, monkeypatch) -> None:
@@ -69,6 +75,7 @@ def test_save_key_and_model_writes_env_not_table(tmp_path: Path, monkeypatch) ->
         assert body["has_api_key"] is True
         assert body["llm_model"] == "gpt-test"
         assert body["web_search"] is True
+        assert body["has_search_key"] is False
         assert "已热加载" in body["message"]
         assert SECRET not in response.text
         assert "api_key" not in body
@@ -81,6 +88,7 @@ def test_save_key_and_model_writes_env_not_table(tmp_path: Path, monkeypatch) ->
         assert listed["has_api_key"] is True
         assert listed["llm_model"] == "gpt-test"
         assert listed["web_search"] is True
+        assert listed["has_search_key"] is False
         assert SECRET not in got.text
         assert "api_key" not in listed
         _assert_no_secret(listed)
@@ -151,6 +159,7 @@ def test_model_only_does_not_touch_env(tmp_path: Path) -> None:
         body = response.json()
         assert body["llm_model"] == "only-model"
         assert body["web_search"] is True
+        assert body["has_search_key"] is False
         assert body["has_api_key"] is True
         assert body["message"] == "已保存"
         assert "api_key" not in body
@@ -190,7 +199,10 @@ def test_settings_view_form_does_not_echo_key() -> None:
     assert "llm_model" in source
     assert "llm_base_url" in source
     assert "接口地址" in source
-    assert "web_search" in source
+    assert "网页搜索" in source
+    assert "search_api_key" in source
+    assert "has_search_key" in source
+    assert "没有网页搜索" not in source
     assert "已迁入" in source
     assert "未迁入" in source
     assert "迁入路径" in source
@@ -208,12 +220,40 @@ def test_web_search_defaults_false_and_model_may_be_empty(tmp_path: Path) -> Non
         assert listed["llm_model"] == ""
         assert listed["llm_base_url"] == ""
         assert listed["web_search"] is False
+        assert listed["has_search_key"] is False
         saved = client.post("/api/settings", json={"model": "", "web_search": False})
         assert saved.status_code == 200
         body = saved.json()
         assert body["llm_model"] == ""
         assert body["web_search"] is False
         assert body["has_api_key"] is False
+        assert body["has_search_key"] is False
+
+
+def test_save_search_key_writes_env_not_table(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv(TAVILY_API_KEY, raising=False)
+    env_path = tmp_path / ".env"
+    db_path = tmp_path / "app.db"
+    search_secret = "tvly-test-do-not-leak"
+    with _client(tmp_path) as client:
+        response = client.post(
+            "/api/settings",
+            json={"search_api_key": search_secret, "web_search": True},
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["has_search_key"] is True
+        assert body["web_search"] is True
+        assert search_secret not in response.text
+        assert "search_api_key" not in body
+        assert TAVILY_API_KEY not in body
+        listed = client.get("/api/settings").json()
+        assert listed["has_search_key"] is True
+        assert listed["web_search"] is True
+        assert search_secret not in str(listed)
+    assert read_env_value(env_path, TAVILY_API_KEY) == search_secret
+    assert os.environ[TAVILY_API_KEY] == search_secret
+    _assert_settings_table_has_no_secret(db_path, search_secret)
 
 
 def test_startup_loads_key_from_env_file(tmp_path: Path, monkeypatch) -> None:

@@ -200,9 +200,10 @@ def test_bulk_refresh_without_code_is_2xx_with_errors(tmp_path: Path) -> None:
         assert by_name["未知票"]["price"] is None
         assert by_name["未知票"]["market_value"] is None
         assert by_name["未知票"]["pnl"] is None
-        assert by_name["未知票"]["weight"] is None
         cash_after = _as_decimal(body["cash"]["balance"])
         denom = Decimal("4000") + cash_after
+        assert by_name["未知票"]["weight"] is None
+        assert by_name["未知票"]["market_value"] is None
         assert abs(_as_decimal(by_name["招商银行"]["weight"]) - Decimal("4000") / denom) < Decimal(
             "1e-9"
         )
@@ -493,16 +494,21 @@ def test_positions_view_has_quote_columns_and_forms() -> None:
     assert "市值" in source
     assert "占比" in source
     assert "浮盈亏" in source
+    assert "收益率" in source
     assert "过期" in source
     assert "刷新现价" in source
     assert "补代码" in source
     assert "手工价" in source
-    assert "自动" in source
     assert "手工" in source
     assert 'v-if="row.stale"' in source
-    assert "sourceLabel(row.source)" in source
+    assert "isManualQuote(row.source)" in source
     assert "data.errors" in source
     table = source.split('<table class="book"')[1].split("</table>")[0]
+    price_cell = table.split("formatNumber(row.price)")[1].split("formatWeight")[0]
+    assert "自动" not in price_cell
+    assert "手工" in price_cell
+    assert "<th>收益率</th>" in table
+    assert "row.market_value" in table
     assert "form.shares" not in table
     assert "contenteditable" not in table.lower()
     assert 'v-model="form' not in table
