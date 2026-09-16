@@ -95,12 +95,13 @@ class DiscoveryRequestGate:
         self._deadline = run_started + timedelta(
             seconds=self.policy.max_runtime_seconds
         )
-        self._next_request_at = (
-            None
-            if fill.last_request_at is None
-            else _aware_utc(fill.last_request_at)
-            + timedelta(seconds=1 / self.policy.requests_per_second)
-        )
+        interval = timedelta(seconds=1 / self.policy.requests_per_second)
+        if fill.last_request_at is not None:
+            self._next_request_at = _aware_utc(fill.last_request_at) + interval
+        elif fill.request_count > 0:
+            self._next_request_at = _aware_utc(self.clock.now()) + interval
+        else:
+            self._next_request_at = None
 
     def __call__(self) -> None:
         now = _aware_utc(self.clock.now())
@@ -468,8 +469,6 @@ def execute_discovery_data_fill(
                                 result,
                                 _aware_utc(timer.now()),
                             )
-                            if checkpoint.attempts > 1:
-                                fill.last_error = None
                     except Exception as exc:
                         session.rollback()
                         fill = session.get(DiscoveryDataFill, fill_id)
@@ -508,6 +507,19 @@ def execute_discovery_data_fill(
         fill = session.get(DiscoveryDataFill, fill_id)
         if fill is not None:
             _pause_running_checkpoints(session, fill, _aware_utc(timer.now()))
+            unresolved = session.scalars(
+                select(DiscoveryDataCheckpoint)
+                .where(
+                    DiscoveryDataCheckpoint.fill_id == fill.id,
+                    DiscoveryDataCheckpoint.status != "done",
+                    DiscoveryDataCheckpoint.error.is_not(None),
+                )
+                .order_by(
+                    DiscoveryDataCheckpoint.updated_at.desc(),
+                    DiscoveryDataCheckpoint.code,
+                )
+            ).first()
+            fill.last_error = None if unresolved is None else unresolved.error
         release(session, fill_id, JOB_TYPE_DISCOVERY_DATA)
         session.commit()
 

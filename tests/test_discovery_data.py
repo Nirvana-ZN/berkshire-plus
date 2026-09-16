@@ -3122,6 +3122,104 @@ def test_successful_retry_clears_checkpoint_and_fill_errors(tmp_path) -> None:
     engine.dispose()
 
 
+def test_recovered_success_does_not_hide_other_terminal_failure(
+    tmp_path,
+) -> None:
+    from jobs.discovery_data import RequestPolicy, execute_discovery_data_fill
+
+    engine = init_db(tmp_path / "mixed-recovery.db")
+    factory = create_session_factory(engine)
+    now = datetime(2026, 9, 16, 12, tzinfo=timezone.utc)
+    failed_code = "000001.SZ"
+    recovered_code = "000002.SZ"
+    with factory() as session:
+        fill = _fill(
+            session,
+            [failed_code, recovered_code],
+            now=now,
+            status="paused",
+        )
+        for code in (failed_code, recovered_code):
+            checkpoint = session.get(
+                DiscoveryDataCheckpoint, (fill.id, code)
+            )
+            assert checkpoint is not None
+            checkpoint.status = "retryable"
+            checkpoint.attempts = 1
+            checkpoint.next_retry_at = now
+            checkpoint.error = f"old {code}"
+        fill.last_error = "stale pause"
+        session.commit()
+        fill_id = fill.id
+    policy = RequestPolicy(
+        requests_per_second=100,
+        max_attempts=2,
+        daily_budget=10,
+        max_runtime_seconds=60,
+    )
+    market = FakeMarketClient(
+        discovery_data={recovered_code: _bundle(recovered_code)},
+        discovery_errors={failed_code: "permanent"},
+    )
+    with factory() as session:
+        execute_discovery_data_fill(
+            session,
+            market,
+            fill_id,
+            policy=policy,
+            clock=FakeClock(now),
+        )
+    with factory() as session:
+        fill = session.get(DiscoveryDataFill, fill_id)
+        failed = session.get(
+            DiscoveryDataCheckpoint, (fill_id, failed_code)
+        )
+        recovered = session.get(
+            DiscoveryDataCheckpoint, (fill_id, recovered_code)
+        )
+        assert fill is not None and failed is not None and recovered is not None
+        assert failed.status == "failed"
+        assert recovered.status == "done"
+        assert fill.last_error == failed.error
+        assert fill.last_error and failed_code in fill.last_error
+    engine.dispose()
+
+
+def test_first_attempt_success_clears_stale_pause_error_when_clean(
+    tmp_path,
+) -> None:
+    from jobs.discovery_data import RequestPolicy, execute_discovery_data_fill
+
+    engine = init_db(tmp_path / "clean-resume.db")
+    factory = create_session_factory(engine)
+    now = datetime(2026, 9, 16, 12, tzinfo=timezone.utc)
+    code = "000001.SZ"
+    with factory() as session:
+        fill = _fill(session, [code], now=now, status="paused")
+        fill.last_error = "maximum run time reached"
+        session.commit()
+        fill_id = fill.id
+    with factory() as session:
+        execute_discovery_data_fill(
+            session,
+            FakeMarketClient(discovery_data={code: _bundle(code)}),
+            fill_id,
+            policy=RequestPolicy(
+                requests_per_second=100,
+                max_attempts=2,
+                daily_budget=10,
+                max_runtime_seconds=60,
+            ),
+            clock=FakeClock(now),
+        )
+    with factory() as session:
+        fill = session.get(DiscoveryDataFill, fill_id)
+        assert fill is not None
+        assert fill.status == "done"
+        assert fill.last_error is None
+    engine.dispose()
+
+
 def test_eta_ignores_completed_checkpoints_before_current_worker_run(
     tmp_path,
 ) -> None:
@@ -3164,6 +3262,8 @@ def test_eta_ignores_completed_checkpoints_before_current_worker_run(
 
 
 def test_init_db_adds_discovery_request_timing_columns(tmp_path) -> None:
+    from jobs.discovery_data import RequestPolicy, execute_discovery_data_fill
+
     db_path = tmp_path / "old-fill.db"
     old_engine = create_engine(f"sqlite:///{db_path.resolve().as_posix()}")
     with old_engine.begin() as conn:
@@ -3187,6 +3287,21 @@ def test_init_db_adds_discovery_request_timing_columns(tmp_path) -> None:
                 """
             )
         )
+        conn.execute(
+            text(
+                """
+                INSERT INTO discovery_data_fills (
+                    id, status, total, completed, failed, request_count,
+                    daily_budget, budget_day, daily_requests, started_at,
+                    updated_at, last_error
+                ) VALUES (
+                    42, 'paused', 1, 0, 0, 3,
+                    10, '2026-09-16', 3, '2026-09-16 12:00:00',
+                    '2026-09-16 12:00:00', 'process stopped'
+                )
+                """
+            )
+        )
     old_engine.dispose()
 
     engine = init_db(db_path)
@@ -3195,4 +3310,52 @@ def test_init_db_adds_discovery_request_timing_columns(tmp_path) -> None:
         for column in inspect(engine).get_columns("discovery_data_fills")
     }
     assert {"last_request_at", "run_started_at"} <= columns
+    factory = create_session_factory(engine)
+    code = "000001.SZ"
+    with factory() as session:
+        fill = session.get(DiscoveryDataFill, 42)
+        assert fill is not None
+        assert fill.request_count == 3
+        assert fill.last_request_at is None
+        session.add(
+            DiscoveryDataCheckpoint(
+                fill_id=fill.id,
+                code=code,
+                status="pending",
+                attempts=0,
+                next_retry_at=None,
+                valuation_points=0,
+                error=None,
+                updated_at=fill.updated_at,
+            )
+        )
+        session.commit()
+    now = datetime(2026, 9, 16, 13, tzinfo=timezone.utc)
+    clock = FakeClock(now)
+    transports: list[datetime] = []
+
+    class MigratedFillMarket(FakeMarketClient):
+        def fetch_discovery_data(
+            self, code: str, *, before_request=None
+        ) -> DiscoveryCompanyData:
+            assert before_request is not None
+            before_request()
+            transports.append(clock.now())
+            return _bundle(code)
+
+    with factory() as session:
+        execute_discovery_data_fill(
+            session,
+            MigratedFillMarket(),
+            42,
+            policy=RequestPolicy(
+                requests_per_second=0.5,
+                max_attempts=2,
+                daily_budget=10,
+                max_runtime_seconds=60,
+            ),
+            clock=clock,
+        )
+    assert clock.sleeps == [2]
+    assert transports == [now + timedelta(seconds=2)]
     engine.dispose()
