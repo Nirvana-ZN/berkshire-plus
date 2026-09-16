@@ -21,7 +21,14 @@ from market.cheap import (
     security_state_eligible,
 )
 from market.eastmoney import EastMoneyClient, FakeMarketClient
-from market.types import MarketError, ValuationPoint
+from market.types import (
+    DiscoveryCompanyData,
+    DiscoveryCompanyError,
+    FinancialRow,
+    MarketError,
+    SecurityState,
+    ValuationPoint,
+)
 
 
 # Live probe 2026-09-16, RPT_VALUEANALYSIS_DET, pageSize=500:
@@ -40,6 +47,24 @@ from market.types import MarketError, ValuationPoint
 # ST/*ST is explicit in f14. East Money returns no taxonomy edition; the
 # stored industry version names our f100 mapping, and industry_as_of records
 # our universe snapshot date rather than claiming an East Money edition.
+
+# Financial source probe 2026-09-16:
+# RPT_DMSK_FN_{INCOME,BALANCE,CASHFLOW} returned CNY statement totals.
+# Detailed RPT_F10_FINANCE_G{INCOME,BALANCE,GCASHFLOW} supplied debt,
+# goodwill, impairment/disposal, and acquisition cash. MAINFINADATA supplied
+# bank NEWCAPITALADER/HXYJBCZL/NONPERLOAN. OTHER_INCOME was not accepted as
+# government grants because the disclosed line includes unrelated other income.
+#
+# 2025 annual-report PDF cross-check (CNY units normalized; every listed value
+# matched exactly, hence 0% difference):
+# - Industrial 美的 000333, AN202603311820893096: revenue 458,502,407,000;
+#   assets 608,791,766,000; equity 236,424,223,000; OCF 53,345,930,000;
+#   capex 11,141,889,000; all four debt components and goodwill also matched.
+# - Bank 招商 600036, AN202603271820811738: revenue 337,532m; assets
+#   13,070,523m; OCF 451,457m; capital/core-tier-1/NPL 18.24%/14.16%/0.94%.
+# - Asset-light 茅台 600519, AN202604161821275610: revenue
+#   172,054,171,890.91; assets 303,834,844,021.44; OCF 61,522,204,989.35;
+#   capex 3,127,594,916.41; pretax/tax also matched exactly.
 
 
 def test_fetch_valuation_history_maps_monthly_pe_pb() -> None:
@@ -644,3 +669,185 @@ def test_old_cached_universe_without_security_metadata_is_rejected() -> None:
         )
         session.commit()
         assert _cached(session, 1001.0) is None
+
+
+def test_field_dictionary_is_immutable_and_marks_unavailable_sources() -> None:
+    from dataclasses import FrozenInstanceError
+
+    from discovery.field_dictionary import FIELD_DICTIONARY
+
+    revenue = FIELD_DICTIONARY["revenue"]
+    assert revenue.report == "RPT_DMSK_FN_INCOME"
+    assert revenue.field == "TOTAL_OPERATE_INCOME"
+    assert revenue.unit == "CNY"
+    assert revenue.consolidated_basis == "consolidated"
+    assert revenue.period_type == "cumulative"
+    assert revenue.derivation_formula is None
+    assert revenue.financial_sector_substitute == "TOTAL_OPERATE_INCOME"
+    assert revenue.source_as_of == "NOTICE_DATE/UPDATE_DATE"
+    with pytest.raises(FrozenInstanceError):
+        revenue.field = "GUESSED"  # type: ignore[misc]
+    with pytest.raises(TypeError):
+        FIELD_DICTIONARY["revenue"] = revenue  # type: ignore[index]
+
+    grants = FIELD_DICTIONARY["government_grants"]
+    assert grants.field is None
+    assert grants.trusted is False
+    assert "OTHER_INCOME" in grants.missing_policy
+
+
+def test_roic_uses_three_year_tax_median_and_average_invested_capital() -> None:
+    class Stub(EastMoneyClient):
+        def _get_json(self, url: str) -> dict:
+            if "MAINFINADATA" in url:
+                return {
+                    "success": True,
+                    "result": {
+                        "data": [
+                            {
+                                "REPORT_TYPE": "年报",
+                                "REPORT_YEAR": year,
+                                "REPORT_DATE": f"{year}-12-31 00:00:00",
+                                "PER_EBIT": ebit,
+                                "TOTAL_SHARE": "1",
+                            }
+                            for year, ebit in [
+                                ("2025", "120000000"),
+                                ("2024", "100000000"),
+                                ("2023", "90000000"),
+                            ]
+                        ]
+                    },
+                }
+            if "RPT_DMSK_FN_INCOME" in url:
+                return {
+                    "success": True,
+                    "result": {
+                        "data": [
+                            {
+                                "REPORT_DATE": f"{year}-12-31 00:00:00",
+                                "DATE_TYPE_CODE": "001",
+                                "TOTAL_PROFIT": pretax,
+                                "INCOME_TAX": tax,
+                            }
+                            for year, pretax, tax in [
+                                ("2025", "120000000", "20000000"),
+                                ("2024", "100000000", "15000000"),
+                                ("2023", "100000000", "20000000"),
+                            ]
+                        ]
+                    },
+                }
+            if "RPT_DMSK_FN_BALANCE" in url:
+                return {
+                    "success": True,
+                    "result": {
+                        "data": [
+                            {
+                                "REPORT_DATE": f"{year}-12-31 00:00:00",
+                                "DATE_TYPE_CODE": "001",
+                                "TOTAL_EQUITY": equity,
+                                "MONETARYFUNDS": cash,
+                            }
+                            for year, equity, cash in [
+                                ("2025", "600000000", "200000000"),
+                                ("2024", "500000000", "100000000"),
+                                ("2023", "400000000", "80000000"),
+                            ]
+                        ]
+                    },
+                }
+            if "RPT_F10_FINANCE_GBALANCE" in url:
+                return {
+                    "success": True,
+                    "result": {
+                        "data": [
+                            {
+                                "REPORT_DATE": f"{year}-12-31 00:00:00",
+                                "REPORT_TYPE": "年报",
+                                "SHORT_LOAN": debt,
+                            }
+                            for year, debt in [
+                                ("2025", "150000000"),
+                                ("2024", "100000000"),
+                                ("2023", "80000000"),
+                            ]
+                        ]
+                    },
+                }
+            return {"success": True, "result": {"data": []}}
+
+    rows = Stub().fetch_financials(["000333.SZ"])
+    current = next(row for row in rows if row.period == "2025")
+    assert current.normalized_effective_tax_rate == Decimal("0.1666666666666666666666666667")
+    assert current.invested_capital == Decimal("525000000")
+    assert current.roic is not None
+    assert abs(current.roic - Decimal("19.04761904761904761904761905")) < Decimal("1e-24")
+
+
+def test_fake_fetch_discovery_data_returns_typed_bundle_or_error() -> None:
+    state = SecurityState(
+        code="600519.SH",
+        name="贵州茅台",
+        exchange="SH",
+        listing_date="2001-08-27",
+        is_st=False,
+        is_delisting=False,
+        trading_status="trading",
+        last_trade_date="2026-09-16",
+        industry="白酒",
+        industry_version="eastmoney:push2delay:clist:f100:v1",
+        industry_as_of="2026-09-16",
+        source="eastmoney:push2delay",
+        market_status_code=2,
+    )
+    bundle = DiscoveryCompanyData(
+        code="600519.SH",
+        security_state=state,
+        financial_rows=(
+            FinancialRow(code="600519.SH", period="2025", period_type="annual"),
+        ),
+        valuation_points=(),
+        request_count=8,
+        source_as_of="2026-09-16",
+    )
+    client = FakeMarketClient(
+        discovery_data={"600519.SH": bundle},
+        discovery_errors={"000333.SZ": "statement unavailable"},
+    )
+
+    assert client.fetch_discovery_data("600519.SH") == bundle
+    with pytest.raises(DiscoveryCompanyError, match="statement unavailable") as caught:
+        client.fetch_discovery_data("000333.SZ")
+    assert caught.value.code == "000333.SZ"
+
+
+def test_real_fetch_discovery_data_keeps_company_and_stage_on_error() -> None:
+    state = SecurityState(
+        code="000333.SZ",
+        name="美的集团",
+        exchange="SZ",
+        listing_date="2013-09-18",
+        is_st=False,
+        is_delisting=False,
+        trading_status="trading",
+        last_trade_date="2026-09-16",
+        industry="白色家电",
+        industry_version="eastmoney:push2delay:clist:f100:v1",
+        industry_as_of="2026-09-16",
+        source="eastmoney:stock/get:f57,f58,f107,f127,f189,f292",
+        market_status_code=5,
+    )
+
+    class Stub(EastMoneyClient):
+        def _security_state_for(self, _code: str) -> SecurityState:
+            return state
+
+        def _financials_for(self, _code: str) -> list[FinancialRow]:
+            raise MarketError("income endpoint unavailable")
+
+    with pytest.raises(DiscoveryCompanyError, match="income endpoint unavailable") as caught:
+        Stub().fetch_discovery_data("000333.SZ")
+    assert caught.value.code == "000333.SZ"
+    assert caught.value.stage == "financials"
+    assert caught.value.request_count == 0

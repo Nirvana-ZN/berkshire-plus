@@ -366,3 +366,146 @@ def test_fetch_valuation_failure_is_empty() -> None:
             raise RuntimeError("timeout")
 
     assert Stub().fetch_valuation("600036.SH") == {}
+
+
+def _statement_payload(*rows: dict[str, object]) -> dict:
+    return {"success": True, "result": {"data": list(rows)}}
+
+
+def test_discovery_income_source_mapping() -> None:
+    from decimal import Decimal
+
+    class Stub(EastMoneyClient):
+        def _get_json(self, url: str) -> dict:
+            if "RPT_DMSK_FN_INCOME" in url:
+                return _statement_payload(
+                    {
+                        "REPORT_DATE": "2025-12-31 00:00:00",
+                        "DATE_TYPE_CODE": "001",
+                        "NOTICE_DATE": "2026-03-31 00:00:00",
+                        "TOTAL_OPERATE_INCOME": "1000000000",
+                        "PARENT_NETPROFIT": "100000000",
+                        "DEDUCT_PARENT_NETPROFIT": "90000000",
+                        "TOTAL_PROFIT": "120000000",
+                        "INCOME_TAX": "20000000",
+                    }
+                )
+            if "RPT_F10_FINANCE_GINCOME" in url:
+                return _statement_payload(
+                    {
+                        "REPORT_DATE": "2025-12-31 00:00:00",
+                        "REPORT_TYPE": "年报",
+                        "ASSET_IMPAIRMENT_INCOME": "-7000000",
+                        "CREDIT_IMPAIRMENT_INCOME": "-3000000",
+                        "ASSET_DISPOSAL_INCOME": "2000000",
+                    }
+                )
+            return _statement_payload()
+
+    row = Stub().fetch_financials(["000333.SZ"])[0]
+    assert row.revenue == Decimal("1000000000")
+    assert row.net_income == Decimal("100000000")
+    assert row.deducted_net_income == Decimal("90000000")
+    assert row.pretax_income == Decimal("120000000")
+    assert row.income_tax == Decimal("20000000")
+    assert row.impairment_loss == Decimal("10000000")
+    assert row.asset_disposal_gain == Decimal("2000000")
+    assert row.government_grants is None
+    assert row.source_as_of == "2026-03-31"
+
+
+def test_discovery_balance_source_mapping_and_visible_debt_sum() -> None:
+    from decimal import Decimal
+
+    class Stub(EastMoneyClient):
+        def _get_json(self, url: str) -> dict:
+            if "RPT_DMSK_FN_BALANCE" in url:
+                return _statement_payload(
+                    {
+                        "REPORT_DATE": "2025-12-31 00:00:00",
+                        "DATE_TYPE_CODE": "001",
+                        "TOTAL_ASSETS": "800000000",
+                        "TOTAL_EQUITY": "600000000",
+                        "MONETARYFUNDS": "200000000",
+                    }
+                )
+            if "RPT_F10_FINANCE_GBALANCE" in url:
+                return _statement_payload(
+                    {
+                        "REPORT_DATE": "2025-12-31 00:00:00",
+                        "REPORT_TYPE": "年报",
+                        "SHORT_LOAN": "50000000",
+                        "LONG_LOAN": "60000000",
+                        "BOND_PAYABLE": "30000000",
+                        "NONCURRENT_LIAB_1YEAR": "10000000",
+                        "GOODWILL": "40000000",
+                    }
+                )
+            return _statement_payload()
+
+    row = Stub().fetch_financials(["000333.SZ"])[0]
+    assert row.total_assets == Decimal("800000000")
+    assert row.net_assets == Decimal("600000000")
+    assert row.cash == Decimal("200000000")
+    assert row.short_loan == Decimal("50000000")
+    assert row.long_loan == Decimal("60000000")
+    assert row.bond_payable == Decimal("30000000")
+    assert row.noncurrent_liab_1year == Decimal("10000000")
+    assert row.interest_debt == Decimal("150000000")
+    assert row.goodwill == Decimal("40000000")
+
+
+def test_discovery_cashflow_source_mapping() -> None:
+    from decimal import Decimal
+
+    class Stub(EastMoneyClient):
+        def _get_json(self, url: str) -> dict:
+            if "RPT_DMSK_FN_CASHFLOW" in url:
+                return _statement_payload(
+                    {
+                        "REPORT_DATE": "2025-12-31 00:00:00",
+                        "DATE_TYPE_CODE": "001",
+                        "NETCASH_OPERATE": "130000000",
+                        "CONSTRUCT_LONG_ASSET": "80000000",
+                    }
+                )
+            if "RPT_F10_FINANCE_GCASHFLOW" in url:
+                return _statement_payload(
+                    {
+                        "REPORT_DATE": "2025-12-31 00:00:00",
+                        "REPORT_TYPE": "年报",
+                        "OBTAIN_SUBSIDIARY_OTHER": "25000000",
+                    }
+                )
+            return _statement_payload()
+
+    row = Stub().fetch_financials(["000333.SZ"])[0]
+    assert row.ocf == Decimal("130000000")
+    assert row.capex == Decimal("80000000")
+    assert row.acquisition_cash_paid == Decimal("25000000")
+
+
+def test_discovery_financial_industry_source_mapping() -> None:
+    from decimal import Decimal
+
+    class Stub(EastMoneyClient):
+        def _get_json(self, url: str) -> dict:
+            if "RPT_F10_FINANCE_MAINFINADATA" in url:
+                return _statement_payload(
+                    {
+                        "REPORT_TYPE": "年报",
+                        "REPORT_YEAR": "2025",
+                        "REPORT_DATE": "2025-12-31 00:00:00",
+                        "NEWCAPITALADER": "18.24",
+                        "HXYJBCZL": "14.16",
+                        "NONPERLOAN": "0.94",
+                        "NON_PERFORMING_LOAN": "68206000000",
+                    }
+                )
+            return _statement_payload()
+
+    row = Stub().fetch_financials(["600036.SH"])[0]
+    assert row.capital_adequacy == Decimal("18.24")
+    assert row.core_tier1_capital_adequacy == Decimal("14.16")
+    assert row.npl == Decimal("0.94")
+    assert row.nonperforming_loan_balance == Decimal("68206000000")

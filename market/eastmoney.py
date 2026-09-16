@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from datetime import date
 from decimal import Decimal, InvalidOperation
+from statistics import median
 from threading import Event
 from typing import Protocol
 from urllib.parse import quote
@@ -13,7 +15,15 @@ from market.cheap import (
     delisting_name_state,
     is_st_name,
 )
-from market.types import Constituent, FinancialRow, MarketError, ValuationPoint
+from market.types import (
+    Constituent,
+    DiscoveryCompanyData,
+    DiscoveryCompanyError,
+    FinancialRow,
+    MarketError,
+    SecurityState,
+    ValuationPoint,
+)
 
 BOARD_LIST_URL = "https://push2delay.eastmoney.com/api/qt/clist/get"
 HS_A_FS = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
@@ -21,7 +31,10 @@ SUGGEST_URL = "https://searchapi.eastmoney.com/api/suggest/get"
 CODETABLE_URL = "https://search-codetable.eastmoney.com/codetable/search"
 FINANCIALS_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
 ORGINFO_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
+STOCK_URL = "https://push2delay.eastmoney.com/api/qt/stock/get"
 VALUATION_PAGE_CAP = 20
+EFFECTIVE_TAX_RATE_MIN = Decimal("0")
+EFFECTIVE_TAX_RATE_MAX = Decimal("0.50")
 BREADTH_URL = (
     "https://push2delay.eastmoney.com/api/qt/ulist.np/get"
     "?fltt=2&secids=0.399317&fields=f3,f12,f104,f105,f106"
@@ -114,6 +127,9 @@ class MarketClient(Protocol):
     def fetch_trading_dates(self, end: str, limit: int = 6) -> list[str]:
         """Return actual exchange dates ending no later than end."""
 
+    def fetch_discovery_data(self, code: str) -> DiscoveryCompanyData:
+        """Return one verified company bundle or raise DiscoveryCompanyError."""
+
 
 class FakeMarketClient:
     def __init__(
@@ -132,6 +148,8 @@ class FakeMarketClient:
         cheap_error: str | None = None,
         valuation_history: Sequence[ValuationPoint] | None = None,
         trading_dates: Sequence[str] | None = None,
+        discovery_data: Mapping[str, DiscoveryCompanyData] | None = None,
+        discovery_errors: Mapping[str, str] | None = None,
     ) -> None:
         self.constituents = list(constituents or [])
         self.financials = list(financials or [])
@@ -160,6 +178,8 @@ class FakeMarketClient:
         self.cheap_error = cheap_error
         self.valuation_history = list(valuation_history or [])
         self.trading_dates = list(trading_dates or [])
+        self.discovery_data = dict(discovery_data or {})
+        self.discovery_errors = dict(discovery_errors or {})
 
     def fetch_constituents(self, scope_type: str, scope_text: str) -> list[Constituent]:
         self.calls.append(("constituents", scope_type, scope_text))
@@ -206,6 +226,19 @@ class FakeMarketClient:
         self.calls.append(("trading_dates", end, str(limit)))
         return [day for day in self.trading_dates if day <= end][-limit:]
 
+    def fetch_discovery_data(self, code: str) -> DiscoveryCompanyData:
+        self.calls.append(("discovery_data", code))
+        if code in self.discovery_errors:
+            raise DiscoveryCompanyError(
+                code, "fake", self.discovery_errors[code], request_count=0
+            )
+        try:
+            return self.discovery_data[code]
+        except KeyError as exc:
+            raise DiscoveryCompanyError(
+                code, "fake", "no configured discovery data", request_count=0
+            ) from exc
+
     def list_boards(self, scope_type: str, query: str = "") -> list[dict[str, str]]:
         self.calls.append(("boards", scope_type, query))
         text = (query or "").strip()
@@ -241,6 +274,15 @@ def _report_kind(item: Mapping[str, object]) -> tuple[str, str] | None:
     year = str(item.get("REPORT_YEAR") or item.get("REPORT_DATE") or "")[:4]
     if len(year) != 4 or not year.isdigit():
         return None
+    date_type = str(item.get("DATE_TYPE_CODE") or "")
+    if date_type == "001":
+        return year, "annual"
+    if date_type == "002":
+        return f"{year}H1", "interim"
+    if date_type == "003":
+        return f"{year}Q1", "quarterly"
+    if date_type == "004":
+        return f"{year}Q3", "quarterly"
     report = str(item.get("REPORT_TYPE") or item.get("REPORTTYPE") or "")
     if "半年" in report or "中报" in report:
         return f"{year}H1", "interim"
@@ -274,6 +316,16 @@ def _as_decimal(value: object) -> Decimal | None:
     return number
 
 
+def _first_decimal(
+    item: Mapping[str, object], *fields: str
+) -> Decimal | None:
+    for field in fields:
+        value = _as_decimal(item.get(field))
+        if value is not None:
+            return value
+    return None
+
+
 def _positive_decimal(value: object) -> Decimal | None:
     number = _as_decimal(value)
     return number if number is not None and number > 0 else None
@@ -293,6 +345,39 @@ def _div(left: Decimal | None, right: Decimal | None) -> Decimal | None:
     if left is None or right is None or right == 0:
         return None
     return left / right
+
+
+def _sum_known(*values: Decimal | None) -> Decimal | None:
+    known = [value for value in values if value is not None]
+    return sum(known, Decimal(0)) if known else None
+
+
+def _source_as_of(*items: Mapping[str, object]) -> str | None:
+    dates = [
+        str(item.get(field) or "")[:10]
+        for item in items
+        for field in ("UPDATE_DATE", "NOTICE_DATE")
+        if str(item.get(field) or "")[:10]
+    ]
+    return max(dates) if dates else None
+
+
+def _impairment_loss(item: Mapping[str, object]) -> Decimal | None:
+    components: list[Decimal | None] = []
+    for direct, income in (
+        ("ASSET_IMPAIRMENT_LOSS", "ASSET_IMPAIRMENT_INCOME"),
+        ("CREDIT_IMPAIRMENT_LOSS", "CREDIT_IMPAIRMENT_INCOME"),
+    ):
+        loss = _as_decimal(item.get(direct))
+        reported_income = _as_decimal(item.get(income))
+        components.append(
+            loss
+            if loss is not None
+            else -reported_income
+            if reported_income is not None
+            else None
+        )
+    return _sum_known(*components)
 
 
 def _is_a_share_code(code: str) -> bool:
@@ -510,6 +595,7 @@ class EastMoneyClient:
     def __init__(self, *, timeout: float = 15.0) -> None:
         self.timeout = timeout
         self._board_lists: dict[int, list[dict[str, str]]] = {}
+        self._request_count = 0
 
     def fetch_constituents(self, scope_type: str, scope_text: str) -> list[Constituent]:
         text = (scope_text or "").strip()
@@ -561,6 +647,61 @@ class EastMoneyClient:
         if not any_ok:
             raise last_error or MarketError("财务接口整体不可用")
         return rows
+
+    def fetch_discovery_data(self, code: str) -> DiscoveryCompanyData:
+        normalized = (code or "").strip().upper()
+        started = self._request_count
+        try:
+            _secid(normalized)
+        except ValueError as exc:
+            raise DiscoveryCompanyError(normalized, "validate", str(exc)) from exc
+        try:
+            security = self._security_state_for(normalized)
+        except Exception as exc:
+            raise DiscoveryCompanyError(
+                normalized,
+                "security_state",
+                str(exc),
+                request_count=self._request_count - started,
+            ) from exc
+        try:
+            financials = self._financials_for(normalized)
+        except Exception as exc:
+            raise DiscoveryCompanyError(
+                normalized,
+                "financials",
+                str(exc),
+                request_count=self._request_count - started,
+            ) from exc
+        try:
+            valuations = self.fetch_valuation_history(normalized)
+        except Exception as exc:
+            raise DiscoveryCompanyError(
+                normalized,
+                "valuation",
+                str(exc),
+                request_count=self._request_count - started,
+            ) from exc
+        if not financials:
+            raise DiscoveryCompanyError(
+                normalized,
+                "financials",
+                "no verified statement rows",
+                request_count=self._request_count - started,
+            )
+        source_dates = [
+            security.industry_as_of,
+            *(row.source_as_of for row in financials if row.source_as_of),
+            *(row.trade_date for row in valuations),
+        ]
+        return DiscoveryCompanyData(
+            code=normalized,
+            security_state=security,
+            financial_rows=tuple(financials),
+            valuation_points=tuple(valuations),
+            request_count=self._request_count - started,
+            source_as_of=max(source_dates),
+        )
 
     def fetch_listed_years(self, codes: Sequence[str]) -> dict[str, int]:
         years: dict[str, int] = {}
@@ -826,6 +967,51 @@ class EastMoneyClient:
             raise MarketError("低估值榜解析不到沪深A股名单")
         return rows
 
+    def _security_state_for(self, code: str) -> SecurityState:
+        fields = "f57,f58,f107,f127,f189,f292"
+        payload = self._get_json_direct(
+            f"{STOCK_URL}?secid={_secid(code)}&fields={fields}"
+        )
+        item = payload.get("data")
+        if not isinstance(item, dict) or str(item.get("f57") or "") != code[:6]:
+            raise MarketError("个股状态接口返回格式错误")
+        name = str(item.get("f58") or "").strip()
+        industry = str(item.get("f127") or "").strip()
+        listing_date = _compact_date(item.get("f189"))
+        exchange = code.rsplit(".", 1)[1]
+        expected_market = 1 if exchange == "SH" else 0
+        if (
+            not name
+            or not industry
+            or listing_date is None
+            or _status_code(item.get("f107")) != expected_market
+        ):
+            raise MarketError("个股状态缺少名称、行业、上市日期或交易所不匹配")
+        trading_dates = self.fetch_trading_dates(date.today().isoformat())
+        if not trading_dates:
+            raise MarketError("交易日接口没有返回日期")
+        last_trade_date = self._last_trade_date(code, trading_dates[-1])
+        if last_trade_date is None:
+            raise MarketError("个股最近交易日不可用")
+        trading_status = (
+            "trading" if last_trade_date == trading_dates[-1] else "suspended"
+        )
+        return SecurityState(
+            code=code,
+            name=name,
+            exchange=exchange,
+            listing_date=listing_date,
+            is_st=is_st_name(name),
+            is_delisting=bool(delisting_name_state(code, name)),
+            trading_status=trading_status,
+            last_trade_date=last_trade_date,
+            industry=industry,
+            industry_version=INDUSTRY_MAPPING_VERSION,
+            industry_as_of=date.today().isoformat(),
+            source="eastmoney:stock/get:f57,f58,f107,f127,f189,f292",
+            market_status_code=_status_code(item.get("f292")),
+        )
+
     def _last_trade_date(self, code: str, end: str) -> str | None:
         from market.sentiment import parse_kline
 
@@ -867,6 +1053,7 @@ class EastMoneyClient:
     def _get_json_direct(self, url: str) -> dict:
         import httpx2
 
+        self._request_count += 1
         with httpx2.Client(timeout=self.timeout, headers=_HTTP_HEADERS) as client:
             response = client.get(url)
             response.raise_for_status()
@@ -953,6 +1140,7 @@ class EastMoneyClient:
         last_error: Exception | None = None
         for candidate in _clist_urls(url):
             try:
+                self._request_count += 1
                 with httpx2.Client(timeout=self.timeout, headers=_HTTP_HEADERS) as client:
                     response = client.get(candidate)
                     response.raise_for_status()
@@ -1117,9 +1305,160 @@ class EastMoneyClient:
         return result
 
     def _financials_for(self, code: str) -> list[FinancialRow]:
+        reports = {
+            "main": "RPT_F10_FINANCE_MAINFINADATA",
+            "income": "RPT_DMSK_FN_INCOME",
+            "balance": "RPT_DMSK_FN_BALANCE",
+            "cashflow": "RPT_DMSK_FN_CASHFLOW",
+            "income_detail": "RPT_F10_FINANCE_GINCOME",
+            "balance_detail": "RPT_F10_FINANCE_GBALANCE",
+            "cashflow_detail": "RPT_F10_FINANCE_GCASHFLOW",
+        }
+        fetched: dict[str, list[dict]] = {}
+        for name, report in reports.items():
+            try:
+                fetched[name] = self._financial_report_rows(code, report)
+            except MarketError:
+                if name.endswith("_detail"):
+                    # Banks reject detailed balance/cashflow reports. Their
+                    # verified substitutes stay in MAINFINADATA; no guessed debt.
+                    fetched[name] = []
+                else:
+                    raise
+
+        mapped: dict[str, dict[tuple[str, str], dict]] = {}
+        keys: set[tuple[str, str]] = set()
+        for name, records in fetched.items():
+            by_period: dict[tuple[str, str], dict] = {}
+            for item in records:
+                kind = _report_kind(item)
+                if kind is not None and kind not in by_period:
+                    by_period[kind] = item
+                    keys.add(kind)
+            mapped[name] = by_period
+
+        rows: list[FinancialRow] = []
+        for period, period_type in sorted(keys, reverse=True):
+            empty: dict[str, object] = {}
+            main = mapped["main"].get((period, period_type), empty)
+            income = mapped["income"].get((period, period_type), empty)
+            balance = mapped["balance"].get((period, period_type), empty)
+            cashflow = mapped["cashflow"].get((period, period_type), empty)
+            income_detail = mapped["income_detail"].get(
+                (period, period_type), empty
+            )
+            balance_detail = mapped["balance_detail"].get(
+                (period, period_type), empty
+            )
+            cashflow_detail = mapped["cashflow_detail"].get(
+                (period, period_type), empty
+            )
+            shares = _first_decimal(
+                main, "TOTAL_SHARE", "TOTALSHARE", "TOTAL_SHARES"
+            )
+            ebit = _mul(_as_decimal(main.get("PER_EBIT")), shares)
+            if ebit is None:
+                ebit = _as_decimal(main.get("EBIT"))
+            net_income = _as_decimal(income.get("PARENT_NETPROFIT"))
+            if net_income is None:
+                net_income = _first_decimal(
+                    main, "PARENTNETPROFIT", "NETPROFIT"
+                )
+            ocf = _as_decimal(cashflow.get("NETCASH_OPERATE"))
+            if ocf is None:
+                ocf = _first_decimal(
+                    main,
+                    "NETCASH_OPERATE_PK",
+                    "NETCASHFLOWOPERATE",
+                    "OPERATECASHFLOW",
+                )
+            short_loan = _as_decimal(balance_detail.get("SHORT_LOAN"))
+            long_loan = _as_decimal(balance_detail.get("LONG_LOAN"))
+            bond_payable = _as_decimal(balance_detail.get("BOND_PAYABLE"))
+            noncurrent_liab_1year = _as_decimal(
+                balance_detail.get("NONCURRENT_LIAB_1YEAR")
+            )
+            # NONCURRENT_LIAB_1YEAR can include non-interest-bearing items and
+            # therefore overstate debt. Keep every component visible.
+            interest_debt = _sum_known(
+                short_loan,
+                long_loan,
+                bond_payable,
+                noncurrent_liab_1year,
+            )
+            rows.append(
+                FinancialRow(
+                    code=code,
+                    period=period,
+                    period_type=period_type,
+                    roe=_first_decimal(main, "ROEJQ", "ROE", "WEIGHTAVGROE"),
+                    net_income=net_income,
+                    ocf=ocf,
+                    capex=_as_decimal(cashflow.get("CONSTRUCT_LONG_ASSET")),
+                    ebit=ebit,
+                    interest=_div(
+                        ebit, _as_decimal(main.get("INTSTCOVRATE"))
+                    ),
+                    gross_margin=_first_decimal(
+                        main, "XSMLL", "GROSSPROFITMARGIN"
+                    ),
+                    net_margin=_first_decimal(
+                        main, "XSJLL", "NETPROFITMARGIN"
+                    ),
+                    shares=shares,
+                    share_change_ma=None,
+                    bps=_as_decimal(main.get("BPS")),
+                    npl=_as_decimal(main.get("NONPERLOAN")),
+                    eps=_first_decimal(main, "EPSJB", "EPSKCJB", "EPSXS"),
+                    revenue=_as_decimal(income.get("TOTAL_OPERATE_INCOME")),
+                    deducted_net_income=_as_decimal(
+                        income.get("DEDUCT_PARENT_NETPROFIT")
+                    ),
+                    total_assets=_as_decimal(balance.get("TOTAL_ASSETS")),
+                    net_assets=_as_decimal(balance.get("TOTAL_EQUITY")),
+                    cash=_as_decimal(balance.get("MONETARYFUNDS")),
+                    short_loan=short_loan,
+                    long_loan=long_loan,
+                    bond_payable=bond_payable,
+                    noncurrent_liab_1year=noncurrent_liab_1year,
+                    interest_debt=interest_debt,
+                    pretax_income=_as_decimal(income.get("TOTAL_PROFIT")),
+                    income_tax=_as_decimal(income.get("INCOME_TAX")),
+                    capital_adequacy=_as_decimal(
+                        main.get("NEWCAPITALADER")
+                    ),
+                    core_tier1_capital_adequacy=_as_decimal(
+                        main.get("HXYJBCZL")
+                    ),
+                    nonperforming_loan_balance=_as_decimal(
+                        main.get("NON_PERFORMING_LOAN")
+                    ),
+                    impairment_loss=_impairment_loss(income_detail),
+                    government_grants=None,
+                    asset_disposal_gain=_as_decimal(
+                        income_detail.get("ASSET_DISPOSAL_INCOME")
+                    ),
+                    goodwill=_as_decimal(balance_detail.get("GOODWILL")),
+                    acquisition_cash_paid=_as_decimal(
+                        cashflow_detail.get("OBTAIN_SUBSIDIARY_OTHER")
+                    ),
+                    source_as_of=_source_as_of(
+                        main,
+                        income,
+                        balance,
+                        cashflow,
+                        income_detail,
+                        balance_detail,
+                        cashflow_detail,
+                    ),
+                )
+            )
+        return self._derive_roic(rows)
+
+    def _financial_report_rows(self, code: str, report: str) -> list[dict]:
         filt = f'(SECUCODE="{code}")'
         url = (
-            f"{FINANCIALS_URL}?reportName=RPT_F10_FINANCE_MAINFINADATA"
+            f"{FINANCIALS_URL}?reportName={report}"
             f"&columns=ALL&pageNumber=1&pageSize=50&sortColumns=REPORT_DATE"
             f"&sortTypes=-1&filter={quote(filt)}"
         )
@@ -1132,67 +1471,71 @@ class EastMoneyClient:
             return []
         if not isinstance(records, list):
             raise MarketError("财务接口整体不可用")
-        rows: list[FinancialRow] = []
-        seen: set[tuple[str, str]] = set()
-        for item in records:
-            if not isinstance(item, dict):
-                continue
-            kind = _report_kind(item)
-            if kind is None:
-                continue
-            period, period_type = kind
-            key = (period, period_type)
-            if key in seen:
-                continue
-            seen.add(key)
-            ocf = _as_decimal(
-                item.get("NETCASH_OPERATE_PK")
-                or item.get("NETCASHFLOWOPERATE")
-                or item.get("OPERATECASHFLOW")
+        return [item for item in records if isinstance(item, dict)]
+
+    def _derive_roic(self, rows: list[FinancialRow]) -> list[FinancialRow]:
+        annual = sorted(
+            (row for row in rows if row.period_type == "annual"),
+            key=lambda row: row.period,
+            reverse=True,
+        )
+        valid_rates = [
+            row.income_tax / row.pretax_income
+            for row in annual[:3]
+            if row.income_tax is not None
+            and row.pretax_income is not None
+            and row.pretax_income > 0
+            and EFFECTIVE_TAX_RATE_MIN
+            <= row.income_tax / row.pretax_income
+            <= EFFECTIVE_TAX_RATE_MAX
+        ]
+        tax_rate = median(valid_rates) if valid_rates else None
+        capital: dict[str, Decimal] = {}
+        for row in annual:
+            if (
+                row.net_assets is not None
+                and row.interest_debt is not None
+                and row.cash is not None
+            ):
+                value = row.net_assets + row.interest_debt - row.cash
+                if value > 0:
+                    capital[row.period] = value
+        derived: dict[tuple[str, str], tuple[Decimal | None, Decimal | None]] = {}
+        for index, row in enumerate(annual):
+            prior = annual[index + 1] if index + 1 < len(annual) else None
+            current_capital = capital.get(row.period)
+            prior_capital = capital.get(prior.period) if prior is not None else None
+            invested_capital = (
+                (current_capital + prior_capital) / 2
+                if current_capital is not None and prior_capital is not None
+                else None
             )
-            shares = _as_decimal(
-                item.get("TOTAL_SHARE")
-                or item.get("TOTALSHARE")
-                or item.get("TOTAL_SHARES")
+            roic = (
+                row.ebit
+                * (Decimal(1) - tax_rate)
+                / invested_capital
+                * Decimal(100)
+                if row.ebit is not None
+                and row.ebit > 0
+                and tax_rate is not None
+                and invested_capital is not None
+                and invested_capital > 0
+                else None
             )
-            # 主要指标表只给每股EBIT和利息保障倍数，反推回绝对额喂利息覆盖门槛
-            ebit = _mul(_as_decimal(item.get("PER_EBIT")), shares) or _as_decimal(
-                item.get("EBIT")
+            derived[(row.period, row.period_type)] = (invested_capital, roic)
+        return [
+            replace(
+                row,
+                normalized_effective_tax_rate=(
+                    tax_rate if row.period_type == "annual" else None
+                ),
+                invested_capital=derived.get(
+                    (row.period, row.period_type), (None, None)
+                )[0],
+                roic=derived.get((row.period, row.period_type), (None, None))[1],
             )
-            interest = _div(ebit, _as_decimal(item.get("INTSTCOVRATE")))
-            # ponytail: 主要指标表没有资本开支，自由现金流门槛只能留缺口；
-            # 东财 FCFF_BACK/FCFF_FORWARD 口径互相打架(美的 +14.6亿 vs -339亿)不能用，
-            # 要补就单独拉现金流量表
-            capex = _as_decimal(
-                item.get("PURCHASEFIXEDASSET")
-                or item.get("CONSTRUCTCASHPAY")
-                or item.get("CAPEX")
-            )
-            rows.append(
-                FinancialRow(
-                    code=code,
-                    period=period,
-                    period_type=period_type,
-                    roe=_as_decimal(item.get("ROEJQ") or item.get("ROE") or item.get("WEIGHTAVGROE")),
-                    net_income=_as_decimal(
-                        item.get("PARENTNETPROFIT") or item.get("NETPROFIT")
-                    ),
-                    ocf=ocf,
-                    capex=capex,
-                    ebit=ebit,
-                    interest=interest,
-                    gross_margin=_as_decimal(item.get("XSMLL") or item.get("GROSSPROFITMARGIN")),
-                    net_margin=_as_decimal(item.get("XSJLL") or item.get("NETPROFITMARGIN")),
-                    shares=shares,
-                    share_change_ma=None,
-                    bps=_as_decimal(item.get("BPS")),
-                    npl=_as_decimal(item.get("NONPERLOAN")),
-                    eps=_as_decimal(
-                        item.get("EPSJB") or item.get("EPSKCJB") or item.get("EPSXS")
-                    ),
-                )
-            )
-        return rows
+            for row in rows
+        ]
 
     def _listed_year_for(self, code: str) -> int | None:
         filt = f'(SECUCODE="{code}")'
