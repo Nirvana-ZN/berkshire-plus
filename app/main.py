@@ -37,6 +37,7 @@ from app.models import (
     Thesis,
     Watchlist,
 )
+from discovery.data_readiness import TrackReadiness, discovery_data_readiness
 from jobs.cheap import (
     begin_cheap_fill,
     cheap_fill_running,
@@ -128,6 +129,33 @@ def _json_optional(value: Decimal | None) -> int | float | None:
     if not quantized.is_finite():
         return None
     return _json_number(quantized)
+
+
+def _readiness_json(report: dict[str, object]) -> dict[str, object]:
+    body = dict(report)
+    tracks = report["tracks"]
+    assert isinstance(tracks, dict)
+    body["tracks"] = {
+        name: {
+            "track": row.track,
+            "ready": row.ready,
+            "eligible": row.eligible,
+            "complete": row.complete,
+            "coverage": _json_number(row.coverage),
+            "missing_fields": list(row.missing_fields),
+            "reason": row.reason,
+        }
+        for name, row in tracks.items()
+        if isinstance(row, TrackReadiness)
+    }
+    thresholds = report["approved_thresholds"]
+    assert isinstance(thresholds, dict)
+    body["approved_thresholds"] = {
+        name: _json_number(value)
+        for name, value in thresholds.items()
+        if isinstance(value, Decimal)
+    }
+    return body
 
 
 def _resolve_research_target(session, market, name: str, code: str, query: str) -> tuple[str, str]:
@@ -764,7 +792,11 @@ def create_app(
     def get_discovery_data_status(request: Request) -> dict[str, object]:
         factory = request.app.state.session_factory
         with factory() as session:
-            return discovery_data_status(session, policy=DEFAULT_POLICY)
+            return discovery_data_status(session, policy=DEFAULT_POLICY) | {
+                "readiness": _readiness_json(
+                    discovery_data_readiness(session, as_of=date.today())
+                )
+            }
 
     @app.post("/api/discovery-data/fill")
     async def post_discovery_data_fill(request: Request):

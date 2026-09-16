@@ -3362,3 +3362,325 @@ def test_init_db_adds_discovery_request_timing_columns(tmp_path) -> None:
     assert clock.sleeps == [2]
     assert transports == [now + timedelta(seconds=2)]
     engine.dispose()
+
+
+def _readiness_row(
+    code: str,
+    *,
+    listing_date: str = "2000-01-01",
+    industry: str = "白色家电",
+) -> CheapRow:
+    return CheapRow(
+        code=code,
+        name=code,
+        price=Decimal("10"),
+        pe=Decimal("10"),
+        pb=Decimal("1"),
+        mcap=Decimal("100"),
+        industry=industry,
+        exchange=code[-2:],
+        listing_date=listing_date,
+        is_st=False,
+        is_delisting=False,
+        trading_status="trading",
+        last_trade_date="2026-09-16",
+        industry_version="test:v1",
+        industry_as_of="2026-09-16",
+        security_source="fake",
+        market_status_code=2,
+    )
+
+
+def _store_readiness_universe(
+    session: Session,
+    rows: list[CheapRow],
+    *,
+    fetched_at: float = 1789560000.0,
+) -> None:
+    from market.cheap import _store
+
+    _store(session, rows, fetched_at)
+    session.commit()
+
+
+def _store_readiness_financial(
+    session: Session,
+    code: str,
+    **fields: Decimal | str | None,
+) -> None:
+    session.add(
+        Financial(
+            code=code,
+            period="2025",
+            period_type="annual",
+            source_as_of=str(fields.pop("source_as_of", "2026-03-31")),
+            **fields,
+        )
+    )
+
+
+def _store_readiness_valuations(
+    session: Session,
+    code: str,
+    *,
+    count: int = 60,
+    ratio_method: str = "PE_TTM/PB_MRQ",
+    fetched_at: datetime = datetime(2026, 9, 16, 12, tzinfo=timezone.utc),
+) -> None:
+    from jobs.discovery_data import persist_valuation_history
+
+    persist_valuation_history(
+        session,
+        [
+            ValuationPoint(
+                code=code,
+                month=f"{2020 + index // 12:04d}-{index % 12 + 1:02d}",
+                trade_date=f"{2020 + index // 12:04d}-{index % 12 + 1:02d}-28",
+                pe=Decimal("10"),
+                pb=Decimal("1"),
+                ratio_method=ratio_method,
+            )
+            for index in range(count)
+        ],
+        fetched_at=fetched_at,
+    )
+
+
+def test_readiness_quality_uses_eligible_denominator_and_one_ratio_method(
+    tmp_path,
+) -> None:
+    from discovery.data_readiness import discovery_data_readiness
+
+    engine = init_db(tmp_path / "readiness-quality.db")
+    old_ready = "000001.SZ"
+    old_mixed = "000002.SZ"
+    recent = "000003.SZ"
+    with Session(engine) as session:
+        _store_readiness_universe(
+            session,
+            [
+                _readiness_row(old_ready),
+                _readiness_row(old_mixed),
+                _readiness_row(recent, listing_date="2024-01-01"),
+            ],
+        )
+        _store_readiness_valuations(session, old_ready)
+        session.commit()
+    # A damaged legacy series must not become complete by blending methods.
+    with engine.begin() as conn:
+        conn.exec_driver_sql("PRAGMA foreign_keys=OFF")
+        for index in range(60):
+            year, month = 2010 + index // 12, index % 12 + 1
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO valuation_history (
+                        code, month, trade_date, pe, pb, price, source,
+                        ratio_method, fetched_at
+                    ) VALUES (
+                        :code, :month, :trade_date, 10, 1, 10, 'legacy',
+                        :ratio_method, '2026-09-16 12:00:00'
+                    )
+                    """
+                ),
+                {
+                    "code": old_mixed,
+                    "month": f"{year:04d}-{month:02d}",
+                    "trade_date": f"{year:04d}-{month:02d}-28",
+                    "ratio_method": "method-a" if index < 30 else "method-b",
+                },
+            )
+    with Session(engine) as session:
+        report = discovery_data_readiness(
+            session,
+            as_of=date(2026, 9, 16),
+            approved_thresholds={"quality_discount": Decimal("0.75")},
+        )
+        approved = discovery_data_readiness(
+            session,
+            as_of=date(2026, 9, 16),
+            approved_thresholds={"quality_discount": Decimal("0.5")},
+        )
+
+    quality = report["tracks"]["quality_discount"]
+    assert quality.eligible == 2
+    assert quality.complete == 1
+    assert quality.coverage == Decimal("0.5")
+    assert quality.ready is False
+    assert quality.reason == "data_not_ready"
+    assert quality.missing_fields == ("valuation_history",)
+    assert report["missing_counts"]["quality_discount"] == {
+        "valuation_history": 1
+    }
+    assert report["company_insufficient"]["quality_discount"] == {
+        "recent_listing": 1
+    }
+    assert report["status"] == "data_not_ready"
+    assert approved["tracks"]["quality_discount"].ready is True
+    assert approved["tracks"]["quality_discount"].reason == "ready"
+    assert approved["status"] == "threshold_not_activated"
+    engine.dispose()
+
+
+def test_readiness_fields_are_track_and_financial_branch_specific(tmp_path) -> None:
+    from discovery.data_readiness import discovery_data_readiness
+
+    engine = init_db(tmp_path / "readiness-fields.db")
+    complete = "000001.SZ"
+    missing_industrial = "000002.SZ"
+    missing_capital = "600001.SH"
+    missing_npl = "600002.SH"
+    unknown = "000003.SZ"
+    with Session(engine) as session:
+        _store_readiness_universe(
+            session,
+            [
+                _readiness_row(complete),
+                _readiness_row(missing_industrial),
+                _readiness_row(missing_capital, industry="银行Ⅱ"),
+                _readiness_row(missing_npl, industry="保险Ⅱ"),
+                _readiness_row(unknown, industry="-"),
+            ],
+        )
+        _store_readiness_financial(
+            session,
+            complete,
+            capex=Decimal("1"),
+            revenue=Decimal("100"),
+            roic=Decimal("12"),
+            government_grants=None,
+        )
+        _store_readiness_financial(
+            session,
+            missing_industrial,
+            capex=None,
+            revenue=None,
+            roic=None,
+            government_grants=None,
+        )
+        _store_readiness_financial(
+            session,
+            missing_capital,
+            capital_adequacy=None,
+            npl=Decimal("1"),
+            revenue=Decimal("100"),
+            roic=None,
+        )
+        _store_readiness_financial(
+            session,
+            missing_npl,
+            capital_adequacy=Decimal("12"),
+            npl=None,
+            revenue=Decimal("100"),
+            roic=None,
+        )
+        _store_readiness_financial(
+            session,
+            unknown,
+            capex=Decimal("1"),
+            revenue=Decimal("100"),
+            roic=Decimal("12"),
+        )
+        for code in (
+            complete,
+            missing_industrial,
+            missing_capital,
+            missing_npl,
+            unknown,
+        ):
+            _store_readiness_valuations(session, code)
+        session.commit()
+
+        report = discovery_data_readiness(session, as_of=date(2026, 9, 16))
+
+    quality = report["tracks"]["quality_discount"]
+    deep_value = report["tracks"]["deep_value"]
+    garp = report["tracks"]["garp"]
+    assert quality.complete == quality.eligible == 5
+    assert quality.missing_fields == ()
+    assert deep_value.missing_fields == (
+        "capex",
+        "capital_adequacy",
+        "industry",
+        "npl",
+    )
+    assert report["missing_counts"]["deep_value"] == {
+        "capital_adequacy": 1,
+        "capex": 1,
+        "industry": 1,
+        "npl": 1,
+    }
+    assert "government_grants" not in deep_value.missing_fields
+    assert garp.missing_fields == ("revenue", "roic")
+    assert report["missing_counts"]["garp"] == {"revenue": 1, "roic": 3}
+    assert "capex" not in garp.missing_fields
+    assert all(track.ready is False for track in report["tracks"].values())
+    assert all(
+        track.reason == "threshold_not_activated"
+        for track in report["tracks"].values()
+    )
+    assert report["status"] == "threshold_not_activated"
+    engine.dispose()
+
+
+def test_readiness_zero_eligible_has_exact_zero_coverage(tmp_path) -> None:
+    from discovery.data_readiness import discovery_data_readiness
+
+    engine = init_db(tmp_path / "readiness-empty.db")
+    with Session(engine) as session:
+        report = discovery_data_readiness(session, as_of=date(2026, 9, 16))
+
+    for track in report["tracks"].values():
+        assert track.eligible == 0
+        assert track.complete == 0
+        assert track.coverage == Decimal("0")
+        assert track.ready is False
+        assert track.reason == "threshold_not_activated"
+    assert report["status"] == "threshold_not_activated"
+    engine.dispose()
+
+
+def test_discovery_status_serializes_decimal_readiness_without_dispatch(
+    tmp_path,
+) -> None:
+    market = FakeMarketClient()
+    with _discovery_client(tmp_path, market) as client:
+        first, second = "000001.SZ", "000002.SZ"
+        with client.app.state.session_factory() as session:
+            _store_readiness_universe(
+                session, [_readiness_row(first), _readiness_row(second)]
+            )
+            _store_readiness_valuations(session, first)
+            _store_readiness_financial(
+                session,
+                first,
+                capex=Decimal("1"),
+                revenue=Decimal("1"),
+                roic=Decimal("1"),
+            )
+            _store_readiness_financial(
+                session,
+                second,
+                capex=Decimal("1"),
+                revenue=Decimal("1"),
+                roic=Decimal("1"),
+            )
+            session.commit()
+        before = list(market.calls)
+
+        response = client.get("/api/discovery-data/status")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "idle"
+        assert body["readiness"]["status"] == "threshold_not_activated"
+        assert body["readiness"]["tracks"]["quality_discount"]["coverage"] == 0.5
+        assert body["readiness"]["tracks"]["quality_discount"]["ready"] is False
+        assert body["readiness"]["source_as_of"] == {
+            "universe": "2026-09-16T12:00:00+00:00",
+            "security": "2026-09-16",
+            "financial": "2026-03-31",
+            "valuation": "2024-12-28",
+            "valuation_fetched_at": "2026-09-16T12:00:00+00:00",
+        }
+        assert market.calls == before
