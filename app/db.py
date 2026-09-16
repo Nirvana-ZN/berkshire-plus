@@ -156,14 +156,81 @@ def _ensure_discovery_fill_columns(engine: Engine) -> None:
                 text("PRAGMA table_info(discovery_data_fills)")
             ).fetchall()
         }
-        for column in ("run_started_at", "last_request_at"):
+        columns = {
+            "run_started_at": "DATETIME",
+            "last_request_at": "DATETIME",
+            "snapshot_status": "VARCHAR",
+        }
+        for column, sql_type in columns.items():
             if names and column not in names:
                 conn.execute(
                     text(
                         "ALTER TABLE discovery_data_fills "
-                        f"ADD COLUMN {column} DATETIME"
+                        f"ADD COLUMN {column} {sql_type}"
                     )
                 )
+
+
+def _classify_discovery_fill_snapshots(engine: Engine) -> None:
+    from sqlalchemy import text
+
+    guidance = "snapshot unavailable or mismatched; start a new fill"
+    with engine.begin() as conn:
+        fills = conn.execute(
+            text(
+                "SELECT id, status, total FROM discovery_data_fills "
+                "WHERE snapshot_status IS NULL"
+            )
+        ).all()
+        for fill_id, status, total in fills:
+            checkpoints = {
+                row[0]
+                for row in conn.execute(
+                    text(
+                        "SELECT code FROM discovery_data_checkpoints "
+                        "WHERE fill_id = :fill_id"
+                    ),
+                    {"fill_id": fill_id},
+                )
+            }
+            snapshots = {
+                row[0]
+                for row in conn.execute(
+                    text(
+                        "SELECT code FROM discovery_universe_securities "
+                        "WHERE fill_id = :fill_id"
+                    ),
+                    {"fill_id": fill_id},
+                )
+            }
+            has_dates = (
+                conn.execute(
+                    text(
+                        "SELECT 1 FROM discovery_fill_trading_dates "
+                        "WHERE fill_id = :fill_id LIMIT 1"
+                    ),
+                    {"fill_id": fill_id},
+                ).first()
+                is not None
+            )
+            if checkpoints:
+                ready = checkpoints == snapshots and has_dates
+            else:
+                ready = int(total or 0) == 0 and not snapshots and has_dates
+            conn.execute(
+                text(
+                    "UPDATE discovery_data_fills SET "
+                    "snapshot_status = :snapshot_status, "
+                    "status = :status, last_error = :last_error "
+                    "WHERE id = :fill_id"
+                ),
+                {
+                    "fill_id": fill_id,
+                    "snapshot_status": "ready" if ready else "unavailable",
+                    "status": status if ready else "snapshot_unavailable",
+                    "last_error": None if ready else guidance,
+                },
+            )
 
 
 def _ensure_financial_text_storage(engine: Engine) -> None:
@@ -343,6 +410,7 @@ def init_db(db_path: Path | None = None) -> Engine:
     _ensure_listed_year(engine)
     _ensure_financial_columns(engine)
     _ensure_discovery_fill_columns(engine)
+    _classify_discovery_fill_snapshots(engine)
     _ensure_financial_text_storage(engine)
     _ensure_valuation_series(engine)
     _reset_stale_financials(engine)

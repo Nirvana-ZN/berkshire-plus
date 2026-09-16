@@ -11,6 +11,8 @@ from sqlalchemy import and_, case, func, select
 from sqlalchemy.orm import Session
 
 from app.models import (
+    DiscoveryDataCheckpoint,
+    DiscoveryDataFill,
     DiscoveryFillTradingDate,
     DiscoveryUniverseSecurity,
     Financial,
@@ -187,20 +189,46 @@ def _persisted_universe(
     )
     latest_fill = (
         select(DiscoveryUniverseSecurity.fill_id)
+        .join(
+            DiscoveryDataFill,
+            DiscoveryDataFill.id == DiscoveryUniverseSecurity.fill_id,
+        )
         .where(DiscoveryUniverseSecurity.snapshot_at < end)
+        .where(DiscoveryDataFill.snapshot_status == "ready")
         .order_by(DiscoveryUniverseSecurity.fill_id.desc())
         .limit(1)
+        .scalar_subquery()
+    )
+    checkpoint_count = (
+        select(func.count())
+        .select_from(DiscoveryDataCheckpoint)
+        .where(
+            DiscoveryDataCheckpoint.fill_id
+            == DiscoveryUniverseSecurity.fill_id
+        )
+        .correlate(DiscoveryUniverseSecurity)
         .scalar_subquery()
     )
     records = session.execute(
         select(
             DiscoveryUniverseSecurity,
             DiscoveryFillTradingDate.trade_date,
+            DiscoveryDataCheckpoint.code,
+            checkpoint_count,
         )
         .outerjoin(
             DiscoveryFillTradingDate,
             DiscoveryFillTradingDate.fill_id
             == DiscoveryUniverseSecurity.fill_id,
+        )
+        .outerjoin(
+            DiscoveryDataCheckpoint,
+            and_(
+                DiscoveryDataCheckpoint.fill_id
+                == DiscoveryUniverseSecurity.fill_id,
+                DiscoveryDataCheckpoint.code
+                == DiscoveryUniverseSecurity.code,
+            ),
         )
         .where(DiscoveryUniverseSecurity.fill_id == latest_fill)
         .order_by(
@@ -210,10 +238,21 @@ def _persisted_universe(
     ).all()
     securities: dict[str, DiscoveryUniverseSecurity] = {}
     trading_dates: set[str] = set()
-    for security, trade_date in records:
+    matched_checkpoints: set[str] = set()
+    expected_checkpoints = 0
+    for security, trade_date, checkpoint_code, count in records:
         securities[security.code] = security
         if trade_date is not None:
             trading_dates.add(trade_date)
+        if checkpoint_code is not None:
+            matched_checkpoints.add(checkpoint_code)
+        expected_checkpoints = int(count or 0)
+    if (
+        not trading_dates
+        or len(securities) != expected_checkpoints
+        or len(matched_checkpoints) != expected_checkpoints
+    ):
+        return [], (), None
     rows = [
         CheapRow(
             code=row.code,

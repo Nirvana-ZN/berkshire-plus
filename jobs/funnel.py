@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from app.models import (
     Financial,
     FinancialFetchCompleteness,
+    FinancialFieldProvenance,
     Instrument,
     ScreenResult,
     ScreenRun,
@@ -39,6 +40,9 @@ _LEGACY_FINANCIAL_FIELDS = (
     "bps",
     "npl",
     "eps",
+)
+_STRICT_SHARED_FINANCIAL_FIELDS = frozenset(
+    {"net_income", "ocf", "capex", "shares", "npl"}
 )
 
 
@@ -89,6 +93,25 @@ def persist_industries(session: Session, snapshots: list[Constituent]) -> None:
 
 def persist_financials(session: Session, rows: list[FinancialRow]) -> None:
     codes: set[str] = set()
+    strict_owned = {
+        (code, period, period_type, field)
+        for code, period, period_type, field in session.execute(
+            select(
+                FinancialFieldProvenance.code,
+                FinancialFieldProvenance.period,
+                FinancialFieldProvenance.period_type,
+                FinancialFieldProvenance.field,
+            ).where(
+                FinancialFieldProvenance.code.in_(
+                    {row.code for row in rows}
+                ),
+                FinancialFieldProvenance.source == "discovery",
+                FinancialFieldProvenance.field.in_(
+                    _STRICT_SHARED_FINANCIAL_FIELDS
+                ),
+            )
+        )
+    }
     for row in rows:
         codes.add(row.code)
         stored = session.get(
@@ -103,6 +126,12 @@ def persist_financials(session: Session, rows: list[FinancialRow]) -> None:
             )
             session.add(stored)
         for field in _LEGACY_FINANCIAL_FIELDS:
+            if (
+                field in _STRICT_SHARED_FINANCIAL_FIELDS
+                and (row.code, row.period, row.period_type, field)
+                in strict_owned
+            ):
+                continue
             setattr(stored, field, getattr(row, field))
     stamp = _now()
     for code in codes:

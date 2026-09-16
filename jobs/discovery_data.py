@@ -61,6 +61,10 @@ class RequestPolicy:
 
 
 DEFAULT_POLICY = RequestPolicy()
+SNAPSHOT_UNAVAILABLE_STATUS = "snapshot_unavailable"
+SNAPSHOT_UNAVAILABLE_GUIDANCE = (
+    "snapshot unavailable or mismatched; start a new fill"
+)
 
 
 class FillClock(Protocol):
@@ -167,6 +171,45 @@ def _latest_fill(session: Session) -> DiscoveryDataFill | None:
     ).first()
 
 
+def _snapshot_parts(
+    session: Session,
+    fill_id: int,
+) -> tuple[set[str], set[str], bool]:
+    checkpoints = set(
+        session.scalars(
+            select(DiscoveryDataCheckpoint.code).where(
+                DiscoveryDataCheckpoint.fill_id == fill_id
+            )
+        )
+    )
+    snapshots = set(
+        session.scalars(
+            select(DiscoveryUniverseSecurity.code).where(
+                DiscoveryUniverseSecurity.fill_id == fill_id
+            )
+        )
+    )
+    has_dates = (
+        session.scalars(
+            select(DiscoveryFillTradingDate.trade_date)
+            .where(DiscoveryFillTradingDate.fill_id == fill_id)
+            .limit(1)
+        ).first()
+        is not None
+    )
+    return checkpoints, snapshots, has_dates
+
+
+def _mark_snapshot_unavailable(
+    fill: DiscoveryDataFill,
+    now: datetime,
+) -> None:
+    fill.status = SNAPSHOT_UNAVAILABLE_STATUS
+    fill.snapshot_status = "unavailable"
+    fill.last_error = SNAPSHOT_UNAVAILABLE_GUIDANCE
+    fill.updated_at = _aware_utc(now)
+
+
 def start_discovery_data_fill(
     session: Session,
     *,
@@ -181,6 +224,32 @@ def start_discovery_data_fill(
         .where(DiscoveryDataFill.status.in_(("queued", "running", "paused")))
         .order_by(DiscoveryDataFill.id.desc())
     ).first()
+    if active is not None:
+        checkpoints, snapshots, has_dates = _snapshot_parts(
+            session, active.id
+        )
+        invalid_snapshot = (
+            bool(checkpoints)
+            and (
+                active.snapshot_status != "ready"
+                or checkpoints != snapshots
+                or not has_dates
+            )
+        ) or (
+            not checkpoints
+            and active.status == "paused"
+            and active.snapshot_status is None
+        )
+        if invalid_snapshot:
+            _mark_snapshot_unavailable(active, stamp)
+            if current_lock == {
+                "type": JOB_TYPE_DISCOVERY_DATA,
+                "job_id": active.id,
+            }:
+                release(session, active.id, JOB_TYPE_DISCOVERY_DATA)
+            session.commit()
+            current_lock = lock_status(session)
+            active = None
     if active is not None and current_lock == {
         "type": JOB_TYPE_DISCOVERY_DATA,
         "job_id": active.id,
@@ -201,6 +270,7 @@ def start_discovery_data_fill(
             started_at=stamp,
             updated_at=stamp,
             last_error=None,
+            snapshot_status=None,
         )
         session.add(active)
         session.flush()
@@ -227,36 +297,27 @@ def _initialize_checkpoints(
     fill: DiscoveryDataFill,
     request_gate: DiscoveryRequestGate,
 ) -> bool:
-    existing_checkpoint = session.scalars(
-        select(DiscoveryDataCheckpoint.code)
-        .where(DiscoveryDataCheckpoint.fill_id == fill.id)
-        .limit(1)
-    ).first()
-    existing_snapshot = session.scalars(
-        select(DiscoveryUniverseSecurity.code)
-        .where(DiscoveryUniverseSecurity.fill_id == fill.id)
-        .limit(1)
-    ).first()
-    existing_trading_date = session.scalars(
-        select(DiscoveryFillTradingDate.trade_date)
-        .where(DiscoveryFillTradingDate.fill_id == fill.id)
-        .limit(1)
-    ).first()
-    if (
-        existing_checkpoint is not None
-        and existing_snapshot is not None
-        and existing_trading_date is not None
-    ):
+    checkpoints, snapshots, has_dates = _snapshot_parts(session, fill.id)
+    if checkpoints:
+        if (
+            fill.snapshot_status != "ready"
+            or checkpoints != snapshots
+            or not has_dates
+        ):
+            _mark_snapshot_unavailable(fill, request_gate.clock.now())
+            session.commit()
+            return False
         return True
-    rows: list[object] = []
-    trading_dates: list[str] = []
+    if snapshots or has_dates or fill.snapshot_status is not None:
+        _mark_snapshot_unavailable(fill, request_gate.clock.now())
+        session.commit()
+        return False
     try:
-        if existing_snapshot is None:
-            fetch = getattr(market, "fetch_cheap_universe")
-            rows = list(fetch(before_request=request_gate))
-            if hasattr(market, "_last_cheap_trading_dates"):
-                trading_dates = list(market._last_cheap_trading_dates)
-        if existing_trading_date is None and not trading_dates:
+        fetch = getattr(market, "fetch_cheap_universe")
+        rows = list(fetch(before_request=request_gate))
+        if hasattr(market, "_last_cheap_trading_dates"):
+            trading_dates = list(market._last_cheap_trading_dates)
+        else:
             fetch_dates = getattr(market, "fetch_trading_dates")
             end = _aware_utc(request_gate.clock.now()).date().isoformat()
             if "before_request" in signature(fetch_dates).parameters:
@@ -266,11 +327,6 @@ def _initialize_checkpoints(
             else:
                 request_gate()
                 trading_dates = list(fetch_dates(end, limit=6))
-        if existing_checkpoint is not None:
-            if existing_snapshot is None and not rows:
-                raise RuntimeError("universe snapshot returned no rows")
-            if existing_trading_date is None and not trading_dates:
-                raise RuntimeError("trading date snapshot returned no dates")
     except DiscoveryRequestStopped:
         return False
     except Exception as exc:
@@ -279,90 +335,60 @@ def _initialize_checkpoints(
         fill.updated_at = _aware_utc(request_gate.clock.now())
         session.commit()
         return False
-    universe: dict[str, object] = {}
-    if existing_snapshot is None:
-        universe = {
-            code: row
-            for row in rows
-            if (
-                code := str(getattr(row, "code", "")).strip().upper()
-            ).endswith((".SH", ".SZ"))
-        }
-    codes = (
-        sorted(universe)
-        if existing_snapshot is None
-        else session.scalars(
-            select(DiscoveryUniverseSecurity.code)
-            .where(DiscoveryUniverseSecurity.fill_id == fill.id)
-            .order_by(DiscoveryUniverseSecurity.code)
-        ).all()
-    )
+    universe = {
+        code: row
+        for row in rows
+        if (
+            code := str(getattr(row, "code", "")).strip().upper()
+        ).endswith((".SH", ".SZ"))
+    }
+    codes = sorted(universe)
     stamp = _aware_utc(request_gate.clock.now())
-    if existing_snapshot is None:
-        session.add_all(
-            [
-                DiscoveryUniverseSecurity(
-                    fill_id=fill.id,
-                    code=code,
-                    name=str(getattr(universe[code], "name", "")),
-                    industry=str(getattr(universe[code], "industry", "")),
-                    exchange=getattr(universe[code], "exchange", None),
-                    listing_date=getattr(
-                        universe[code], "listing_date", None
-                    ),
-                    is_st=getattr(universe[code], "is_st", None),
-                    is_delisting=getattr(
-                        universe[code], "is_delisting", None
-                    ),
-                    trading_status=getattr(
-                        universe[code], "trading_status", None
-                    ),
-                    is_suspended=(
-                        True
-                        if getattr(
-                            universe[code], "trading_status", None
-                        )
-                        == "suspended"
-                        else False
-                        if getattr(
-                            universe[code], "trading_status", None
-                        )
-                        == "trading"
-                        else None
-                    ),
-                    last_trade_date=getattr(
-                        universe[code], "last_trade_date", None
-                    ),
-                    industry_version=getattr(
-                        universe[code], "industry_version", None
-                    ),
-                    source_as_of=getattr(
-                        universe[code], "industry_as_of", None
-                    ),
-                    provenance=getattr(
-                        universe[code], "security_source", None
-                    ),
-                    market_status_code=getattr(
-                        universe[code], "market_status_code", None
-                    ),
-                    snapshot_at=stamp,
-                )
-                for code in codes
-            ]
-        )
-    if existing_trading_date is None:
-        session.add_all(
-            [
-                DiscoveryFillTradingDate(
-                    fill_id=fill.id, trade_date=trade_date
-                )
-                for trade_date in sorted(set(trading_dates))
-            ]
-        )
-    if existing_checkpoint is not None:
-        fill.updated_at = stamp
-        session.commit()
-        return True
+    session.add_all(
+        [
+            DiscoveryUniverseSecurity(
+                fill_id=fill.id,
+                code=code,
+                name=str(getattr(universe[code], "name", "")),
+                industry=str(getattr(universe[code], "industry", "")),
+                exchange=getattr(universe[code], "exchange", None),
+                listing_date=getattr(universe[code], "listing_date", None),
+                is_st=getattr(universe[code], "is_st", None),
+                is_delisting=getattr(universe[code], "is_delisting", None),
+                trading_status=getattr(universe[code], "trading_status", None),
+                is_suspended=(
+                    True
+                    if getattr(universe[code], "trading_status", None)
+                    == "suspended"
+                    else False
+                    if getattr(universe[code], "trading_status", None)
+                    == "trading"
+                    else None
+                ),
+                last_trade_date=getattr(
+                    universe[code], "last_trade_date", None
+                ),
+                industry_version=getattr(
+                    universe[code], "industry_version", None
+                ),
+                source_as_of=getattr(universe[code], "industry_as_of", None),
+                provenance=getattr(
+                    universe[code], "security_source", None
+                ),
+                market_status_code=getattr(
+                    universe[code], "market_status_code", None
+                ),
+                snapshot_at=stamp,
+            )
+            for code in codes
+        ]
+    )
+    session.add_all(
+        [
+            DiscoveryFillTradingDate(fill_id=fill.id, trade_date=trade_date)
+            for trade_date in sorted(set(trading_dates))
+        ]
+    )
     session.add_all(
         [
             DiscoveryDataCheckpoint(
@@ -380,6 +406,7 @@ def _initialize_checkpoints(
     )
     fill.total = len(codes)
     fill.updated_at = stamp
+    fill.snapshot_status = "ready"
     if not codes:
         fill.status = "done"
     session.commit()
@@ -508,6 +535,14 @@ def execute_discovery_data_fill(
         fill = session.get(DiscoveryDataFill, fill_id)
         if fill is None:
             return
+        if fill.status == "paused" and fill.snapshot_status is None:
+            checkpoints, _snapshots, _has_dates = _snapshot_parts(
+                session, fill.id
+            )
+            if not checkpoints:
+                _mark_snapshot_unavailable(fill, run_started)
+                session.commit()
+                return
         fill.status = "running"
         fill.daily_budget = policy.daily_budget
         fill.run_started_at = run_started
@@ -696,6 +731,9 @@ def discovery_data_status(
             "daily_requests": 0,
             "budget_day": _policy_day(now or datetime.now(timezone.utc)),
             "last_error": None,
+            "snapshot_status": None,
+            "restart_required": False,
+            "guidance": None,
             **base,
         }
     counts = _checkpoint_counts(session, fill.id)
@@ -714,6 +752,13 @@ def discovery_data_status(
         "daily_requests": fill.daily_requests,
         "budget_day": fill.budget_day,
         "last_error": fill.last_error,
+        "snapshot_status": fill.snapshot_status,
+        "restart_required": fill.status == SNAPSHOT_UNAVAILABLE_STATUS,
+        "guidance": (
+            SNAPSHOT_UNAVAILABLE_GUIDANCE
+            if fill.status == SNAPSHOT_UNAVAILABLE_STATUS
+            else None
+        ),
         **base,
         "daily_budget": fill.daily_budget,
         "eta_seconds": _eta_seconds(session, fill, remaining),

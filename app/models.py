@@ -353,6 +353,7 @@ class DiscoveryDataFill(Base):
     last_request_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    snapshot_status: Mapped[str | None] = mapped_column(String, nullable=True)
 
 
 class DiscoveryDataCheckpoint(Base):

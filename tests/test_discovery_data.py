@@ -9,7 +9,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, inspect, select, text
+from sqlalchemy import create_engine, delete, inspect, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -327,6 +327,7 @@ def test_discovery_then_legacy_preserves_discovery_financial_fields(tmp_path) ->
         period_type="annual",
         roe=Decimal("99"),
         net_income=Decimal("100"),
+        capex=Decimal("7"),
         revenue=Decimal("337532000000.12"),
         government_grants=Decimal("5"),
     )
@@ -336,6 +337,7 @@ def test_discovery_then_legacy_preserves_discovery_financial_fields(tmp_path) ->
         period_type=discovery.period_type,
         roe=Decimal("18"),
         net_income=Decimal("102"),
+        capex=Decimal("9"),
         revenue=Decimal("999"),
     )
     with Session(engine) as session:
@@ -348,9 +350,20 @@ def test_discovery_then_legacy_preserves_discovery_financial_fields(tmp_path) ->
         )
         assert stored is not None
         assert stored.roe == Decimal("18")
-        assert stored.net_income == Decimal("102")
+        assert stored.net_income == Decimal("100")
+        assert stored.capex == Decimal("7")
         assert stored.revenue == Decimal("337532000000.12")
         assert stored.government_grants == Decimal("5")
+        assert session.get(
+            FinancialFieldProvenance,
+            (
+                legacy.code,
+                legacy.period,
+                legacy.period_type,
+                "capex",
+                "discovery",
+            ),
+        ) is not None
         assert {
             row.mode
             for row in session.scalars(
@@ -412,6 +425,8 @@ def test_readiness_requires_strict_field_provenance_in_both_write_orders(
         assert stored.capex is not None
         if strict_capex is None:
             assert stored.capex == legacy.capex
+        else:
+            assert stored.capex == strict_capex
         provenance = session.get(
             FinancialFieldProvenance,
             (code, "2025", "annual", "capex", "discovery"),
@@ -421,6 +436,46 @@ def test_readiness_requires_strict_field_provenance_in_both_write_orders(
             session, as_of=date(2026, 9, 16)
         )
         assert report.tracks["deep_value"].complete == expected_complete
+    engine.dispose()
+
+
+def test_strict_value_and_provenance_rollback_together(tmp_path) -> None:
+    from jobs.discovery_data import persist_discovery_financials
+    from jobs.funnel import persist_financials
+
+    engine = init_db(tmp_path / "financial-provenance-rollback.db")
+    code = "000333.SZ"
+    strict = FinancialRow(
+        code=code,
+        period="2025",
+        period_type="annual",
+        capex=Decimal("7"),
+        source_as_of="2026-03-31",
+    )
+    with Session(engine) as session:
+        persist_financials(
+            session,
+            [replace(strict, capex=Decimal("9"), source_as_of=None)],
+        )
+        session.commit()
+        persist_discovery_financials(session, [strict])
+        session.flush()
+        stored = session.get(Financial, (code, "2025", "annual"))
+        assert stored is not None and stored.capex == Decimal("7")
+        assert session.get(
+            FinancialFieldProvenance,
+            (code, "2025", "annual", "capex", "discovery"),
+        ) is not None
+        session.rollback()
+
+    with Session(engine) as session:
+        stored = session.get(Financial, (code, "2025", "annual"))
+        provenance = session.get(
+            FinancialFieldProvenance,
+            (code, "2025", "annual", "capex", "discovery"),
+        )
+        assert stored is not None and stored.capex == Decimal("9")
+        assert provenance is None
     engine.dispose()
 
 
@@ -2647,6 +2702,32 @@ def _bundle(
     )
 
 
+def _snapshot_security(
+    fill_id: int,
+    code: str,
+    now: datetime,
+) -> DiscoveryUniverseSecurity:
+    state = _security(code)
+    return DiscoveryUniverseSecurity(
+        fill_id=fill_id,
+        code=state.code,
+        name=state.name,
+        industry=state.industry,
+        exchange=state.exchange,
+        listing_date=state.listing_date,
+        is_st=state.is_st,
+        is_delisting=state.is_delisting,
+        trading_status=state.trading_status,
+        is_suspended=state.trading_status == "suspended",
+        last_trade_date=state.last_trade_date,
+        industry_version=state.industry_version,
+        source_as_of=state.industry_as_of,
+        provenance=state.source,
+        market_status_code=state.market_status_code,
+        snapshot_at=now,
+    )
+
+
 def _fill(
     session: Session,
     codes: list[str],
@@ -2668,6 +2749,7 @@ def _fill(
         started_at=now,
         updated_at=now,
         last_error=None,
+        snapshot_status="ready" if codes and with_snapshot else None,
     )
     session.add(fill)
     session.flush()
@@ -2689,25 +2771,8 @@ def _fill(
     if codes and with_snapshot:
         session.add_all(
             [
-                DiscoveryUniverseSecurity(
-                    fill_id=fill.id,
-                    code=state.code,
-                    name=state.name,
-                    industry=state.industry,
-                    exchange=state.exchange,
-                    listing_date=state.listing_date,
-                    is_st=state.is_st,
-                    is_delisting=state.is_delisting,
-                    trading_status=state.trading_status,
-                    is_suspended=state.trading_status == "suspended",
-                    last_trade_date=state.last_trade_date,
-                    industry_version=state.industry_version,
-                    source_as_of=state.industry_as_of,
-                    provenance=state.source,
-                    market_status_code=state.market_status_code,
-                    snapshot_at=now,
-                )
-                for state in (_security(code) for code in codes)
+                _snapshot_security(fill.id, code, now)
+                for code in codes
             ]
         )
         session.add_all(
@@ -2826,113 +2891,102 @@ def test_discovery_fill_resume_skips_completed_and_retries_due_checkpoint(
     engine.dispose()
 
 
-def test_resumable_fill_hydrates_missing_snapshot_without_resetting_checkpoints(
+@pytest.mark.parametrize(
+    "snapshot_codes",
+    [
+        ("000001.SZ",),
+        ("000001.SZ", "000002.SZ", "000003.SZ"),
+        ("000001.SZ", "000003.SZ"),
+    ],
+    ids=("missing", "extra", "changed"),
+)
+def test_resumable_fill_rejects_checkpoint_snapshot_mismatch(
     tmp_path,
+    snapshot_codes: tuple[str, ...],
 ) -> None:
-    from jobs.discovery_data import RequestPolicy, execute_discovery_data_fill
+    from discovery.data_readiness import discovery_data_readiness
+    from jobs.discovery_data import (
+        RequestPolicy,
+        discovery_data_status,
+        execute_discovery_data_fill,
+        start_discovery_data_fill,
+    )
 
-    engine = init_db(tmp_path / "fill-hydrate-snapshot.db")
+    engine = init_db(tmp_path / f"snapshot-mismatch-{len(snapshot_codes)}.db")
     factory = create_session_factory(engine)
     now = datetime(2026, 9, 16, 12, tzinfo=timezone.utc)
-    done_code, pending_code = "000001.SZ", "000002.SZ"
+    checkpoint_codes = ("000001.SZ", "000002.SZ")
     with factory() as session:
         fill = _fill(
             session,
-            [done_code, pending_code],
+            list(checkpoint_codes),
             now=now,
             status="paused",
-            daily_budget=1,
-            with_snapshot=False,
         )
         fill_id = fill.id
         done = session.get(
-            DiscoveryDataCheckpoint, (fill_id, done_code)
+            DiscoveryDataCheckpoint, (fill_id, checkpoint_codes[0])
         )
         assert done is not None
         done.status = "done"
         done.attempts = 2
         done.valuation_points = 60
         fill.completed = 1
+        session.execute(
+            delete(DiscoveryUniverseSecurity).where(
+                DiscoveryUniverseSecurity.fill_id == fill_id
+            )
+        )
+        session.add_all(
+            [
+                _snapshot_security(fill_id, code, now)
+                for code in snapshot_codes
+            ]
+        )
         session.commit()
 
-    frozen_dates = [
-        "2026-09-09",
-        "2026-09-10",
-        "2026-09-11",
-        "2026-09-14",
-        "2026-09-15",
-        "2026-09-16",
-    ]
     market = FakeMarketClient(
-        cheap_universe=[
-            _readiness_row(done_code),
-            _readiness_row(pending_code),
-        ],
-        trading_dates=frozen_dates,
-        discovery_data={pending_code: _bundle(pending_code)},
+        cheap_universe=[_readiness_row(code) for code in snapshot_codes],
+        trading_dates=["2026-09-15", "2026-09-16"],
     )
-    policy = RequestPolicy(
-        requests_per_second=100,
-        max_attempts=3,
-        daily_budget=1,
-        max_runtime_seconds=60,
-    )
-    clock = FakeClock(now)
     with factory() as session:
         execute_discovery_data_fill(
-            session, market, fill_id, policy=policy, clock=clock
+            session,
+            market,
+            fill_id,
+            policy=RequestPolicy(requests_per_second=100),
+            clock=FakeClock(now),
         )
-    with factory() as session:
-        done = session.get(
-            DiscoveryDataCheckpoint, (fill_id, done_code)
-        )
-        pending = session.get(
-            DiscoveryDataCheckpoint, (fill_id, pending_code)
-        )
-        assert done is not None and pending is not None
-        assert (
-            done.status,
-            done.attempts,
-            done.valuation_points,
-        ) == ("done", 2, 60)
-        assert pending.status == "pending"
-        assert session.query(DiscoveryUniverseSecurity).filter_by(
-            fill_id=fill_id
-        ).count() == 2
-        assert session.scalars(
-            select(DiscoveryFillTradingDate.trade_date)
-            .where(DiscoveryFillTradingDate.fill_id == fill_id)
-            .order_by(DiscoveryFillTradingDate.trade_date)
-        ).all() == frozen_dates
-    assert market.calls.count(("cheap",)) == 1
-    assert not any(call[0] == "discovery_data" for call in market.calls)
-
-    clock.advance(days=1)
-    with factory() as session:
-        execute_discovery_data_fill(
-            session, market, fill_id, policy=policy, clock=clock
-        )
+    assert market.calls == []
     with factory() as session:
         fill = session.get(DiscoveryDataFill, fill_id)
         done = session.get(
-            DiscoveryDataCheckpoint, (fill_id, done_code)
+            DiscoveryDataCheckpoint, (fill_id, checkpoint_codes[0])
         )
         pending = session.get(
-            DiscoveryDataCheckpoint, (fill_id, pending_code)
+            DiscoveryDataCheckpoint, (fill_id, checkpoint_codes[1])
         )
         assert fill is not None and done is not None and pending is not None
-        assert (fill.status, fill.completed) == ("done", 2)
-        assert (done.status, done.attempts) == ("done", 2)
-        assert (pending.status, pending.attempts) == ("done", 1)
-    assert market.calls.count(("cheap",)) == 1
-    assert (
-        "discovery_data",
-        pending_code,
-    ) in market.calls
-    assert (
-        "discovery_data",
-        done_code,
-    ) not in market.calls
+        assert fill.status == "snapshot_unavailable"
+        assert fill.snapshot_status == "unavailable"
+        assert fill.last_error and "new fill" in fill.last_error
+        assert (done.status, done.attempts, done.valuation_points) == (
+            "done",
+            2,
+            60,
+        )
+        assert (pending.status, pending.attempts) == ("pending", 0)
+        status = discovery_data_status(session, now=now)
+        assert status["restart_required"] is True
+        assert "new fill" in str(status["guidance"])
+        assert discovery_data_readiness(
+            session, as_of=now.date()
+        ).observations == {}
+        replacement, dispatch = start_discovery_data_fill(
+            session, now=now + timedelta(seconds=1)
+        )
+        assert replacement is not None and dispatch
+        assert replacement.id != fill_id
     engine.dispose()
 
 
@@ -3189,6 +3243,7 @@ def test_discovery_data_duplicate_start_is_idempotent_and_lock_conflicts(
                 exchange="SZ",
             )
         ],
+        trading_dates=["2026-09-15", "2026-09-16"],
         discovery_data={code: _bundle(code)},
         discovery_gate=gate,
     )
@@ -3731,10 +3786,7 @@ def test_init_db_adds_discovery_request_timing_columns(tmp_path) -> None:
     with factory() as session:
         execute_discovery_data_fill(
             session,
-            MigratedFillMarket(
-                cheap_universe=[_readiness_row(code)],
-                trading_dates=["2026-09-15", "2026-09-16"],
-            ),
+            MigratedFillMarket(),
             42,
             policy=RequestPolicy(
                 requests_per_second=0.5,
@@ -3744,8 +3796,114 @@ def test_init_db_adds_discovery_request_timing_columns(tmp_path) -> None:
             ),
             clock=clock,
         )
-    assert clock.sleeps == [2, 2]
-    assert transports == [now + timedelta(seconds=4)]
+    assert clock.sleeps == []
+    assert transports == []
+    with factory() as session:
+        fill = session.get(DiscoveryDataFill, 42)
+        assert fill is not None
+        assert fill.status == "snapshot_unavailable"
+        assert fill.snapshot_status == "unavailable"
+    engine.dispose()
+
+
+def test_init_db_marks_completed_presnapshot_fill_restart_required(
+    tmp_path,
+) -> None:
+    from discovery.data_readiness import discovery_data_readiness
+    from jobs.discovery_data import (
+        discovery_data_status,
+        start_discovery_data_fill,
+    )
+
+    db_path = tmp_path / "completed-presnapshot-fill.db"
+    old_engine = create_engine(f"sqlite:///{db_path.resolve().as_posix()}")
+    with old_engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE discovery_data_fills (
+                    id INTEGER NOT NULL PRIMARY KEY,
+                    status VARCHAR NOT NULL,
+                    total INTEGER NOT NULL,
+                    completed INTEGER NOT NULL,
+                    failed INTEGER NOT NULL,
+                    request_count INTEGER NOT NULL,
+                    daily_budget INTEGER NOT NULL,
+                    budget_day VARCHAR,
+                    daily_requests INTEGER NOT NULL,
+                    started_at DATETIME NOT NULL,
+                    run_started_at DATETIME,
+                    last_request_at DATETIME,
+                    updated_at DATETIME NOT NULL,
+                    last_error TEXT
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE discovery_data_checkpoints (
+                    fill_id INTEGER NOT NULL,
+                    code VARCHAR NOT NULL,
+                    status VARCHAR NOT NULL,
+                    attempts INTEGER NOT NULL,
+                    next_retry_at DATETIME,
+                    valuation_points INTEGER NOT NULL,
+                    error TEXT,
+                    updated_at DATETIME NOT NULL,
+                    PRIMARY KEY (fill_id, code)
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                INSERT INTO discovery_data_fills (
+                    id, status, total, completed, failed, request_count,
+                    daily_budget, budget_day, daily_requests, started_at,
+                    updated_at
+                ) VALUES (
+                    42, 'done', 1, 1, 0, 10, 1000, '2026-09-16', 10,
+                    '2026-09-16 12:00:00', '2026-09-16 13:00:00'
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                INSERT INTO discovery_data_checkpoints (
+                    fill_id, code, status, attempts, valuation_points,
+                    updated_at
+                ) VALUES (
+                    42, '000001.SZ', 'done', 2, 60,
+                    '2026-09-16 13:00:00'
+                )
+                """
+            )
+        )
+    old_engine.dispose()
+
+    engine = init_db(db_path)
+    now = datetime(2026, 9, 16, 14, tzinfo=timezone.utc)
+    with Session(engine) as session:
+        legacy = session.get(DiscoveryDataFill, 42)
+        assert legacy is not None
+        assert legacy.status == "snapshot_unavailable"
+        assert legacy.snapshot_status == "unavailable"
+        status = discovery_data_status(session, now=now)
+        assert status["restart_required"] is True
+        assert "new fill" in str(status["guidance"])
+        assert discovery_data_readiness(
+            session, as_of=now.date()
+        ).observations == {}
+        replacement, dispatch = start_discovery_data_fill(
+            session, now=now
+        )
+        assert replacement is not None and dispatch
+        assert replacement.id != legacy.id
     engine.dispose()
 
 
@@ -3803,6 +3961,7 @@ def _store_readiness_universe(
         started_at=stamp,
         updated_at=stamp,
         last_error=None,
+        snapshot_status="ready",
     )
     session.add(fill)
     session.flush()
@@ -3832,6 +3991,21 @@ def _store_readiness_universe(
         [
             DiscoveryFillTradingDate(fill_id=fill.id, trade_date=trade_date)
             for trade_date in trading_dates
+        ]
+    )
+    session.add_all(
+        [
+            DiscoveryDataCheckpoint(
+                fill_id=fill.id,
+                code=row.code,
+                status="done",
+                attempts=1,
+                next_retry_at=None,
+                valuation_points=0,
+                error=None,
+                updated_at=stamp,
+            )
+            for row in rows
         ]
     )
     session.commit()
