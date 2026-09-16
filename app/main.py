@@ -44,8 +44,15 @@ from jobs.cheap import (
     execute_cheap_fill,
     load_cheap_board,
 )
+from jobs.discovery_data import (
+    DEFAULT_POLICY,
+    discovery_data_status,
+    execute_discovery_data_fill,
+    start_discovery_data_fill,
+)
 from jobs.funnel import execute_funnel
 from jobs.lock import (
+    JOB_TYPE_DISCOVERY_DATA,
     JOB_TYPE_FUNNEL,
     JOB_TYPE_RESEARCH,
     JOB_TYPE_REVIEW,
@@ -741,6 +748,69 @@ def create_app(
         market = app.state.market_client
         with factory() as session:
             execute_cheap_fill(session, market)
+
+    def _run_discovery_data_fill(fill_id: int) -> None:
+        factory = app.state.session_factory
+        market = app.state.market_client
+        with factory() as session:
+            execute_discovery_data_fill(
+                session,
+                market,
+                fill_id,
+                policy=DEFAULT_POLICY,
+            )
+
+    @app.get("/api/discovery-data/status")
+    def get_discovery_data_status(request: Request) -> dict[str, object]:
+        factory = request.app.state.session_factory
+        with factory() as session:
+            return discovery_data_status(session, policy=DEFAULT_POLICY)
+
+    @app.post("/api/discovery-data/fill")
+    async def post_discovery_data_fill(request: Request):
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+        if payload is None:
+            payload = {}
+        if not isinstance(payload, dict):
+            return _error_json(
+                400,
+                error="请求无效",
+                code="INVALID_DISCOVERY_DATA_FILL",
+                detail="请求体必须是对象",
+            )
+        sync = _as_bool(payload.get("sync")) and bool(
+            getattr(request.app.state, "allow_sync", False)
+        )
+        factory = request.app.state.session_factory
+        with factory() as session:
+            fill, dispatch = start_discovery_data_fill(
+                session,
+                policy=DEFAULT_POLICY,
+            )
+            if fill is None:
+                session.rollback()
+                current = lock_status(session)
+                if current and current.get("type") == JOB_TYPE_DISCOVERY_DATA:
+                    active_id = int(current["job_id"])
+                    return discovery_data_status(session, policy=DEFAULT_POLICY) | {
+                        "id": active_id
+                    }
+                return _conflict_locked(session)
+            fill_id = fill.id
+        if dispatch:
+            if sync:
+                _run_discovery_data_fill(fill_id)
+            else:
+                threading.Thread(
+                    target=_run_discovery_data_fill,
+                    args=(fill_id,),
+                    daemon=True,
+                ).start()
+        with factory() as session:
+            return discovery_data_status(session, policy=DEFAULT_POLICY)
 
     @app.get("/api/cheap")
     def cheap(request: Request, sort: str = Query("pe")):

@@ -5,11 +5,19 @@ from datetime import datetime, timezone
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
-from app.models import JobLock, PortfolioReview, ResearchJob, ScreenRun
+from app.models import (
+    DiscoveryDataCheckpoint,
+    DiscoveryDataFill,
+    JobLock,
+    PortfolioReview,
+    ResearchJob,
+    ScreenRun,
+)
 
 JOB_TYPE_FUNNEL = "funnel"
 JOB_TYPE_RESEARCH = "research"
 JOB_TYPE_REVIEW = "review"
+JOB_TYPE_DISCOVERY_DATA = "discovery_data"
 LOCK_ROW_ID = 1
 ACTIVE_STATUSES = ("queued", "running")
 
@@ -46,6 +54,25 @@ def clear_stale_lock(session: Session) -> None:
         review.status = "failed"
         review.error = "进程重启，任务中断"
         review.updated_at = datetime.now(timezone.utc)
+    leftover_discovery = session.scalars(
+        select(DiscoveryDataFill).where(
+            DiscoveryDataFill.status.in_(ACTIVE_STATUSES)
+        )
+    ).all()
+    interrupted_at = datetime.now(timezone.utc)
+    for fill in leftover_discovery:
+        fill.status = "paused"
+        fill.last_error = "进程重启，任务已暂停"
+        fill.updated_at = interrupted_at
+        checkpoints = session.scalars(
+            select(DiscoveryDataCheckpoint).where(
+                DiscoveryDataCheckpoint.fill_id == fill.id,
+                DiscoveryDataCheckpoint.status == "running",
+            )
+        ).all()
+        for checkpoint in checkpoints:
+            checkpoint.status = "pending"
+            checkpoint.updated_at = interrupted_at
     row = session.get(JobLock, LOCK_ROW_ID)
     if row is not None:
         row.job_id = None

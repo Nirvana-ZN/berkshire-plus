@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from threading import Event
@@ -98,6 +99,10 @@ _SUFFIXES = ("Ⅱ", "II", "2")
 
 
 class MarketClient(Protocol):
+    @property
+    def request_count(self) -> int:
+        """Total external requests made by this client instance."""
+
     def fetch_constituents(self, scope_type: str, scope_text: str) -> list[Constituent]:
         """Return the resolved constituent list, or raise MarketError."""
 
@@ -148,6 +153,8 @@ class FakeMarketClient:
         trading_dates: Sequence[str] | None = None,
         discovery_data: Mapping[str, DiscoveryCompanyData] | None = None,
         discovery_errors: Mapping[str, str] | None = None,
+        discovery_request_counts: Mapping[str, int] | None = None,
+        discovery_gate: Event | None = None,
     ) -> None:
         self.constituents = list(constituents or [])
         self.financials = list(financials or [])
@@ -178,6 +185,13 @@ class FakeMarketClient:
         self.trading_dates = list(trading_dates or [])
         self.discovery_data = dict(discovery_data or {})
         self.discovery_errors = dict(discovery_errors or {})
+        self.discovery_request_counts = dict(discovery_request_counts or {})
+        self.discovery_gate = discovery_gate
+        self._request_count = 0
+
+    @property
+    def request_count(self) -> int:
+        return self._request_count
 
     def fetch_constituents(self, scope_type: str, scope_text: str) -> list[Constituent]:
         self.calls.append(("constituents", scope_type, scope_text))
@@ -212,6 +226,7 @@ class FakeMarketClient:
 
     def fetch_cheap_universe(self) -> list[CheapRow]:
         self.calls.append(("cheap",))
+        self._request_count += 1
         if self.cheap_error is not None:
             raise MarketError(self.cheap_error)
         return list(self.cheap_universe)
@@ -226,16 +241,32 @@ class FakeMarketClient:
 
     def fetch_discovery_data(self, code: str) -> DiscoveryCompanyData:
         self.calls.append(("discovery_data", code))
+        if self.discovery_gate is not None:
+            self.discovery_gate.wait(timeout=10)
+        request_count = self.discovery_request_counts.get(code)
         if code in self.discovery_errors:
+            used = 0 if request_count is None else request_count
+            self._request_count += used
             raise DiscoveryCompanyError(
-                code, "fake", self.discovery_errors[code], request_count=0
+                code,
+                "fake",
+                self.discovery_errors[code],
+                request_count=used,
             )
         try:
-            return self.discovery_data[code]
+            result = self.discovery_data[code]
         except KeyError as exc:
+            used = 0 if request_count is None else request_count
+            self._request_count += used
             raise DiscoveryCompanyError(
-                code, "fake", "no configured discovery data", request_count=0
+                code,
+                "fake",
+                "no configured discovery data",
+                request_count=used,
             ) from exc
+        used = result.request_count if request_count is None else request_count
+        self._request_count += used
+        return result if used == result.request_count else replace(result, request_count=used)
 
     def list_boards(self, scope_type: str, query: str = "") -> list[dict[str, str]]:
         self.calls.append(("boards", scope_type, query))
@@ -663,6 +694,10 @@ class EastMoneyClient:
         self.timeout = timeout
         self._board_lists: dict[int, list[dict[str, str]]] = {}
         self._request_count = 0
+
+    @property
+    def request_count(self) -> int:
+        return self._request_count
 
     def fetch_constituents(self, scope_type: str, scope_text: str) -> list[Constituent]:
         text = (scope_text or "").strip()

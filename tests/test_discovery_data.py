@@ -1,19 +1,25 @@
 import json
+import time
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from pathlib import Path
+from threading import Event
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
+from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.db import init_db
+from app.db import create_session_factory, init_db
+from app.main import create_app
 from app.models import (
     DiscoveryDataCheckpoint,
     DiscoveryDataFill,
     Financial,
+    JobLock,
     Setting,
     ValuationHistory,
 )
@@ -1777,3 +1783,543 @@ def test_real_discovery_path_reports_per_source_dates_and_request_count() -> Non
         valuation=latest_trade,
         financial="2026-04-01",
     )
+
+
+class FakeClock:
+    def __init__(self, now: datetime) -> None:
+        self.current = now
+        self.sleeps: list[float] = []
+
+    def now(self) -> datetime:
+        return self.current
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.current += timedelta(seconds=seconds)
+
+    def advance(self, **kwargs: float) -> None:
+        self.current += timedelta(**kwargs)
+
+
+def _security(code: str) -> SecurityState:
+    return SecurityState(
+        code=code,
+        name=code,
+        exchange=code[-2:],
+        listing_date="2001-01-01",
+        is_st=False,
+        is_delisting=False,
+        trading_status="trading",
+        last_trade_date="2026-09-16",
+        industry="测试",
+        industry_version="test:v1",
+        industry_as_of="2026-09-16",
+        source="fake",
+    )
+
+
+def _bundle(
+    code: str,
+    *,
+    request_count: int = 1,
+    valuation_points: tuple[ValuationPoint, ...] = (),
+) -> DiscoveryCompanyData:
+    return DiscoveryCompanyData(
+        code=code,
+        security_state=_security(code),
+        financial_rows=(
+            FinancialRow(code=code, period="2025", period_type="annual"),
+        ),
+        valuation_points=valuation_points,
+        request_count=request_count,
+        source_as_of=DiscoverySourceAsOf(
+            security="2026-09-16",
+            valuation=None,
+            financial="2026-03-31",
+        ),
+    )
+
+
+def _fill(
+    session: Session,
+    codes: list[str],
+    *,
+    now: datetime,
+    status: str = "running",
+    daily_budget: int = 100,
+) -> DiscoveryDataFill:
+    fill = DiscoveryDataFill(
+        status=status,
+        total=len(codes),
+        completed=0,
+        failed=0,
+        request_count=0,
+        daily_budget=daily_budget,
+        budget_day=now.date().isoformat(),
+        daily_requests=0,
+        started_at=now,
+        updated_at=now,
+        last_error=None,
+    )
+    session.add(fill)
+    session.flush()
+    session.add_all(
+        [
+            DiscoveryDataCheckpoint(
+                fill_id=fill.id,
+                code=code,
+                status="pending",
+                attempts=0,
+                next_retry_at=None,
+                valuation_points=0,
+                error=None,
+                updated_at=now,
+            )
+            for code in codes
+        ]
+    )
+    session.commit()
+    return fill
+
+
+def test_discovery_fill_commits_success_before_later_company_failure(tmp_path) -> None:
+    from jobs.discovery_data import RequestPolicy, execute_discovery_data_fill
+
+    engine = init_db(tmp_path / "fill-commit.db")
+    factory = create_session_factory(engine)
+    now = datetime(2026, 9, 16, 12, tzinfo=timezone.utc)
+    first, second = "000001.SZ", "000002.SZ"
+    with factory() as session:
+        fill_id = _fill(session, [first, second], now=now).id
+    market = FakeMarketClient(
+        discovery_data={first: _bundle(first)},
+        discovery_errors={second: "statement unavailable"},
+        discovery_request_counts={second: 2},
+    )
+    policy = RequestPolicy(
+        requests_per_second=100,
+        max_attempts=1,
+        daily_budget=100,
+        max_runtime_seconds=60,
+        company_request_reservation=3,
+    )
+    with factory() as session:
+        execute_discovery_data_fill(
+            session, market, fill_id, policy=policy, clock=FakeClock(now)
+        )
+    with factory() as session:
+        assert session.get(Financial, (first, "2025", "annual")) is not None
+        done = session.get(DiscoveryDataCheckpoint, (fill_id, first))
+        failed = session.get(DiscoveryDataCheckpoint, (fill_id, second))
+        fill = session.get(DiscoveryDataFill, fill_id)
+        assert done is not None and done.status == "done"
+        assert failed is not None and failed.status == "failed"
+        assert failed.attempts == 1
+        assert failed.error and "statement unavailable" in failed.error
+        assert fill is not None
+        assert (fill.status, fill.completed, fill.failed, fill.request_count) == (
+            "done",
+            1,
+            1,
+            3,
+        )
+    engine.dispose()
+
+
+def test_discovery_fill_resume_skips_completed_and_retries_due_checkpoint(
+    tmp_path,
+) -> None:
+    from jobs.discovery_data import RequestPolicy, execute_discovery_data_fill
+
+    engine = init_db(tmp_path / "fill-resume.db")
+    factory = create_session_factory(engine)
+    now = datetime(2026, 9, 16, 12, tzinfo=timezone.utc)
+    done_code, retry_code, pending_code = "000001.SZ", "000002.SZ", "000003.SZ"
+    with factory() as session:
+        fill = _fill(
+            session,
+            [done_code, retry_code, pending_code],
+            now=now,
+            status="paused",
+        )
+        fill_id = fill.id
+        done = session.get(DiscoveryDataCheckpoint, (fill_id, done_code))
+        retry = session.get(DiscoveryDataCheckpoint, (fill_id, retry_code))
+        assert done is not None and retry is not None
+        done.status = "done"
+        done.attempts = 1
+        retry.status = "retryable"
+        retry.attempts = 1
+        retry.next_retry_at = now - timedelta(seconds=1)
+        fill.completed = 1
+        session.commit()
+    market = FakeMarketClient(
+        discovery_data={
+            retry_code: _bundle(retry_code),
+            pending_code: _bundle(pending_code),
+        }
+    )
+    policy = RequestPolicy(
+        requests_per_second=100,
+        max_attempts=3,
+        daily_budget=100,
+        max_runtime_seconds=60,
+        company_request_reservation=2,
+    )
+    with factory() as session:
+        execute_discovery_data_fill(
+            session, market, fill_id, policy=policy, clock=FakeClock(now)
+        )
+    assert [call for call in market.calls if call[0] == "discovery_data"] == [
+        ("discovery_data", retry_code),
+        ("discovery_data", pending_code),
+    ]
+    with factory() as session:
+        fill = session.get(DiscoveryDataFill, fill_id)
+        assert fill is not None
+        assert (fill.status, fill.completed, fill.failed) == ("done", 3, 0)
+    engine.dispose()
+
+
+def test_discovery_fill_throttles_and_stops_on_durable_daily_budget(
+    tmp_path,
+) -> None:
+    from jobs.discovery_data import (
+        RequestPolicy,
+        discovery_data_status,
+        execute_discovery_data_fill,
+    )
+
+    engine = init_db(tmp_path / "fill-budget.db")
+    factory = create_session_factory(engine)
+    now = datetime(2026, 9, 16, 12, tzinfo=timezone.utc)
+    codes = ["000001.SZ", "000002.SZ", "000003.SZ"]
+    with factory() as session:
+        fill_id = _fill(session, codes, now=now, daily_budget=4).id
+    market = FakeMarketClient(
+        discovery_data={code: _bundle(code, request_count=2) for code in codes}
+    )
+    clock = FakeClock(now)
+    policy = RequestPolicy(
+        requests_per_second=2,
+        max_attempts=2,
+        daily_budget=4,
+        max_runtime_seconds=60,
+        company_request_reservation=2,
+    )
+    with factory() as session:
+        execute_discovery_data_fill(
+            session, market, fill_id, policy=policy, clock=clock
+        )
+    assert clock.sleeps == [1.0]
+    assert [call[1] for call in market.calls if call[0] == "discovery_data"] == codes[:2]
+    with factory() as session:
+        fill = session.get(DiscoveryDataFill, fill_id)
+        untouched = session.get(DiscoveryDataCheckpoint, (fill_id, codes[2]))
+        assert fill is not None and untouched is not None
+        assert (fill.status, fill.daily_requests, fill.completed) == ("paused", 4, 2)
+        assert untouched.status == "pending"
+        assert discovery_data_status(
+            session, policy=policy, now=clock.now()
+        )["eta_seconds"] == 1
+
+    # Restart on the same local-policy day cannot reset persisted usage.
+    with factory() as session:
+        execute_discovery_data_fill(
+            session, market, fill_id, policy=policy, clock=clock
+        )
+    assert [call[1] for call in market.calls if call[0] == "discovery_data"] == codes[:2]
+
+    # Only a local-policy day change resets the durable daily counter.
+    clock.advance(days=1)
+    with factory() as session:
+        execute_discovery_data_fill(
+            session, market, fill_id, policy=policy, clock=clock
+        )
+    with factory() as session:
+        fill = session.get(DiscoveryDataFill, fill_id)
+        assert fill is not None
+        assert (fill.status, fill.daily_requests, fill.completed) == ("done", 2, 3)
+    engine.dispose()
+
+
+def test_discovery_failure_retries_to_cap_and_status_eta_needs_two_samples(
+    tmp_path,
+) -> None:
+    from jobs.discovery_data import (
+        RequestPolicy,
+        discovery_data_status,
+        execute_discovery_data_fill,
+    )
+
+    engine = init_db(tmp_path / "fill-retry.db")
+    factory = create_session_factory(engine)
+    now = datetime(2026, 9, 16, 12, tzinfo=timezone.utc)
+    code = "000001.SZ"
+    with factory() as session:
+        fill_id = _fill(session, [code], now=now).id
+    market = FakeMarketClient(
+        discovery_errors={code: "temporary"},
+        discovery_request_counts={code: 1},
+    )
+    clock = FakeClock(now)
+    policy = RequestPolicy(
+        requests_per_second=100,
+        max_attempts=2,
+        daily_budget=100,
+        max_runtime_seconds=60,
+        retry_delay_seconds=10,
+        company_request_reservation=2,
+    )
+    with factory() as session:
+        execute_discovery_data_fill(
+            session, market, fill_id, policy=policy, clock=clock
+        )
+        status = discovery_data_status(session, policy=policy, now=clock.now())
+        assert status["status"] == "paused"
+        assert status["retryable"] == 1
+        assert status["failed"] == 0
+        assert status["eta_seconds"] is None
+        assert status["requests_per_second"] == 100
+        assert status["max_attempts"] == 2
+        assert status["daily_budget"] == 100
+        assert status["max_runtime_seconds"] == 60
+    clock.advance(seconds=10)
+    with factory() as session:
+        execute_discovery_data_fill(
+            session, market, fill_id, policy=policy, clock=clock
+        )
+    with factory() as session:
+        checkpoint = session.get(DiscoveryDataCheckpoint, (fill_id, code))
+        fill = session.get(DiscoveryDataFill, fill_id)
+        assert checkpoint is not None and fill is not None
+        assert (checkpoint.status, checkpoint.attempts) == ("failed", 2)
+        assert checkpoint.next_retry_at is None
+        assert fill.status == "done"
+        assert fill.last_error and "temporary" in fill.last_error
+    engine.dispose()
+
+
+def test_discovery_empty_bundle_is_success_and_max_runtime_pauses_next(
+    tmp_path,
+) -> None:
+    from jobs.discovery_data import RequestPolicy, execute_discovery_data_fill
+
+    engine = init_db(tmp_path / "fill-runtime.db")
+    factory = create_session_factory(engine)
+    now = datetime(2026, 9, 16, 12, tzinfo=timezone.utc)
+    first, second = "000001.SZ", "000002.SZ"
+    with factory() as session:
+        fill_id = _fill(session, [first, second], now=now).id
+    clock = FakeClock(now)
+    empty = replace(
+        _bundle(first, request_count=1),
+        financial_rows=(),
+        valuation_points=(),
+    )
+
+    class SlowFake(FakeMarketClient):
+        def fetch_discovery_data(self, code: str) -> DiscoveryCompanyData:
+            result = super().fetch_discovery_data(code)
+            clock.advance(seconds=61)
+            return result
+
+    market = SlowFake(
+        discovery_data={
+            first: empty,
+            second: _bundle(second),
+        }
+    )
+    policy = RequestPolicy(
+        requests_per_second=100,
+        max_attempts=2,
+        daily_budget=100,
+        max_runtime_seconds=60,
+        company_request_reservation=2,
+    )
+    with factory() as session:
+        execute_discovery_data_fill(
+            session, market, fill_id, policy=policy, clock=clock
+        )
+    with factory() as session:
+        fill = session.get(DiscoveryDataFill, fill_id)
+        empty_checkpoint = session.get(
+            DiscoveryDataCheckpoint, (fill_id, first)
+        )
+        pending = session.get(DiscoveryDataCheckpoint, (fill_id, second))
+        assert fill is not None and empty_checkpoint is not None and pending is not None
+        assert (fill.status, fill.completed, fill.failed) == ("paused", 1, 0)
+        assert empty_checkpoint.status == "done"
+        assert empty_checkpoint.valuation_points == 0
+        assert pending.status == "pending"
+    assert [call[1] for call in market.calls if call[0] == "discovery_data"] == [
+        first
+    ]
+    engine.dispose()
+
+
+def _discovery_client(
+    tmp_path: Path,
+    market: FakeMarketClient,
+    *,
+    allow_sync: bool = True,
+) -> TestClient:
+    from market.quotes import FakeQuoteClient
+
+    return TestClient(
+        create_app(
+            db_path=tmp_path / "app.db",
+            env_path=tmp_path / ".env",
+            quote_client=FakeQuoteClient(),
+            market_client=market,
+            allow_sync=allow_sync,
+        )
+    )
+
+
+def test_discovery_data_api_start_status_and_get_is_read_only(tmp_path) -> None:
+    from market.cheap import CheapRow
+
+    code = "000001.SZ"
+    market = FakeMarketClient(
+        cheap_universe=[
+            CheapRow(
+                code=code,
+                name="平安银行",
+                price=Decimal("10"),
+                pe=Decimal("5"),
+                pb=Decimal("1"),
+                mcap=Decimal("100"),
+                industry="银行",
+                exchange="SZ",
+            )
+        ],
+        discovery_data={code: _bundle(code)},
+    )
+    with _discovery_client(tmp_path, market) as client:
+        started = client.post("/api/discovery-data/fill", json={"sync": True})
+        assert started.status_code == 200
+        assert started.json()["status"] == "done"
+        assert started.json()["type"] == "discovery_data"
+        before = list(market.calls)
+        status = client.get("/api/discovery-data/status")
+        assert status.status_code == 200
+        assert status.json()["completed"] == 1
+        assert status.json()["eta_seconds"] is None
+        assert client.get("/api/health").json()["lock"] is None
+        assert market.calls == before
+
+
+def test_discovery_data_duplicate_start_is_idempotent_and_lock_conflicts(
+    tmp_path,
+) -> None:
+    from market.cheap import CheapRow
+
+    code = "000001.SZ"
+    gate = Event()
+    market = FakeMarketClient(
+        cheap_universe=[
+            CheapRow(
+                code=code,
+                name="平安银行",
+                price=Decimal("10"),
+                pe=Decimal("5"),
+                pb=Decimal("1"),
+                mcap=Decimal("100"),
+                industry="银行",
+                exchange="SZ",
+            )
+        ],
+        discovery_data={code: _bundle(code)},
+        discovery_gate=gate,
+    )
+    db_path = tmp_path / "app.db"
+    with _discovery_client(tmp_path, market, allow_sync=False) as client:
+        first = client.post("/api/discovery-data/fill", json={})
+        assert first.status_code == 200
+        second = client.post("/api/discovery-data/fill", json={})
+        assert second.status_code == 200
+        assert second.json()["id"] == first.json()["id"]
+        with client.app.state.session_factory() as session:
+            assert session.query(DiscoveryDataFill).count() == 1
+        gate.set()
+        for _ in range(100):
+            if client.get("/api/discovery-data/status").json()["status"] == "done":
+                break
+            time.sleep(0.01)
+        assert client.get("/api/discovery-data/status").json()["status"] == "done"
+
+    other_market = FakeMarketClient()
+    with _discovery_client(tmp_path, other_market) as client:
+        with client.app.state.session_factory() as session:
+            lock = session.get(JobLock, 1)
+            assert lock is not None
+            lock.job_id = 77
+            lock.job_type = "review"
+            lock.held_at = datetime.now(timezone.utc)
+            session.commit()
+        blocked = client.post("/api/discovery-data/fill", json={"sync": True})
+        assert blocked.status_code == 409
+        assert blocked.json()["code"] == "JOB_LOCKED"
+        assert blocked.json()["job_type"] == "review"
+
+
+def test_startup_pauses_interrupted_discovery_fill_and_preserves_done(
+    tmp_path,
+) -> None:
+    db_path = tmp_path / "app.db"
+    engine = init_db(db_path)
+    now = datetime(2026, 9, 16, 12, tzinfo=timezone.utc)
+    with Session(engine) as session:
+        fill = _fill(
+            session, ["000001.SZ", "000002.SZ"], now=now, status="running"
+        )
+        running = session.get(
+            DiscoveryDataCheckpoint, (fill.id, "000001.SZ")
+        )
+        done = session.get(DiscoveryDataCheckpoint, (fill.id, "000002.SZ"))
+        assert running is not None and done is not None
+        running.status = "running"
+        done.status = "done"
+        fill.completed = 1
+        lock = session.get(JobLock, 1)
+        if lock is None:
+            lock = JobLock(
+                id=1,
+                job_id=None,
+                job_type=None,
+                held_at=None,
+            )
+            session.add(lock)
+        lock.job_id = fill.id
+        lock.job_type = "discovery_data"
+        lock.held_at = now
+        session.commit()
+        fill_id = fill.id
+    engine.dispose()
+
+    market = FakeMarketClient(
+        discovery_data={"000001.SZ": _bundle("000001.SZ")}
+    )
+    with _discovery_client(tmp_path, market) as client:
+        status = client.get("/api/discovery-data/status").json()
+        assert status["id"] == fill_id
+        assert status["status"] == "paused"
+        assert status["completed"] == 1
+        with client.app.state.session_factory() as session:
+            pending = session.get(
+                DiscoveryDataCheckpoint, (fill_id, "000001.SZ")
+            )
+            done = session.get(
+                DiscoveryDataCheckpoint, (fill_id, "000002.SZ")
+            )
+            assert pending is not None and pending.status == "pending"
+            assert done is not None and done.status == "done"
+            assert session.get(JobLock, 1).job_id is None
+        resumed = client.post(
+            "/api/discovery-data/fill", json={"sync": True}
+        ).json()
+        assert (resumed["status"], resumed["completed"]) == ("done", 2)
+        assert [
+            call for call in market.calls if call[0] == "discovery_data"
+        ] == [("discovery_data", "000001.SZ")]
