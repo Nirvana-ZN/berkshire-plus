@@ -8,7 +8,13 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from app.models import Setting
-from market.cheap import METHOD, CheapRow, _cached, security_state_eligible
+from market.cheap import (
+    DELISTING_NAME_METHOD,
+    METHOD,
+    CheapRow,
+    _cached,
+    security_state_eligible,
+)
 from market.eastmoney import EastMoneyClient, FakeMarketClient
 from market.types import ValuationPoint
 
@@ -265,6 +271,19 @@ def test_cheap_universe_freezes_fields_and_live_row_is_eligible() -> None:
                             "f292": 9,
                         },
                         {
+                            "f12": "000004",
+                            "f13": 0,
+                            "f14": "国华退",
+                            "f2": "-",
+                            "f9": "10",
+                            "f23": "1",
+                            "f20": "50",
+                            "f26": 19910114,
+                            "f100": "软件开发",
+                            "f124": 1789516800,
+                            "f292": 6,
+                        },
+                        {
                             "f12": "430047",
                             "f13": 0,
                             "f14": "诺思兰德",
@@ -294,10 +313,20 @@ def test_cheap_universe_freezes_fields_and_live_row_is_eligible() -> None:
                 }
             if "secid=1.601238" in url:
                 raise RuntimeError("stock kline unavailable")
+            if "secid=0.000004" in url:
+                return {"data": {"klines": ["2026-09-10,1,2,3,4,5,6"]}}
             assert "secid=1.605303" in url
             return {"data": {"klines": ["2026-09-10,23,24,25,26,27,28"]}}
 
     by_code = {row.code: row for row in Stub().fetch_cheap_universe()}
+    frozen_dates = [
+        "2026-09-09",
+        "2026-09-10",
+        "2026-09-11",
+        "2026-09-14",
+        "2026-09-15",
+        "2026-09-16",
+    ]
 
     assert set(by_code) == {
         "600036.SH",
@@ -306,6 +335,7 @@ def test_cheap_universe_freezes_fields_and_live_row_is_eligible() -> None:
         "688555.SH",
         "601238.SH",
         "601091.SH",
+        "000004.SZ",
     }
     normal = by_code["600036.SH"]
     assert normal.exchange == "SH"
@@ -317,28 +347,28 @@ def test_cheap_universe_freezes_fields_and_live_row_is_eligible() -> None:
     assert normal.industry == "银行Ⅱ"
     assert normal.industry_version == "eastmoney:push2delay:clist:f100:v1"
     assert normal.industry_as_of == date.today().isoformat()
-    assert security_state_eligible(
-        normal,
-        [
-            "2026-09-09",
-            "2026-09-10",
-            "2026-09-11",
-            "2026-09-14",
-            "2026-09-15",
-            "2026-09-16",
-        ],
-    )
+    assert security_state_eligible(normal, frozen_dates)
     suspended = by_code["605303.SH"]
     assert suspended.trading_status == "suspended"
     assert suspended.last_trade_date == "2026-09-10"
-    assert suspended.is_delisting is None
+    assert suspended.is_delisting is False
+    assert security_state_eligible(suspended, frozen_dates)
+    marked = by_code["000004.SZ"]
+    assert marked.trading_status == "suspended"
+    assert marked.is_delisting is True
+    assert not security_state_eligible(marked, frozen_dates)
     unavailable = by_code["601238.SH"]
     assert unavailable.trading_status is None
     assert unavailable.last_trade_date is None
-    assert by_code["603056.SH"].is_delisting is None
+    assert by_code["603056.SH"].is_delisting is False
     assert by_code["688555.SH"].is_delisting is True
-    assert by_code["601091.SH"].is_delisting is None
+    assert not security_state_eligible(by_code["688555.SH"], frozen_dates)
+    assert by_code["601091.SH"].is_delisting is False
     assert by_code["601091.SH"].trading_status is None
+    assert (
+        DELISTING_NAME_METHOD
+        == "exchange-rules:sh-prefix-tuishi:sz-suffix-tui:v1"
+    )
 
 
 def test_suspended_security_uses_latest_five_frozen_exchange_dates() -> None:
@@ -394,12 +424,12 @@ def test_old_cached_universe_without_security_metadata_is_rejected() -> None:
             Setting(
                 key="cheap_universe",
                 value=json.dumps(
-                    {"method": "v2", "fetched_at": 1000.0, "rows": [old_row]}
+                    {"method": "v3", "fetched_at": 1000.0, "rows": [old_row]}
                 ),
             )
         )
         session.commit()
-        assert METHOD == "v3"
+        assert METHOD == "v4"
         assert _cached(session, 1001.0) is None
         setting = session.get(Setting, "cheap_universe")
         assert setting is not None

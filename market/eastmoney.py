@@ -7,7 +7,7 @@ from threading import Event
 from typing import Protocol
 from urllib.parse import quote
 
-from market.cheap import INDUSTRY_MAPPING_VERSION, CheapRow
+from market.cheap import INDUSTRY_MAPPING_VERSION, CheapRow, delisting_name_state
 from market.types import Constituent, FinancialRow, MarketError, ValuationPoint
 
 BOARD_LIST_URL = "https://push2delay.eastmoney.com/api/qt/clist/get"
@@ -751,12 +751,6 @@ class EastMoneyClient:
             else:
                 trading_status = None
                 last_trade_date = None
-            if name.startswith("退市") or name.endswith("退"):
-                is_delisting: bool | None = True
-            elif trading_status == "trading":
-                is_delisting = False
-            else:
-                is_delisting = None
             rows.append(
                 CheapRow(
                     code=code,
@@ -769,7 +763,7 @@ class EastMoneyClient:
                     exchange=code.rsplit(".", 1)[1],
                     listing_date=_compact_date(item.get("f26")),
                     is_st=name.upper().startswith(("ST", "*ST")),
-                    is_delisting=is_delisting,
+                    is_delisting=delisting_name_state(code, name),
                     trading_status=trading_status,
                     last_trade_date=last_trade_date,
                     # Our mapping revision and retrieval snapshot, not an East

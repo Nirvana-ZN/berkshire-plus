@@ -18,8 +18,9 @@ SHOW_LIMIT = 30
 SORTS = frozenset({"pe", "pb"})
 SCOPE = "hs_a"
 SCOPE_LABEL = "沪深A股（不含北交所）"
-METHOD = "v3"
+METHOD = "v4"
 INDUSTRY_MAPPING_VERSION = "eastmoney:push2delay:clist:f100:v1"
+DELISTING_NAME_METHOD = "exchange-rules:sh-prefix-tuishi:sz-suffix-tui:v1"
 _SECURITY_FIELDS = frozenset(
     {
         "exchange",
@@ -59,6 +60,22 @@ class CheapRow:
 
 def _is_st(name: str) -> bool:
     return "ST" in (name or "").upper()
+
+
+def delisting_name_state(code: str, name: str) -> bool | None:
+    """Exchange-mandated abbreviation marks; independent of East Money f292."""
+    code = (code or "").strip().upper()
+    name = (name or "").strip()
+    if (
+        not name
+        or len(code) != 9
+        or code[6] != "."
+        or not code[:6].isdigit()
+        or not code.endswith((".SH", ".SZ"))
+    ):
+        return None
+    # Shanghai prefixes 退市; Shenzhen suffixes 退 while the code stays fixed.
+    return name.startswith("退市") if code.endswith(".SH") else name.endswith("退")
 
 
 def _metric(row: CheapRow, sort: str) -> Decimal | None:
