@@ -1,14 +1,20 @@
 import json
 from dataclasses import replace
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import Session
 
-from app.models import Setting
+from app.db import init_db
+from app.models import (
+    DiscoveryDataCheckpoint,
+    DiscoveryDataFill,
+    Setting,
+    ValuationHistory,
+)
 from market.cheap import (
     CACHE_KEY,
     DELISTING_NAME_METHOD,
@@ -30,6 +36,259 @@ from market.types import (
     SecurityState,
     ValuationPoint,
 )
+
+
+NEW_FINANCIAL_VALUES = {
+    "revenue": Decimal("1000.01"),
+    "deducted_net_income": Decimal("90.02"),
+    "total_assets": Decimal("2000.03"),
+    "net_assets": Decimal("800.04"),
+    "cash": Decimal("300.05"),
+    "short_loan": Decimal("10.06"),
+    "long_loan": Decimal("20.07"),
+    "bond_payable": Decimal("30.08"),
+    "noncurrent_liab_1year": Decimal("40.09"),
+    "interest_debt": Decimal("100.10"),
+    "pretax_income": Decimal("120.11"),
+    "income_tax": Decimal("20.12"),
+    "normalized_effective_tax_rate": Decimal("16.13"),
+    "invested_capital": Decimal("600.14"),
+    "roic": Decimal("18.15"),
+    "capital_adequacy": Decimal("14.16"),
+    "core_tier1_capital_adequacy": Decimal("12.17"),
+    "nonperforming_loan_balance": Decimal("9.18"),
+    "impairment_loss": Decimal("8.19"),
+    "government_grants": Decimal("7.20"),
+    "asset_disposal_gain": Decimal("6.21"),
+    "goodwill": Decimal("5.22"),
+    "acquisition_cash_paid": Decimal("4.23"),
+    "source_as_of": "2026-03-31",
+}
+
+
+def test_init_db_adds_discovery_tables_and_migrates_old_financial_schema(
+    tmp_path,
+) -> None:
+    db_path = tmp_path / "old.db"
+    old_engine = create_engine(f"sqlite:///{db_path.resolve().as_posix()}")
+    with old_engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE financials (
+                    code VARCHAR NOT NULL,
+                    period VARCHAR NOT NULL,
+                    period_type VARCHAR NOT NULL,
+                    roe NUMERIC(20, 8),
+                    net_income NUMERIC(20, 8),
+                    ocf NUMERIC(20, 8),
+                    capex NUMERIC(20, 8),
+                    ebit NUMERIC(20, 8),
+                    interest NUMERIC(20, 8),
+                    gross_margin NUMERIC(20, 8),
+                    net_margin NUMERIC(20, 8),
+                    shares NUMERIC(20, 8),
+                    share_change_ma BOOLEAN,
+                    bps NUMERIC(20, 8),
+                    npl NUMERIC(20, 8),
+                    eps NUMERIC(20, 8),
+                    PRIMARY KEY (code, period, period_type)
+                )
+                """
+            )
+        )
+    old_engine.dispose()
+
+    engine = init_db(db_path)
+    schema = inspect(engine)
+    assert set(NEW_FINANCIAL_VALUES) <= {
+        column["name"] for column in schema.get_columns("financials")
+    }
+    assert {
+        "valuation_history",
+        "discovery_data_fills",
+        "discovery_data_checkpoints",
+    } <= set(schema.get_table_names())
+    assert {column["name"] for column in schema.get_columns("valuation_history")} == {
+        "code",
+        "month",
+        "trade_date",
+        "pe",
+        "pb",
+        "price",
+        "source",
+        "ratio_method",
+        "fetched_at",
+    }
+    checkpoint_unique = {
+        tuple(item["column_names"])
+        for item in schema.get_unique_constraints("discovery_data_checkpoints")
+    }
+    checkpoint_pk = tuple(
+        schema.get_pk_constraint("discovery_data_checkpoints")["constrained_columns"]
+    )
+    assert ("fill_id", "code") in checkpoint_unique or checkpoint_pk == (
+        "fill_id",
+        "code",
+    )
+    assert any(
+        fk["referred_table"] == "discovery_data_fills"
+        for fk in schema.get_foreign_keys("discovery_data_checkpoints")
+    )
+    engine.dispose()
+
+
+def test_financial_new_fields_round_trip_through_db_and_snapshot(tmp_path) -> None:
+    from jobs.cheap import _rows_from_db
+    from jobs.funnel import persist_financials
+    from screen.replay import _to_financial, dump_snapshot
+
+    engine = init_db(tmp_path / "round-trip.db")
+    row = FinancialRow(
+        code="000333.SZ",
+        period="2025",
+        period_type="annual",
+        **NEW_FINANCIAL_VALUES,
+    )
+    with Session(engine) as session:
+        persist_financials(session, [row])
+        session.commit()
+        loaded = _rows_from_db(session, [row.code])[0]
+    for field, expected in NEW_FINANCIAL_VALUES.items():
+        assert getattr(loaded, field) == expected
+
+    frozen = dump_snapshot([], [loaded], {}, set())["financials"][0]
+    replayed = _to_financial(frozen)
+    for field, expected in NEW_FINANCIAL_VALUES.items():
+        assert getattr(replayed, field) == expected
+    legacy = _to_financial(
+        {"code": row.code, "period": row.period, "period_type": "annual"}
+    )
+    assert all(getattr(legacy, field) is None for field in NEW_FINANCIAL_VALUES)
+    engine.dispose()
+
+
+def test_discovery_operational_models_round_trip(tmp_path) -> None:
+    engine = init_db(tmp_path / "operations.db")
+    now = datetime.now(timezone.utc)
+    with Session(engine) as session:
+        fill = DiscoveryDataFill(
+            status="running",
+            total=2,
+            completed=1,
+            failed=0,
+            request_count=7,
+            daily_budget=1000,
+            budget_day="2026-09-16",
+            daily_requests=7,
+            started_at=now,
+            updated_at=now,
+            last_error=None,
+        )
+        session.add(fill)
+        session.flush()
+        checkpoint = DiscoveryDataCheckpoint(
+            fill_id=fill.id,
+            code="600519.SH",
+            status="done",
+            attempts=1,
+            next_retry_at=None,
+            valuation_points=61,
+            error=None,
+            updated_at=now,
+        )
+        session.add(checkpoint)
+        session.commit()
+        session.expire_all()
+        assert session.get(
+            DiscoveryDataCheckpoint, (fill.id, "600519.SH")
+        ).valuation_points == 61
+    engine.dispose()
+
+
+def test_persist_valuation_history_updates_same_method(tmp_path) -> None:
+    from jobs.discovery_data import persist_valuation_history
+
+    engine = init_db(tmp_path / "valuation.db")
+    first_fetch = datetime(2026, 9, 16, 8, tzinfo=timezone.utc)
+    second_fetch = datetime(2026, 9, 16, 9, tzinfo=timezone.utc)
+    first = ValuationPoint(
+        code="600519.SH",
+        month="2026-08",
+        trade_date="2026-08-30",
+        pe=Decimal("20"),
+        pb=Decimal("7"),
+        price=Decimal("1450"),
+        source="eastmoney:RPT_VALUEANALYSIS_DET",
+        ratio_method="PE_TTM/PB_MRQ",
+    )
+    updated = replace(
+        first,
+        trade_date="2026-08-31",
+        pe=Decimal("19.2"),
+        pb=Decimal("7.1"),
+        price=Decimal("1460"),
+    )
+    with Session(engine) as session:
+        persist_valuation_history(session, [first], fetched_at=first_fetch)
+        session.commit()
+        persist_valuation_history(session, [updated], fetched_at=second_fetch)
+        session.commit()
+        stored = session.get(ValuationHistory, (first.code, first.month))
+        assert stored is not None
+        assert (
+            stored.trade_date,
+            stored.pe,
+            stored.pb,
+            stored.price,
+            stored.source,
+            stored.ratio_method,
+        ) == (
+            updated.trade_date,
+            updated.pe,
+            updated.pb,
+            updated.price,
+            updated.source,
+            updated.ratio_method,
+        )
+        assert stored.fetched_at == second_fetch.replace(tzinfo=None)
+    engine.dispose()
+
+
+def test_persist_valuation_history_rejects_mixed_method_without_partial_write(
+    tmp_path,
+) -> None:
+    from jobs.discovery_data import persist_valuation_history
+
+    engine = init_db(tmp_path / "valuation-mixed.db")
+    now = datetime.now(timezone.utc)
+    existing = ValuationPoint(
+        code="600519.SH",
+        month="2026-08",
+        trade_date="2026-08-31",
+        pe=Decimal("19.2"),
+        pb=Decimal("7.1"),
+        price=Decimal("1460"),
+        ratio_method="PE_TTM/PB_MRQ",
+    )
+    extra = replace(existing, code="000333.SZ")
+    mixed = replace(
+        existing,
+        month="2026-07",
+        trade_date="2026-07-31",
+        ratio_method="PE_STATIC/PB_LF",
+    )
+    with Session(engine) as session:
+        persist_valuation_history(session, [existing], fetched_at=now)
+        session.commit()
+        with pytest.raises(ValueError, match="ratio_method"):
+            persist_valuation_history(session, [extra, mixed], fetched_at=now)
+        session.rollback()
+        assert session.get(ValuationHistory, (extra.code, extra.month)) is None
+        stored = session.get(ValuationHistory, (existing.code, existing.month))
+        assert stored is not None
+        assert stored.ratio_method == existing.ratio_method
+    engine.dispose()
 
 
 # Live probe 2026-09-16, RPT_VALUEANALYSIS_DET, pageSize=500:

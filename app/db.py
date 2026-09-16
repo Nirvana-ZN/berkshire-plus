@@ -10,7 +10,7 @@ from sqlalchemy.pool import NullPool
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "app.db"
 FIN_FETCH_KEY = "fin_fetch_version"
-FIN_FETCH_VERSION = "2"
+FIN_FETCH_VERSION = "3"
 
 
 class Base(DeclarativeBase):
@@ -70,15 +70,45 @@ def _ensure_listed_year(engine: Engine) -> None:
 def _ensure_financial_columns(engine: Engine) -> None:
     from sqlalchemy import text
 
-    wanted = ("bps", "npl", "eps")
+    wanted = {
+        "bps": "NUMERIC(20, 8)",
+        "npl": "NUMERIC(20, 8)",
+        "eps": "NUMERIC(20, 8)",
+        "revenue": "NUMERIC(20, 8)",
+        "deducted_net_income": "NUMERIC(20, 8)",
+        "total_assets": "NUMERIC(20, 8)",
+        "net_assets": "NUMERIC(20, 8)",
+        "cash": "NUMERIC(20, 8)",
+        "short_loan": "NUMERIC(20, 8)",
+        "long_loan": "NUMERIC(20, 8)",
+        "bond_payable": "NUMERIC(20, 8)",
+        "noncurrent_liab_1year": "NUMERIC(20, 8)",
+        "interest_debt": "NUMERIC(20, 8)",
+        "pretax_income": "NUMERIC(20, 8)",
+        "income_tax": "NUMERIC(20, 8)",
+        "normalized_effective_tax_rate": "NUMERIC(20, 8)",
+        "invested_capital": "NUMERIC(20, 8)",
+        "roic": "NUMERIC(20, 8)",
+        "capital_adequacy": "NUMERIC(20, 8)",
+        "core_tier1_capital_adequacy": "NUMERIC(20, 8)",
+        "nonperforming_loan_balance": "NUMERIC(20, 8)",
+        "impairment_loss": "NUMERIC(20, 8)",
+        "government_grants": "NUMERIC(20, 8)",
+        "asset_disposal_gain": "NUMERIC(20, 8)",
+        "goodwill": "NUMERIC(20, 8)",
+        "acquisition_cash_paid": "NUMERIC(20, 8)",
+        "source_as_of": "VARCHAR",
+    }
     with engine.begin() as conn:
         rows = conn.execute(text("PRAGMA table_info(financials)")).fetchall()
         names = {row[1] for row in rows}
         if not names:
             return
-        for column in wanted:
+        for column, sql_type in wanted.items():
             if column not in names:
-                conn.execute(text(f"ALTER TABLE financials ADD COLUMN {column} NUMERIC(20, 8)"))
+                conn.execute(
+                    text(f"ALTER TABLE financials ADD COLUMN {column} {sql_type}")
+                )
 
 
 def _reset_stale_financials(engine: Engine) -> None:

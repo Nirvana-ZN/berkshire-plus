@@ -31,6 +31,29 @@ _FIN_FIELDS = (
     "bps",
     "npl",
     "eps",
+    "revenue",
+    "deducted_net_income",
+    "total_assets",
+    "net_assets",
+    "cash",
+    "short_loan",
+    "long_loan",
+    "bond_payable",
+    "noncurrent_liab_1year",
+    "interest_debt",
+    "pretax_income",
+    "income_tax",
+    "normalized_effective_tax_rate",
+    "invested_capital",
+    "roic",
+    "capital_adequacy",
+    "core_tier1_capital_adequacy",
+    "nonperforming_loan_balance",
+    "impairment_loss",
+    "government_grants",
+    "asset_disposal_gain",
+    "goodwill",
+    "acquisition_cash_paid",
 )
 
 
@@ -94,6 +117,7 @@ def _fin_json(row: FinancialRow) -> dict[str, object]:
         "period": row.period,
         "period_type": row.period_type,
         "share_change_ma": row.share_change_ma,
+        "source_as_of": row.source_as_of,
     }
     for key in _FIN_FIELDS:
         payload[key] = _num(getattr(row, key))
@@ -143,6 +167,36 @@ def _to_financial(item: dict) -> FinancialRow:
         bps=_dec(item.get("bps")),
         npl=_dec(item.get("npl")),
         eps=_dec(item.get("eps")),
+        revenue=_dec(item.get("revenue")),
+        deducted_net_income=_dec(item.get("deducted_net_income")),
+        total_assets=_dec(item.get("total_assets")),
+        net_assets=_dec(item.get("net_assets")),
+        cash=_dec(item.get("cash")),
+        short_loan=_dec(item.get("short_loan")),
+        long_loan=_dec(item.get("long_loan")),
+        bond_payable=_dec(item.get("bond_payable")),
+        noncurrent_liab_1year=_dec(item.get("noncurrent_liab_1year")),
+        interest_debt=_dec(item.get("interest_debt")),
+        pretax_income=_dec(item.get("pretax_income")),
+        income_tax=_dec(item.get("income_tax")),
+        normalized_effective_tax_rate=_dec(
+            item.get("normalized_effective_tax_rate")
+        ),
+        invested_capital=_dec(item.get("invested_capital")),
+        roic=_dec(item.get("roic")),
+        capital_adequacy=_dec(item.get("capital_adequacy")),
+        core_tier1_capital_adequacy=_dec(
+            item.get("core_tier1_capital_adequacy")
+        ),
+        nonperforming_loan_balance=_dec(item.get("nonperforming_loan_balance")),
+        impairment_loss=_dec(item.get("impairment_loss")),
+        government_grants=_dec(item.get("government_grants")),
+        asset_disposal_gain=_dec(item.get("asset_disposal_gain")),
+        goodwill=_dec(item.get("goodwill")),
+        acquisition_cash_paid=_dec(item.get("acquisition_cash_paid")),
+        source_as_of=(
+            str(item["source_as_of"]) if item.get("source_as_of") else None
+        ),
     )
 
 
@@ -168,6 +222,30 @@ def _cached_financials(session: Session, codes: list[str]) -> list[FinancialRow]
             bps=row.bps,
             npl=row.npl,
             eps=row.eps,
+            revenue=row.revenue,
+            deducted_net_income=row.deducted_net_income,
+            total_assets=row.total_assets,
+            net_assets=row.net_assets,
+            cash=row.cash,
+            short_loan=row.short_loan,
+            long_loan=row.long_loan,
+            bond_payable=row.bond_payable,
+            noncurrent_liab_1year=row.noncurrent_liab_1year,
+            interest_debt=row.interest_debt,
+            pretax_income=row.pretax_income,
+            income_tax=row.income_tax,
+            normalized_effective_tax_rate=row.normalized_effective_tax_rate,
+            invested_capital=row.invested_capital,
+            roic=row.roic,
+            capital_adequacy=row.capital_adequacy,
+            core_tier1_capital_adequacy=row.core_tier1_capital_adequacy,
+            nonperforming_loan_balance=row.nonperforming_loan_balance,
+            impairment_loss=row.impairment_loss,
+            government_grants=row.government_grants,
+            asset_disposal_gain=row.asset_disposal_gain,
+            goodwill=row.goodwill,
+            acquisition_cash_paid=row.acquisition_cash_paid,
+            source_as_of=row.source_as_of,
         )
         for row in rows
     ]

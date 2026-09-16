@@ -1,7 +1,17 @@
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
@@ -151,6 +161,108 @@ class Financial(Base):
     bps: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
     npl: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
     eps: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
+    revenue: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
+    deducted_net_income: Mapped[Decimal | None] = mapped_column(
+        Numeric(20, 8), nullable=True
+    )
+    total_assets: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
+    net_assets: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
+    cash: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
+    short_loan: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
+    long_loan: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
+    bond_payable: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
+    noncurrent_liab_1year: Mapped[Decimal | None] = mapped_column(
+        Numeric(20, 8), nullable=True
+    )
+    interest_debt: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
+    pretax_income: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
+    income_tax: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
+    normalized_effective_tax_rate: Mapped[Decimal | None] = mapped_column(
+        Numeric(20, 8), nullable=True
+    )
+    invested_capital: Mapped[Decimal | None] = mapped_column(
+        Numeric(20, 8), nullable=True
+    )
+    roic: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
+    capital_adequacy: Mapped[Decimal | None] = mapped_column(
+        Numeric(20, 8), nullable=True
+    )
+    core_tier1_capital_adequacy: Mapped[Decimal | None] = mapped_column(
+        Numeric(20, 8), nullable=True
+    )
+    nonperforming_loan_balance: Mapped[Decimal | None] = mapped_column(
+        Numeric(20, 8), nullable=True
+    )
+    impairment_loss: Mapped[Decimal | None] = mapped_column(
+        Numeric(20, 8), nullable=True
+    )
+    government_grants: Mapped[Decimal | None] = mapped_column(
+        Numeric(20, 8), nullable=True
+    )
+    asset_disposal_gain: Mapped[Decimal | None] = mapped_column(
+        Numeric(20, 8), nullable=True
+    )
+    goodwill: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
+    acquisition_cash_paid: Mapped[Decimal | None] = mapped_column(
+        Numeric(20, 8), nullable=True
+    )
+    source_as_of: Mapped[str | None] = mapped_column(String, nullable=True)
+
+
+class ValuationHistory(Base):
+    __tablename__ = "valuation_history"
+
+    code: Mapped[str] = mapped_column(String, primary_key=True)
+    month: Mapped[str] = mapped_column(String, primary_key=True)
+    trade_date: Mapped[str] = mapped_column(String, nullable=False)
+    pe: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
+    pb: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
+    price: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
+    source: Mapped[str] = mapped_column(String, nullable=False)
+    ratio_method: Mapped[str] = mapped_column(String, nullable=False)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class DiscoveryDataFill(Base):
+    __tablename__ = "discovery_data_fills"
+    __table_args__ = (Index("ix_discovery_data_fills_status", "status"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    status: Mapped[str] = mapped_column(String, nullable=False)
+    total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    completed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    failed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    request_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    daily_budget: Mapped[int] = mapped_column(Integer, nullable=False)
+    budget_day: Mapped[str | None] = mapped_column(String, nullable=True)
+    daily_requests: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class DiscoveryDataCheckpoint(Base):
+    __tablename__ = "discovery_data_checkpoints"
+    __table_args__ = (
+        Index(
+            "ix_discovery_data_checkpoints_fill_status_retry",
+            "fill_id",
+            "status",
+            "next_retry_at",
+        ),
+    )
+
+    fill_id: Mapped[int] = mapped_column(
+        ForeignKey("discovery_data_fills.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    code: Mapped[str] = mapped_column(String, primary_key=True)
+    status: Mapped[str] = mapped_column(String, nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    valuation_points: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 
 
 class ResearchJob(Base):
