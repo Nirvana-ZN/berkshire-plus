@@ -684,7 +684,7 @@ def test_field_dictionary_is_immutable_and_marks_unavailable_sources() -> None:
     assert revenue.consolidated_basis == "consolidated"
     assert revenue.period_type == "cumulative"
     assert revenue.derivation_formula is None
-    assert revenue.financial_sector_substitute == "TOTAL_OPERATE_INCOME"
+    assert revenue.financial_sector_substitute == "TOTALOPERATEREVE"
     assert revenue.source_as_of == "NOTICE_DATE/UPDATE_DATE"
     with pytest.raises(FrozenInstanceError):
         revenue.field = "GUESSED"  # type: ignore[misc]
@@ -857,7 +857,9 @@ def test_real_fetch_discovery_data_keeps_company_and_stage_on_error() -> None:
         def _security_state_for(self, _code: str) -> SecurityState:
             return state
 
-        def _discovery_financials_for(self, _code: str) -> list[FinancialRow]:
+        def _discovery_financials_for(
+            self, _code: str, *, industry: str | None = None
+        ) -> list[FinancialRow]:
             raise MarketError("income endpoint unavailable")
 
     with pytest.raises(DiscoveryCompanyError, match="income endpoint unavailable") as caught:
@@ -925,6 +927,147 @@ def test_discovery_detail_source_failure_is_typed_without_partial_success(
         Stub().fetch_discovery_data("000333.SZ")
     assert caught.value.stage == "financials"
     assert caught.value.request_count > 0
+
+
+def test_bank_discovery_bundle_skips_rejected_industrial_details() -> None:
+    seen: list[str] = []
+    state = SecurityState(
+        code="600036.SH",
+        name="招商银行",
+        exchange="SH",
+        listing_date="2002-04-09",
+        is_st=False,
+        is_delisting=False,
+        trading_status="trading",
+        last_trade_date="2026-09-16",
+        industry="银行Ⅱ",
+        industry_version="eastmoney:push2delay:clist:f100:v1",
+        industry_as_of="2026-09-16",
+        source="eastmoney:stock/get:f57,f58,f107,f127,f189,f292",
+    )
+
+    class Stub(EastMoneyClient):
+        def _security_state_for(self, _code: str) -> SecurityState:
+            return state
+
+        def _get_json(self, url: str) -> dict:
+            seen.append(url)
+            self._request_count += 1
+            if "MAINFINADATA" in url:
+                return {
+                    "success": True,
+                    "result": {
+                        "data": [
+                            {
+                                "REPORT_TYPE": "年报",
+                                "REPORT_YEAR": "2025",
+                                "NOTICE_DATE": "2026-03-28",
+                                "TOTALOPERATEREVE": "337532000000",
+                                "PARENTNETPROFIT": "150181000000",
+                                "KCFJCXSYJLR": "150007000000",
+                                "TOTAL_ASSETS_PK": "13070523000000",
+                                "TOTAL_EQUITY_PK": "1280899000000",
+                                "NETCASH_OPERATE_PK": "451457000000",
+                                "NEWCAPITALADER": "18.24",
+                                "HXYJBCZL": "14.16",
+                                "NONPERLOAN": "0.94",
+                                "NON_PERFORMING_LOAN": "68206000000",
+                            }
+                        ]
+                    },
+                }
+            if "RPT_F10_FINANCE_GINCOME" in url:
+                return {
+                    "success": True,
+                    "result": {
+                        "data": [
+                            {
+                                "REPORT_DATE": "2025-12-31",
+                                "REPORT_TYPE": "年报",
+                                "NOTICE_DATE": "2026-03-28",
+                                "CREDIT_IMPAIRMENT_LOSS": "39586000000",
+                            }
+                        ]
+                    },
+                }
+            if (
+                "RPT_F10_FINANCE_GBALANCE" in url
+                or "RPT_F10_FINANCE_GCASHFLOW" in url
+            ):
+                return {
+                    "success": False,
+                    "message": "report inapplicable to bank",
+                }
+            return {"success": True, "result": {"data": []}}
+
+        def fetch_valuation_history(self, _code: str) -> list[ValuationPoint]:
+            return []
+
+    result = Stub().fetch_discovery_data("600036.SH")
+    row = result.financial_rows[0]
+    assert row.revenue == Decimal("337532000000")
+    assert row.total_assets == Decimal("13070523000000")
+    assert row.capital_adequacy == Decimal("18.24")
+    assert row.core_tier1_capital_adequacy == Decimal("14.16")
+    assert row.npl == Decimal("0.94")
+    assert row.impairment_loss == Decimal("39586000000")
+    assert row.short_loan is None
+    assert row.goodwill is None
+    assert row.acquisition_cash_paid is None
+    assert row.roic is None
+    assert not any("RPT_F10_FINANCE_GBALANCE" in url for url in seen)
+    assert not any("RPT_F10_FINANCE_GCASHFLOW" in url for url in seen)
+
+
+def test_bank_applicable_income_detail_failure_is_typed() -> None:
+    state = SecurityState(
+        code="600036.SH",
+        name="招商银行",
+        exchange="SH",
+        listing_date="2002-04-09",
+        is_st=False,
+        is_delisting=False,
+        trading_status="trading",
+        last_trade_date="2026-09-16",
+        industry="银行Ⅱ",
+        industry_version="eastmoney:push2delay:clist:f100:v1",
+        industry_as_of="2026-09-16",
+        source="eastmoney:stock/get:f57,f58,f107,f127,f189,f292",
+    )
+
+    class Stub(EastMoneyClient):
+        def _security_state_for(self, _code: str) -> SecurityState:
+            return state
+
+        def _get_json(self, url: str) -> dict:
+            if "MAINFINADATA" in url:
+                return {
+                    "success": True,
+                    "result": {
+                        "data": [
+                            {
+                                "REPORT_TYPE": "年报",
+                                "REPORT_YEAR": "2025",
+                                "NEWCAPITALADER": "18.24",
+                            }
+                        ]
+                    },
+                }
+            if "RPT_F10_FINANCE_GINCOME" in url:
+                return {
+                    "success": False,
+                    "message": "bank impairment source unavailable",
+                }
+            return {"success": True, "result": {"data": []}}
+
+        def fetch_valuation_history(self, _code: str) -> list[ValuationPoint]:
+            raise AssertionError("failed bank source must stop the bundle")
+
+    with pytest.raises(
+        DiscoveryCompanyError, match="bank impairment source unavailable"
+    ) as caught:
+        Stub().fetch_discovery_data("600036.SH")
+    assert caught.value.stage == "financials"
 
 
 def test_real_discovery_path_reports_per_source_dates_and_request_count() -> None:

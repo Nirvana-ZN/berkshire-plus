@@ -490,8 +490,11 @@ def test_discovery_cashflow_source_mapping() -> None:
 def test_discovery_financial_industry_source_mapping() -> None:
     from decimal import Decimal
 
+    seen: list[str] = []
+
     class Stub(EastMoneyClient):
         def _get_json(self, url: str) -> dict:
+            seen.append(url)
             if "RPT_F10_FINANCE_MAINFINADATA" in url:
                 return _statement_payload(
                     {
@@ -502,16 +505,72 @@ def test_discovery_financial_industry_source_mapping() -> None:
                         "HXYJBCZL": "14.16",
                         "NONPERLOAN": "0.94",
                         "NON_PERFORMING_LOAN": "68206000000",
+                        "TOTALOPERATEREVE": "337532000000",
+                        "PARENTNETPROFIT": "150181000000",
+                        "KCFJCXSYJLR": "150007000000",
+                        "TOTAL_ASSETS_PK": "13070523000000",
+                        "TOTAL_EQUITY_PK": "1280899000000",
+                        "NETCASH_OPERATE_PK": "451457000000",
                     }
                 )
+            if (
+                "RPT_F10_FINANCE_GBALANCE" in url
+                or "RPT_F10_FINANCE_GCASHFLOW" in url
+            ):
+                return {
+                    "success": False,
+                    "message": "report inapplicable to bank",
+                }
             return _statement_payload()
 
-    row = Stub()._discovery_financials_for("600036.SH")[0]
+    row = Stub()._discovery_financials_for(
+        "600036.SH", industry="银行Ⅱ"
+    )[0]
+    assert row.revenue == Decimal("337532000000")
+    assert row.net_income == Decimal("150181000000")
+    assert row.deducted_net_income == Decimal("150007000000")
+    assert row.total_assets == Decimal("13070523000000")
+    assert row.net_assets == Decimal("1280899000000")
+    assert row.ocf == Decimal("451457000000")
     assert row.capital_adequacy == Decimal("18.24")
     assert row.core_tier1_capital_adequacy == Decimal("14.16")
     assert row.npl == Decimal("0.94")
     assert row.nonperforming_loan_balance == Decimal("68206000000")
     assert row.roic is None
+    assert not any("RPT_F10_FINANCE_GBALANCE" in url for url in seen)
+    assert not any("RPT_F10_FINANCE_GCASHFLOW" in url for url in seen)
+
+
+def test_discovery_insurance_industry_uses_shared_branch_convention() -> None:
+    seen: list[str] = []
+
+    class Stub(EastMoneyClient):
+        def _get_json(self, url: str) -> dict:
+            seen.append(url)
+            if "MAINFINADATA" in url:
+                return _statement_payload(
+                    {
+                        "REPORT_TYPE": "年报",
+                        "REPORT_YEAR": "2025",
+                        "TOTALOPERATEREVE": "100",
+                    }
+                )
+            if (
+                "RPT_F10_FINANCE_GBALANCE" in url
+                or "RPT_F10_FINANCE_GCASHFLOW" in url
+            ):
+                return {
+                    "success": False,
+                    "message": "report inapplicable to insurance",
+                }
+            return _statement_payload()
+
+    row = Stub()._discovery_financials_for(
+        "601336.SH", industry="保险Ⅱ"
+    )[0]
+    assert row.revenue == Decimal("100")
+    assert not any("RPT_F10_FINANCE_GBALANCE" in url for url in seen)
+    assert not any("RPT_F10_FINANCE_GCASHFLOW" in url for url in seen)
 
 
 def test_discovery_strict_parser_rejects_legacy_aliases() -> None:

@@ -335,6 +335,13 @@ def _dictionary_decimal(
     )
 
 
+def _dictionary_financial_decimal(
+    metric: str, item: Mapping[str, object]
+) -> Decimal | None:
+    field = FIELD_DICTIONARY[metric].financial_sector_substitute
+    return _as_decimal(item.get(field)) if isinstance(field, str) else None
+
+
 def _positive_decimal(value: object) -> Decimal | None:
     number = _as_decimal(value)
     return number if number is not None and number > 0 else None
@@ -392,6 +399,16 @@ def _is_financial_industry(item: Mapping[str, object]) -> bool:
     return any(
         _as_decimal(item.get(field)) is not None
         for field in ("NEWCAPITALADER", "HXYJBCZL", "NONPERLOAN")
+    )
+
+
+def _financial_branch(
+    industry: str | None, main_rows: Sequence[Mapping[str, object]]
+) -> bool:
+    from screen.funnel import _bank_or_insurance
+
+    return _bank_or_insurance(industry or "") or any(
+        _is_financial_industry(row) for row in main_rows
     )
 
 
@@ -680,7 +697,9 @@ class EastMoneyClient:
                 request_count=self._request_count - started,
             ) from exc
         try:
-            financials = self._discovery_financials_for(normalized)
+            financials = self._discovery_financials_for(
+                normalized, industry=security.industry
+            )
         except Exception as exc:
             raise DiscoveryCompanyError(
                 normalized,
@@ -1326,11 +1345,19 @@ class EastMoneyClient:
     def _financials_for(self, code: str) -> list[FinancialRow]:
         return self._financial_rows_for(code, strict=False)
 
-    def _discovery_financials_for(self, code: str) -> list[FinancialRow]:
-        return self._financial_rows_for(code, strict=True)
+    def _discovery_financials_for(
+        self, code: str, *, industry: str | None = None
+    ) -> list[FinancialRow]:
+        return self._financial_rows_for(
+            code, strict=True, industry=industry
+        )
 
     def _financial_rows_for(
-        self, code: str, *, strict: bool
+        self,
+        code: str,
+        *,
+        strict: bool,
+        industry: str | None = None,
     ) -> list[FinancialRow]:
         reports = {
             "main": "RPT_F10_FINANCE_MAINFINADATA",
@@ -1341,8 +1368,21 @@ class EastMoneyClient:
             "balance_detail": "RPT_F10_FINANCE_GBALANCE",
             "cashflow_detail": "RPT_F10_FINANCE_GCASHFLOW",
         }
-        fetched: dict[str, list[dict]] = {}
+        fetched: dict[str, list[dict]] = {
+            "main": self._financial_report_rows(code, reports["main"])
+        }
+        financial_branch = strict and _financial_branch(
+            industry, fetched["main"]
+        )
         for name, report in reports.items():
+            if name == "main":
+                continue
+            if financial_branch and name in {
+                "balance_detail",
+                "cashflow_detail",
+            }:
+                fetched[name] = []
+                continue
             try:
                 fetched[name] = self._financial_report_rows(code, report)
             except MarketError:
@@ -1380,6 +1420,17 @@ class EastMoneyClient:
             cashflow_detail = mapped["cashflow_detail"].get(
                 (period, period_type), empty
             )
+
+            def metric(
+                name: str, item: Mapping[str, object]
+            ) -> Decimal | None:
+                value = _dictionary_decimal(name, item)
+                return (
+                    _dictionary_financial_decimal(name, main)
+                    if financial_branch and value is None
+                    else value
+                )
+
             shares = (
                 _first_decimal(
                     main, "TOTAL_SHARE", "TOTALSHARE", "TOTAL_SHARES"
@@ -1394,12 +1445,12 @@ class EastMoneyClient:
             )
             if not strict and ebit is None:
                 ebit = _as_decimal(main.get("EBIT"))
-            net_income = _dictionary_decimal("net_income", income)
+            net_income = metric("net_income", income)
             if not strict and net_income is None:
                 net_income = _first_decimal(
                     main, "PARENTNETPROFIT", "NETPROFIT"
                 )
-            ocf = _dictionary_decimal("ocf", cashflow)
+            ocf = metric("ocf", cashflow)
             if not strict and ocf is None:
                 ocf = _first_decimal(
                     main,
@@ -1407,7 +1458,7 @@ class EastMoneyClient:
                     "NETCASHFLOWOPERATE",
                     "OPERATECASHFLOW",
                 )
-            capex = _dictionary_decimal("capex", cashflow)
+            capex = metric("capex", cashflow)
             if not strict and capex is None:
                 capex = _first_decimal(
                     main,
@@ -1415,14 +1466,10 @@ class EastMoneyClient:
                     "CONSTRUCTCASHPAY",
                     "CAPEX",
                 )
-            short_loan = _dictionary_decimal(
-                "short_loan", balance_detail
-            )
-            long_loan = _dictionary_decimal("long_loan", balance_detail)
-            bond_payable = _dictionary_decimal(
-                "bond_payable", balance_detail
-            )
-            noncurrent_liab_1year = _dictionary_decimal(
+            short_loan = metric("short_loan", balance_detail)
+            long_loan = metric("long_loan", balance_detail)
+            bond_payable = metric("bond_payable", balance_detail)
+            noncurrent_liab_1year = metric(
                 "noncurrent_liab_1year", balance_detail
             )
             # NONCURRENT_LIAB_1YEAR can include non-interest-bearing items and
@@ -1477,53 +1524,48 @@ class EastMoneyClient:
                         if not strict
                         else None
                     ),
-                    npl=_dictionary_decimal("npl", main),
+                    npl=metric("npl", main),
                     eps=(
                         _first_decimal(main, "EPSJB", "EPSKCJB", "EPSXS")
                         if not strict
                         else None
                     ),
-                    revenue=_dictionary_decimal("revenue", income),
-                    deducted_net_income=_dictionary_decimal(
+                    revenue=metric("revenue", income),
+                    deducted_net_income=metric(
                         "deducted_net_income", income
                     ),
-                    total_assets=_dictionary_decimal(
-                        "total_assets", balance
-                    ),
-                    net_assets=_dictionary_decimal("net_assets", balance),
-                    cash=_dictionary_decimal("cash", balance),
+                    total_assets=metric("total_assets", balance),
+                    net_assets=metric("net_assets", balance),
+                    cash=metric("cash", balance),
                     short_loan=short_loan,
                     long_loan=long_loan,
                     bond_payable=bond_payable,
                     noncurrent_liab_1year=noncurrent_liab_1year,
                     interest_debt=interest_debt,
-                    pretax_income=_dictionary_decimal(
-                        "pretax_income", income
-                    ),
-                    income_tax=_dictionary_decimal("income_tax", income),
+                    pretax_income=metric("pretax_income", income),
+                    income_tax=metric("income_tax", income),
                     roic=(
                         None
-                        if _is_financial_industry(main)
-                        else _dictionary_decimal("roic", main)
+                        if financial_branch
+                        or _is_financial_industry(main)
+                        else metric("roic", main)
                     ),
-                    capital_adequacy=_dictionary_decimal(
+                    capital_adequacy=metric(
                         "capital_adequacy", main
                     ),
-                    core_tier1_capital_adequacy=_dictionary_decimal(
+                    core_tier1_capital_adequacy=metric(
                         "core_tier1_capital_adequacy", main
                     ),
-                    nonperforming_loan_balance=_dictionary_decimal(
+                    nonperforming_loan_balance=metric(
                         "nonperforming_loan_balance", main
                     ),
                     impairment_loss=_impairment_loss(income_detail),
                     government_grants=None,
-                    asset_disposal_gain=_dictionary_decimal(
+                    asset_disposal_gain=metric(
                         "asset_disposal_gain", income_detail
                     ),
-                    goodwill=_dictionary_decimal(
-                        "goodwill", balance_detail
-                    ),
-                    acquisition_cash_paid=_dictionary_decimal(
+                    goodwill=metric("goodwill", balance_detail),
+                    acquisition_cash_paid=metric(
                         "acquisition_cash_paid", cashflow_detail
                     ),
                     source_as_of=_source_as_of(
