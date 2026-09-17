@@ -1158,3 +1158,999 @@ def test_existing_research_jobs_gain_nullable_discovery_provenance(
             )
         ).one()
     assert migrated_row == (1, None, "garp")
+
+
+def test_discovery_constants_are_exact() -> None:
+    from discovery.constants import (
+        COMMON_STAGE,
+        RUN_TERMINAL_STATUSES,
+        STAGE_STATUSES,
+        TERMINAL_FAILURES,
+        TRACKS,
+        TRACK_STAGES,
+        VERDICTS,
+    )
+
+    assert TRACKS == frozenset(
+        {"quality_discount", "deep_value", "garp"}
+    )
+    assert COMMON_STAGE == "common"
+    assert TRACK_STAGES == ("track_gate", "competition", "adjudication")
+    assert STAGE_STATUSES == frozenset(
+        {
+            "queued",
+            "running",
+            "waiting_confirmation",
+            "confirmed",
+            "failed",
+            "ruler_not_ready",
+            "data_not_ready",
+            "insufficient_candidates",
+        }
+    )
+    assert RUN_TERMINAL_STATUSES == frozenset(
+        {"failed", "completed", "partially_completed", "abandoned"}
+    )
+    assert VERDICTS == frozenset({"pass", "drop", "insufficient"})
+    assert TERMINAL_FAILURES == frozenset(
+        {
+            "failed",
+            "ruler_not_ready",
+            "data_not_ready",
+            "insufficient_candidates",
+        }
+    )
+
+
+_UNSET = object()
+
+
+def _stage_state(
+    *,
+    run_id: object = 1,
+    track: object = _UNSET,
+    stage: object = "common",
+    status: object = "queued",
+    attempt: object = 1,
+    input_fingerprint: object = "input-1",
+    ruler_version_id: object = 7,
+    algorithm_version: object = "discovery-v1",
+    superseded: object = False,
+    failure_kind: object = None,
+):
+    from discovery.workflow import StageState
+
+    resolved_track = (
+        None if stage == "common" else "quality_discount"
+    ) if track is _UNSET else track
+    return StageState(
+        run_id=run_id,  # type: ignore[arg-type]
+        track=resolved_track,  # type: ignore[arg-type]
+        stage=stage,  # type: ignore[arg-type]
+        status=status,  # type: ignore[arg-type]
+        attempt=attempt,  # type: ignore[arg-type]
+        input_fingerprint=input_fingerprint,  # type: ignore[arg-type]
+        ruler_version_id=ruler_version_id,  # type: ignore[arg-type]
+        algorithm_version=algorithm_version,  # type: ignore[arg-type]
+        superseded=superseded,  # type: ignore[arg-type]
+        failure_kind=failure_kind,  # type: ignore[arg-type]
+    )
+
+
+def _predecessor_for(state, **changes):
+    from dataclasses import replace
+
+    previous_stage = {
+        "track_gate": "common",
+        "competition": "track_gate",
+        "adjudication": "competition",
+    }.get(state.stage)
+    if previous_stage is None:
+        return None
+    predecessor = _stage_state(
+        run_id=state.run_id,
+        track=None if previous_stage == "common" else state.track,
+        stage=previous_stage,
+        status="confirmed",
+        ruler_version_id=state.ruler_version_id,
+    )
+    return replace(predecessor, **changes)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"run_id": 0},
+        {"run_id": True},
+        {"run_id": "1"},
+        {"stage": None},
+        {"stage": "unknown"},
+        {"stage": "common", "track": "quality_discount"},
+        {"stage": "track_gate", "track": None},
+        {"stage": "track_gate", "track": "momentum"},
+        {"attempt": 0},
+        {"attempt": True},
+        {"attempt": 1.0},
+        {"input_fingerprint": ""},
+        {"input_fingerprint": 1},
+        {"algorithm_version": ""},
+        {"algorithm_version": 1},
+        {"ruler_version_id": True},
+        {"ruler_version_id": 1.0},
+        {"superseded": 0},
+        {"status": "insufficient_candidates"},
+        {"status": "ruler_not_ready"},
+        {"status": "failed", "failure_kind": None},
+        {"status": "failed", "failure_kind": []},
+        {"status": "queued", "failure_kind": "transient"},
+    ],
+)
+def test_stage_state_rejects_malformed_runtime_values(
+    changes: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError):
+        _stage_state(**changes)
+
+
+def test_stage_state_is_fully_immutable() -> None:
+    from dataclasses import FrozenInstanceError
+
+    state = _stage_state()
+
+    with pytest.raises(FrozenInstanceError):
+        state.status = "running"
+
+
+@pytest.mark.parametrize(
+    ("current", "target"),
+    [
+        ("queued", "running"),
+        ("running", "waiting_confirmation"),
+        ("waiting_confirmation", "confirmed"),
+    ],
+)
+def test_stage_state_accepts_only_the_exact_normal_flow(
+    current: str, target: str
+) -> None:
+    from discovery.workflow import transition_stage
+
+    old = _stage_state(status=current)
+    new = transition_stage(
+        old,
+        target,
+        run_status="running",
+        predecessor=None,
+    )
+
+    assert new.status == target
+    assert old.status == current
+
+
+@pytest.mark.parametrize(
+    ("stage", "current", "target", "failure_kind"),
+    [
+        ("common", "running", "failed", "transient"),
+        ("common", "running", "failed", "permanent"),
+        ("common", "running", "data_not_ready", None),
+        ("track_gate", "running", "ruler_not_ready", None),
+        (
+            "adjudication",
+            "waiting_confirmation",
+            "insufficient_candidates",
+            None,
+        ),
+    ],
+)
+def test_stage_state_accepts_designed_terminal_transitions(
+    stage: str,
+    current: str,
+    target: str,
+    failure_kind: str | None,
+) -> None:
+    from discovery.workflow import transition_stage
+
+    state = _stage_state(stage=stage, status=current)
+    result = transition_stage(
+        state,
+        target,
+        run_status="running",
+        predecessor=_predecessor_for(state),
+        failure_kind=failure_kind,
+    )
+
+    assert result.status == target
+    assert result.failure_kind == failure_kind
+
+
+@pytest.mark.parametrize(
+    ("stage", "current", "target", "failure_kind"),
+    [
+        ("common", "queued", "waiting_confirmation", None),
+        ("common", "queued", "confirmed", None),
+        ("common", "running", "confirmed", None),
+        ("common", "running", "queued", None),
+        ("common", "waiting_confirmation", "running", None),
+        ("common", "confirmed", "waiting_confirmation", None),
+        ("common", "failed", "running", None),
+        ("common", "queued", "failed", "transient"),
+        ("common", "running", "ruler_not_ready", None),
+        ("common", "running", "insufficient_candidates", None),
+        (
+            "track_gate",
+            "waiting_confirmation",
+            "insufficient_candidates",
+            None,
+        ),
+    ],
+)
+def test_stage_state_rejects_invalid_transitions(
+    stage: str,
+    current: str,
+    target: str,
+    failure_kind: str | None,
+) -> None:
+    from discovery.workflow import WorkflowError, transition_stage
+
+    state = _stage_state(
+        stage=stage,
+        status=current,
+        failure_kind="transient" if current == "failed" else None,
+    )
+
+    with pytest.raises(WorkflowError):
+        transition_stage(
+            state,
+            target,
+            run_status="running",
+            predecessor=_predecessor_for(state),
+            failure_kind=failure_kind,
+        )
+
+
+@pytest.mark.parametrize(
+    ("stage", "expected_previous"),
+    [
+        ("track_gate", "common"),
+        ("competition", "track_gate"),
+        ("adjudication", "competition"),
+    ],
+)
+def test_track_stage_accepts_exact_predecessor_chain(
+    stage: str, expected_previous: str
+) -> None:
+    from discovery.workflow import transition_stage
+
+    state = _stage_state(stage=stage)
+    predecessor = _predecessor_for(state)
+
+    assert predecessor.stage == expected_previous
+    assert (
+        transition_stage(
+            state,
+            "running",
+            run_status="running",
+            predecessor=predecessor,
+        ).status
+        == "running"
+    )
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"run_id": 2},
+        {"track": "deep_value"},
+        {"stage": "adjudication"},
+        {"status": "waiting_confirmation"},
+        {"superseded": True},
+    ],
+)
+def test_track_stage_rejects_wrong_or_stale_predecessor(
+    changes: dict[str, object],
+) -> None:
+    from discovery.workflow import WorkflowError, transition_stage
+
+    state = _stage_state(stage="competition")
+    predecessor = _predecessor_for(state, **changes)
+
+    with pytest.raises(WorkflowError) as error:
+        transition_stage(
+            state,
+            "running",
+            run_status="running",
+            predecessor=predecessor,
+        )
+    assert error.value.code == "invalid_predecessor"
+
+
+def test_common_rejects_predecessor_and_track_stage_rejects_omission() -> None:
+    from discovery.workflow import WorkflowError, transition_stage
+
+    common = _stage_state()
+    gate = _stage_state(stage="track_gate")
+    for state, predecessor in (
+        (common, _stage_state(status="confirmed")),
+        (gate, None),
+    ):
+        with pytest.raises(WorkflowError) as error:
+            transition_stage(
+                state,
+                "running",
+                run_status="running",
+                predecessor=predecessor,
+            )
+        assert error.value.code == "invalid_predecessor"
+
+
+def test_transition_requires_explicit_run_and_predecessor_context() -> None:
+    from discovery.workflow import transition_stage
+
+    state = _stage_state()
+
+    with pytest.raises(TypeError):
+        transition_stage(state, "running", predecessor=None)
+    with pytest.raises(TypeError):
+        transition_stage(state, "running", run_status="running")
+
+
+@pytest.mark.parametrize(
+    ("run_status", "code"),
+    [
+        ("abandoned", "run_abandoned"),
+        ("failed", "run_terminal"),
+        ("completed", "run_terminal"),
+        ("partially_completed", "run_terminal"),
+        ("unknown", "invalid_run_status"),
+        ([], "invalid_run_status"),
+    ],
+)
+def test_transition_rejects_terminal_or_invalid_run_status(
+    run_status: object, code: str
+) -> None:
+    from discovery.workflow import WorkflowError, transition_stage
+
+    with pytest.raises(WorkflowError) as error:
+        transition_stage(
+            _stage_state(),
+            "running",
+            run_status=run_status,  # type: ignore[arg-type]
+            predecessor=None,
+        )
+    assert error.value.code == code
+
+
+@pytest.mark.parametrize(
+    "run_status",
+    ["running", "completed", "partially_completed", "failed"],
+)
+def test_confirmed_duplicate_is_idempotent_after_terminal_aggregation(
+    run_status: str,
+) -> None:
+    from discovery.workflow import WorkflowError, transition_stage
+
+    state = _stage_state(stage="competition", status="confirmed")
+    predecessor = _predecessor_for(state)
+    assert (
+        transition_stage(
+            state,
+            "confirmed",
+            run_status=run_status,
+            predecessor=predecessor,
+        )
+        is state
+    )
+
+    for invalid in (None, _predecessor_for(state, run_id=2)):
+        with pytest.raises(WorkflowError) as error:
+            transition_stage(
+                state,
+                "confirmed",
+                run_status="running",
+                predecessor=invalid,
+            )
+        assert error.value.code == "invalid_predecessor"
+
+
+def test_confirmed_duplicate_still_validates_every_guard() -> None:
+    from dataclasses import replace
+
+    from discovery.workflow import WorkflowError, transition_stage
+
+    state = _stage_state(stage="competition", status="confirmed")
+    predecessor = _predecessor_for(state)
+    cases = [
+        (
+            replace(state, superseded=True),
+            "confirmed",
+            "completed",
+            predecessor,
+            None,
+            "stage_superseded",
+        ),
+        (
+            state,
+            "confirmed",
+            "completed",
+            _predecessor_for(state, superseded=True),
+            None,
+            "invalid_predecessor",
+        ),
+        (
+            state,
+            "confirmed",
+            "completed",
+            predecessor,
+            "transient",
+            "invalid_failure_kind",
+        ),
+        (
+            state,
+            [],
+            "completed",
+            predecessor,
+            None,
+            "invalid_status",
+        ),
+        (
+            state,
+            "confirmed",
+            "unknown",
+            predecessor,
+            None,
+            "invalid_run_status",
+        ),
+        (
+            state,
+            "confirmed",
+            "abandoned",
+            predecessor,
+            None,
+            "run_abandoned",
+        ),
+    ]
+    for current, target, run_status, upstream, failure_kind, code in cases:
+        with pytest.raises(WorkflowError) as error:
+            transition_stage(
+                current,
+                target,  # type: ignore[arg-type]
+                run_status=run_status,
+                predecessor=upstream,
+                failure_kind=failure_kind,
+            )
+        assert error.value.code == code
+
+
+@pytest.mark.parametrize("operation", ["transition", "retry"])
+def test_superseded_stage_rejects_every_mutation(operation: str) -> None:
+    from discovery.workflow import WorkflowError, retry_stage, transition_stage
+
+    state = _stage_state(
+        status="failed" if operation == "retry" else "queued",
+        superseded=True,
+        failure_kind="transient" if operation == "retry" else None,
+    )
+    with pytest.raises(WorkflowError) as error:
+        if operation == "transition":
+            transition_stage(
+                state,
+                "running",
+                run_status="running",
+                predecessor=None,
+            )
+        else:
+            retry_stage(
+                state,
+                run_status="running",
+                predecessor=None,
+                input_fingerprint="input-1",
+                ruler_version_id=7,
+            )
+    assert error.value.code == "stage_superseded"
+
+
+def test_retry_uses_natural_failure_and_preserves_old_attempt() -> None:
+    from discovery.workflow import retry_stage, transition_stage
+
+    running = _stage_state(
+        stage="competition",
+        status="running",
+        attempt=2,
+    )
+    predecessor = _predecessor_for(running)
+    old = transition_stage(
+        running,
+        "failed",
+        run_status="running",
+        predecessor=predecessor,
+        failure_kind="transient",
+    )
+    new = retry_stage(
+        old,
+        run_status="running",
+        predecessor=predecessor,
+        input_fingerprint="input-1",
+        ruler_version_id=7,
+    )
+
+    assert new == _stage_state(
+        stage="competition",
+        status="queued",
+        attempt=3,
+    )
+    assert old.status == "failed"
+    assert old.attempt == 2
+    assert old.failure_kind == "transient"
+
+
+@pytest.mark.parametrize(
+    "available_builds",
+    [
+        "discovery-v1",
+        b"discovery-v1",
+        object(),
+        1,
+        frozenset({1}),
+        ["discovery-v1", object()],
+    ],
+)
+def test_retry_rejects_malformed_build_registry(
+    available_builds: object,
+) -> None:
+    from discovery.workflow import WorkflowError, retry_stage
+
+    state = _stage_state(status="failed", failure_kind="transient")
+    with pytest.raises(WorkflowError) as error:
+        retry_stage(
+            state,
+            run_status="running",
+            predecessor=None,
+            input_fingerprint="input-1",
+            ruler_version_id=7,
+            available_builds=available_builds,  # type: ignore[arg-type]
+        )
+    assert error.value.code == "algorithm_unavailable"
+
+
+@pytest.mark.parametrize(
+    "predecessor_changes",
+    [
+        None,
+        {"run_id": 2},
+        {"track": "deep_value"},
+        {"stage": "adjudication"},
+        {"status": "waiting_confirmation"},
+        {"superseded": True},
+    ],
+)
+def test_downstream_retry_rejects_missing_wrong_or_stale_predecessor(
+    predecessor_changes: dict[str, object] | None,
+) -> None:
+    from discovery.workflow import WorkflowError, retry_stage
+
+    state = _stage_state(
+        stage="competition",
+        status="failed",
+        failure_kind="transient",
+    )
+    predecessor = (
+        None
+        if predecessor_changes is None
+        else _predecessor_for(state, **predecessor_changes)
+    )
+    with pytest.raises(WorkflowError) as error:
+        retry_stage(
+            state,
+            run_status="running",
+            predecessor=predecessor,
+            input_fingerprint="input-1",
+            ruler_version_id=7,
+        )
+    assert error.value.code == "invalid_predecessor"
+
+
+def test_common_retry_rejects_any_predecessor() -> None:
+    from discovery.workflow import WorkflowError, retry_stage
+
+    state = _stage_state(status="failed", failure_kind="transient")
+    with pytest.raises(WorkflowError) as error:
+        retry_stage(
+            state,
+            run_status="running",
+            predecessor=_stage_state(status="confirmed"),
+            input_fingerprint="input-1",
+            ruler_version_id=7,
+        )
+    assert error.value.code == "invalid_predecessor"
+
+
+@pytest.mark.parametrize(
+    ("changes", "code"),
+    [
+        ({"input_fingerprint": "input-2"}, "inputs_changed"),
+        ({"ruler_version_id": 8}, "ruler_changed"),
+        ({"algorithm_version": "retired-build"}, "algorithm_unavailable"),
+        ({"failure_kind": "permanent"}, "retry_not_allowed"),
+        ({"status": "data_not_ready", "failure_kind": None}, "retry_not_allowed"),
+    ],
+)
+def test_retry_rejects_invalid_invariants(
+    changes: dict[str, object], code: str
+) -> None:
+    from dataclasses import replace
+
+    from discovery.workflow import WorkflowError, retry_stage
+
+    old = _stage_state(status="failed", failure_kind="transient")
+    candidate = replace(old, **changes)
+
+    with pytest.raises(WorkflowError) as error:
+        retry_stage(
+            candidate,
+            run_status="running",
+            predecessor=None,
+            input_fingerprint="input-1",
+            ruler_version_id=7,
+        )
+    assert error.value.code == code
+    assert candidate == replace(old, **changes)
+
+
+@pytest.mark.parametrize(
+    ("stage", "status"),
+    [
+        ("common", "data_not_ready"),
+        ("track_gate", "ruler_not_ready"),
+        ("adjudication", "insufficient_candidates"),
+    ],
+)
+def test_dedicated_terminal_failures_reject_retry(
+    stage: str, status: str
+) -> None:
+    from discovery.workflow import WorkflowError, retry_stage
+
+    state = _stage_state(stage=stage, status=status)
+    with pytest.raises(WorkflowError) as error:
+        retry_stage(
+            state,
+            run_status="running",
+            predecessor=_predecessor_for(state),
+            input_fingerprint="input-1",
+            ruler_version_id=7,
+        )
+    assert error.value.code == "retry_not_allowed"
+
+
+@pytest.mark.parametrize(
+    ("run_status", "code"),
+    [
+        ("abandoned", "run_abandoned"),
+        ("failed", "run_terminal"),
+        ("completed", "run_terminal"),
+        ("partially_completed", "run_terminal"),
+        ("unknown", "invalid_run_status"),
+    ],
+)
+def test_retry_requires_explicit_mutable_run_status(
+    run_status: str, code: str
+) -> None:
+    from discovery.workflow import WorkflowError, retry_stage
+
+    state = _stage_state(status="failed", failure_kind="transient")
+    with pytest.raises(WorkflowError) as error:
+        retry_stage(
+            state,
+            run_status=run_status,
+            predecessor=None,
+            input_fingerprint="input-1",
+            ruler_version_id=7,
+        )
+    assert error.value.code == code
+
+    with pytest.raises(TypeError):
+        retry_stage(
+            state,
+            predecessor=None,
+            input_fingerprint="input-1",
+            ruler_version_id=7,
+        )
+
+
+def _track_statuses(**overrides: str) -> dict[str, str]:
+    statuses = {
+        "quality_discount": "queued",
+        "deep_value": "queued",
+        "garp": "queued",
+    }
+    statuses.update(overrides)
+    return statuses
+
+
+@pytest.mark.parametrize(
+    ("run_status", "common", "tracks", "expected"),
+    [
+        (
+            "abandoned",
+            "failed",
+            _track_statuses(
+                quality_discount="confirmed",
+                deep_value="confirmed",
+                garp="confirmed",
+            ),
+            "abandoned",
+        ),
+        (
+            "running",
+            "failed",
+            _track_statuses(
+                quality_discount="confirmed",
+                deep_value="confirmed",
+                garp="confirmed",
+            ),
+            "failed",
+        ),
+        (
+            "running",
+            "running",
+            _track_statuses(
+                quality_discount="confirmed",
+                deep_value="confirmed",
+                garp="confirmed",
+            ),
+            "completed",
+        ),
+        (
+            "running",
+            "running",
+            _track_statuses(
+                quality_discount="confirmed",
+                deep_value="failed",
+                garp="insufficient_candidates",
+            ),
+            "partially_completed",
+        ),
+        (
+            "running",
+            "data_not_ready",
+            _track_statuses(
+                quality_discount="failed",
+                deep_value="data_not_ready",
+                garp="ruler_not_ready",
+            ),
+            "failed",
+        ),
+        (
+            "running",
+            "confirmed",
+            _track_statuses(
+                quality_discount="confirmed",
+                deep_value="running",
+                garp="waiting_confirmation",
+            ),
+            "running",
+        ),
+        (
+            "running",
+            "confirmed",
+            _track_statuses(garp="waiting_confirmation"),
+            "waiting_confirmation",
+        ),
+        ("running", "queued", _track_statuses(), "queued"),
+    ],
+)
+def test_aggregate_status_precedence(
+    run_status: str,
+    common: str,
+    tracks: dict[str, str],
+    expected: str,
+) -> None:
+    from discovery.aggregate import aggregate_run_status
+
+    assert aggregate_run_status(run_status, common, tracks) == expected
+
+
+@pytest.mark.parametrize(
+    ("run_status", "common", "tracks"),
+    [
+        ("unknown", "queued", _track_statuses()),
+        ([], "queued", _track_statuses()),
+        ("running", {}, _track_statuses()),
+        ("running", "queued", {}),
+        (
+            "running",
+            "queued",
+            {
+                "quality_discount": "queued",
+                "deep_value": "queued",
+                "momentum": "queued",
+            },
+        ),
+        ("running", "queued", _track_statuses(garp="unknown")),
+        ("running", "queued", _track_statuses(garp=[])),
+        ("running", "queued", []),
+    ],
+)
+def test_aggregate_status_rejects_malformed_inputs(
+    run_status: object, common: object, tracks: object
+) -> None:
+    from discovery.aggregate import aggregate_run_status
+
+    with pytest.raises(ValueError):
+        aggregate_run_status(
+            run_status,  # type: ignore[arg-type]
+            common,  # type: ignore[arg-type]
+            tracks,  # type: ignore[arg-type]
+        )
+
+
+def test_recomputation_requires_complete_available_saved_build() -> None:
+    from discovery.builds import (
+        AVAILABLE_BUILDS,
+        BUILD_VERSION,
+        AlgorithmUnavailableError,
+        validate_recomputation,
+    )
+
+    assert AVAILABLE_BUILDS == frozenset({BUILD_VERSION})
+    validate_recomputation(
+        BUILD_VERSION,
+        snapshot_complete=True,
+        ruler_payload_complete=True,
+        persisted_input_fingerprint="input-1",
+        requested_input_fingerprint="input-1",
+        persisted_ruler_version_id=7,
+        requested_ruler_version_id=7,
+    )
+    for values in (
+        {
+            "algorithm_version": "retired-build",
+            "snapshot_complete": True,
+            "ruler_payload_complete": True,
+            "persisted_input_fingerprint": "input-1",
+            "requested_input_fingerprint": "input-1",
+            "persisted_ruler_version_id": 7,
+            "requested_ruler_version_id": 7,
+        },
+        {
+            "algorithm_version": BUILD_VERSION,
+            "snapshot_complete": "yes",
+            "ruler_payload_complete": True,
+            "persisted_input_fingerprint": "input-1",
+            "requested_input_fingerprint": "input-1",
+            "persisted_ruler_version_id": 7,
+            "requested_ruler_version_id": 7,
+        },
+        {
+            "algorithm_version": BUILD_VERSION,
+            "snapshot_complete": True,
+            "ruler_payload_complete": 1,
+            "persisted_input_fingerprint": "input-1",
+            "requested_input_fingerprint": "input-1",
+            "persisted_ruler_version_id": 7,
+            "requested_ruler_version_id": 7,
+        },
+        {
+            "algorithm_version": BUILD_VERSION,
+            "snapshot_complete": True,
+            "ruler_payload_complete": True,
+            "persisted_input_fingerprint": "input-1",
+            "requested_input_fingerprint": "input-2",
+            "persisted_ruler_version_id": 7,
+            "requested_ruler_version_id": 7,
+        },
+        {
+            "algorithm_version": BUILD_VERSION,
+            "snapshot_complete": True,
+            "ruler_payload_complete": True,
+            "persisted_input_fingerprint": "input-1",
+            "requested_input_fingerprint": "input-1",
+            "persisted_ruler_version_id": 7,
+            "requested_ruler_version_id": 8,
+        },
+        {
+            "algorithm_version": BUILD_VERSION,
+            "snapshot_complete": True,
+            "ruler_payload_complete": True,
+            "persisted_input_fingerprint": "",
+            "requested_input_fingerprint": "",
+            "persisted_ruler_version_id": 7,
+            "requested_ruler_version_id": 7,
+        },
+        {
+            "algorithm_version": BUILD_VERSION,
+            "snapshot_complete": True,
+            "ruler_payload_complete": True,
+            "persisted_input_fingerprint": "input-1",
+            "requested_input_fingerprint": "input-1",
+            "persisted_ruler_version_id": None,
+            "requested_ruler_version_id": None,
+        },
+        {
+            "algorithm_version": [],
+            "snapshot_complete": True,
+            "ruler_payload_complete": True,
+            "persisted_input_fingerprint": "input-1",
+            "requested_input_fingerprint": "input-1",
+            "persisted_ruler_version_id": 7,
+            "requested_ruler_version_id": 7,
+        },
+        {
+            "algorithm_version": BUILD_VERSION,
+            "snapshot_complete": True,
+            "ruler_payload_complete": True,
+            "persisted_input_fingerprint": [],
+            "requested_input_fingerprint": [],
+            "persisted_ruler_version_id": 7,
+            "requested_ruler_version_id": 7,
+        },
+        {
+            "algorithm_version": BUILD_VERSION,
+            "snapshot_complete": True,
+            "ruler_payload_complete": True,
+            "persisted_input_fingerprint": "input-1",
+            "requested_input_fingerprint": "input-1",
+            "persisted_ruler_version_id": 1,
+            "requested_ruler_version_id": True,
+        },
+        {
+            "algorithm_version": BUILD_VERSION,
+            "snapshot_complete": True,
+            "ruler_payload_complete": True,
+            "persisted_input_fingerprint": "input-1",
+            "requested_input_fingerprint": "input-1",
+            "persisted_ruler_version_id": "",
+            "requested_ruler_version_id": "",
+        },
+        {
+            "algorithm_version": BUILD_VERSION,
+            "snapshot_complete": True,
+            "ruler_payload_complete": True,
+            "persisted_input_fingerprint": "input-1",
+            "requested_input_fingerprint": "input-1",
+            "persisted_ruler_version_id": 7,
+            "requested_ruler_version_id": 7,
+            "available_builds": object(),
+        },
+    ):
+        with pytest.raises(AlgorithmUnavailableError) as error:
+            validate_recomputation(**values)
+        assert error.value.code == "algorithm_unavailable"
+
+
+def test_historical_read_does_not_consult_build_registry() -> None:
+    from discovery.builds import read_historical
+
+    persisted = {
+        "algorithm_version": "retired-build",
+        "results": [{"code": "600000.SH"}],
+    }
+
+    replay = read_historical(persisted)
+    replay["results"][0]["code"] = "changed"
+
+    assert replay is not persisted
+    assert persisted["results"][0]["code"] == "600000.SH"
+
+
+def test_historical_read_rejects_non_plain_objects() -> None:
+    from discovery.builds import read_historical
+
+    with pytest.raises(TypeError, match="plain JSON-like"):
+        read_historical({"orm_row": object()})
+
+
+def test_historical_read_rejects_cycles() -> None:
+    from discovery.builds import read_historical
+
+    persisted: dict[str, object] = {}
+    persisted["self"] = persisted
+
+    with pytest.raises(TypeError, match="cycles"):
+        read_historical(persisted)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_historical_read_rejects_non_finite_numbers(value: float) -> None:
+    from discovery.builds import read_historical
+
+    with pytest.raises(TypeError, match="finite"):
+        read_historical({"metric": value})
