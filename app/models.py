@@ -3,6 +3,7 @@ from decimal import Decimal, InvalidOperation
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     ForeignKeyConstraint,
@@ -418,10 +419,25 @@ class DiscoveryFillTradingDate(Base):
 
 class ResearchJob(Base):
     __tablename__ = "research_jobs"
+    __table_args__ = (
+        CheckConstraint(
+            "discovery_track IS NULL OR discovery_track IN "
+            "('quality_discount', 'deep_value', 'garp')",
+            name="ck_research_jobs_discovery_track",
+        ),
+        CheckConstraint(
+            "discovery_run_id IS NULL OR discovery_track IS NOT NULL",
+            name="ck_research_jobs_discovery_pair",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
     screen_run_id: Mapped[int | None] = mapped_column(ForeignKey("screen_runs.id"), nullable=True)
+    discovery_run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("discovery_runs.id", ondelete="SET NULL"), nullable=True
+    )
+    discovery_track: Mapped[str | None] = mapped_column(String, nullable=True)
     name: Mapped[str] = mapped_column(String, nullable=False)
     code: Mapped[str] = mapped_column(String, nullable=False)
     status: Mapped[str] = mapped_column(String, nullable=False)

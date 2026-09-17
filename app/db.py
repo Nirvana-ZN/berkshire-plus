@@ -80,6 +80,94 @@ def seed_local_user(session: Session) -> None:
     session.commit()
 
 
+def _ensure_discovery_indexes(engine: Engine) -> None:
+    from sqlalchemy import text
+
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_discovery_current_week "
+                "ON discovery_runs(user_id, week_key) WHERE current = 1"
+            )
+        )
+
+
+def _ensure_research_columns(engine: Engine) -> None:
+    from sqlalchemy import text
+
+    with engine.begin() as conn:
+        names = {
+            row[1]
+            for row in conn.execute(text("PRAGMA table_info(research_jobs)")).all()
+        }
+        if "discovery_run_id" not in names:
+            conn.execute(
+                text(
+                    "ALTER TABLE research_jobs ADD COLUMN discovery_run_id "
+                    "INTEGER REFERENCES discovery_runs(id) ON DELETE SET NULL"
+                )
+            )
+        if "discovery_track" not in names:
+            conn.execute(
+                text(
+                    "ALTER TABLE research_jobs ADD COLUMN discovery_track VARCHAR"
+                )
+            )
+        invalid_provenance = """
+            (NEW.discovery_track IS NOT NULL AND NEW.discovery_track NOT IN (
+                'quality_discount', 'deep_value', 'garp'
+            ))
+            OR (
+                NEW.discovery_run_id IS NOT NULL
+                AND (
+                    NEW.discovery_track IS NULL
+                    OR NOT EXISTS (
+                        SELECT 1 FROM discovery_runs
+                        WHERE id = NEW.discovery_run_id
+                          AND user_id = NEW.user_id
+                    )
+                )
+            )
+        """
+        conn.execute(
+            text(
+                "CREATE TRIGGER IF NOT EXISTS "
+                "trg_research_jobs_discovery_provenance_insert "
+                "BEFORE INSERT ON research_jobs "
+                f"WHEN {invalid_provenance} "
+                "BEGIN "
+                "SELECT RAISE(ABORT, 'invalid discovery research provenance'); "
+                "END"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE TRIGGER IF NOT EXISTS "
+                "trg_research_jobs_discovery_provenance_update "
+                "BEFORE UPDATE OF user_id, discovery_run_id, discovery_track "
+                "ON research_jobs "
+                f"WHEN {invalid_provenance} "
+                "BEGIN "
+                "SELECT RAISE(ABORT, 'invalid discovery research provenance'); "
+                "END"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE TRIGGER IF NOT EXISTS "
+                "trg_discovery_runs_research_ownership_update "
+                "BEFORE UPDATE OF user_id ON discovery_runs "
+                "WHEN EXISTS ("
+                "SELECT 1 FROM research_jobs "
+                "WHERE discovery_run_id = OLD.id AND user_id != NEW.user_id"
+                ") "
+                "BEGIN "
+                "SELECT RAISE(ABORT, 'discovery research owner mismatch'); "
+                "END"
+            )
+        )
+
+
 def _ensure_listed_year(engine: Engine) -> None:
     from sqlalchemy import text
 
@@ -404,9 +492,12 @@ def _infer_legacy_financial_completeness(engine: Engine) -> None:
 
 def init_db(db_path: Path | None = None) -> Engine:
     from app import models as _models  # noqa: F401
+    from app import discovery_models as _discovery_models  # noqa: F401
 
     engine = create_db_engine(db_path)
     Base.metadata.create_all(engine)
+    _ensure_discovery_indexes(engine)
+    _ensure_research_columns(engine)
     _ensure_listed_year(engine)
     _ensure_financial_columns(engine)
     _ensure_discovery_fill_columns(engine)
