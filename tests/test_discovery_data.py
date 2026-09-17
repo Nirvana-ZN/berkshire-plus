@@ -3495,6 +3495,34 @@ def test_wrong_type_release_cannot_clear_colliding_job_id(tmp_path) -> None:
     engine.dispose()
 
 
+@pytest.mark.parametrize("terminal_status", ["done", "failed"])
+def test_start_discovery_fill_returns_terminal_fill_until_its_lock_is_released(
+    tmp_path,
+    terminal_status,
+) -> None:
+    from jobs.discovery_data import start_discovery_data_fill
+    from jobs.lock import JOB_TYPE_DISCOVERY_DATA, ensure_lock_row
+
+    engine = init_db(tmp_path / f"terminal-lock-{terminal_status}.db")
+    now = datetime(2026, 9, 16, 12, tzinfo=timezone.utc)
+    with Session(engine) as session:
+        fill = _fill(session, [], now=now, status=terminal_status)
+        fill_id = fill.id
+        lock = ensure_lock_row(session)
+        lock.job_id = fill_id
+        lock.job_type = JOB_TYPE_DISCOVERY_DATA
+        lock.held_at = now
+        session.commit()
+
+        existing, dispatch = start_discovery_data_fill(session, now=now)
+
+        assert existing is not None
+        assert existing.id == fill_id
+        assert dispatch is False
+        assert session.query(DiscoveryDataFill).count() == 1
+    engine.dispose()
+
+
 def test_discovery_fill_post_rejects_malformed_json_but_accepts_empty_and_object(
     tmp_path,
 ) -> None:

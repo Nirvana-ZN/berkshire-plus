@@ -250,11 +250,10 @@ def start_discovery_data_fill(
             session.commit()
             current_lock = lock_status(session)
             active = None
-    if active is not None and current_lock == {
-        "type": JOB_TYPE_DISCOVERY_DATA,
-        "job_id": active.id,
-    }:
-        return active, False
+    if current_lock is not None and current_lock.get("type") == JOB_TYPE_DISCOVERY_DATA:
+        locked_fill = session.get(DiscoveryDataFill, current_lock.get("job_id"))
+        if locked_fill is not None:
+            return locked_fill, False
     if current_lock is not None:
         return None, False
     if active is None:
