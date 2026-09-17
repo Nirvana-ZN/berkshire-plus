@@ -12,6 +12,30 @@ RULER_IDS = {
 }
 
 
+def ruler_payloads_json(
+    ruler_ids: dict[str, int | None] | None = None,
+) -> str:
+    from discovery.snapshot import _sha256, canonical_json
+
+    ids = ruler_ids or RULER_IDS
+    values = {}
+    for track, ruler_id in ids.items():
+        if ruler_id is None:
+            values[track] = None
+            continue
+        payload = {
+            "scope": "weekly-discovery",
+            "track": track,
+            "algorithm_version": "discovery-v1",
+        }
+        values[track] = {
+            "id": ruler_id,
+            "payload": payload,
+            "sha256": _sha256(payload),
+        }
+    return canonical_json(values)
+
+
 def add_unfrozen_run(
     session,
     *,
@@ -39,6 +63,7 @@ def add_unfrozen_run(
         deep_value_ruler_version_id=ids["deep_value"],
         garp_ruler_version_id=ids["garp"],
         algorithm_version="discovery-v1",
+        ruler_payloads_json=ruler_payloads_json(ids),
         input_fingerprint=None,
     )
     session.add(run)

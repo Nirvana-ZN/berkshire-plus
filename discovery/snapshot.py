@@ -28,6 +28,7 @@ from app.discovery_models import (
     DiscoveryDecision,
     DiscoveryEvidence,
     DiscoveryInputSnapshot,
+    DiscoveryOverride,
     DiscoveryResult,
     DiscoveryRun,
     DiscoveryStage,
@@ -101,6 +102,7 @@ class FrozenRunInputs:
     financial_version: str
     valuation_version: str
     ruler_version_ids: Mapping[str, int | None]
+    ruler_payloads: Mapping[str, FrozenValue]
     algorithm_version: str
     trading_dates: Mapping[str, tuple[str, ...]]
     snapshot_at: datetime
@@ -113,6 +115,7 @@ class HistoricalReplay:
     common_results: tuple[Mapping[str, FrozenValue], ...]
     track_stages: tuple[Mapping[str, FrozenValue], ...]
     track_results: tuple[Mapping[str, FrozenValue], ...]
+    overrides: tuple[Mapping[str, FrozenValue], ...]
     decisions: tuple[Mapping[str, FrozenValue], ...]
     evidence: tuple[Mapping[str, FrozenValue], ...]
 
@@ -312,6 +315,8 @@ def freeze_inputs(
 
     version_values = _validated_versions(versions)
     _validate_run_metadata(run, version_values)
+    _frozen_ruler_payloads(run)
+    version_values["ruler_payloads"] = _load_json(run.ruler_payloads_json)
     normalized_dates = _validated_trading_dates(trading_dates)
     if (
         type(snapshot_at) is not datetime
@@ -433,6 +438,89 @@ def _run_ruler_ids(run: DiscoveryRun) -> Mapping[str, int | None]:
     return MappingProxyType(values)
 
 
+def freeze_discovery_ruler_payloads(
+    session: Session,
+    ruler_version_ids: Mapping[str, int | None],
+    algorithm_version: str,
+    *,
+    user_id: int = 1,
+) -> str:
+    """Resolve and canonically freeze exact compatible ruler payloads."""
+
+    ids = dict(ruler_version_ids)
+    if set(ids) != set(TRACKS):
+        raise ValueError("ruler IDs must contain every discovery track")
+    frozen: dict[str, object] = {}
+    for track in TRACKS:
+        ruler_id = ids[track]
+        if ruler_id is None:
+            frozen[track] = None
+            continue
+        if type(ruler_id) is not int or ruler_id < 1:
+            raise ValueError("ruler IDs must be positive integers or null")
+        row = session.get(RulerVersion, ruler_id)
+        if row is None or row.user_id != user_id:
+            raise ValueError(f"{track} ruler is unavailable")
+        payload = _load_json(row.payload_json)
+        if (
+            type(payload) is not dict
+            or payload.get("scope") != "weekly-discovery"
+            or payload.get("track") != track
+            or payload.get("algorithm_version") != algorithm_version
+        ):
+            raise ValueError(f"{track} ruler payload is incompatible")
+        frozen[track] = {
+            "id": ruler_id,
+            "payload": payload,
+            "sha256": _sha256(payload),
+        }
+    return canonical_json(frozen)
+
+
+def _frozen_ruler_payloads(
+    run: DiscoveryRun,
+) -> Mapping[str, FrozenValue]:
+    if not run.ruler_payloads_json:
+        raise ValueError(
+            "frozen input integrity error: ruler payloads are unavailable"
+        )
+    value = _load_json(run.ruler_payloads_json)
+    if type(value) is not dict or set(value) != set(TRACKS):
+        raise ValueError(
+            "frozen input integrity error: ruler payload set is malformed"
+        )
+    if canonical_json(value) != run.ruler_payloads_json:
+        raise ValueError(
+            "frozen input integrity error: ruler payloads are not canonical"
+        )
+    ids = _run_ruler_ids(run)
+    for track in TRACKS:
+        entry = value[track]
+        if entry is None:
+            if ids[track] is not None:
+                raise ValueError(
+                    "frozen input integrity error: ruler payload is missing"
+                )
+            continue
+        if (
+            type(entry) is not dict
+            or set(entry) != {"id", "payload", "sha256"}
+            or entry["id"] != ids[track]
+            or type(entry["payload"]) is not dict
+            or entry["payload"].get("scope") != "weekly-discovery"
+            or entry["payload"].get("track") != track
+            or entry["payload"].get("algorithm_version")
+            != run.algorithm_version
+            or entry["sha256"] != _sha256(entry["payload"])
+        ):
+            raise ValueError(
+                "frozen input integrity error: ruler payload mismatch"
+            )
+    frozen = _frozen(value)
+    assert isinstance(frozen, Mapping)
+    return frozen
+
+
 def _require_utc(value: object, label: str) -> datetime:
     if (
         type(value) is not datetime
@@ -453,6 +541,8 @@ def load_frozen_inputs(session: Session, run_id: int) -> FrozenRunInputs:
         raise ValueError("discovery run has incomplete frozen inputs")
     run_snapshot_at = _require_utc(run.snapshot_at, "run snapshot_at")
     run_rulers = _run_ruler_ids(run)
+    run_ruler_payloads = _frozen_ruler_payloads(run)
+    plain_ruler_payloads = _load_json(run.ruler_payloads_json)
     try:
         trading_value = _load_json(run.trading_dates_json)
         if not isinstance(trading_value, dict):
@@ -534,6 +624,7 @@ def load_frozen_inputs(session: Session, run_id: int) -> FrozenRunInputs:
             "financial_version": row.financial_version,
             "valuation_version": row.valuation_version,
             "ruler_version_ids": dict(row_rulers),
+            "ruler_payloads": plain_ruler_payloads,
             "algorithm_version": row.algorithm_version,
         }
         fingerprint = _sha256(semantic)
@@ -576,6 +667,7 @@ def load_frozen_inputs(session: Session, run_id: int) -> FrozenRunInputs:
             "financial_version": run.financial_version,
             "valuation_version": run.valuation_version,
             "ruler_version_ids": dict(run_rulers),
+            "ruler_payloads": plain_ruler_payloads,
             "algorithm_version": run.algorithm_version,
         }
     )
@@ -588,6 +680,7 @@ def load_frozen_inputs(session: Session, run_id: int) -> FrozenRunInputs:
         financial_version=run.financial_version,
         valuation_version=run.valuation_version,
         ruler_version_ids=run_rulers,
+        ruler_payloads=run_ruler_payloads,
         algorithm_version=run.algorithm_version,
         trading_dates=MappingProxyType(trading_dates),
         snapshot_at=run_snapshot_at,
@@ -1104,6 +1197,24 @@ def load_historical_replay(session: Session, run_id: int) -> HistoricalReplay:
             DiscoveryResult.id,
         )
     ).all()
+    overrides = session.execute(
+        select(DiscoveryOverride, DiscoveryStage)
+        .join(
+            DiscoveryStage,
+            (DiscoveryStage.run_id == DiscoveryOverride.run_id)
+            & (DiscoveryStage.track == DiscoveryOverride.track)
+            & (DiscoveryStage.stage == DiscoveryOverride.stage)
+            & (DiscoveryStage.attempt == DiscoveryOverride.attempt),
+        )
+        .where(DiscoveryOverride.run_id == run_id)
+        .order_by(
+            _track_order(DiscoveryOverride.track),
+            _stage_order(DiscoveryOverride.stage),
+            DiscoveryOverride.attempt,
+            DiscoveryOverride.code,
+            DiscoveryOverride.id,
+        )
+    ).all()
     decisions = session.execute(
         select(DiscoveryDecision, DiscoveryStage)
         .join(
@@ -1150,6 +1261,7 @@ def load_historical_replay(session: Session, run_id: int) -> HistoricalReplay:
                     "confirmed_at": stage.confirmed_at,
                     "input_fingerprint": stage.input_fingerprint,
                     "algorithm_version": stage.algorithm_version,
+                    "retry_of_stage_id": stage.retry_of_stage_id,
                     "failure_kind": stage.failure_kind,
                     "superseded": stage.superseded_at is not None,
                     "superseded_at": stage.superseded_at,
@@ -1190,6 +1302,11 @@ def load_historical_replay(session: Session, run_id: int) -> HistoricalReplay:
                     "input_fingerprint": stage.input_fingerprint,
                     "ruler_version_id": stage.ruler_version_id,
                     "algorithm_version": stage.algorithm_version,
+                    "common_stage_id": stage.common_stage_id,
+                    "predecessor_stage_id": stage.predecessor_stage_id,
+                    "predecessor_stage": stage.predecessor_stage,
+                    "retry_of_stage_id": stage.retry_of_stage_id,
+                    "reopen_of_stage_id": stage.reopen_of_stage_id,
                     "failure_kind": stage.failure_kind,
                     "superseded": stage.superseded_at is not None,
                     "superseded_at": stage.superseded_at,
@@ -1217,11 +1334,28 @@ def load_historical_replay(session: Session, run_id: int) -> HistoricalReplay:
             )
             for row, stage in track
         ),
+        overrides=tuple(
+            _history_row(
+                {
+                    "track": row.track,
+                    "stage": row.stage,
+                    "attempt": row.attempt,
+                    "code": row.code,
+                    "action": row.action,
+                    "reason": row.reason,
+                    "created_at": row.created_at,
+                    "stage_status": stage.status,
+                    "superseded": stage.superseded_at is not None,
+                }
+            )
+            for row, stage in overrides
+        ),
         decisions=tuple(
             _history_row(
                 {
                     "track": row.track,
                     "attempt": row.competition_attempt,
+                    "competition_stage_id": row.competition_stage_id,
                     "code": row.code,
                     "decision": row.decision,
                     "exclusion_reason": row.exclusion_reason,
@@ -1238,6 +1372,7 @@ def load_historical_replay(session: Session, run_id: int) -> HistoricalReplay:
                 {
                     "track": row.track,
                     "attempt": row.competition_attempt,
+                    "competition_stage_id": row.competition_stage_id,
                     "code": row.code,
                     "ruler_version_id": row.ruler_version_id,
                     "rule_version": row.rule_version,

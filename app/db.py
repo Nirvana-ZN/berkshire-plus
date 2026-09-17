@@ -98,7 +98,10 @@ def _ensure_discovery_snapshot_columns(engine: Engine) -> None:
     from sqlalchemy import text
 
     wanted = {
-        "discovery_runs": {"trading_dates_json": "TEXT"},
+        "discovery_runs": {
+            "trading_dates_json": "TEXT",
+            "ruler_payloads_json": "TEXT",
+        },
         "discovery_input_snapshots": {"ruler_versions_json": "TEXT"},
     }
     with engine.begin() as conn:
@@ -117,6 +120,259 @@ def _ensure_discovery_snapshot_columns(engine: Engine) -> None:
                             f'"{column}" {sql_type}'
                         )
                     )
+
+
+def _ensure_discovery_lineage(engine: Engine) -> None:
+    """Add legacy columns; triggers replace unavailable SQLite ALTER FKs."""
+
+    from sqlalchemy import text
+
+    with engine.begin() as conn:
+        common_names = {
+            row[1]
+            for row in conn.execute(
+                text("PRAGMA table_info(discovery_common_stages)")
+            ).all()
+        }
+        if common_names and "retry_of_stage_id" not in common_names:
+            conn.execute(
+                text(
+                    "ALTER TABLE discovery_common_stages "
+                    "ADD COLUMN retry_of_stage_id INTEGER"
+                )
+            )
+        names = {
+            row[1]
+            for row in conn.execute(
+                text("PRAGMA table_info(discovery_stages)")
+            ).all()
+        }
+        for column, sql_type in {
+            "common_stage_id": "INTEGER",
+            "predecessor_stage_id": "INTEGER",
+            "predecessor_stage": "VARCHAR",
+            "retry_of_stage_id": "INTEGER",
+            "reopen_of_stage_id": "INTEGER",
+        }.items():
+            if names and column not in names:
+                conn.execute(
+                    text(
+                        "ALTER TABLE discovery_stages "
+                        f"ADD COLUMN {column} {sql_type}"
+                    )
+                )
+
+        # ponytail: only deterministic one-candidate legacy chains are safe to
+        # recover; ambiguous rows intentionally remain null and fail closed.
+        conn.execute(
+            text(
+                "UPDATE discovery_stages AS child "
+                "SET common_stage_id = ("
+                "SELECT parent.id FROM discovery_common_stages AS parent "
+                "WHERE parent.run_id = child.run_id "
+                "AND parent.status = 'confirmed' "
+                "AND parent.superseded_at IS NULL "
+                "AND parent.created_at <= child.created_at"
+                ") WHERE child.stage = 'track_gate' "
+                "AND child.common_stage_id IS NULL "
+                "AND child.predecessor_stage_id IS NULL "
+                "AND child.predecessor_stage IS NULL "
+                "AND 1 = (SELECT COUNT(*) "
+                "FROM discovery_common_stages AS parent "
+                "WHERE parent.run_id = child.run_id "
+                "AND parent.status = 'confirmed' "
+                "AND parent.superseded_at IS NULL "
+                "AND parent.created_at <= child.created_at)"
+            )
+        )
+        for child_stage, parent_stage in (
+            ("competition", "track_gate"),
+            ("adjudication", "competition"),
+        ):
+            conn.execute(
+                text(
+                    "UPDATE discovery_stages AS child "
+                    "SET predecessor_stage_id = ("
+                    "SELECT parent.id FROM discovery_stages AS parent "
+                    "WHERE parent.run_id = child.run_id "
+                    "AND parent.track = child.track "
+                    "AND parent.stage = :parent_stage "
+                    "AND parent.status = 'confirmed' "
+                    "AND parent.superseded_at IS NULL "
+                    "AND parent.created_at <= child.created_at"
+                    "), predecessor_stage = :parent_stage "
+                    "WHERE child.stage = :child_stage "
+                    "AND child.predecessor_stage_id IS NULL "
+                    "AND child.predecessor_stage IS NULL "
+                    "AND child.common_stage_id IS NULL "
+                    "AND 1 = (SELECT COUNT(*) "
+                    "FROM discovery_stages AS parent "
+                    "WHERE parent.run_id = child.run_id "
+                    "AND parent.track = child.track "
+                    "AND parent.stage = :parent_stage "
+                    "AND parent.status = 'confirmed' "
+                    "AND parent.superseded_at IS NULL "
+                    "AND parent.created_at <= child.created_at)"
+                ),
+                {
+                    "child_stage": child_stage,
+                    "parent_stage": parent_stage,
+                },
+            )
+
+        invalid = """
+            (NEW.stage = 'track_gate' AND (
+                NEW.common_stage_id IS NULL
+                OR NEW.predecessor_stage_id IS NOT NULL
+                OR NEW.predecessor_stage IS NOT NULL
+                OR NOT EXISTS (
+                    SELECT 1 FROM discovery_common_stages p
+                    WHERE p.id = NEW.common_stage_id
+                      AND p.run_id = NEW.run_id
+                      AND p.status = 'confirmed'
+                      AND p.superseded_at IS NULL
+                )
+            ))
+            OR (NEW.stage IN ('competition', 'adjudication') AND (
+                NEW.common_stage_id IS NOT NULL
+                OR NEW.predecessor_stage_id IS NULL
+                OR NEW.predecessor_stage != CASE NEW.stage
+                    WHEN 'competition' THEN 'track_gate'
+                    ELSE 'competition'
+                END
+                OR NOT EXISTS (
+                    SELECT 1 FROM discovery_stages p
+                    WHERE p.id = NEW.predecessor_stage_id
+                      AND p.run_id = NEW.run_id
+                      AND p.track = NEW.track
+                      AND p.stage = NEW.predecessor_stage
+                      AND p.status = 'confirmed'
+                      AND p.superseded_at IS NULL
+                )
+            ))
+            OR NEW.stage NOT IN ('track_gate', 'competition', 'adjudication')
+        """
+        conn.execute(
+            text(
+                "CREATE TRIGGER IF NOT EXISTS "
+                "trg_discovery_stage_lineage_insert "
+                "BEFORE INSERT ON discovery_stages "
+                f"WHEN {invalid} "
+                "BEGIN "
+                "SELECT RAISE(ABORT, 'invalid discovery stage lineage'); "
+                "END"
+            )
+        )
+
+        common_origin_invalid = """
+            (NEW.attempt = 1 AND NEW.retry_of_stage_id IS NOT NULL)
+            OR (NEW.retry_of_stage_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM discovery_common_stages parent
+                WHERE parent.id = NEW.retry_of_stage_id
+                  AND parent.run_id = NEW.run_id
+                  AND parent.status = 'failed'
+                  AND parent.superseded_at IS NOT NULL
+                  AND parent.attempt + 1 = NEW.attempt
+                  AND parent.created_at <= NEW.created_at
+            ))
+        """
+        for action in ("INSERT", "UPDATE"):
+            update_columns = (
+                " OF run_id, attempt, retry_of_stage_id, created_at"
+                if action == "UPDATE"
+                else ""
+            )
+            conn.execute(
+                text(
+                    "CREATE TRIGGER IF NOT EXISTS "
+                    f"trg_discovery_common_stage_origin_{action.lower()} "
+                    f"BEFORE {action}{update_columns} "
+                    "ON discovery_common_stages "
+                    f"WHEN {common_origin_invalid} "
+                    "BEGIN "
+                    "SELECT RAISE(ABORT, "
+                    "'invalid discovery common stage origin'); "
+                    "END"
+                )
+            )
+
+        track_origin_invalid = """
+            (NEW.retry_of_stage_id IS NOT NULL
+             AND NEW.reopen_of_stage_id IS NOT NULL)
+            OR (NEW.attempt = 1 AND (
+                NEW.retry_of_stage_id IS NOT NULL
+                OR NEW.reopen_of_stage_id IS NOT NULL
+            ))
+            OR (NEW.retry_of_stage_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM discovery_stages parent
+                WHERE parent.id = NEW.retry_of_stage_id
+                  AND parent.run_id = NEW.run_id
+                  AND parent.track = NEW.track
+                  AND parent.stage = NEW.stage
+                  AND parent.status = 'failed'
+                  AND parent.superseded_at IS NOT NULL
+                  AND parent.attempt + 1 = NEW.attempt
+                  AND parent.created_at <= NEW.created_at
+            ))
+            OR (NEW.reopen_of_stage_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM discovery_stages parent
+                WHERE parent.id = NEW.reopen_of_stage_id
+                  AND parent.run_id = NEW.run_id
+                  AND parent.track = NEW.track
+                  AND parent.stage = NEW.stage
+                  AND parent.status = 'confirmed'
+                  AND parent.superseded_at IS NOT NULL
+                  AND parent.attempt + 1 = NEW.attempt
+                  AND parent.created_at <= NEW.created_at
+            ))
+        """
+        for action in ("INSERT", "UPDATE"):
+            update_columns = (
+                " OF run_id, track, stage, attempt, retry_of_stage_id, "
+                "reopen_of_stage_id, created_at"
+                if action == "UPDATE"
+                else ""
+            )
+            conn.execute(
+                text(
+                    "CREATE TRIGGER IF NOT EXISTS "
+                    f"trg_discovery_stage_origin_{action.lower()} "
+                    f"BEFORE {action}{update_columns} ON discovery_stages "
+                    f"WHEN {track_origin_invalid} "
+                    "BEGIN "
+                    "SELECT RAISE(ABORT, 'invalid discovery stage origin'); "
+                    "END"
+                )
+            )
+        conn.execute(
+            text(
+                "CREATE TRIGGER IF NOT EXISTS "
+                "trg_discovery_stage_lineage_update "
+                "BEFORE UPDATE OF run_id, track, stage, common_stage_id, "
+                "predecessor_stage_id, predecessor_stage "
+                "ON discovery_stages "
+                f"WHEN {invalid} "
+                "BEGIN "
+                "SELECT RAISE(ABORT, 'invalid discovery stage lineage'); "
+                "END"
+            )
+        )
+
+
+def _ensure_job_lock_columns(engine: Engine) -> None:
+    """Add the discovery lease token without changing legacy lock semantics."""
+
+    from sqlalchemy import text
+
+    with engine.begin() as conn:
+        names = {
+            row[1]
+            for row in conn.execute(text("PRAGMA table_info(job_lock)")).all()
+        }
+        if names and "owner_token" not in names:
+            conn.execute(
+                text("ALTER TABLE job_lock ADD COLUMN owner_token VARCHAR")
+            )
 
 
 def _ensure_research_columns(engine: Engine) -> None:
@@ -604,6 +860,8 @@ def init_db(db_path: Path | None = None) -> Engine:
     engine = create_db_engine(db_path)
     Base.metadata.create_all(engine)
     _ensure_discovery_snapshot_columns(engine)
+    _ensure_discovery_lineage(engine)
+    _ensure_job_lock_columns(engine)
     _ensure_discovery_indexes(engine)
     _ensure_research_columns(engine)
     _ensure_listed_year(engine)

@@ -164,6 +164,7 @@ class JobLock(Base):
     job_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     job_type: Mapped[str | None] = mapped_column(String, nullable=True)
     held_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    owner_token: Mapped[str | None] = mapped_column(String, nullable=True)
 
 
 class ScreenRun(Base):

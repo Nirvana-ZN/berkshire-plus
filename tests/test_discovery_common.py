@@ -96,8 +96,60 @@ def _add_track_stage(
     status="queued",
     superseded_at=None,
 ):
-    from app.discovery_models import DiscoveryStage
+    from sqlalchemy import func, select
 
+    from app.discovery_models import (
+        DiscoveryCommonResult,
+        DiscoveryCommonStage,
+        DiscoveryStage,
+    )
+
+    parent = session.scalars(
+        select(DiscoveryCommonStage)
+        .where(
+            DiscoveryCommonStage.run_id == run.id,
+            DiscoveryCommonStage.status == "confirmed",
+            DiscoveryCommonStage.superseded_at.is_(None),
+        )
+        .order_by(DiscoveryCommonStage.attempt.desc())
+    ).first()
+    if parent is None:
+        parent = _add_common_stage(
+            session,
+            run,
+            attempt=(
+                session.scalar(
+                    select(func.max(DiscoveryCommonStage.attempt)).where(
+                        DiscoveryCommonStage.run_id == run.id
+                    )
+                )
+                or 0
+            )
+            + 1,
+            status="confirmed",
+            created_at=created_at - timedelta(seconds=1),
+        )
+    parent.status = "confirmed"
+    if not session.scalar(
+        select(DiscoveryCommonResult.id).where(
+            DiscoveryCommonResult.run_id == run.id,
+            DiscoveryCommonResult.attempt == parent.attempt,
+            DiscoveryCommonResult.code == "600000.SH",
+        )
+    ):
+        session.add(
+            DiscoveryCommonResult(
+                run_id=run.id,
+                attempt=parent.attempt,
+                code="600000.SH",
+                verdict="pass",
+                reason=None,
+                metrics_json="{}",
+                created_at=created_at,
+            )
+        )
+        parent.total_count = 1
+        parent.pass_count = 1
     stage = DiscoveryStage(
         run_id=run.id,
         track=track,
@@ -112,6 +164,9 @@ def _add_track_stage(
         input_fingerprint=run.input_fingerprint,
         ruler_version_id=getattr(run, f"{track}_ruler_version_id"),
         algorithm_version=run.algorithm_version,
+        common_stage_id=parent.id,
+        predecessor_stage_id=None,
+        predecessor_stage=None,
         failure_kind=None,
         superseded_at=superseded_at,
         created_at=created_at,
@@ -593,6 +648,7 @@ def test_execute_rejects_snapshot_or_stage_identity_mismatch(tmp_path) -> None:
 def test_drain_serializes_cross_table_order_and_releases_lock(
     tmp_path, monkeypatch
 ) -> None:
+    from app.discovery_models import DiscoveryCommonStage
     from app.models import JobLock
     from jobs import discovery as job
 
@@ -606,7 +662,8 @@ def test_drain_serializes_cross_table_order_and_releases_lock(
             track="quality_discount",
             created_at=SNAPSHOT_AT - timedelta(minutes=1),
         )
-        common = _add_common_stage(session, run, created_at=SNAPSHOT_AT)
+        common = session.get(DiscoveryCommonStage, early.common_stage_id)
+        assert common is not None and common.status == "confirmed"
         late = _add_track_stage(
             session,
             run,
@@ -624,30 +681,17 @@ def test_drain_serializes_cross_table_order_and_releases_lock(
         session.commit()
 
         order = []
-        real_classifier = job.classify_common
+        def track_executor(context):
+            order.append(("track", context.stage_id))
+            return _passing_track_outcome(context)
 
-        def recording_classifier(item, dates):
-            order.append(("common", common.id))
-            return real_classifier(item, dates)
-
-        def track_executor(worker, stage_id):
-            from app.discovery_models import DiscoveryStage
-
-            order.append(("track", stage_id))
-            stage = worker.get(DiscoveryStage, stage_id)
-            assert stage is not None
-            stage.status = "waiting_confirmation"
-            stage.updated_at = datetime.now(timezone.utc)
-
-        monkeypatch.setattr(job, "classify_common", recording_classifier)
         outcome = job.drain_run_queue(
             session, run_id, track_executor=track_executor
         )
         assert outcome.acquired
-        assert outcome.executed == 3
+        assert outcome.executed == 2
         assert order == [
             ("track", early.id),
-            ("common", common.id),
             ("track", late.id),
         ]
         assert session.get(type(skipped), skipped.id).status == "queued"
@@ -673,7 +717,29 @@ def _add_track_result(session, stage, *, code="600000.SH"):
         created_at=SNAPSHOT_AT,
     )
     session.add(result)
+    stage.total_count += 1
+    stage.pass_count += 1
     return result
+
+
+def _passing_track_outcome(context, *, codes=None):
+    from jobs.discovery import TrackExecutionOutcome, TrackExecutionResult
+
+    return TrackExecutionOutcome(
+        status="waiting_confirmation",
+        results=tuple(
+            TrackExecutionResult(
+                code=code,
+                verdict="pass",
+                reason=None,
+                metrics_json="{}",
+                rank=None,
+            )
+            for code in (
+                context.candidate_codes if codes is None else tuple(codes)
+            )
+        ),
+    )
 
 
 def test_drain_commits_successful_track_callback_atomically(tmp_path) -> None:
@@ -693,12 +759,8 @@ def test_drain_commits_successful_track_callback_atomically(tmp_path) -> None:
         run_id, stage_id = run.id, stage.id
         session.commit()
 
-        def execute(worker, selected_id):
-            selected = worker.get(DiscoveryStage, selected_id)
-            assert selected is not None
-            _add_track_result(worker, selected)
-            selected.status = "waiting_confirmation"
-            selected.updated_at = datetime.now(timezone.utc)
+        def execute(context):
+            return _passing_track_outcome(context)
 
         outcome = drain_run_queue(
             session, run_id, track_executor=execute
@@ -715,7 +777,350 @@ def test_drain_commits_successful_track_callback_atomically(tmp_path) -> None:
     engine.dispose()
 
 
-def test_drain_rolls_back_flushed_track_writes_then_marks_failed(
+def test_track_executor_is_pure_and_drain_persists_its_outcome(
+    tmp_path,
+) -> None:
+    from dataclasses import FrozenInstanceError
+
+    from sqlalchemy import func, select
+
+    from app.discovery_models import DiscoveryResult, DiscoveryStage
+    from jobs.discovery import (
+        TrackExecutionContext,
+        TrackExecutionOutcome,
+        TrackExecutionResult,
+        drain_run_queue,
+    )
+
+    engine = init_db(tmp_path / "pure-track-executor.db")
+    factory = create_session_factory(engine)
+    seen = []
+    with factory() as session:
+        run = _freeze_run(session, [company("600000.SH")])
+        stage = _add_track_stage(
+            session,
+            run,
+            track="quality_discount",
+            created_at=SNAPSHOT_AT,
+        )
+        run_id, stage_id = run.id, stage.id
+        session.commit()
+
+        def execute(context):
+            assert isinstance(context, TrackExecutionContext)
+            assert not hasattr(context, "session")
+            assert context.stage_id == stage_id
+            assert context.candidate_codes == ("600000.SH",)
+            with pytest.raises(FrozenInstanceError):
+                context.stage_id = 999
+            seen.append(context)
+            return TrackExecutionOutcome(
+                status="waiting_confirmation",
+                results=(
+                    TrackExecutionResult(
+                        code="600000.SH",
+                        verdict="pass",
+                        reason=None,
+                        metrics_json="{}",
+                        rank=None,
+                    ),
+                ),
+            )
+
+        outcome = drain_run_queue(
+            session, run_id, track_executor=execute
+        )
+        assert outcome.executed == 1
+        assert len(seen) == 1
+        persisted = session.get(DiscoveryStage, stage_id)
+        assert persisted is not None
+        assert (
+            persisted.status,
+            persisted.total_count,
+            persisted.pass_count,
+        ) == ("waiting_confirmation", 1, 1)
+        assert session.scalar(
+            select(func.count()).select_from(DiscoveryResult)
+        ) == 1
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("status", "selected_codes", "expected_status"),
+    [
+        ("waiting_confirmation", ("600000.SH",), "failed"),
+        ("waiting_confirmation", (), "failed"),
+        (
+            "waiting_confirmation",
+            ("600001.SH", "600000.SH"),
+            "waiting_confirmation",
+        ),
+        ("data_not_ready", (), "data_not_ready"),
+        ("ruler_not_ready", (), "ruler_not_ready"),
+    ],
+)
+def test_waiting_track_outcome_requires_exact_candidate_code_set(
+    tmp_path,
+    status: str,
+    selected_codes: tuple[str, ...],
+    expected_status: str,
+) -> None:
+    from sqlalchemy import func, select
+
+    from app.discovery_models import (
+        DiscoveryCommonResult,
+        DiscoveryCommonStage,
+        DiscoveryResult,
+        DiscoveryStage,
+    )
+    from jobs.discovery import (
+        TrackExecutionOutcome,
+        TrackExecutionResult,
+        drain_run_queue,
+    )
+
+    engine = init_db(
+        tmp_path / f"exact-track-results-{status}-{len(selected_codes)}.db"
+    )
+    factory = create_session_factory(engine)
+    with factory() as session:
+        run = _freeze_run(
+            session,
+            [company("600000.SH"), company("600001.SH")],
+        )
+        selected = _add_track_stage(
+            session,
+            run,
+            track="quality_discount",
+            created_at=SNAPSHOT_AT,
+        )
+        sibling = _add_track_stage(
+            session,
+            run,
+            track="deep_value",
+            created_at=SNAPSHOT_AT + timedelta(seconds=1),
+        )
+        common = session.get(
+            DiscoveryCommonStage, selected.common_stage_id
+        )
+        assert common is not None
+        session.add(
+            DiscoveryCommonResult(
+                run_id=run.id,
+                attempt=common.attempt,
+                code="600001.SH",
+                verdict="pass",
+                reason=None,
+                metrics_json="{}",
+                created_at=SNAPSHOT_AT,
+            )
+        )
+        common.total_count = 2
+        common.pass_count = 2
+        run_id, selected_id, sibling_id = (
+            run.id,
+            selected.id,
+            sibling.id,
+        )
+        session.commit()
+
+        def execute(context):
+            if context.stage_id != selected_id:
+                return _passing_track_outcome(context)
+            return TrackExecutionOutcome(
+                status=status,
+                results=tuple(
+                    TrackExecutionResult(
+                        code=code,
+                        verdict="pass",
+                        reason=None,
+                        metrics_json="{}",
+                        rank=None,
+                    )
+                    for code in selected_codes
+                ),
+            )
+
+        outcome = drain_run_queue(
+            session, run_id, track_executor=execute
+        )
+        assert outcome.executed == 2
+        selected_stage = session.get(DiscoveryStage, selected_id)
+        assert selected_stage is not None
+        assert selected_stage.status == expected_status
+        assert selected_stage.failure_kind == (
+            "permanent" if expected_status == "failed" else None
+        )
+        assert session.get(DiscoveryStage, sibling_id).status == (
+            "waiting_confirmation"
+        )
+        assert session.scalar(
+            select(func.count())
+            .select_from(DiscoveryResult)
+            .where(
+                DiscoveryResult.run_id == run_id,
+                DiscoveryResult.track == "quality_discount",
+            )
+        ) == (
+            2 if expected_status == "waiting_confirmation" else 0
+        )
+        assert session.scalar(
+            select(func.count())
+            .select_from(DiscoveryResult)
+            .where(
+                DiscoveryResult.run_id == run_id,
+                DiscoveryResult.track == "deep_value",
+            )
+        ) == 2
+    engine.dispose()
+
+
+def test_waiting_track_outcome_accepts_empty_exact_candidate_set(
+    tmp_path,
+) -> None:
+    from sqlalchemy import select
+
+    from app.discovery_models import (
+        DiscoveryCommonResult,
+        DiscoveryCommonStage,
+        DiscoveryStage,
+    )
+    from jobs.discovery import drain_run_queue
+
+    engine = init_db(tmp_path / "empty-exact-track-results.db")
+    factory = create_session_factory(engine)
+    with factory() as session:
+        run = _freeze_run(session, [company("600000.SH")])
+        stage = _add_track_stage(
+            session,
+            run,
+            track="quality_discount",
+            created_at=SNAPSHOT_AT,
+        )
+        common = session.get(DiscoveryCommonStage, stage.common_stage_id)
+        assert common is not None
+        row = session.scalar(
+            select(DiscoveryCommonResult).where(
+                DiscoveryCommonResult.run_id == run.id,
+                DiscoveryCommonResult.attempt == common.attempt,
+            )
+        )
+        assert row is not None
+        session.delete(row)
+        common.total_count = 0
+        common.pass_count = 0
+        run_id, stage_id = run.id, stage.id
+        session.commit()
+
+        outcome = drain_run_queue(
+            session,
+            run_id,
+            track_executor=_passing_track_outcome,
+        )
+        assert outcome.executed == 1
+        persisted = session.get(DiscoveryStage, stage_id)
+        assert persisted is not None
+        assert (
+            persisted.status,
+            persisted.total_count,
+            persisted.pass_count,
+        ) == ("waiting_confirmation", 0, 0)
+    engine.dispose()
+
+
+def test_drain_persists_validated_competition_evidence(tmp_path) -> None:
+    from sqlalchemy import select
+
+    from app.discovery_models import DiscoveryEvidence, DiscoveryStage
+    from jobs.discovery import (
+        TrackExecutionEvidence,
+        TrackExecutionOutcome,
+        TrackExecutionResult,
+        drain_run_queue,
+    )
+
+    engine = init_db(tmp_path / "competition-evidence.db")
+    factory = create_session_factory(engine)
+    with factory() as session:
+        run = _freeze_run(session, [company("600000.SH")])
+        gate = _add_track_stage(
+            session,
+            run,
+            track="quality_discount",
+            status="confirmed",
+            created_at=SNAPSHOT_AT,
+        )
+        _add_track_result(session, gate)
+        competition = DiscoveryStage(
+            run_id=run.id,
+            track=gate.track,
+            stage="competition",
+            attempt=1,
+            status="queued",
+            total_count=0,
+            pass_count=0,
+            drop_count=0,
+            insufficient_count=0,
+            input_fingerprint=run.input_fingerprint,
+            ruler_version_id=gate.ruler_version_id,
+            algorithm_version=run.algorithm_version,
+            common_stage_id=None,
+            predecessor_stage_id=gate.id,
+            predecessor_stage="track_gate",
+            created_at=SNAPSHOT_AT + timedelta(seconds=1),
+            updated_at=SNAPSHOT_AT + timedelta(seconds=1),
+        )
+        session.add(competition)
+        session.commit()
+
+        def execute(context):
+            assert context.candidate_codes == ("600000.SH",)
+            return TrackExecutionOutcome(
+                status="waiting_confirmation",
+                results=(
+                    TrackExecutionResult(
+                        code="600000.SH",
+                        verdict="pass",
+                        reason=None,
+                        metrics_json="{}",
+                        rank=1,
+                    ),
+                ),
+                evidence=(
+                    TrackExecutionEvidence(
+                        code="600000.SH",
+                        rule_version="rules-v1",
+                        kind="quality",
+                        rule_id="roe",
+                        input_fields_json='{"roe":"12"}',
+                        display_text="ROE 通过",
+                        as_of="2026-09-18",
+                        data_completeness="complete",
+                    ),
+                ),
+            )
+
+        outcome = drain_run_queue(
+            session, run.id, track_executor=execute
+        )
+        assert outcome.executed == 1
+        evidence = session.scalar(select(DiscoveryEvidence))
+        assert evidence is not None
+        assert (
+            evidence.competition_stage_id,
+            evidence.competition_attempt,
+            evidence.ruler_version_id,
+            evidence.code,
+        ) == (
+            competition.id,
+            competition.attempt,
+            competition.ruler_version_id,
+            "600000.SH",
+        )
+    engine.dispose()
+
+
+def test_drain_marks_throwing_pure_executor_failed_without_writes(
     tmp_path,
 ) -> None:
     from app.discovery_models import DiscoveryResult, DiscoveryStage
@@ -735,12 +1140,7 @@ def test_drain_rolls_back_flushed_track_writes_then_marks_failed(
         run_id, stage_id = run.id, stage.id
         session.commit()
 
-        def execute(worker, selected_id):
-            selected = worker.get(DiscoveryStage, selected_id)
-            assert selected is not None
-            _add_track_result(worker, selected)
-            selected.status = "waiting_confirmation"
-            worker.flush()
+        def execute(_context):
             raise RuntimeError("track programmer bug")
 
         outcome = drain_run_queue(session, run_id, track_executor=execute)
@@ -778,13 +1178,11 @@ def test_drain_integrity_error_rolls_back_and_releases_lock(tmp_path) -> None:
         run_id, stage_id = run.id, stage.id
         session.commit()
 
-        def execute(worker, selected_id):
-            selected = worker.get(DiscoveryStage, selected_id)
-            assert selected is not None
-            _add_track_result(worker, selected)
-            _add_track_result(worker, selected)
-            selected.status = "waiting_confirmation"
-            worker.flush()
+        def execute(context):
+            return _passing_track_outcome(
+                context,
+                codes=("600000.SH", "600000.SH"),
+            )
 
         outcome = drain_run_queue(session, run_id, track_executor=execute)
         assert outcome.executed == 1
@@ -797,7 +1195,7 @@ def test_drain_integrity_error_rolls_back_and_releases_lock(tmp_path) -> None:
     engine.dispose()
 
 
-def test_drain_rejects_track_callback_commit(tmp_path) -> None:
+def test_drain_rejects_obsolete_session_executor_signature(tmp_path) -> None:
     from app.discovery_models import DiscoveryResult, DiscoveryStage
     from app.models import JobLock
     from jobs.discovery import drain_run_queue
@@ -815,12 +1213,8 @@ def test_drain_rejects_track_callback_commit(tmp_path) -> None:
         run_id, stage_id = run.id, stage.id
         session.commit()
 
-        def execute(worker, selected_id):
-            selected = worker.get(DiscoveryStage, selected_id)
-            assert selected is not None
-            _add_track_result(worker, selected)
-            selected.status = "waiting_confirmation"
-            worker.commit()
+        def execute(_session, _stage_id):
+            raise AssertionError("obsolete executor must not be called")
 
         outcome = drain_run_queue(session, run_id, track_executor=execute)
         assert outcome.executed == 1
@@ -876,7 +1270,7 @@ def test_drain_fails_safely_if_track_executor_does_not_advance(tmp_path) -> None
         run_id = run.id
         session.commit()
         outcome = drain_run_queue(
-            session, run_id, track_executor=lambda _session, _id: None
+            session, run_id, track_executor=lambda _context: None
         )
         assert outcome.executed == 1
         session.expire_all()
@@ -979,4 +1373,869 @@ def test_startup_recovery_fails_only_running_then_drain_resumes_queued(
             .where(DiscoveryCommonResult.attempt == 2)
         ) == 1
         assert session.get(DiscoveryCommonStage, ids[0]).status == "failed"
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("fault", "metrics", "code", "verdict", "rank"),
+    [
+        ("metrics", '{"bad":NaN}', "600000.SH", "pass", 1),
+        ("rank", "{}", "600000.SH", "pass", 0),
+        ("code", "{}", "000001.SZ", "pass", 1),
+        ("verdict", "{}", "600000.SH", "maybe", 1),
+    ],
+)
+def test_track_executor_malformed_output_rolls_back_and_fails_permanent(
+    tmp_path,
+    fault: str,
+    metrics: str,
+    code: str,
+    verdict: str,
+    rank: int,
+) -> None:
+    from sqlalchemy import func, select
+
+    from app.discovery_models import DiscoveryResult, DiscoveryStage
+    from jobs.discovery import drain_run_queue
+
+    engine = init_db(tmp_path / f"malformed-{fault}.db")
+    factory = create_session_factory(engine)
+    with factory() as session:
+        run = _freeze_run(session, [company("600000.SH")])
+        stage = _add_track_stage(
+            session,
+            run,
+            track="quality_discount",
+            created_at=SNAPSHOT_AT,
+        )
+        run_id, stage_id = run.id, stage.id
+        session.commit()
+
+        def malformed(_context):
+            from jobs.discovery import (
+                TrackExecutionOutcome,
+                TrackExecutionResult,
+            )
+
+            return TrackExecutionOutcome(
+                status="waiting_confirmation",
+                results=(
+                    TrackExecutionResult(
+                    code=code,
+                    verdict=verdict,
+                    reason=None,
+                    metrics_json=metrics,
+                        rank=rank,
+                    ),
+                ),
+            )
+
+        outcome = drain_run_queue(
+            session, run_id, track_executor=malformed
+        )
+        assert outcome.acquired
+        failed = session.get(DiscoveryStage, stage_id)
+        assert failed is not None
+        assert (failed.status, failed.failure_kind) == (
+            "failed",
+            "permanent",
+        )
+        assert session.scalar(
+            select(func.count()).select_from(DiscoveryResult)
+        ) == 0
+    engine.dispose()
+
+
+def test_malformed_pure_outcome_preserves_history_and_continues(
+    tmp_path,
+) -> None:
+    from sqlalchemy import func, select
+
+    from app.discovery_models import (
+        DiscoveryCommonStage,
+        DiscoveryResult,
+        DiscoveryRun,
+        DiscoveryStage,
+    )
+    from jobs.discovery import drain_run_queue
+
+    engine = init_db(tmp_path / "pure-executor-history.db")
+    factory = create_session_factory(engine)
+    with factory() as session:
+        run = _freeze_run(session, [company("600000.SH")])
+        history = _add_track_stage(
+            session,
+            run,
+            track="garp",
+            status="confirmed",
+            superseded_at=SNAPSHOT_AT,
+            created_at=SNAPSHOT_AT - timedelta(minutes=1),
+        )
+        prior = _add_track_result(session, history)
+        selected = _add_track_stage(
+            session,
+            run,
+            track="quality_discount",
+            created_at=SNAPSHOT_AT,
+        )
+        sibling = _add_track_stage(
+            session,
+            run,
+            track="deep_value",
+            created_at=SNAPSHOT_AT + timedelta(seconds=1),
+        )
+        run_id = run.id
+        prior_id = prior.id
+        selected_id = selected.id
+        sibling_id = sibling.id
+        common_id = selected.common_stage_id
+        original_fingerprint = run.input_fingerprint
+        session.commit()
+        historical_stage = tuple(
+            getattr(history, column.name)
+            for column in history.__table__.columns
+        )
+        historical_result = tuple(
+            getattr(prior, column.name)
+            for column in prior.__table__.columns
+        )
+        common = session.get(DiscoveryCommonStage, common_id)
+        assert common is not None
+        common_history = tuple(
+            getattr(common, column.name)
+            for column in common.__table__.columns
+        )
+        sibling_identity = (
+            sibling.run_id,
+            sibling.track,
+            sibling.stage,
+            sibling.attempt,
+            sibling.input_fingerprint,
+            sibling.ruler_version_id,
+            sibling.algorithm_version,
+            sibling.common_stage_id,
+            sibling.predecessor_stage_id,
+        )
+
+        def execute(context):
+            if context.stage_id != selected_id:
+                return _passing_track_outcome(context)
+            return _passing_track_outcome(
+                context,
+                codes=("000001.SZ",),
+            )
+
+        outcome = drain_run_queue(
+            session, run_id, track_executor=execute
+        )
+        assert outcome.executed == 2
+        rejected = session.get(DiscoveryStage, selected_id)
+        continued = session.get(DiscoveryStage, sibling_id)
+        assert rejected is not None
+        assert (rejected.status, rejected.failure_kind) == (
+            "failed",
+            "permanent",
+        )
+        assert continued is not None
+        assert continued.status == "waiting_confirmation"
+        assert session.scalar(
+            select(func.count())
+            .select_from(DiscoveryResult)
+            .where(
+                DiscoveryResult.run_id == run_id,
+                DiscoveryResult.track == "quality_discount",
+            )
+        ) == 0
+        assert session.scalar(
+            select(func.count())
+            .select_from(DiscoveryResult)
+            .where(
+                DiscoveryResult.run_id == run_id,
+                DiscoveryResult.track == "deep_value",
+            )
+        ) == 1
+        persisted_prior = session.get(DiscoveryResult, prior_id)
+        assert persisted_prior is not None
+        assert tuple(
+            getattr(persisted_prior, column.name)
+            for column in persisted_prior.__table__.columns
+        ) == historical_result
+        persisted_history = session.get(DiscoveryStage, history.id)
+        assert persisted_history is not None
+        assert tuple(
+            getattr(persisted_history, column.name)
+            for column in persisted_history.__table__.columns
+        ) == historical_stage
+        assert session.get(DiscoveryRun, run_id).input_fingerprint == (
+            original_fingerprint
+        )
+        persisted_common = session.get(DiscoveryCommonStage, common_id)
+        assert persisted_common is not None
+        assert tuple(
+            getattr(persisted_common, column.name)
+            for column in persisted_common.__table__.columns
+        ) == common_history
+        assert (
+            continued.run_id,
+            continued.track,
+            continued.stage,
+            continued.attempt,
+            continued.input_fingerprint,
+            continued.ruler_version_id,
+            continued.algorithm_version,
+            continued.common_stage_id,
+            continued.predecessor_stage_id,
+        ) == sibling_identity
+    engine.dispose()
+
+
+def test_old_discovery_worker_cannot_commit_or_release_new_lease(
+    tmp_path,
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    from sqlalchemy import func, select
+
+    from app.discovery_models import DiscoveryResult, DiscoveryStage
+    from app.models import JobLock
+    from jobs.discovery import DiscoveryLockLostError, drain_run_queue
+    from jobs.lock import acquire_discovery, clear_stale_lock
+
+    engine = init_db(tmp_path / "lease-aba.db")
+    factory = create_session_factory(engine)
+    entered = Event()
+    resume = Event()
+    with factory() as session:
+        run = _freeze_run(session, [company("600000.SH")])
+        stage = _add_track_stage(
+            session,
+            run,
+            track="quality_discount",
+            created_at=SNAPSHOT_AT,
+        )
+        old_token = acquire_discovery(session, run.id)
+        assert old_token
+        run_id, stage_id = run.id, stage.id
+        session.commit()
+
+    def blocked(context):
+        entered.set()
+        assert resume.wait(5)
+        return _passing_track_outcome(context)
+
+    def work():
+        with factory() as session:
+            return drain_run_queue(
+                session,
+                run_id,
+                track_executor=blocked,
+                lock_already_held=True,
+                owner_token=old_token,
+            )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(work)
+        assert entered.wait(5)
+        with factory() as session:
+            clear_stale_lock(session)
+            new_token = acquire_discovery(session, run_id)
+            assert new_token and new_token != old_token
+            session.commit()
+        resume.set()
+        with pytest.raises(DiscoveryLockLostError):
+            future.result(timeout=5)
+
+    with factory() as session:
+        lock = session.get(JobLock, 1)
+        assert lock is not None and lock.owner_token == new_token
+        assert session.scalar(
+            select(func.count()).select_from(DiscoveryResult)
+        ) == 0
+        failed = session.get(DiscoveryStage, stage_id)
+        assert failed is not None
+        assert (failed.status, failed.failure_kind) == (
+            "failed",
+            "transient",
+        )
+    engine.dispose()
+
+
+def test_adopted_lease_is_released_when_adoption_and_first_release_fail(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from sqlalchemy.exc import OperationalError
+
+    from app.discovery_models import DiscoveryStage
+    from app.models import JobLock
+    from jobs import discovery as discovery_job
+    from jobs.lock import acquire_discovery
+
+    engine = init_db(tmp_path / "adoption-finalizer.db")
+    factory = create_session_factory(engine)
+    with factory() as setup:
+        run = _freeze_run(setup, [company("600000.SH")])
+        stage = _add_track_stage(
+            setup,
+            run,
+            track="quality_discount",
+            created_at=SNAPSHOT_AT,
+        )
+        run_id, stage_id = run.id, stage.id
+        setup.commit()
+        token = acquire_discovery(setup, run_id)
+        assert token
+        setup.commit()
+
+    with factory() as worker:
+        original_get = worker.get
+
+        def broken_get(model, ident, *args, **kwargs):
+            if model is JobLock:
+                raise OperationalError(
+                    "SELECT job_lock",
+                    {},
+                    RuntimeError("database is locked"),
+                )
+            return original_get(model, ident, *args, **kwargs)
+
+        monkeypatch.setattr(worker, "get", broken_get)
+        original_release = discovery_job.release
+        release_calls = 0
+
+        def flaky_release(*args, **kwargs):
+            nonlocal release_calls
+            release_calls += 1
+            if release_calls == 1:
+                raise OperationalError(
+                    "UPDATE job_lock",
+                    {},
+                    RuntimeError("database is locked"),
+                )
+            return original_release(*args, **kwargs)
+
+        monkeypatch.setattr(discovery_job, "release", flaky_release)
+        with pytest.raises(OperationalError):
+            discovery_job.drain_run_queue(
+                worker,
+                run_id,
+                track_executor=lambda *_: None,
+                lock_already_held=True,
+                owner_token=token,
+            )
+        assert release_calls == 2
+
+    with factory() as session:
+        lock = session.get(JobLock, 1)
+        assert lock is not None
+        assert (lock.job_id, lock.job_type, lock.owner_token) == (
+            None,
+            None,
+            None,
+        )
+        unchanged = session.get(DiscoveryStage, stage_id)
+        assert unchanged is not None and unchanged.status == "queued"
+    engine.dispose()
+
+
+def test_exclusive_sqlite_adoption_failure_releases_exact_lease(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sqlite3
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    from sqlalchemy.exc import OperationalError
+
+    from app.discovery_models import DiscoveryStage
+    from app.models import JobLock
+    from jobs import discovery as discovery_job
+    from jobs.lock import acquire_discovery
+
+    db_path = tmp_path / "exclusive-adoption-finalizer.db"
+    engine = init_db(db_path)
+    factory = create_session_factory(engine)
+    with factory() as setup:
+        run = _freeze_run(setup, [company("600000.SH")])
+        stage = _add_track_stage(
+            setup,
+            run,
+            track="quality_discount",
+            created_at=SNAPSHOT_AT,
+        )
+        run_id, stage_id = run.id, stage.id
+        setup.commit()
+        token = acquire_discovery(setup, run_id)
+        assert token
+        setup.commit()
+
+    release_failed = Event()
+    prepared = Event()
+    start = Event()
+    release_calls = 0
+    original_release = discovery_job.release
+
+    def observed_release(*args, **kwargs):
+        nonlocal release_calls
+        release_calls += 1
+        try:
+            return original_release(*args, **kwargs)
+        except OperationalError:
+            release_failed.set()
+            raise
+
+    monkeypatch.setattr(discovery_job, "release", observed_release)
+
+    def work():
+        with factory() as worker:
+            worker.connection().exec_driver_sql("PRAGMA busy_timeout=0")
+            prepared.set()
+            assert start.wait(5)
+            return discovery_job.drain_run_queue(
+                worker,
+                run_id,
+                track_executor=lambda _context: None,
+                lock_already_held=True,
+                owner_token=token,
+            )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(work)
+        assert prepared.wait(5)
+        blocker = sqlite3.connect(db_path)
+        try:
+            blocker.execute("BEGIN EXCLUSIVE")
+            start.set()
+            assert release_failed.wait(10)
+            blocker.rollback()
+            with pytest.raises(OperationalError):
+                future.result(timeout=10)
+        finally:
+            blocker.close()
+    assert release_calls == 2
+
+    with factory() as session:
+        lock = session.get(JobLock, 1)
+        assert lock is not None
+        assert (lock.job_id, lock.job_type, lock.owner_token) == (
+            None,
+            None,
+            None,
+        )
+        unchanged = session.get(DiscoveryStage, stage_id)
+        assert unchanged is not None and unchanged.status == "queued"
+    engine.dispose()
+
+
+def test_pure_executor_has_no_database_handle_and_tracks_continue(
+    tmp_path,
+) -> None:
+    from sqlalchemy import func, select
+
+    from app.discovery_models import DiscoveryResult, DiscoveryStage
+    from app.models import JobLock
+    from jobs.discovery import drain_run_queue
+
+    engine = init_db(tmp_path / "connection-commit-seal.db")
+    factory = create_session_factory(engine)
+    with factory() as session:
+        run = _freeze_run(session, [company("600000.SH")])
+        first = _add_track_stage(
+            session,
+            run,
+            track="quality_discount",
+            created_at=SNAPSHOT_AT,
+        )
+        second = _add_track_stage(
+            session,
+            run,
+            track="deep_value",
+            created_at=SNAPSHOT_AT + timedelta(seconds=1),
+        )
+        run_id, first_id, second_id = run.id, first.id, second.id
+        session.commit()
+
+        def execute(context):
+            assert not hasattr(context, "commit")
+            assert not hasattr(context, "connection")
+            assert not hasattr(context, "get")
+            if context.stage_id == first_id:
+                raise RuntimeError("pure executor failed")
+            return _passing_track_outcome(context)
+
+        outcome = drain_run_queue(
+            session, run_id, track_executor=execute
+        )
+        assert outcome.executed == 2
+        assert session.get(DiscoveryStage, first_id).status == "failed"
+        assert session.get(DiscoveryStage, second_id).status == (
+            "waiting_confirmation"
+        )
+        assert session.scalar(
+            select(func.count())
+            .select_from(DiscoveryResult)
+            .where(DiscoveryResult.track == "quality_discount")
+        ) == 0
+        assert session.scalar(
+            select(func.count())
+            .select_from(DiscoveryResult)
+            .where(DiscoveryResult.track == "deep_value")
+        ) == 1
+        lock = session.get(JobLock, 1)
+        assert lock is not None and lock.job_id is None
+    engine.dispose()
+
+
+def test_china_week_key_flips_at_monday_midnight_utc_plus_8() -> None:
+    from discovery.constants import china_week_key
+
+    assert china_week_key(
+        datetime(2026, 9, 20, 15, 59, 59, tzinfo=timezone.utc)
+    ) == "2026-W38"
+    assert china_week_key(
+        datetime(2026, 9, 20, 16, 0, tzinfo=timezone.utc)
+    ) == "2026-W39"
+
+
+def test_startup_recovery_preserves_prior_week_running_stages(
+    tmp_path,
+) -> None:
+    from app.discovery_models import DiscoveryCommonStage, DiscoveryStage
+    from app.models import JobLock
+    from jobs.lock import JOB_TYPE_DISCOVERY, clear_stale_lock, ensure_lock_row
+
+    engine = init_db(tmp_path / "week-aware-recovery.db")
+    factory = create_session_factory(engine)
+    now = SNAPSHOT_AT + timedelta(days=7)
+    with factory() as session:
+        old_run = _freeze_run(
+            session, [company("600000.SH")], week_key="2026-W38"
+        )
+        current_run = _freeze_run(
+            session, [company("600000.SH")], week_key="2026-W39"
+        )
+        old_common = _add_common_stage(
+            session, old_run, status="running"
+        )
+        old_track = _add_track_stage(
+            session,
+            old_run,
+            track="quality_discount",
+            status="running",
+            created_at=SNAPSHOT_AT,
+        )
+        current_common = _add_common_stage(
+            session, current_run, status="running"
+        )
+        current_track = _add_track_stage(
+            session,
+            current_run,
+            track="quality_discount",
+            status="running",
+            created_at=SNAPSHOT_AT,
+        )
+        lock = ensure_lock_row(session)
+        lock.job_id = old_run.id
+        lock.job_type = JOB_TYPE_DISCOVERY
+        lock.owner_token = "stale"
+        session.commit()
+        old_common_before = tuple(
+            getattr(old_common, column.name)
+            for column in old_common.__table__.columns
+        )
+        old_track_before = tuple(
+            getattr(old_track, column.name)
+            for column in old_track.__table__.columns
+        )
+        ids = (
+            old_common.id,
+            old_track.id,
+            current_common.id,
+            current_track.id,
+        )
+
+        clear_stale_lock(session, now_provider=lambda: now)
+        session.expire_all()
+
+        preserved_common = session.get(DiscoveryCommonStage, ids[0])
+        preserved_track = session.get(DiscoveryStage, ids[1])
+        assert tuple(
+            getattr(preserved_common, column.name)
+            for column in preserved_common.__table__.columns
+        ) == old_common_before
+        assert tuple(
+            getattr(preserved_track, column.name)
+            for column in preserved_track.__table__.columns
+        ) == old_track_before
+        assert (
+            session.get(DiscoveryCommonStage, ids[2]).status,
+            session.get(DiscoveryCommonStage, ids[2]).failure_kind,
+        ) == ("failed", "transient")
+        assert (
+            session.get(DiscoveryStage, ids[3]).status,
+            session.get(DiscoveryStage, ids[3]).failure_kind,
+        ) == ("failed", "transient")
+        assert session.get(JobLock, 1).job_id is None
+    engine.dispose()
+
+
+def test_common_rollover_after_classification_commits_only_running_claim(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fastapi.testclient import TestClient
+
+    from app.discovery_models import (
+        DiscoveryCommonResult,
+        DiscoveryCommonStage,
+        DiscoveryRun,
+    )
+    from app.main import create_app
+    from app.models import JobLock
+    from jobs import discovery as discovery_job
+    from jobs.discovery import drain_run_queue
+    from market.quotes import FakeQuoteClient
+
+    db_path = tmp_path / "common-rollover.db"
+    engine = init_db(db_path)
+    factory = create_session_factory(engine)
+    now = [SNAPSHOT_AT]
+    with factory() as session:
+        run = _freeze_run(session, [company("600000.SH")])
+        stage = _add_common_stage(session, run)
+        run_id, stage_id = run.id, stage.id
+        session.commit()
+        run_before = tuple(
+            getattr(run, column.name)
+            for column in run.__table__.columns
+        )
+        original = discovery_job.classify_common
+
+        def rollover(item, dates):
+            result = original(item, dates)
+            now[0] += timedelta(days=7)
+            return result
+
+        monkeypatch.setattr(discovery_job, "classify_common", rollover)
+        outcome = drain_run_queue(
+            session,
+            run_id,
+            now_provider=lambda: now[0],
+        )
+        assert outcome.acquired
+        assert session.get(DiscoveryCommonStage, stage_id).status == "running"
+        assert session.scalar(
+            select(func.count()).select_from(DiscoveryCommonResult)
+        ) == 0
+        assert tuple(
+            getattr(session.get(DiscoveryRun, run_id), column.name)
+            for column in DiscoveryRun.__table__.columns
+        ) == run_before
+        assert session.get(JobLock, 1).job_id is None
+    engine.dispose()
+
+    app = create_app(
+        db_path=db_path,
+        quote_client=FakeQuoteClient(),
+        env_path=tmp_path / ".env",
+        discovery_clock=lambda: now[0],
+    )
+    with TestClient(app) as client:
+        history = client.get(
+            f"/api/discoveries/{run_id}/stages/safety"
+        )
+        assert history.status_code == 200
+        assert history.json()["current"]["status"] == "running"
+
+
+def test_track_rollover_after_executor_commits_only_running_claim(
+    tmp_path,
+) -> None:
+    from fastapi.testclient import TestClient
+
+    from app.discovery_models import DiscoveryResult, DiscoveryRun, DiscoveryStage
+    from app.main import create_app
+    from app.models import JobLock
+    from jobs.discovery import drain_run_queue
+    from market.quotes import FakeQuoteClient
+
+    db_path = tmp_path / "track-rollover.db"
+    engine = init_db(db_path)
+    factory = create_session_factory(engine)
+    now = [SNAPSHOT_AT]
+    with factory() as session:
+        run = _freeze_run(session, [company("600000.SH")])
+        stage = _add_track_stage(
+            session,
+            run,
+            track="quality_discount",
+            created_at=SNAPSHOT_AT,
+        )
+        run_id, stage_id = run.id, stage.id
+        session.commit()
+        run_before = tuple(
+            getattr(run, column.name)
+            for column in run.__table__.columns
+        )
+
+        def rollover(context):
+            now[0] += timedelta(days=7)
+            return _passing_track_outcome(context)
+
+        outcome = drain_run_queue(
+            session,
+            run_id,
+            track_executor=rollover,
+            now_provider=lambda: now[0],
+        )
+        assert outcome.acquired
+        assert session.get(DiscoveryStage, stage_id).status == "running"
+        assert session.scalar(
+            select(func.count()).select_from(DiscoveryResult)
+        ) == 0
+        assert tuple(
+            getattr(session.get(DiscoveryRun, run_id), column.name)
+            for column in DiscoveryRun.__table__.columns
+        ) == run_before
+        assert session.get(JobLock, 1).job_id is None
+    engine.dispose()
+
+    app = create_app(
+        db_path=db_path,
+        quote_client=FakeQuoteClient(),
+        env_path=tmp_path / ".env",
+        discovery_clock=lambda: now[0],
+    )
+    with TestClient(app) as client:
+        history = client.get(
+            f"/api/discoveries/{run_id}/tracks/quality_discount"
+            "/stages/track_gate"
+        )
+        assert history.status_code == 200
+        assert history.json()["current"]["status"] == "running"
+
+
+def test_common_failure_after_rollover_does_not_persist_failure(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.discovery_models import DiscoveryCommonStage
+    from app.models import JobLock
+    from jobs import discovery as discovery_job
+    from jobs.discovery import drain_run_queue
+
+    engine = init_db(tmp_path / "common-rollover-failure.db")
+    factory = create_session_factory(engine)
+    now = [SNAPSHOT_AT]
+    with factory() as session:
+        run = _freeze_run(session, [company("600000.SH")])
+        stage = _add_common_stage(session, run)
+        run_id, stage_id = run.id, stage.id
+        session.commit()
+
+        def rollover_then_fail(*_args):
+            now[0] += timedelta(days=7)
+            raise RuntimeError("late common failure")
+
+        monkeypatch.setattr(
+            discovery_job,
+            "classify_common",
+            rollover_then_fail,
+        )
+        outcome = drain_run_queue(
+            session,
+            run_id,
+            now_provider=lambda: now[0],
+        )
+        assert outcome.acquired
+        persisted = session.get(DiscoveryCommonStage, stage_id)
+        assert (
+            persisted.status,
+            persisted.error,
+            persisted.failure_kind,
+        ) == ("running", None, None)
+        assert session.get(JobLock, 1).job_id is None
+    engine.dispose()
+
+
+def test_track_failure_after_rollover_does_not_persist_failure(
+    tmp_path,
+) -> None:
+    from app.discovery_models import DiscoveryStage
+    from app.models import JobLock
+    from jobs.discovery import drain_run_queue
+
+    engine = init_db(tmp_path / "track-rollover-failure.db")
+    factory = create_session_factory(engine)
+    now = [SNAPSHOT_AT]
+    with factory() as session:
+        run = _freeze_run(session, [company("600000.SH")])
+        stage = _add_track_stage(
+            session,
+            run,
+            track="quality_discount",
+            created_at=SNAPSHOT_AT,
+        )
+        run_id, stage_id = run.id, stage.id
+        session.commit()
+
+        def rollover_then_fail(_context):
+            now[0] += timedelta(days=7)
+            raise RuntimeError("late track failure")
+
+        with pytest.raises(RuntimeError, match="late track failure"):
+            drain_run_queue(
+                session,
+                run_id,
+                track_executor=rollover_then_fail,
+                now_provider=lambda: now[0],
+            )
+        persisted = session.get(DiscoveryStage, stage_id)
+        assert (
+            persisted.status,
+            persisted.error,
+            persisted.failure_kind,
+        ) == ("running", None, None)
+        assert session.get(JobLock, 1).job_id is None
+    engine.dispose()
+
+
+@pytest.mark.parametrize("kind", ["common", "track"])
+def test_prior_week_queued_stage_is_not_claimed(
+    tmp_path, kind: str
+) -> None:
+    from app.discovery_models import DiscoveryCommonStage, DiscoveryStage
+    from app.models import JobLock
+    from jobs.discovery import drain_run_queue
+
+    engine = init_db(tmp_path / f"prior-week-{kind}.db")
+    factory = create_session_factory(engine)
+    now = SNAPSHOT_AT + timedelta(days=7)
+    with factory() as session:
+        run = _freeze_run(session, [company("600000.SH")])
+        stage = (
+            _add_common_stage(session, run)
+            if kind == "common"
+            else _add_track_stage(
+                session,
+                run,
+                track="quality_discount",
+                created_at=SNAPSHOT_AT,
+            )
+        )
+        run_id, stage_id = run.id, stage.id
+        session.commit()
+
+        outcome = drain_run_queue(
+            session,
+            run_id,
+            track_executor=_passing_track_outcome,
+            now_provider=lambda: now,
+        )
+        assert outcome.executed == 0
+        model = (
+            DiscoveryCommonStage
+            if kind == "common"
+            else DiscoveryStage
+        )
+        assert session.get(model, stage_id).status == "queued"
+        assert session.get(JobLock, 1).job_id is None
     engine.dispose()

@@ -48,6 +48,11 @@ class StageState:
     algorithm_version: str
     superseded: bool
     failure_kind: str | None = None
+    stage_id: int | None = None
+    common_stage_id: int | None = None
+    predecessor_stage_id: int | None = None
+    retry_of_stage_id: int | None = None
+    reopen_of_stage_id: int | None = None
 
     def __post_init__(self) -> None:
         if type(self.run_id) is not int or self.run_id < 1:
@@ -77,6 +82,20 @@ class StageState:
             raise ValueError("algorithm version is required")
         if type(self.superseded) is not bool:
             raise ValueError("superseded must be boolean")
+        for label, value in (
+            ("stage ID", self.stage_id),
+            ("common stage ID", self.common_stage_id),
+            ("predecessor stage ID", self.predecessor_stage_id),
+            ("retry origin ID", self.retry_of_stage_id),
+            ("reopen origin ID", self.reopen_of_stage_id),
+        ):
+            if value is not None and (type(value) is not int or value < 1):
+                raise ValueError(f"{label} must be a positive integer")
+        if (
+            self.retry_of_stage_id is not None
+            and self.reopen_of_stage_id is not None
+        ):
+            raise ValueError("stage cannot have retry and reopen origins")
         if (
             self.status == "insufficient_candidates"
             and self.stage != "adjudication"
@@ -126,16 +145,38 @@ def _validate_predecessor(
         "adjudication": "competition",
     }.get(state.stage)
     if expected_stage is None:
-        if predecessor is not None:
+        if (
+            predecessor is not None
+            or state.common_stage_id is not None
+            or state.predecessor_stage_id is not None
+        ):
             raise WorkflowError(
                 "invalid_predecessor",
                 "common stage has no predecessor",
             )
         return
 
+    lineage_id = (
+        state.common_stage_id
+        if expected_stage == COMMON_STAGE
+        else state.predecessor_stage_id
+    )
+    if lineage_id is None:
+        raise WorkflowError(
+            "lineage_unavailable",
+            f"{state.stage} has no persisted predecessor identity",
+        )
+    if (
+        (expected_stage == COMMON_STAGE and state.predecessor_stage_id is not None)
+        or (expected_stage != COMMON_STAGE and state.common_stage_id is not None)
+    ):
+        raise WorkflowError(
+            "invalid_predecessor", f"{state.stage} has conflicting lineage"
+        )
     expected_track = None if expected_stage == COMMON_STAGE else state.track
     if (
         type(predecessor) is not StageState
+        or predecessor.stage_id != lineage_id
         or predecessor.run_id != state.run_id
         or predecessor.track != expected_track
         or predecessor.stage != expected_stage
@@ -229,6 +270,10 @@ def retry_stage(
             "retry_not_allowed",
             "retry requires a transient failed stage",
         )
+    if state.stage_id is None:
+        raise WorkflowError(
+            "lineage_unavailable", "retry requires exact failed-stage identity"
+        )
     if (
         type(input_fingerprint) is not str
         or state.input_fingerprint != input_fingerprint
@@ -253,4 +298,54 @@ def retry_stage(
         status="queued",
         attempt=state.attempt + 1,
         failure_kind=None,
+        stage_id=None,
+        retry_of_stage_id=state.stage_id,
+        reopen_of_stage_id=None,
+    )
+
+
+def reopen_stage(
+    state: StageState,
+    *,
+    run_status: str,
+    predecessor: StageState | None,
+    available_builds: Collection[str] | None = None,
+) -> StageState:
+    """Create a corrected queued attempt while retaining frozen provenance."""
+
+    _validate_run_mutation(run_status)
+    if state.stage not in {"track_gate", "competition"}:
+        raise WorkflowError(
+            "invalid_reopen_stage",
+            "only track gate or competition can be reopened",
+        )
+    if state.superseded:
+        raise WorkflowError(
+            "stage_superseded", "superseded stage is immutable"
+        )
+    _validate_predecessor(state, predecessor)
+    if state.status != "confirmed":
+        raise WorkflowError(
+            "reopen_not_allowed",
+            "reopen requires a confirmed stage",
+        )
+    if state.stage_id is None:
+        raise WorkflowError(
+            "lineage_unavailable", "reopen requires exact stage identity"
+        )
+    builds = AVAILABLE_BUILDS if available_builds is None else available_builds
+    if not _is_build_available(state.algorithm_version, builds):
+        raise WorkflowError(
+            "algorithm_unavailable",
+            "saved algorithm build is unavailable",
+        )
+    return replace(
+        state,
+        status="queued",
+        attempt=state.attempt + 1,
+        superseded=False,
+        failure_kind=None,
+        stage_id=None,
+        retry_of_stage_id=None,
+        reopen_of_stage_id=state.stage_id,
     )

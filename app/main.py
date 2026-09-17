@@ -63,12 +63,14 @@ from jobs.discovery_data import (
 )
 from jobs.funnel import execute_funnel
 from jobs.lock import (
+    JOB_TYPE_DISCOVERY,
     JOB_TYPE_DISCOVERY_DATA,
     JOB_TYPE_FUNNEL,
     JOB_TYPE_RESEARCH,
     JOB_TYPE_REVIEW,
     clear_stale_lock,
     lock_status,
+    release,
     try_acquire,
 )
 from jobs.research import execute_research
@@ -787,6 +789,7 @@ def create_app(
         )
         app.state.discovery_workers_lock = threading.Lock()
         app.state.discovery_workers = set()
+        app.state.discovery_worker_leases = {}
         app.state.discovery_shutting_down = False
         load_env_key(resolved_env, OPENAI_API_KEY)
         load_env_key(resolved_env, OPENAI_BASE_URL)
@@ -817,7 +820,10 @@ def create_app(
                 session.rollback()
                 logger.exception("初始目标写入失败")
             try:
-                clear_stale_lock(session)
+                clear_stale_lock(
+                    session,
+                    now_provider=app.state.discovery_clock,
+                )
                 clear_cheap_fill(session)
                 session.commit()
             except Exception:
@@ -831,10 +837,33 @@ def create_app(
         with app.state.discovery_workers_lock:
             app.state.discovery_shutting_down = True
             discovery_workers = tuple(app.state.discovery_workers)
+            discovery_leases = {
+                worker: app.state.discovery_worker_leases.get(worker)
+                for worker in discovery_workers
+            }
         for worker in discovery_workers:
             join = getattr(worker, "join", None)
             if callable(join):
-                join()
+                join(timeout=0.1)
+        alive = [
+            worker
+            for worker in discovery_workers
+            if callable(getattr(worker, "is_alive", None))
+            and worker.is_alive()
+        ]
+        if alive:
+            with session_factory() as session:
+                for worker in alive:
+                    lease = discovery_leases.get(worker)
+                    if lease is not None:
+                        run_id, owner_token = lease
+                        release(
+                            session,
+                            run_id,
+                            JOB_TYPE_DISCOVERY,
+                            owner_token=owner_token,
+                        )
+                session.commit()
         engine.dispose()
 
     app = FastAPI(title="本机工作台", lifespan=lifespan)

@@ -47,6 +47,7 @@ class DiscoveryRun(Base):
     )
     algorithm_version: Mapped[str] = mapped_column(String, nullable=False)
     trading_dates_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    ruler_payloads_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     input_fingerprint: Mapped[str | None] = mapped_column(String, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     replay_of_run_id: Mapped[int | None] = mapped_column(
@@ -88,6 +89,19 @@ class DiscoveryCommonStage(Base):
         UniqueConstraint(
             "run_id", "attempt", name="uq_discovery_common_stage_attempt"
         ),
+        UniqueConstraint(
+            "id", "run_id", name="uq_discovery_common_stage_lineage_parent"
+        ),
+        ForeignKeyConstraint(
+            ["retry_of_stage_id", "run_id"],
+            ["discovery_common_stages.id", "discovery_common_stages.run_id"],
+            name="fk_discovery_common_stage_retry_origin",
+        ),
+        CheckConstraint(
+            "(attempt != 1 OR retry_of_stage_id IS NULL) "
+            "AND (retry_of_stage_id IS NULL OR retry_of_stage_id != id)",
+            name="ck_discovery_common_stage_origin",
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -108,6 +122,9 @@ class DiscoveryCommonStage(Base):
     )
     input_fingerprint: Mapped[str] = mapped_column(String, nullable=False)
     algorithm_version: Mapped[str] = mapped_column(String, nullable=False)
+    retry_of_stage_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
     failure_kind: Mapped[str | None] = mapped_column(String, nullable=True)
     superseded_at: Mapped[datetime | None] = mapped_column(
         UTCDateTime(), nullable=True
@@ -161,6 +178,68 @@ class DiscoveryStage(Base):
             "attempt",
             name="uq_discovery_stage_artifact_parent",
         ),
+        UniqueConstraint(
+            "id",
+            "run_id",
+            "track",
+            "stage",
+            name="uq_discovery_stage_lineage_parent",
+        ),
+        ForeignKeyConstraint(
+            ["common_stage_id", "run_id"],
+            ["discovery_common_stages.id", "discovery_common_stages.run_id"],
+            name="fk_discovery_stage_common_lineage",
+        ),
+        ForeignKeyConstraint(
+            ["predecessor_stage_id", "run_id", "track", "predecessor_stage"],
+            [
+                "discovery_stages.id",
+                "discovery_stages.run_id",
+                "discovery_stages.track",
+                "discovery_stages.stage",
+            ],
+            name="fk_discovery_stage_track_lineage",
+        ),
+        ForeignKeyConstraint(
+            ["retry_of_stage_id", "run_id", "track", "stage"],
+            [
+                "discovery_stages.id",
+                "discovery_stages.run_id",
+                "discovery_stages.track",
+                "discovery_stages.stage",
+            ],
+            name="fk_discovery_stage_retry_origin",
+        ),
+        ForeignKeyConstraint(
+            ["reopen_of_stage_id", "run_id", "track", "stage"],
+            [
+                "discovery_stages.id",
+                "discovery_stages.run_id",
+                "discovery_stages.track",
+                "discovery_stages.stage",
+            ],
+            name="fk_discovery_stage_reopen_origin",
+        ),
+        CheckConstraint(
+            "(stage = 'track_gate' AND common_stage_id IS NOT NULL "
+            "AND predecessor_stage_id IS NULL AND predecessor_stage IS NULL) "
+            "OR (stage = 'competition' AND common_stage_id IS NULL "
+            "AND predecessor_stage_id IS NOT NULL "
+            "AND predecessor_stage = 'track_gate') "
+            "OR (stage = 'adjudication' AND common_stage_id IS NULL "
+            "AND predecessor_stage_id IS NOT NULL "
+            "AND predecessor_stage = 'competition')",
+            name="ck_discovery_stage_exact_lineage",
+        ),
+        CheckConstraint(
+            "NOT (retry_of_stage_id IS NOT NULL "
+            "AND reopen_of_stage_id IS NOT NULL) "
+            "AND (attempt != 1 OR (retry_of_stage_id IS NULL "
+            "AND reopen_of_stage_id IS NULL)) "
+            "AND (retry_of_stage_id IS NULL OR retry_of_stage_id != id) "
+            "AND (reopen_of_stage_id IS NULL OR reopen_of_stage_id != id)",
+            name="ck_discovery_stage_origin",
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -186,6 +265,19 @@ class DiscoveryStage(Base):
         ForeignKey("ruler_versions.id"), nullable=True
     )
     algorithm_version: Mapped[str] = mapped_column(String, nullable=False)
+    common_stage_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    predecessor_stage_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    predecessor_stage: Mapped[str | None] = mapped_column(
+        String, nullable=True
+    )
+    retry_of_stage_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    reopen_of_stage_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
     failure_kind: Mapped[str | None] = mapped_column(String, nullable=True)
     superseded_at: Mapped[datetime | None] = mapped_column(
         UTCDateTime(), nullable=True

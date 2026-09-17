@@ -17,6 +17,24 @@ from tests.discovery_helpers import (
     versions,
 )
 
+def _passing_track_outcome(context):
+    from jobs.discovery import TrackExecutionOutcome, TrackExecutionResult
+
+    return TrackExecutionOutcome(
+        status="waiting_confirmation",
+        results=tuple(
+            TrackExecutionResult(
+                code=code,
+                verdict="pass",
+                reason=None,
+                metrics_json="{}",
+                rank=None,
+            )
+            for code in context.candidate_codes
+        ),
+    )
+
+
 EXPECTED_COLUMNS = {
     "discovery_runs": {
         "id",
@@ -35,6 +53,7 @@ EXPECTED_COLUMNS = {
         "garp_ruler_version_id",
         "algorithm_version",
         "trading_dates_json",
+        "ruler_payloads_json",
         "input_fingerprint",
         "error",
         "replay_of_run_id",
@@ -70,6 +89,7 @@ EXPECTED_COLUMNS = {
         "confirmed_at",
         "input_fingerprint",
         "algorithm_version",
+        "retry_of_stage_id",
         "failure_kind",
         "superseded_at",
         "created_at",
@@ -101,6 +121,11 @@ EXPECTED_COLUMNS = {
         "input_fingerprint",
         "ruler_version_id",
         "algorithm_version",
+        "common_stage_id",
+        "predecessor_stage_id",
+        "predecessor_stage",
+        "retry_of_stage_id",
+        "reopen_of_stage_id",
         "failure_kind",
         "superseded_at",
         "created_at",
@@ -227,9 +252,46 @@ def _add_track_stage(
     stage: str = "track_gate",
     attempt: int = 1,
 ):
-    from app.discovery_models import DiscoveryStage
+    from sqlalchemy import select
+
+    from app.discovery_models import DiscoveryCommonStage, DiscoveryStage
 
     now = _now()
+    if stage == "track_gate":
+        parent = session.scalars(
+            select(DiscoveryCommonStage)
+            .where(
+                DiscoveryCommonStage.run_id == run_id,
+                DiscoveryCommonStage.superseded_at.is_(None),
+            )
+            .order_by(DiscoveryCommonStage.attempt.desc())
+        ).first()
+        if parent is None:
+            parent = _add_common_stage(session, run_id)
+        parent.status = "confirmed"
+        common_stage_id = parent.id
+        predecessor_stage_id = None
+        predecessor_stage = None
+    else:
+        expected = "track_gate" if stage == "competition" else "competition"
+        parent = session.scalars(
+            select(DiscoveryStage)
+            .where(
+                DiscoveryStage.run_id == run_id,
+                DiscoveryStage.track == track,
+                DiscoveryStage.stage == expected,
+                DiscoveryStage.superseded_at.is_(None),
+            )
+            .order_by(DiscoveryStage.attempt.desc())
+        ).first()
+        if parent is None:
+            parent = _add_track_stage(
+                session, run_id, track=track, stage=expected
+            )
+        parent.status = "confirmed"
+        common_stage_id = None
+        predecessor_stage_id = parent.id
+        predecessor_stage = expected
     row = DiscoveryStage(
         run_id=run_id,
         track=track,
@@ -242,6 +304,9 @@ def _add_track_stage(
         insufficient_count=0,
         input_fingerprint="run-fingerprint",
         algorithm_version="algorithm-v1",
+        common_stage_id=common_stage_id,
+        predecessor_stage_id=predecessor_stage_id,
+        predecessor_stage=predecessor_stage,
         created_at=now,
         updated_at=now,
     )
@@ -360,6 +425,40 @@ def test_discovery_schema_has_all_tables_columns_foreign_keys_and_index(
         for fk in schema.get_foreign_keys("discovery_stages")
     )
     assert any(
+        fk["referred_table"] == "discovery_common_stages"
+        and fk["constrained_columns"] == ["common_stage_id", "run_id"]
+        and fk["referred_columns"] == ["id", "run_id"]
+        for fk in schema.get_foreign_keys("discovery_stages")
+    )
+    assert any(
+        fk["referred_table"] == "discovery_stages"
+        and fk["constrained_columns"]
+        == [
+            "predecessor_stage_id",
+            "run_id",
+            "track",
+            "predecessor_stage",
+        ]
+        and fk["referred_columns"]
+        == ["id", "run_id", "track", "stage"]
+        for fk in schema.get_foreign_keys("discovery_stages")
+    )
+    assert any(
+        fk["referred_table"] == "discovery_common_stages"
+        and fk["constrained_columns"] == ["retry_of_stage_id", "run_id"]
+        and fk["referred_columns"] == ["id", "run_id"]
+        for fk in schema.get_foreign_keys("discovery_common_stages")
+    )
+    for origin in ("retry_of_stage_id", "reopen_of_stage_id"):
+        assert any(
+            fk["referred_table"] == "discovery_stages"
+            and fk["constrained_columns"]
+            == [origin, "run_id", "track", "stage"]
+            and fk["referred_columns"]
+            == ["id", "run_id", "track", "stage"]
+            for fk in schema.get_foreign_keys("discovery_stages")
+        )
+    assert any(
         fk["referred_table"] == "ruler_versions"
         and fk["constrained_columns"] == ["ruler_version_id"]
         for fk in schema.get_foreign_keys("discovery_evidence")
@@ -375,6 +474,200 @@ def test_discovery_schema_has_all_tables_columns_foreign_keys_and_index(
         ).scalar_one()
     assert foreign_keys_on == 1
     assert "WHERE current = 1" in index_sql
+
+
+def test_job_lock_has_nullable_owner_token(tmp_path: Path) -> None:
+    schema = inspect(init_db(tmp_path / "lock-token.db"))
+    token = next(
+        column
+        for column in schema.get_columns("job_lock")
+        if column["name"] == "owner_token"
+    )
+    assert token["nullable"] is True
+
+
+def test_discovery_lease_requires_exact_owner_token(tmp_path: Path) -> None:
+    from app.models import JobLock
+    from jobs.lock import (
+        JOB_TYPE_DISCOVERY,
+        acquire_discovery,
+        release,
+    )
+
+    engine = init_db(tmp_path / "lease-owner.db")
+    factory = create_session_factory(engine)
+    with factory() as session:
+        token = acquire_discovery(session, 7)
+        assert token
+        session.commit()
+    with factory() as session:
+        assert not release(session, 7, JOB_TYPE_DISCOVERY)
+        session.commit()
+        lock = session.get(JobLock, 1)
+        assert lock is not None and lock.owner_token == token
+        assert acquire_discovery(session, 7) is None
+        session.rollback()
+    with factory() as session:
+        assert release(
+            session,
+            7,
+            JOB_TYPE_DISCOVERY,
+            owner_token=token,
+        )
+        session.commit()
+
+
+def test_shutdown_revokes_hung_discovery_worker_without_waiting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from threading import Event
+    from time import monotonic
+
+    from fastapi.testclient import TestClient
+    from sqlalchemy import func, select
+
+    from app import discovery_routes
+    from app.discovery_models import (
+        DiscoveryCommonResult,
+        DiscoveryCommonStage,
+    )
+    from app.main import create_app
+    from jobs import discovery as discovery_job
+    from jobs.lock import clear_stale_lock
+    from market.quotes import FakeQuoteClient
+
+    db_path = tmp_path / "bounded-shutdown.db"
+    _seed_api_snapshot(db_path)
+    entered = Event()
+    resume = Event()
+    finished = Event()
+    original_classify = discovery_job.classify_common
+    original_drain = discovery_routes._drain
+
+    def blocked(item, dates):
+        entered.set()
+        assert resume.wait(5)
+        return original_classify(item, dates)
+
+    def observed_drain(*args):
+        try:
+            return original_drain(*args)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(discovery_job, "classify_common", blocked)
+    monkeypatch.setattr(discovery_routes, "_drain", observed_drain)
+    app = create_app(
+        db_path=db_path,
+        quote_client=FakeQuoteClient(),
+        env_path=tmp_path / ".env",
+        allow_sync=False,
+        discovery_clock=lambda: SNAPSHOT_AT,
+    )
+    client = TestClient(app)
+    client.__enter__()
+    response = client.post("/api/discoveries", json={})
+    run_id = response.json()["id"]
+    assert entered.wait(5)
+    started = monotonic()
+    client.__exit__(None, None, None)
+    assert monotonic() - started < 1
+    resume.set()
+    assert finished.wait(5)
+
+    engine = init_db(db_path)
+    factory = create_session_factory(engine)
+    with factory() as session:
+        clear_stale_lock(session)
+        assert session.scalar(
+            select(func.count()).select_from(DiscoveryCommonResult)
+        ) == 0
+        stage = session.scalar(
+            select(DiscoveryCommonStage).where(
+                DiscoveryCommonStage.run_id == run_id
+            )
+        )
+        assert stage is not None
+        assert (stage.status, stage.failure_kind) == (
+            "failed",
+            "transient",
+        )
+    engine.dispose()
+
+
+def test_shutdown_does_not_revoke_newer_discovery_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from threading import Event
+
+    from fastapi.testclient import TestClient
+
+    from app import discovery_routes
+    from app.main import create_app
+    from app.models import JobLock
+    from jobs import discovery as discovery_job
+    from jobs.lock import (
+        JOB_TYPE_DISCOVERY,
+        acquire_discovery,
+        release,
+    )
+    from market.quotes import FakeQuoteClient
+
+    db_path = tmp_path / "shutdown-lease-aba.db"
+    _seed_api_snapshot(db_path)
+    entered = Event()
+    resume = Event()
+    finished = Event()
+    original_classify = discovery_job.classify_common
+    original_drain = discovery_routes._drain
+
+    def blocked(item, dates):
+        entered.set()
+        assert resume.wait(5)
+        return original_classify(item, dates)
+
+    def observed_drain(*args):
+        try:
+            return original_drain(*args)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(discovery_job, "classify_common", blocked)
+    monkeypatch.setattr(discovery_routes, "_drain", observed_drain)
+    app = create_app(
+        db_path=db_path,
+        quote_client=FakeQuoteClient(),
+        env_path=tmp_path / ".env",
+        allow_sync=False,
+        discovery_clock=lambda: SNAPSHOT_AT,
+    )
+    client = TestClient(app)
+    client.__enter__()
+    response = client.post("/api/discoveries", json={})
+    run_id = response.json()["id"]
+    assert entered.wait(5)
+    with app.state.discovery_workers_lock:
+        worker = next(iter(app.state.discovery_workers))
+        captured_run, old_token = app.state.discovery_worker_leases[worker]
+    assert captured_run == run_id
+    with app.state.session_factory() as session:
+        assert release(
+            session,
+            run_id,
+            JOB_TYPE_DISCOVERY,
+            owner_token=old_token,
+        )
+        session.commit()
+        new_token = acquire_discovery(session, run_id)
+        assert new_token and new_token != old_token
+        session.commit()
+
+    client.__exit__(None, None, None)
+    with app.state.session_factory() as session:
+        lock = session.get(JobLock, 1)
+        assert lock is not None and lock.owner_token == new_token
+    resume.set()
+    assert finished.wait(5)
 
 
 def test_current_week_partial_index_allows_history_but_rejects_second_current(
@@ -604,6 +897,7 @@ def test_discovery_artifacts_reject_missing_or_mismatched_stages(
         DiscoveryEvidence,
         DiscoveryOverride,
         DiscoveryResult,
+        DiscoveryStage,
     )
 
     engine = init_db(tmp_path / "artifact-parent.db")
@@ -637,7 +931,7 @@ def test_discovery_artifacts_reject_missing_or_mismatched_stages(
             run_id=run_id,
             track="garp",
             stage="track_gate",
-            attempt=1,
+            attempt=2,
             code="600000.SH",
             verdict="pass",
             metrics_json="{}",
@@ -755,12 +1049,16 @@ def test_competition_artifacts_reject_wrong_stage_and_accept_competition(
 
 
 def test_deleting_stages_cascades_their_artifacts(tmp_path: Path) -> None:
+    from sqlalchemy import delete
+
     from app.discovery_models import (
         DiscoveryCommonResult,
+        DiscoveryCommonStage,
         DiscoveryDecision,
         DiscoveryEvidence,
         DiscoveryOverride,
         DiscoveryResult,
+        DiscoveryStage,
     )
 
     engine = init_db(tmp_path / "artifact-cascade.db")
@@ -832,9 +1130,17 @@ def test_deleting_stages_cascades_their_artifacts(tmp_path: Path) -> None:
         )
         session.commit()
 
-        session.delete(common)
-        session.delete(gate)
-        session.delete(competition)
+        session.execute(
+            delete(DiscoveryStage).where(DiscoveryStage.id == competition.id)
+        )
+        session.execute(
+            delete(DiscoveryStage).where(DiscoveryStage.id == gate.id)
+        )
+        session.execute(
+            delete(DiscoveryCommonStage).where(
+                DiscoveryCommonStage.id == common.id
+            )
+        )
         session.commit()
 
         for table in (
@@ -1239,12 +1545,24 @@ def _stage_state(
     algorithm_version: object = "discovery-v1",
     superseded: object = False,
     failure_kind: object = None,
+    stage_id: object = _UNSET,
+    common_stage_id: object = _UNSET,
+    predecessor_stage_id: object = _UNSET,
+    retry_of_stage_id: object = None,
+    reopen_of_stage_id: object = None,
 ):
     from discovery.workflow import StageState
 
     resolved_track = (
         None if stage == "common" else "quality_discount"
     ) if track is _UNSET else track
+    resolved_stage_id = 1 if stage_id is _UNSET else stage_id
+    resolved_common_id = (
+        101 if stage == "track_gate" else None
+    ) if common_stage_id is _UNSET else common_stage_id
+    resolved_predecessor_id = (
+        102 if stage in {"competition", "adjudication"} else None
+    ) if predecessor_stage_id is _UNSET else predecessor_stage_id
     return StageState(
         run_id=run_id,  # type: ignore[arg-type]
         track=resolved_track,  # type: ignore[arg-type]
@@ -1256,6 +1574,11 @@ def _stage_state(
         algorithm_version=algorithm_version,  # type: ignore[arg-type]
         superseded=superseded,  # type: ignore[arg-type]
         failure_kind=failure_kind,  # type: ignore[arg-type]
+        stage_id=resolved_stage_id,  # type: ignore[arg-type]
+        common_stage_id=resolved_common_id,  # type: ignore[arg-type]
+        predecessor_stage_id=resolved_predecessor_id,  # type: ignore[arg-type]
+        retry_of_stage_id=retry_of_stage_id,  # type: ignore[arg-type]
+        reopen_of_stage_id=reopen_of_stage_id,  # type: ignore[arg-type]
     )
 
 
@@ -1275,6 +1598,11 @@ def _predecessor_for(state, **changes):
         stage=previous_stage,
         status="confirmed",
         ruler_version_id=state.ruler_version_id,
+        stage_id=(
+            state.common_stage_id
+            if previous_stage == "common"
+            else state.predecessor_stage_id
+        ),
     )
     return replace(predecessor, **changes)
 
@@ -1698,10 +2026,43 @@ def test_retry_uses_natural_failure_and_preserves_old_attempt() -> None:
         stage="competition",
         status="queued",
         attempt=3,
+        stage_id=None,
+        retry_of_stage_id=1,
     )
     assert old.status == "failed"
     assert old.attempt == 2
     assert old.failure_kind == "transient"
+
+
+def test_pure_reopen_rejects_adjudication_and_records_exact_origin() -> None:
+    from discovery.workflow import WorkflowError, reopen_stage
+
+    adjudication = _stage_state(
+        stage="adjudication",
+        status="confirmed",
+        predecessor_stage_id=2,
+    )
+    with pytest.raises(WorkflowError) as error:
+        reopen_stage(
+            adjudication,
+            run_status="running",
+            predecessor=_predecessor_for(adjudication),
+        )
+    assert error.value.code == "invalid_reopen_stage"
+
+    competition = _stage_state(
+        stage="competition",
+        status="confirmed",
+        predecessor_stage_id=2,
+    )
+    reopened = reopen_stage(
+        competition,
+        run_status="running",
+        predecessor=_predecessor_for(competition),
+    )
+    assert reopened.stage_id is None
+    assert reopened.retry_of_stage_id is None
+    assert reopened.reopen_of_stage_id == competition.stage_id
 
 
 @pytest.mark.parametrize(
@@ -2749,6 +3110,246 @@ def test_existing_discovery_snapshot_schema_upgrades_idempotently(
             load_frozen_inputs(session, 1)
 
 
+def test_upgraded_discovery_stage_lineage_triggers_are_idempotent(
+    tmp_path: Path,
+) -> None:
+    from sqlalchemy import create_engine
+    from sqlalchemy.exc import IntegrityError
+
+    db_path = tmp_path / "legacy-lineage.db"
+    legacy = create_engine(f"sqlite:///{db_path.as_posix()}")
+    with legacy.begin() as conn:
+        conn.execute(
+            text(
+                "CREATE TABLE users (id INTEGER PRIMARY KEY, "
+                "name VARCHAR NOT NULL)"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE TABLE ruler_versions (id INTEGER PRIMARY KEY, "
+                "user_id INTEGER NOT NULL, digest VARCHAR NOT NULL, "
+                "reason VARCHAR NOT NULL, payload_json TEXT NOT NULL, "
+                "activated_at DATETIME NOT NULL)"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE TABLE discovery_runs (id INTEGER PRIMARY KEY, "
+                "user_id INTEGER NOT NULL, week_key VARCHAR NOT NULL, "
+                "current BOOLEAN NOT NULL, status VARCHAR NOT NULL, "
+                "created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL, "
+                "snapshot_at DATETIME, data_version VARCHAR NOT NULL, "
+                "financial_version VARCHAR NOT NULL, "
+                "valuation_version VARCHAR NOT NULL, "
+                "quality_discount_ruler_version_id INTEGER, "
+                "deep_value_ruler_version_id INTEGER, "
+                "garp_ruler_version_id INTEGER, "
+                "algorithm_version VARCHAR NOT NULL, "
+                "input_fingerprint VARCHAR, error TEXT, "
+                "replay_of_run_id INTEGER)"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE TABLE discovery_common_stages ("
+                "id INTEGER PRIMARY KEY, run_id INTEGER NOT NULL, "
+                "attempt INTEGER NOT NULL, status VARCHAR NOT NULL, "
+                "total_count INTEGER NOT NULL, pass_count INTEGER NOT NULL, "
+                "drop_count INTEGER NOT NULL, "
+                "insufficient_count INTEGER NOT NULL, error TEXT, "
+                "confirmed_at DATETIME, input_fingerprint VARCHAR NOT NULL, "
+                "algorithm_version VARCHAR NOT NULL, failure_kind VARCHAR, "
+                "superseded_at DATETIME, created_at DATETIME NOT NULL, "
+                "updated_at DATETIME NOT NULL, UNIQUE(run_id, attempt), "
+                "UNIQUE(id, run_id))"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE TABLE discovery_stages ("
+                "id INTEGER PRIMARY KEY, run_id INTEGER NOT NULL, "
+                "track VARCHAR NOT NULL, stage VARCHAR NOT NULL, "
+                "attempt INTEGER NOT NULL, status VARCHAR NOT NULL, "
+                "total_count INTEGER NOT NULL, pass_count INTEGER NOT NULL, "
+                "drop_count INTEGER NOT NULL, "
+                "insufficient_count INTEGER NOT NULL, error TEXT, "
+                "confirmed_at DATETIME, input_fingerprint VARCHAR NOT NULL, "
+                "ruler_version_id INTEGER, algorithm_version VARCHAR NOT NULL, "
+                "failure_kind VARCHAR, superseded_at DATETIME, "
+                "created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL, "
+                "UNIQUE(run_id, track, stage, attempt), "
+                "UNIQUE(id, run_id, track, stage, attempt), "
+                "UNIQUE(id, run_id, track, stage))"
+            )
+        )
+        conn.execute(text("INSERT INTO users VALUES (1, '本机用户')"))
+        conn.execute(
+            text(
+                "INSERT INTO discovery_runs VALUES ("
+                "1, 1, '2026-W37', 1, 'running', "
+                "'2026-09-17 03:00:00', '2026-09-17 03:00:00', NULL, "
+                "'d', 'f', 'v', NULL, NULL, NULL, 'discovery-v1', "
+                "'fingerprint', NULL, NULL)"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO discovery_common_stages VALUES ("
+                "1, 1, 1, 'confirmed', 0, 0, 0, 0, NULL, "
+                "'2026-09-17 03:00:00', 'fingerprint', 'discovery-v1', "
+                "NULL, NULL, '2026-09-17 03:00:00', "
+                "'2026-09-17 03:00:00')"
+            )
+        )
+        for row in [
+            (
+                1,
+                "track_gate",
+                "confirmed",
+                "2026-09-17 03:01:00",
+            ),
+            (
+                2,
+                "competition",
+                "confirmed",
+                "2026-09-17 03:02:00",
+            ),
+            (
+                3,
+                "adjudication",
+                "queued",
+                "2026-09-17 03:03:00",
+            ),
+        ]:
+            stage_id, stage_name, status, created = row
+            conn.execute(
+                text(
+                    "INSERT INTO discovery_stages VALUES ("
+                    f"{stage_id}, 1, 'garp', '{stage_name}', 1, "
+                    f"'{status}', 0, 0, 0, 0, NULL, "
+                    + (
+                        f"'{created}'"
+                        if status == "confirmed"
+                        else "NULL"
+                    )
+                    + ", 'fingerprint', NULL, 'discovery-v1', NULL, NULL, "
+                    f"'{created}', '{created}')"
+                )
+            )
+        conn.execute(
+            text(
+                "INSERT INTO discovery_runs VALUES ("
+                "2, 1, '2026-W36', 0, 'running', "
+                "'2026-09-17 02:00:00', '2026-09-17 02:00:00', NULL, "
+                "'d', 'f', 'v', NULL, NULL, NULL, 'discovery-v1', "
+                "'fingerprint-2', NULL, NULL)"
+            )
+        )
+        for common_id, attempt in [(2, 1), (3, 2)]:
+            conn.execute(
+                text(
+                    "INSERT INTO discovery_common_stages VALUES ("
+                    f"{common_id}, 2, {attempt}, 'confirmed', "
+                    "0, 0, 0, 0, NULL, '2026-09-17 02:00:00', "
+                    "'fingerprint-2', 'discovery-v1', NULL, NULL, "
+                    "'2026-09-17 02:00:00', '2026-09-17 02:00:00')"
+                )
+            )
+        conn.execute(
+            text(
+                "INSERT INTO discovery_stages VALUES ("
+                "4, 2, 'garp', 'track_gate', 1, 'queued', "
+                "0, 0, 0, 0, NULL, NULL, 'fingerprint-2', NULL, "
+                "'discovery-v1', NULL, NULL, "
+                "'2026-09-17 02:01:00', '2026-09-17 02:01:00')"
+            )
+        )
+    legacy.dispose()
+
+    init_db(db_path).dispose()
+    engine = init_db(db_path)
+    with engine.connect() as conn:
+        recovered = conn.execute(
+            text(
+                "SELECT id, common_stage_id, predecessor_stage_id, "
+                "predecessor_stage FROM discovery_stages "
+                "WHERE id IN (1, 2, 3, 4) ORDER BY id"
+            )
+        ).all()
+    assert recovered == [
+        (1, 1, None, None),
+        (2, None, 1, "track_gate"),
+        (3, None, 2, "competition"),
+        (4, None, None, None),
+    ]
+    insert = (
+        "INSERT INTO discovery_stages "
+        "(run_id, track, stage, attempt, status, total_count, pass_count, "
+        "drop_count, insufficient_count, input_fingerprint, "
+        "algorithm_version, common_stage_id, predecessor_stage_id, "
+        "predecessor_stage, created_at, updated_at) VALUES "
+    )
+    values = (
+        "1, 'deep_value', 'track_gate', 1, 'queued', 0, 0, 0, 0, "
+        "'fingerprint', 'discovery-v1', "
+    )
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                insert
+                + f"({values}1, NULL, NULL, "
+                "'2026-09-17 03:00:00', '2026-09-17 03:00:00')"
+            )
+        )
+    with pytest.raises(IntegrityError, match="invalid discovery stage lineage"):
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    insert
+                    + "(1, 'quality_discount', 'track_gate', 1, 'queued', "
+                    "0, 0, 0, 0, 'fingerprint', 'discovery-v1', "
+                    "NULL, NULL, NULL, "
+                    "'2026-09-17 03:00:00', '2026-09-17 03:00:00')"
+                )
+            )
+    with pytest.raises(IntegrityError, match="invalid discovery stage lineage"):
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "UPDATE discovery_stages SET common_stage_id = NULL "
+                    "WHERE id = 5"
+                )
+            )
+    with pytest.raises(IntegrityError, match="invalid discovery stage origin"):
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO discovery_stages "
+                    "(run_id, track, stage, attempt, status, total_count, "
+                    "pass_count, drop_count, insufficient_count, "
+                    "input_fingerprint, algorithm_version, common_stage_id, "
+                    "retry_of_stage_id, reopen_of_stage_id, created_at, "
+                    "updated_at) VALUES "
+                    "(1, 'deep_value', 'track_gate', 2, 'queued', "
+                    "0, 0, 0, 0, 'fingerprint', 'discovery-v1', 1, "
+                    "5, 5, '2026-09-17 03:01:00', "
+                    "'2026-09-17 03:01:00')"
+                )
+            )
+    with pytest.raises(
+        IntegrityError, match="invalid discovery common stage origin"
+    ):
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "UPDATE discovery_common_stages "
+                    "SET retry_of_stage_id = 1 WHERE id = 1"
+                )
+            )
+    engine.dispose()
+
+
 def test_freeze_rejects_wrong_session_and_detached_run_without_writes(
     tmp_path: Path,
 ) -> None:
@@ -2944,13 +3545,6 @@ def test_historical_replay_includes_ordered_zero_result_stages(
                 stage="adjudication",
                 attempt=1,
             ),
-            _add_track_stage(
-                session,
-                run.id,
-                track="garp",
-                stage="track_gate",
-                attempt=1,
-            ),
         ]
         stages[0].ruler_version_id = 1
         session.commit()
@@ -2964,9 +3558,13 @@ def test_historical_replay_includes_ordered_zero_result_stages(
         (row["track"], row["stage"], row["attempt"])
         for row in replay.track_stages
     ] == [
+        ("quality_discount", "track_gate", 1),
+        ("quality_discount", "competition", 1),
         ("quality_discount", "adjudication", 1),
+        ("deep_value", "track_gate", 1),
         ("deep_value", "competition", 1),
         ("garp", "track_gate", 1),
+        ("garp", "competition", 1),
         ("garp", "adjudication", 2),
     ]
     assert replay.track_stages[-1]["ruler_version_id"] == 1
@@ -3401,10 +3999,11 @@ def test_three_tracks_advance_independently_with_injected_executor(
     from fastapi.testclient import TestClient
     from sqlalchemy import select
 
-    from app.discovery_models import DiscoveryResult, DiscoveryStage
+    from app.discovery_models import DiscoveryStage
     from app.main import create_app
     from app.models import RulerVersion
     from discovery.snapshot import canonical_json
+    from jobs.discovery import TrackExecutionOutcome, TrackExecutionResult
     from market.quotes import FakeQuoteClient
 
     db_path = tmp_path / "discovery-tracks.db"
@@ -3433,28 +4032,23 @@ def test_three_tracks_advance_independently_with_injected_executor(
 
     executed: list[tuple[str, str]] = []
 
-    def execute(session, stage_id: int) -> None:
-        stage = session.get(DiscoveryStage, stage_id)
-        assert stage is not None
-        executed.append((stage.track, stage.stage))
-        session.add(
-            DiscoveryResult(
-                run_id=stage.run_id,
-                track=stage.track,
-                stage=stage.stage,
-                attempt=stage.attempt,
-                code="600000.SH",
-                verdict="pass",
-                reason=None,
-                metrics_json='{"score":"1"}',
-                rank=1,
-                created_at=SNAPSHOT_AT,
-            )
+    def execute(context):
+        executed.append((context.track, context.stage))
+        return TrackExecutionOutcome(
+            status="waiting_confirmation",
+            results=tuple(
+                TrackExecutionResult(
+                    code=code,
+                    verdict="pass",
+                    reason=None,
+                    metrics_json='{"score":"1"}',
+                    rank=index,
+                )
+                for index, code in enumerate(
+                    context.candidate_codes, start=1
+                )
+            ),
         )
-        stage.total_count = 1
-        stage.pass_count = 1
-        stage.status = "waiting_confirmation"
-        stage.updated_at = SNAPSHOT_AT
 
     app = create_app(
         db_path=db_path,
@@ -3503,7 +4097,7 @@ def test_three_tracks_advance_independently_with_injected_executor(
                 f"/api/discoveries/{run_id}/tracks/{track}"
                 "/stages/adjudication"
             ).json()["current"]["status"] == "waiting_confirmation"
-        assert len(executed) == 9
+        assert len(executed) == 6
 
     with SessionLocal() as session:
         stages = session.scalars(
@@ -3589,6 +4183,9 @@ def test_startup_resumes_confirmed_upstream_queued_stage_once(
                 input_fingerprint=run.input_fingerprint,
                 ruler_version_id=run.garp_ruler_version_id,
                 algorithm_version=run.algorithm_version,
+                common_stage_id=common.id,
+                predecessor_stage_id=None,
+                predecessor_stage=None,
                 created_at=SNAPSHOT_AT,
                 updated_at=SNAPSHOT_AT,
             )
@@ -3597,12 +4194,9 @@ def test_startup_resumes_confirmed_upstream_queued_stage_once(
 
     executed: list[int] = []
 
-    def execute(session, stage_id: int) -> None:
-        stage = session.get(DiscoveryStage, stage_id)
-        assert stage is not None
-        executed.append(stage_id)
-        stage.status = "waiting_confirmation"
-        stage.updated_at = SNAPSHOT_AT
+    def execute(context):
+        executed.append(context.stage_id)
+        return _passing_track_outcome(context)
 
     with TestClient(
         create_app(**base, discovery_track_executor=execute)
@@ -4125,7 +4719,6 @@ def test_stage_reads_preserve_zero_result_attempts_and_partitions(
             common = session.query(DiscoveryCommonStage).filter_by(
                 run_id=run_id
             ).one()
-            common.superseded_at = SNAPSHOT_AT
             session.add_all(
                 [
                     DiscoveryCommonResult(
@@ -4168,7 +4761,6 @@ def test_stage_reads_preserve_zero_result_attempts_and_partitions(
                 track="garp",
                 stage="track_gate",
             ).one()
-            gate.superseded_at = SNAPSHOT_AT
             second_gate = DiscoveryStage(
                 run_id=run_id,
                 track="garp",
@@ -4182,11 +4774,16 @@ def test_stage_reads_preserve_zero_result_attempts_and_partitions(
                 input_fingerprint=gate.input_fingerprint,
                 ruler_version_id=gate.ruler_version_id,
                 algorithm_version=gate.algorithm_version,
+                common_stage_id=common.id,
+                predecessor_stage_id=None,
+                predecessor_stage=None,
                 created_at=SNAPSHOT_AT,
                 updated_at=SNAPSHOT_AT,
             )
             session.add(second_gate)
             session.flush()
+            common.superseded_at = SNAPSHOT_AT
+            gate.superseded_at = SNAPSHOT_AT
             session.add_all(
                 DiscoveryResult(
                     run_id=run_id,
@@ -4506,6 +5103,10 @@ def test_exact_discovery_endpoint_surface(tmp_path: Path) -> None:
             "/api/discoveries/{run_id}/stages/safety/confirm",
         ),
         (
+            "POST",
+            "/api/discoveries/{run_id}/stages/safety/retry",
+        ),
+        (
             "GET",
             "/api/discoveries/{run_id}/tracks/{track}/stages/{stage}",
         ),
@@ -4513,6 +5114,18 @@ def test_exact_discovery_endpoint_surface(tmp_path: Path) -> None:
             "POST",
             "/api/discoveries/{run_id}/tracks/{track}/stages/{stage}/confirm",
         ),
+        (
+            "POST",
+            "/api/discoveries/{run_id}/tracks/{track}/stages/{stage}/retry",
+        ),
+        (
+            "POST",
+            "/api/discoveries/{run_id}/tracks/{track}/stages/{stage}/reopen",
+        ),
+        ("POST", "/api/discoveries/{run_id}/overrides"),
+        ("DELETE", "/api/discoveries/{run_id}/overrides/{override_id}"),
+        ("POST", "/api/discoveries/{run_id}/decisions"),
+        ("POST", "/api/discoveries/{run_id}/recompute"),
         ("POST", "/api/discoveries/{run_id}/abandon"),
     }
 
@@ -4555,11 +5168,8 @@ def test_track_confirmation_duplicate_and_two_session_race(
         session.commit()
     engine.dispose()
 
-    def execute(session, stage_id: int) -> None:
-        stage = session.get(DiscoveryStage, stage_id)
-        assert stage is not None
-        stage.status = "waiting_confirmation"
-        stage.updated_at = SNAPSHOT_AT
+    def execute(context):
+        return _passing_track_outcome(context)
 
     app = create_app(
         db_path=db_path,
@@ -4883,14 +5493,11 @@ def test_track_executor_failure_does_not_strand_sibling_tracks(
 
     executed: list[str] = []
 
-    def execute(session, stage_id: int) -> None:
-        stage = session.get(DiscoveryStage, stage_id)
-        assert stage is not None
-        executed.append(stage.track)
-        if stage.track == "deep_value":
+    def execute(context):
+        executed.append(context.track)
+        if context.track == "deep_value":
             raise RuntimeError("deep value failed")
-        stage.status = "waiting_confirmation"
-        stage.updated_at = SNAPSHOT_AT
+        return _passing_track_outcome(context)
 
     app = create_app(
         db_path=db_path,
@@ -5045,13 +5652,14 @@ def test_integrity_race_winner_redispatches_failed_original_queue(
     assert len(starts) == 2
 
 
-def test_lifespan_waits_for_discovery_workers_before_dispose(
+def test_lifespan_bounds_discovery_worker_shutdown(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from threading import Event, Thread
 
     from fastapi.testclient import TestClient
 
+    from app import discovery_routes
     from app.main import create_app
     from jobs import discovery as discovery_job
     from market.quotes import FakeQuoteClient
@@ -5060,14 +5668,23 @@ def test_lifespan_waits_for_discovery_workers_before_dispose(
     _seed_api_snapshot(db_path)
     entered = Event()
     release_worker = Event()
+    worker_finished = Event()
     original = discovery_job.classify_common
+    original_drain = discovery_routes._drain
 
     def blocked_classifier(*args, **kwargs):
         entered.set()
         assert release_worker.wait(5)
         return original(*args, **kwargs)
 
+    def observed_drain(*args):
+        try:
+            return original_drain(*args)
+        finally:
+            worker_finished.set()
+
     monkeypatch.setattr(discovery_job, "classify_common", blocked_classifier)
+    monkeypatch.setattr(discovery_routes, "_drain", observed_drain)
     first_app = create_app(
         db_path=db_path,
         quote_client=FakeQuoteClient(),
@@ -5094,9 +5711,9 @@ def test_lifespan_waits_for_discovery_workers_before_dispose(
 
         closer = Thread(target=shutdown)
         closer.start()
-        assert not shutdown_finished.wait(0.1)
+        assert shutdown_finished.wait(2)
         release_worker.set()
-        assert shutdown_finished.wait(5)
+        assert worker_finished.wait(5)
         closer.join()
         with first_app.state.discovery_workers_lock:
             assert not first_app.state.discovery_workers
@@ -5115,7 +5732,7 @@ def test_lifespan_waits_for_discovery_workers_before_dispose(
     with TestClient(second_app) as second_client:
         current = second_client.get("/api/discoveries/current")
         assert current.status_code == 200
-        assert current.json()["status"] == "waiting_confirmation"
+        assert current.json()["status"] == "failed"
         with second_app.state.discovery_workers_lock:
             assert not second_app.state.discovery_workers
 
