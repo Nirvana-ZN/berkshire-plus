@@ -70,6 +70,7 @@ def company(
     name: str | None = None,
     industry: str | None = "制造业",
     amount: Decimal | None = Decimal("10.2500"),
+    price: Decimal | None = Decimal("12.50"),
     source: str = "annual-report",
     as_of: str = "2025-12-31",
     recent_listing: bool = False,
@@ -84,17 +85,31 @@ def company(
         security_status=security_status
         or {
             "exchange": code.rsplit(".", 1)[-1],
+            "listing_date": "2026-08-01" if recent_listing else "2000-01-01",
             "is_st": False,
             "is_delisting": False,
-            "is_suspended": False,
+            "trading_status": "trading",
+            "last_trade_date": "2026-09-17",
+            "industry_version": "test-industry-v1",
+            "industry_as_of": "2026-09-17",
+            "security_source": "test-exchange",
         },
         fields={
             "amount": amount,
+            "price": price,
             "listing_date": "2026-08-01" if recent_listing else "2000-01-01",
             "recent_listing": recent_listing,
         },
-        sources={"amount": source, "listing_date": "exchange"},
-        as_of={"amount": as_of, "listing_date": "2026-09-17"},
+        sources={
+            "amount": source,
+            "price": "test-market",
+            "listing_date": "exchange",
+        },
+        as_of={
+            "amount": as_of,
+            "price": "2026-09-17",
+            "listing_date": "2026-09-17",
+        },
     )
 
 

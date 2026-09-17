@@ -18,6 +18,7 @@ JOB_TYPE_FUNNEL = "funnel"
 JOB_TYPE_RESEARCH = "research"
 JOB_TYPE_REVIEW = "review"
 JOB_TYPE_DISCOVERY_DATA = "discovery_data"
+JOB_TYPE_DISCOVERY = "discovery"
 LOCK_ROW_ID = 1
 ACTIVE_STATUSES = ("queued", "running")
 
@@ -32,6 +33,9 @@ def ensure_lock_row(session: Session) -> JobLock:
 
 
 def clear_stale_lock(session: Session) -> None:
+    # Local import registers discovery tables without creating an app-model cycle.
+    from app.discovery_models import DiscoveryCommonStage, DiscoveryStage
+
     ensure_lock_row(session)
     leftover = session.scalars(
         select(ScreenRun).where(ScreenRun.status.in_(ACTIVE_STATUSES))
@@ -78,6 +82,26 @@ def clear_stale_lock(session: Session) -> None:
             fill.updated_at = interrupted_at
             if fill.last_error is None:
                 fill.last_error = "进程重启，任务已暂停"
+    interrupted_stages = [
+        *session.scalars(
+            select(DiscoveryCommonStage).where(
+                DiscoveryCommonStage.status == "running",
+                DiscoveryCommonStage.superseded_at.is_(None),
+            )
+        ).all(),
+        *session.scalars(
+            select(DiscoveryStage).where(
+                DiscoveryStage.status == "running",
+                DiscoveryStage.superseded_at.is_(None),
+            )
+        ).all(),
+    ]
+    for stage in interrupted_stages:
+        stage.status = "failed"
+        stage.failure_kind = "transient"
+        if stage.error is None:
+            stage.error = "进程重启，任务中断"
+        stage.updated_at = interrupted_at
     row = session.get(JobLock, LOCK_ROW_ID)
     if row is not None:
         row.job_id = None
