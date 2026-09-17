@@ -92,6 +92,33 @@ def _ensure_discovery_indexes(engine: Engine) -> None:
         )
 
 
+def _ensure_discovery_snapshot_columns(engine: Engine) -> None:
+    """Add Task 3 provenance columns without inventing historical values."""
+
+    from sqlalchemy import text
+
+    wanted = {
+        "discovery_runs": {"trading_dates_json": "TEXT"},
+        "discovery_input_snapshots": {"ruler_versions_json": "TEXT"},
+    }
+    with engine.begin() as conn:
+        for table, columns in wanted.items():
+            names = {
+                row[1]
+                for row in conn.execute(
+                    text(f'PRAGMA table_info("{table}")')
+                ).all()
+            }
+            for column, sql_type in columns.items():
+                if names and column not in names:
+                    conn.execute(
+                        text(
+                            f'ALTER TABLE "{table}" ADD COLUMN '
+                            f'"{column}" {sql_type}'
+                        )
+                    )
+
+
 def _ensure_research_columns(engine: Engine) -> None:
     from sqlalchemy import text
 
@@ -496,6 +523,7 @@ def init_db(db_path: Path | None = None) -> Engine:
 
     engine = create_db_engine(db_path)
     Base.metadata.create_all(engine)
+    _ensure_discovery_snapshot_columns(engine)
     _ensure_discovery_indexes(engine)
     _ensure_research_columns(engine)
     _ensure_listed_year(engine)

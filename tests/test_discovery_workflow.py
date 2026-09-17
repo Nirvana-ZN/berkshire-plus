@@ -1,4 +1,7 @@
-from datetime import datetime, timezone
+from dataclasses import replace
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
+import json
 from pathlib import Path
 
 import pytest
@@ -6,6 +9,14 @@ from sqlalchemy import inspect, text
 from sqlalchemy.exc import IntegrityError
 
 from app.db import create_session_factory, init_db
+from tests.discovery_helpers import (
+    RULER_IDS,
+    SNAPSHOT_AT,
+    add_unfrozen_run,
+    company,
+    freeze_one,
+    versions,
+)
 
 
 EXPECTED_COLUMNS = {
@@ -25,6 +36,7 @@ EXPECTED_COLUMNS = {
         "deep_value_ruler_version_id",
         "garp_ruler_version_id",
         "algorithm_version",
+        "trading_dates_json",
         "input_fingerprint",
         "error",
         "replay_of_run_id",
@@ -42,6 +54,7 @@ EXPECTED_COLUMNS = {
         "data_version",
         "financial_version",
         "valuation_version",
+        "ruler_versions_json",
         "algorithm_version",
         "input_fingerprint",
         "snapshot_at",
@@ -250,6 +263,11 @@ def test_discovery_schema_has_all_tables_columns_foreign_keys_and_index(
         assert expected == {
             column["name"] for column in schema.get_columns(table)
         }, table
+    assert next(
+        column
+        for column in schema.get_columns("discovery_input_snapshots")
+        if column["name"] == "ruler_versions_json"
+    )["nullable"] is False
 
     for table in {
         "discovery_input_snapshots",
@@ -443,6 +461,9 @@ def test_discovery_composite_keys_reject_duplicates(tmp_path: Path) -> None:
                 "data_version": "d1",
                 "financial_version": "f1",
                 "valuation_version": "v1",
+                "ruler_versions_json": (
+                    '{"deep_value":1,"garp":1,"quality_discount":1}'
+                ),
                 "algorithm_version": "a1",
                 "input_fingerprint": "company-1",
                 "snapshot_at": now,
@@ -861,6 +882,9 @@ def test_deleting_run_cascades_workflow_rows_and_preserves_research(
                 data_version="d1",
                 financial_version="f1",
                 valuation_version="v1",
+                ruler_versions_json=(
+                    '{"deep_value":1,"garp":1,"quality_discount":1}'
+                ),
                 algorithm_version="a1",
                 input_fingerprint="company",
                 snapshot_at=now,
@@ -2154,3 +2178,809 @@ def test_historical_read_rejects_non_finite_numbers(value: float) -> None:
 
     with pytest.raises(TypeError, match="finite"):
         read_historical({"metric": value})
+
+
+def test_snapshot_canonical_json_supports_financial_primitives() -> None:
+    from discovery.snapshot import canonical_json
+
+    value = {
+        "amount": Decimal("10.2500"),
+        "as_of": date(2025, 12, 31),
+        "missing": None,
+        "snapshot": datetime(
+            2026, 9, 17, 11, 0, 0, 123000, tzinfo=timezone(timedelta(hours=8))
+        ),
+        "中文": "值",
+    }
+
+    assert canonical_json(value) == (
+        '{"amount":"10.25","as_of":"2025-12-31","missing":null,'
+        '"snapshot":"2026-09-17T03:00:00.123000Z","中文":"值"}'
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        datetime(2026, 9, 17, 3, 0),
+        float("nan"),
+        float("inf"),
+        Decimal("NaN"),
+        object(),
+        {1: "not-a-string-key"},
+    ],
+)
+def test_snapshot_canonical_json_rejects_unsafe_values(value: object) -> None:
+    from discovery.snapshot import canonical_json
+
+    with pytest.raises((TypeError, ValueError)):
+        canonical_json({"value": value})
+
+
+def test_snapshot_canonical_json_rejects_cycles() -> None:
+    from discovery.snapshot import canonical_json
+
+    cyclic: dict[str, object] = {}
+    cyclic["self"] = cyclic
+    with pytest.raises(TypeError, match="cycles"):
+        canonical_json(cyclic)
+
+
+def test_freeze_loads_only_copied_persisted_inputs(tmp_path: Path) -> None:
+    from app.models import (
+        DiscoveryDataFill,
+        DiscoveryUniverseSecurity,
+        Financial,
+    )
+    from discovery.snapshot import (
+        CompanySnapshotInput,
+        freeze_inputs,
+        load_frozen_inputs,
+    )
+
+    engine = init_db(tmp_path / "snapshot-copy.db")
+    SessionLocal = create_session_factory(engine)
+    with SessionLocal() as session:
+        fill = DiscoveryDataFill(
+            status="completed",
+            total=2,
+            completed=2,
+            failed=0,
+            request_count=2,
+            daily_budget=100,
+            started_at=SNAPSHOT_AT,
+            updated_at=SNAPSHOT_AT,
+            snapshot_status="ready",
+        )
+        session.add(fill)
+        session.flush()
+        financials = [
+            Financial(
+                code="000001.SZ",
+                period="2025",
+                period_type="annual",
+                net_income=Decimal("123.4500"),
+                source_as_of="2025-12-31",
+            ),
+            Financial(
+                code="600000.SH",
+                period="2025",
+                period_type="annual",
+                net_income=None,
+                source_as_of="2025-12-31",
+            ),
+        ]
+        securities = [
+            DiscoveryUniverseSecurity(
+                fill_id=fill.id,
+                code="000001.SZ",
+                name="平安银行",
+                industry="银行",
+                exchange="SZ",
+                listing_date="1991-04-03",
+                is_st=False,
+                is_delisting=False,
+                trading_status="trading",
+                is_suspended=False,
+                last_trade_date="2026-09-17",
+                provenance="eastmoney",
+                source_as_of="2026-09-17",
+                snapshot_at=SNAPSHOT_AT,
+            ),
+            DiscoveryUniverseSecurity(
+                fill_id=fill.id,
+                code="600000.SH",
+                name="近期上市",
+                industry="制造业",
+                exchange="SH",
+                listing_date="2026-08-01",
+                is_st=False,
+                is_delisting=False,
+                trading_status="trading",
+                is_suspended=False,
+                last_trade_date="2026-09-17",
+                provenance="eastmoney",
+                source_as_of="2026-09-17",
+                snapshot_at=SNAPSHOT_AT,
+            ),
+        ]
+        session.add_all([*financials, *securities])
+        run = add_unfrozen_run(session, week_key="2026-W40")
+        inputs = [
+            CompanySnapshotInput(
+                code=security.code,
+                name=security.name,
+                industry=security.industry,
+                security_status={
+                    "exchange": security.exchange,
+                    "trading_status": security.trading_status,
+                    "is_suspended": security.is_suspended,
+                },
+                fields={
+                    "net_income": financial.net_income,
+                    "listing_date": security.listing_date,
+                    "recent_listing": security.code == "600000.SH",
+                },
+                sources={
+                    "net_income": "annual-report",
+                    "listing_date": security.provenance,
+                },
+                as_of={
+                    "net_income": financial.source_as_of,
+                    "listing_date": security.source_as_of,
+                },
+            )
+            for security, financial in zip(securities, financials, strict=True)
+        ]
+        freeze_inputs(
+            session,
+            run,
+            inputs,
+            versions(),
+            {"SH": ["2026-09-16", "2026-09-17"], "SZ": ["2026-09-17"]},
+            snapshot_at=SNAPSHOT_AT,
+        )
+        run_id = run.id
+        session.commit()
+
+        financials[0].net_income = Decimal("999")
+        securities[0].name = "被修改"
+        securities[1].listing_date = None
+        session.commit()
+
+        loaded = load_frozen_inputs(session, run_id)
+        assert [item.code for item in loaded.companies] == [
+            "000001.SZ",
+            "600000.SH",
+        ]
+        first, second = loaded.companies
+        assert first.name == "平安银行"
+        assert first.fields["net_income"] == "123.45"
+        assert second.fields["net_income"] is None
+        assert second.fields["recent_listing"] is True
+        assert second.fields["listing_date"] == "2026-08-01"
+        assert loaded.trading_dates == {
+            "SH": ("2026-09-16", "2026-09-17"),
+            "SZ": ("2026-09-17",),
+        }
+        assert loaded.ruler_version_ids == RULER_IDS
+
+
+def test_snapshot_fingerprint_is_order_independent_and_semantic(
+    tmp_path: Path,
+) -> None:
+    from discovery.snapshot import freeze_inputs
+
+    engine = init_db(tmp_path / "snapshot-fingerprint.db")
+    SessionLocal = create_session_factory(engine)
+    base = [
+        company("600000.SH"),
+        company("000001.SZ", amount=None, recent_listing=True),
+    ]
+
+    def frozen_fingerprint(
+        week: int,
+        companies,
+        *,
+        supplied_versions=None,
+        trading_dates=None,
+    ) -> str:
+        actual_versions = supplied_versions or versions()
+        with SessionLocal() as session:
+            run = add_unfrozen_run(
+                session,
+                week_key=f"2026-W{week}",
+                data_version=actual_versions.data_version,
+                financial_version=actual_versions.financial_version,
+                valuation_version=actual_versions.valuation_version,
+                ruler_ids=dict(actual_versions.ruler_version_ids),
+            )
+            freeze_inputs(
+                session,
+                run,
+                companies,
+                actual_versions,
+                trading_dates or {"SH": ["2026-09-17"], "SZ": ["2026-09-17"]},
+                snapshot_at=SNAPSHOT_AT,
+            )
+            return run.input_fingerprint
+
+    expected = frozen_fingerprint(41, base)
+    assert frozen_fingerprint(42, reversed(base)) == expected
+
+    changed = [
+        replace(base[0], sources={**base[0].sources, "amount": "restated"}),
+        replace(base[0], as_of={**base[0].as_of, "amount": "2026-01-01"}),
+        replace(
+            base[0],
+            security_status={**base[0].security_status, "is_st": True},
+        ),
+        replace(base[0], fields={key: value for key, value in base[0].fields.items() if key != "amount"}),
+    ]
+    for week, first in enumerate(changed, start=43):
+        assert frozen_fingerprint(week, [first, base[1]]) != expected
+    assert (
+        frozen_fingerprint(
+            47,
+            base,
+            supplied_versions=versions(data_version="data-v2"),
+        )
+        != expected
+    )
+    assert (
+        frozen_fingerprint(
+            48,
+            base,
+            trading_dates={"SH": ["2026-09-16"], "SZ": ["2026-09-17"]},
+        )
+        != expected
+    )
+
+
+def test_freeze_validates_everything_before_session_mutation(
+    tmp_path: Path,
+) -> None:
+    from sqlalchemy import select
+
+    from app.discovery_models import DiscoveryInputSnapshot
+    from discovery.snapshot import freeze_inputs
+
+    engine = init_db(tmp_path / "snapshot-atomic.db")
+    SessionLocal = create_session_factory(engine)
+    with SessionLocal() as session:
+        run = add_unfrozen_run(session, week_key="2026-W49")
+        bad = replace(company("000001.SZ"), fields={"bad": object()})
+
+        with pytest.raises(TypeError):
+            freeze_inputs(
+                session,
+                run,
+                [company("600000.SH"), bad],
+                versions(),
+                {"SH": ["2026-09-17"], "SZ": ["2026-09-17"]},
+                snapshot_at=SNAPSHOT_AT,
+            )
+
+        assert session.scalars(select(DiscoveryInputSnapshot)).all() == []
+        assert not session.new
+        assert run.input_fingerprint is None
+        assert run.snapshot_at is None
+        assert run.trading_dates_json is None
+
+
+@pytest.mark.parametrize("inputs", [[], [company("600000.SH"), company("600000.SH")]])
+def test_freeze_rejects_empty_or_duplicate_universe_before_writes(
+    tmp_path: Path, inputs
+) -> None:
+    from discovery.snapshot import freeze_inputs
+
+    engine = init_db(tmp_path / f"snapshot-invalid-{len(inputs)}.db")
+    SessionLocal = create_session_factory(engine)
+    with SessionLocal() as session:
+        run = add_unfrozen_run(session, week_key="2026-W50")
+        with pytest.raises(ValueError):
+            freeze_inputs(
+                session,
+                run,
+                inputs,
+                versions(),
+                {"SH": ["2026-09-17"]},
+                snapshot_at=SNAPSHOT_AT,
+            )
+        assert run.input_fingerprint is None
+        assert not session.new
+
+
+def test_freeze_rejects_metadata_mismatch_and_refreeze(tmp_path: Path) -> None:
+    from discovery.snapshot import freeze_inputs
+
+    engine = init_db(tmp_path / "snapshot-immutable.db")
+    SessionLocal = create_session_factory(engine)
+    with SessionLocal() as session:
+        run = add_unfrozen_run(session, week_key="2026-W51")
+        with pytest.raises(ValueError, match="metadata"):
+            freeze_inputs(
+                session,
+                run,
+                [company("600000.SH")],
+                versions(data_version="data-v2"),
+                {"SH": ["2026-09-17"]},
+                snapshot_at=SNAPSHOT_AT,
+            )
+        freeze_inputs(
+            session,
+            run,
+            [company("600000.SH")],
+            versions(),
+            {"SH": ["2026-09-17"]},
+            snapshot_at=SNAPSHOT_AT,
+        )
+        with pytest.raises(ValueError, match="already frozen"):
+            freeze_inputs(
+                session,
+                run,
+                [company("600000.SH")],
+                versions(),
+                {"SH": ["2026-09-17"]},
+                snapshot_at=SNAPSHOT_AT,
+            )
+
+
+def test_historical_replay_loads_all_attempts_without_current_engine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.discovery_models import (
+        DiscoveryCommonResult,
+        DiscoveryDecision,
+        DiscoveryEvidence,
+        DiscoveryResult,
+    )
+    from discovery.snapshot import load_historical_replay
+
+    engine = init_db(tmp_path / "historical-replay.db")
+    SessionLocal = create_session_factory(engine)
+    with SessionLocal() as session:
+        run = add_unfrozen_run(session, week_key="2026-W52")
+        common_one = _add_common_stage(session, run.id, attempt=1)
+        common_one.status = "failed"
+        common_one.failure_kind = "transient"
+        common_one.superseded_at = SNAPSHOT_AT
+        common_two = _add_common_stage(session, run.id, attempt=2)
+        common_two.status = "confirmed"
+        gate_one = _add_track_stage(session, run.id, attempt=1)
+        gate_one.status = "failed"
+        gate_one.failure_kind = "transient"
+        gate_one.superseded_at = SNAPSHOT_AT
+        gate_two = _add_track_stage(session, run.id, attempt=2)
+        gate_two.status = "confirmed"
+        competition = _add_track_stage(
+            session, run.id, stage="competition", attempt=1
+        )
+        competition.status = "confirmed"
+        session.add_all(
+            [
+                DiscoveryCommonResult(
+                    run_id=run.id,
+                    attempt=1,
+                    code="600000.SH",
+                    verdict="drop",
+                    reason="old",
+                    metrics_json='{"score":1}',
+                    created_at=SNAPSHOT_AT,
+                ),
+                DiscoveryCommonResult(
+                    run_id=run.id,
+                    attempt=2,
+                    code="600000.SH",
+                    verdict="pass",
+                    metrics_json='{"score":2}',
+                    created_at=SNAPSHOT_AT,
+                ),
+                DiscoveryResult(
+                    run_id=run.id,
+                    track="garp",
+                    stage="track_gate",
+                    attempt=1,
+                    code="600000.SH",
+                    verdict="drop",
+                    metrics_json='{"score":1}',
+                    rank=2,
+                    created_at=SNAPSHOT_AT,
+                ),
+                DiscoveryResult(
+                    run_id=run.id,
+                    track="garp",
+                    stage="track_gate",
+                    attempt=2,
+                    code="600000.SH",
+                    verdict="pass",
+                    metrics_json='{"score":2}',
+                    rank=1,
+                    created_at=SNAPSHOT_AT,
+                ),
+                DiscoveryDecision(
+                    run_id=run.id,
+                    track="garp",
+                    competition_attempt=1,
+                    competition_stage_id=competition.id,
+                    code="600000.SH",
+                    decision="keep",
+                    keep_note="persisted",
+                    created_at=SNAPSHOT_AT,
+                ),
+                DiscoveryEvidence(
+                    run_id=run.id,
+                    track="garp",
+                    competition_attempt=1,
+                    competition_stage_id=competition.id,
+                    code="600000.SH",
+                    ruler_version_id=1,
+                    rule_version="retired-rules",
+                    kind="risk",
+                    rule_id="leverage",
+                    input_fields_json='["debt"]',
+                    display_text="Persisted risk.",
+                    as_of="2025-12-31",
+                    data_completeness="complete",
+                    created_at=SNAPSHOT_AT,
+                ),
+            ]
+        )
+        session.commit()
+
+        monkeypatch.setattr(
+            "discovery.builds.validate_recomputation",
+            lambda *args, **kwargs: pytest.fail("current engine invoked"),
+        )
+        replay = load_historical_replay(session, run.id)
+
+    assert [row["attempt"] for row in replay.common_results] == [1, 2]
+    assert [row["attempt"] for row in replay.track_results] == [1, 2]
+    assert replay.common_results[0]["superseded"] is True
+    assert replay.track_results[0]["superseded"] is True
+    assert replay.decisions[0]["keep_note"] == "persisted"
+    assert replay.evidence[0]["rule_version"] == "retired-rules"
+    with pytest.raises(TypeError):
+        replay.track_results[0]["verdict"] = "changed"
+
+
+def test_existing_discovery_snapshot_schema_upgrades_idempotently(
+    tmp_path: Path,
+) -> None:
+    from sqlalchemy import create_engine
+
+    from app.discovery_models import DiscoveryInputSnapshot, DiscoveryRun
+    from discovery.snapshot import load_frozen_inputs
+
+    db_path = tmp_path / "prior-discovery-schema.db"
+    legacy = create_engine(f"sqlite:///{db_path.as_posix()}")
+    with legacy.begin() as conn:
+        conn.execute(
+            text(
+                "CREATE TABLE users ("
+                "id INTEGER PRIMARY KEY, name VARCHAR NOT NULL)"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE TABLE ruler_versions ("
+                "id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, "
+                "digest VARCHAR NOT NULL, reason VARCHAR NOT NULL, "
+                "payload_json TEXT NOT NULL, activated_at DATETIME NOT NULL)"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE TABLE discovery_runs ("
+                "id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, "
+                "week_key VARCHAR NOT NULL, current BOOLEAN NOT NULL, "
+                "status VARCHAR NOT NULL, created_at DATETIME NOT NULL, "
+                "updated_at DATETIME NOT NULL, snapshot_at DATETIME, "
+                "data_version VARCHAR NOT NULL, "
+                "financial_version VARCHAR NOT NULL, "
+                "valuation_version VARCHAR NOT NULL, "
+                "quality_discount_ruler_version_id INTEGER, "
+                "deep_value_ruler_version_id INTEGER, "
+                "garp_ruler_version_id INTEGER, "
+                "algorithm_version VARCHAR NOT NULL, "
+                "input_fingerprint VARCHAR, error TEXT, replay_of_run_id INTEGER)"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE TABLE discovery_input_snapshots ("
+                "id INTEGER PRIMARY KEY, run_id INTEGER NOT NULL, "
+                "code VARCHAR NOT NULL, name VARCHAR NOT NULL, industry VARCHAR, "
+                "security_status VARCHAR NOT NULL, fields_json TEXT NOT NULL, "
+                "sources_json TEXT NOT NULL, as_of_json TEXT NOT NULL, "
+                "data_version VARCHAR NOT NULL, "
+                "financial_version VARCHAR NOT NULL, "
+                "valuation_version VARCHAR NOT NULL, "
+                "algorithm_version VARCHAR NOT NULL, "
+                "input_fingerprint VARCHAR NOT NULL, "
+                "snapshot_at DATETIME NOT NULL, "
+                "UNIQUE (run_id, code), "
+                "FOREIGN KEY(run_id) REFERENCES discovery_runs(id) "
+                "ON DELETE CASCADE)"
+            )
+        )
+        conn.execute(text("INSERT INTO users VALUES (1, '本机用户')"))
+        conn.execute(
+            text(
+                "INSERT INTO ruler_versions VALUES "
+                "(1, 1, 'old', 'legacy', '{}', '2026-09-17 03:00:00')"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO discovery_runs VALUES ("
+                "1, 1, '2026-W37', 0, 'completed', "
+                "'2026-09-17 03:00:00', '2026-09-17 03:00:00', "
+                "'2026-09-17 03:00:00', 'd1', 'f1', 'v1', 1, 1, 1, "
+                "'discovery-v1', 'legacy-run-fingerprint', NULL, NULL)"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO discovery_input_snapshots VALUES ("
+                "1, 1, '600000.SH', '旧快照', '制造业', '{}', '{}', '{}', '{}', "
+                "'d1', 'f1', 'v1', 'discovery-v1', "
+                "'legacy-row-fingerprint', '2026-09-17 03:00:00')"
+            )
+        )
+    legacy.dispose()
+
+    init_db(db_path).dispose()
+    engine = init_db(db_path)
+    schema = inspect(engine)
+    assert "trading_dates_json" in {
+        column["name"] for column in schema.get_columns("discovery_runs")
+    }
+    assert "ruler_versions_json" in {
+        column["name"]
+        for column in schema.get_columns("discovery_input_snapshots")
+    }
+
+    SessionLocal = create_session_factory(engine)
+    with SessionLocal() as session:
+        run = session.get(DiscoveryRun, 1)
+        snapshot = session.get(DiscoveryInputSnapshot, 1)
+        assert run is not None and run.trading_dates_json is None
+        assert snapshot is not None and snapshot.ruler_versions_json is None
+        with pytest.raises(ValueError, match="incomplete frozen inputs"):
+            load_frozen_inputs(session, 1)
+
+
+def test_freeze_rejects_wrong_session_and_detached_run_without_writes(
+    tmp_path: Path,
+) -> None:
+    from sqlalchemy import func, select
+
+    from app.discovery_models import DiscoveryInputSnapshot, DiscoveryRun
+    from discovery.snapshot import freeze_inputs
+
+    engine = init_db(tmp_path / "snapshot-session-ownership.db")
+    SessionLocal = create_session_factory(engine)
+    with SessionLocal() as owner:
+        run = add_unfrozen_run(owner, week_key="2026-W53")
+        owner.commit()
+        original = (run.input_fingerprint, run.trading_dates_json, run.snapshot_at)
+
+        with SessionLocal() as wrong:
+            with pytest.raises(ValueError, match="supplied session"):
+                freeze_inputs(
+                    wrong,
+                    run,
+                    [company("600000.SH")],
+                    versions(),
+                    {"SH": ["2026-09-17"]},
+                    snapshot_at=SNAPSHOT_AT,
+                )
+            assert not wrong.new
+            wrong.commit()
+
+        owner.expunge(run)
+        with pytest.raises(ValueError, match="supplied session"):
+            freeze_inputs(
+                owner,
+                run,
+                [company("600000.SH")],
+                versions(),
+                {"SH": ["2026-09-17"]},
+                snapshot_at=SNAPSHOT_AT,
+            )
+        owner.commit()
+
+    with SessionLocal() as check:
+        assert check.scalar(
+            select(func.count()).select_from(DiscoveryInputSnapshot)
+        ) == 0
+        persisted = check.get(DiscoveryRun, run.id)
+        assert persisted is not None
+        assert (
+            persisted.input_fingerprint,
+            persisted.trading_dates_json,
+            persisted.snapshot_at,
+        ) == original
+
+
+def test_bad_later_company_cannot_commit_partial_snapshot(tmp_path: Path) -> None:
+    from sqlalchemy import func, select
+
+    from app.discovery_models import DiscoveryInputSnapshot, DiscoveryRun
+    from discovery.snapshot import freeze_inputs
+
+    engine = init_db(tmp_path / "snapshot-late-validation.db")
+    SessionLocal = create_session_factory(engine)
+    with SessionLocal() as session:
+        run = add_unfrozen_run(session, week_key="2026-W54")
+        run_id = run.id
+        original = (run.input_fingerprint, run.trading_dates_json, run.snapshot_at)
+        malformed = replace(company("000001.SZ"), sources={"amount": object()})
+        with pytest.raises(TypeError):
+            freeze_inputs(
+                session,
+                run,
+                [company("600000.SH"), malformed],
+                versions(),
+                {"SH": ["2026-09-17"], "SZ": ["2026-09-17"]},
+                snapshot_at=SNAPSHOT_AT,
+            )
+        assert not session.new
+        session.commit()
+
+    with SessionLocal() as check:
+        assert check.scalar(
+            select(func.count()).select_from(DiscoveryInputSnapshot)
+        ) == 0
+        persisted = check.get(DiscoveryRun, run_id)
+        assert persisted is not None
+        assert (
+            persisted.input_fingerprint,
+            persisted.trading_dates_json,
+            persisted.snapshot_at,
+        ) == original
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "payload",
+        "row_metadata",
+        "row_fingerprint",
+        "run_fingerprint",
+        "calendar",
+        "row_timestamp",
+        "run_timestamp",
+    ],
+)
+def test_load_frozen_inputs_rejects_persisted_tampering(
+    tmp_path: Path, tamper: str
+) -> None:
+    from sqlalchemy import select
+
+    from app.discovery_models import DiscoveryInputSnapshot
+    from discovery.snapshot import load_frozen_inputs
+
+    engine = init_db(tmp_path / f"snapshot-tamper-{tamper}.db")
+    SessionLocal = create_session_factory(engine)
+    with SessionLocal() as session:
+        run = freeze_one(session, week_key=f"2026-{tamper}")
+        row = session.scalar(
+            select(DiscoveryInputSnapshot).where(
+                DiscoveryInputSnapshot.run_id == run.id
+            )
+        )
+        assert row is not None
+        if tamper == "payload":
+            row.fields_json = '{"amount":null,"recent_listing":false}'
+        elif tamper == "row_metadata":
+            row.financial_version = "tampered"
+        elif tamper == "row_fingerprint":
+            row.input_fingerprint = "0" * 64
+        elif tamper == "run_fingerprint":
+            run.input_fingerprint = "0" * 64
+        elif tamper == "calendar":
+            run.trading_dates_json = '{"SH":["2026-09-15"]}'
+        elif tamper == "row_timestamp":
+            row.snapshot_at = SNAPSHOT_AT + timedelta(seconds=1)
+        else:
+            run.snapshot_at = SNAPSHOT_AT + timedelta(seconds=1)
+        session.commit()
+        session.expire_all()
+
+        with pytest.raises(ValueError, match="integrity"):
+            load_frozen_inputs(session, run.id)
+
+
+def test_load_frozen_inputs_preserves_missing_and_absent_fields(
+    tmp_path: Path,
+) -> None:
+    from discovery.snapshot import load_frozen_inputs
+
+    engine = init_db(tmp_path / "snapshot-missing-absent.db")
+    SessionLocal = create_session_factory(engine)
+    with SessionLocal() as session:
+        run = freeze_one(session)
+        session.commit()
+        loaded = load_frozen_inputs(session, run.id)
+
+    fields = loaded.companies[0].fields
+    assert fields["amount"] is None
+    assert "not_supplied" not in fields
+
+
+def test_historical_replay_includes_ordered_zero_result_stages(
+    tmp_path: Path,
+) -> None:
+    from discovery.snapshot import load_historical_replay
+
+    engine = init_db(tmp_path / "replay-stage-history.db")
+    SessionLocal = create_session_factory(engine)
+    with SessionLocal() as session:
+        run = add_unfrozen_run(session, week_key="2026-W55")
+        _add_common_stage(session, run.id, attempt=2)
+        first = _add_common_stage(session, run.id, attempt=1)
+        first.status = "failed"
+        first.failure_kind = "transient"
+        first.superseded_at = SNAPSHOT_AT
+        stages = [
+            _add_track_stage(
+                session,
+                run.id,
+                track="garp",
+                stage="adjudication",
+                attempt=2,
+            ),
+            _add_track_stage(
+                session,
+                run.id,
+                track="deep_value",
+                stage="competition",
+                attempt=1,
+            ),
+            _add_track_stage(
+                session,
+                run.id,
+                track="quality_discount",
+                stage="adjudication",
+                attempt=1,
+            ),
+            _add_track_stage(
+                session,
+                run.id,
+                track="garp",
+                stage="track_gate",
+                attempt=1,
+            ),
+        ]
+        stages[0].ruler_version_id = 1
+        session.commit()
+
+        replay = load_historical_replay(session, run.id)
+
+    assert [row["attempt"] for row in replay.common_stages] == [1, 2]
+    assert replay.common_stages[0]["failure_kind"] == "transient"
+    assert replay.common_stages[0]["superseded"] is True
+    assert [
+        (row["track"], row["stage"], row["attempt"])
+        for row in replay.track_stages
+    ] == [
+        ("quality_discount", "adjudication", 1),
+        ("deep_value", "competition", 1),
+        ("garp", "track_gate", 1),
+        ("garp", "adjudication", 2),
+    ]
+    assert replay.track_stages[-1]["ruler_version_id"] == 1
+    assert replay.common_results == ()
+    assert replay.track_results == ()
+
+
+def test_historical_replay_rejects_unknown_run(tmp_path: Path) -> None:
+    from discovery.snapshot import load_historical_replay
+
+    engine = init_db(tmp_path / "replay-unknown.db")
+    SessionLocal = create_session_factory(engine)
+    with SessionLocal() as session:
+        with pytest.raises(ValueError, match="run not found"):
+            load_historical_replay(session, 999_999)

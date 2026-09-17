@@ -46,6 +46,7 @@ class DiscoveryRun(Base):
         ForeignKey("ruler_versions.id"), nullable=True
     )
     algorithm_version: Mapped[str] = mapped_column(String, nullable=False)
+    trading_dates_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     input_fingerprint: Mapped[str | None] = mapped_column(String, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     replay_of_run_id: Mapped[int | None] = mapped_column(
@@ -75,6 +76,7 @@ class DiscoveryInputSnapshot(Base):
     data_version: Mapped[str] = mapped_column(String, nullable=False)
     financial_version: Mapped[str] = mapped_column(String, nullable=False)
     valuation_version: Mapped[str] = mapped_column(String, nullable=False)
+    ruler_versions_json: Mapped[str] = mapped_column(Text, nullable=False)
     algorithm_version: Mapped[str] = mapped_column(String, nullable=False)
     input_fingerprint: Mapped[str] = mapped_column(String, nullable=False)
     snapshot_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
