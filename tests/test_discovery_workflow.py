@@ -1,7 +1,6 @@
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
-import json
 from pathlib import Path
 
 import pytest
@@ -17,7 +16,6 @@ from tests.discovery_helpers import (
     freeze_one,
     versions,
 )
-
 
 EXPECTED_COLUMNS = {
     "discovery_runs": {
@@ -1190,8 +1188,8 @@ def test_discovery_constants_are_exact() -> None:
         RUN_TERMINAL_STATUSES,
         STAGE_STATUSES,
         TERMINAL_FAILURES,
-        TRACKS,
         TRACK_STAGES,
+        TRACKS,
         VERDICTS,
     )
 
@@ -2984,3 +2982,2657 @@ def test_historical_replay_rejects_unknown_run(tmp_path: Path) -> None:
     with SessionLocal() as session:
         with pytest.raises(ValueError, match="run not found"):
             load_historical_replay(session, 999_999)
+
+
+def _api_payload(
+    captured_at: datetime,
+    *,
+    financial_rows=None,
+    valuation_points=None,
+) -> str:
+    from discovery.company_payload import serialize_company_payload
+    from market.types import (
+        DiscoveryCompanyData,
+        DiscoverySourceAsOf,
+        FinancialRow,
+        SecurityState,
+        ValuationPoint,
+    )
+
+    rows = (
+        (
+            FinancialRow(
+                code="600000.SH",
+                period="2025",
+                period_type="annual",
+                net_income=Decimal("100"),
+                source_as_of="2026-03-31",
+            ),
+        )
+        if financial_rows is None
+        else financial_rows
+    )
+    points = (
+        (
+            ValuationPoint(
+                code="600000.SH",
+                month="2026-09",
+                trade_date="2026-09-17",
+                pe=Decimal("8"),
+                pb=Decimal("0.8"),
+                price=Decimal("10"),
+                source="eastmoney",
+                ratio_method="PE_TTM/PB_MRQ",
+            ),
+        )
+        if valuation_points is None
+        else valuation_points
+    )
+    return serialize_company_payload(
+        DiscoveryCompanyData(
+            code="600000.SH",
+            security_state=SecurityState(
+                code="600000.SH",
+                name="浦发银行",
+                industry="银行",
+                exchange="SH",
+                listing_date="1999-11-10",
+                is_st=False,
+                is_delisting=False,
+                trading_status="trading",
+                last_trade_date="2026-09-17",
+                industry_version="eastmoney-2026-09-17",
+                industry_as_of="2026-09-17",
+                source="eastmoney",
+                market_status_code=1,
+            ),
+            financial_rows=tuple(rows),
+            valuation_points=tuple(points),
+            request_count=1,
+            source_as_of=DiscoverySourceAsOf(
+                security="2026-09-17",
+                financial=(
+                    max(
+                        (
+                            row.source_as_of
+                            for row in rows
+                            if row.source_as_of is not None
+                        ),
+                        default=None,
+                    )
+                ),
+                valuation=(
+                    max((row.trade_date for row in points), default=None)
+                ),
+            ),
+        ),
+        captured_at=captured_at,
+    )
+
+
+def _seed_api_snapshot(db_path: Path) -> None:
+    from app.models import (
+        DiscoveryDataCheckpoint,
+        DiscoveryDataFill,
+        DiscoveryFillTradingDate,
+        DiscoveryUniverseSecurity,
+        Financial,
+        FinancialFetchCompleteness,
+        FinancialFieldProvenance,
+        RulerVersion,
+        ValuationHistory,
+        ValuationSeries,
+    )
+    from discovery.company_payload import company_payload_digest
+
+    engine = init_db(db_path)
+    SessionLocal = create_session_factory(engine)
+    with SessionLocal() as session:
+        fill = DiscoveryDataFill(
+            status="done",
+            total=1,
+            completed=1,
+            failed=0,
+            request_count=1,
+            daily_budget=100,
+            budget_day="2026-09-17",
+            daily_requests=1,
+            started_at=SNAPSHOT_AT,
+            updated_at=SNAPSHOT_AT,
+            snapshot_status="ready",
+        )
+        session.add(fill)
+        session.flush()
+        payload_json = _api_payload(SNAPSHOT_AT)
+        session.add(
+            DiscoveryUniverseSecurity(
+                fill_id=fill.id,
+                code="600000.SH",
+                name="浦发银行",
+                industry="银行",
+                exchange="SH",
+                listing_date="1999-11-10",
+                is_st=False,
+                is_delisting=False,
+                trading_status="trading",
+                is_suspended=False,
+                last_trade_date="2026-09-17",
+                industry_version="eastmoney-2026-09-17",
+                source_as_of="2026-09-17",
+                provenance="eastmoney",
+                market_status_code=1,
+                snapshot_at=SNAPSHOT_AT,
+            )
+        )
+        session.add(DiscoveryFillTradingDate(fill_id=fill.id, trade_date="2026-09-17"))
+        session.add(
+            DiscoveryDataCheckpoint(
+                fill_id=fill.id,
+                code="600000.SH",
+                status="done",
+                attempts=1,
+                next_retry_at=None,
+                valuation_points=1,
+                error=None,
+                payload_json=payload_json,
+                payload_digest=company_payload_digest(payload_json),
+                updated_at=SNAPSHOT_AT,
+            )
+        )
+        financial = Financial(
+            code="600000.SH",
+            period="2025",
+            period_type="annual",
+            net_income=Decimal("100"),
+            source_as_of="2026-03-31",
+        )
+        session.add(financial)
+        session.add(
+            FinancialFieldProvenance(
+                code=financial.code,
+                period=financial.period,
+                period_type=financial.period_type,
+                field="net_income",
+                source="discovery",
+            )
+        )
+        session.add(
+            FinancialFetchCompleteness(
+                code="600000.SH",
+                mode="discovery",
+                completed_at=SNAPSHOT_AT,
+            )
+        )
+        session.add(ValuationSeries(code="600000.SH", ratio_method="PE_TTM/PB_MRQ"))
+        session.flush()
+        session.add(
+            ValuationHistory(
+                code="600000.SH",
+                month="2026-09",
+                trade_date="2026-09-17",
+                pe=Decimal("8"),
+                pb=Decimal("0.8"),
+                price=Decimal("10"),
+                source="eastmoney",
+                ratio_method="PE_TTM/PB_MRQ",
+                fetched_at=SNAPSHOT_AT,
+            )
+        )
+        session.add(
+            RulerVersion(
+                user_id=1,
+                digest="legacy-funnel",
+                reason="旧漏斗尺子",
+                payload_json='{"funnel":{"ROE_FLOOR":"0.1"}}',
+                activated_at=SNAPSHOT_AT,
+            )
+        )
+        session.commit()
+    engine.dispose()
+
+
+def _add_second_api_fill(
+    db_path: Path,
+    *,
+    valuation_points: int,
+    payload_json: str | None = None,
+) -> tuple[datetime, datetime]:
+    from app.models import (
+        DiscoveryDataCheckpoint,
+        DiscoveryDataFill,
+        DiscoveryFillTradingDate,
+        DiscoveryUniverseSecurity,
+    )
+    from discovery.company_payload import company_payload_digest
+
+    started = SNAPSHOT_AT + timedelta(hours=1)
+    completed = SNAPSHOT_AT + timedelta(hours=2)
+    engine = init_db(db_path)
+    SessionLocal = create_session_factory(engine)
+    with SessionLocal() as session:
+        fill = DiscoveryDataFill(
+            status="done",
+            total=1,
+            completed=1,
+            failed=0,
+            request_count=1,
+            daily_budget=100,
+            budget_day="2026-09-17",
+            daily_requests=1,
+            started_at=started,
+            run_started_at=started,
+            updated_at=completed,
+            snapshot_status="ready",
+        )
+        session.add(fill)
+        session.flush()
+        checkpoint_payload = (
+            _api_payload(
+                completed,
+                financial_rows=(),
+                valuation_points=(),
+            )
+            if payload_json is None
+            else payload_json
+        )
+        session.add_all(
+            [
+                DiscoveryUniverseSecurity(
+                    fill_id=fill.id,
+                    code="600000.SH",
+                    name="浦发银行",
+                    industry="银行",
+                    exchange="SH",
+                    listing_date="1999-11-10",
+                    is_st=False,
+                    is_delisting=False,
+                    trading_status="trading",
+                    is_suspended=False,
+                    last_trade_date="2026-09-17",
+                    industry_version="eastmoney-2026-09-17",
+                    source_as_of="2026-09-17",
+                    provenance="eastmoney",
+                    market_status_code=1,
+                    snapshot_at=started,
+                ),
+                DiscoveryFillTradingDate(fill_id=fill.id, trade_date="2026-09-17"),
+                DiscoveryDataCheckpoint(
+                    fill_id=fill.id,
+                    code="600000.SH",
+                    status="done",
+                    attempts=1,
+                    next_retry_at=None,
+                    valuation_points=valuation_points,
+                    error=None,
+                    payload_json=checkpoint_payload,
+                    payload_digest=company_payload_digest(
+                        checkpoint_payload
+                    ),
+                    updated_at=completed,
+                ),
+            ]
+        )
+        session.commit()
+    engine.dispose()
+    return started, completed
+
+
+def test_discovery_api_create_read_confirm_and_missing_rulers(tmp_path: Path) -> None:
+    from fastapi.testclient import TestClient
+
+    from app.main import create_app
+    from market.quotes import FakeQuoteClient
+
+    db_path = tmp_path / "discovery-api.db"
+    _seed_api_snapshot(db_path)
+    app = create_app(
+        db_path=db_path,
+        quote_client=FakeQuoteClient(),
+        env_path=tmp_path / ".env",
+        allow_sync=True,
+        discovery_clock=lambda: SNAPSHOT_AT,
+    )
+    with TestClient(app) as client:
+        created = client.post("/api/discoveries", json={"sync": True})
+        assert created.status_code == 200
+        run = created.json()
+        assert run["status"] == "waiting_confirmation"
+        assert run["ruler_version_ids"] == {
+            "quality_discount": None,
+            "deep_value": None,
+            "garp": None,
+        }
+        assert client.post("/api/discoveries", json={}).json()["id"] == run["id"]
+
+        safety = client.get(
+            f"/api/discoveries/{run['id']}/stages/safety"
+        ).json()
+        assert safety["current"]["status"] == "waiting_confirmation"
+        assert [row["code"] for row in safety["pass"]] == ["600000.SH"]
+
+        confirmed = client.post(
+            f"/api/discoveries/{run['id']}/stages/safety/confirm",
+            json={"sync": True},
+        )
+        assert confirmed.status_code == 200
+        assert client.post(
+            f"/api/discoveries/{run['id']}/stages/safety/confirm",
+            json={},
+        ).status_code == 200
+        for track in ("quality_discount", "deep_value", "garp"):
+            stage = client.get(
+                f"/api/discoveries/{run['id']}/tracks/{track}"
+                "/stages/track_gate"
+            ).json()
+            assert stage["current"]["status"] == "ruler_not_ready"
+
+        from app.models import Financial, ValuationHistory
+        from discovery.snapshot import load_frozen_inputs
+
+        with app.state.session_factory() as session:
+            session.get(
+                Financial, ("600000.SH", "2025", "annual")
+            ).net_income = Decimal("999")
+            session.get(
+                ValuationHistory, ("600000.SH", "2026-09")
+            ).price = Decimal("99")
+            session.commit()
+            frozen = load_frozen_inputs(session, run["id"])
+        company = frozen.companies[0]
+        assert company.fields["price"] == "10"
+        assert (
+            company.fields["financial_history"][0]["values"]["net_income"]
+            == "100"
+        )
+        assert company.fields["financial_history"][0]["provenance"] == {
+            "net_income": ("discovery",)
+        }
+        assert company.fields["valuation_history"][0]["source"] == "eastmoney"
+        assert frozen.data_version.startswith("discovery-fill:1:")
+        assert frozen.financial_version.startswith("financial:fill:1:")
+        assert frozen.valuation_version.startswith("valuation:fill:1:")
+
+
+def test_discovery_api_rejects_bad_body_and_supports_abandon(tmp_path: Path) -> None:
+    from fastapi.testclient import TestClient
+
+    from app.main import create_app
+    from market.quotes import FakeQuoteClient
+
+    db_path = tmp_path / "discovery-abandon.db"
+    _seed_api_snapshot(db_path)
+    app = create_app(
+        db_path=db_path,
+        quote_client=FakeQuoteClient(),
+        env_path=tmp_path / ".env",
+        allow_sync=True,
+        discovery_clock=lambda: SNAPSHOT_AT,
+    )
+    with TestClient(app) as client:
+        assert client.post(
+            "/api/discoveries",
+            content="[1]",
+            headers={"content-type": "application/json"},
+        ).status_code == 400
+        created = client.post(
+            "/api/discoveries", json={"sync": True}
+        ).json()
+        abandoned = client.post(
+            f"/api/discoveries/{created['id']}/abandon", json={}
+        )
+        assert abandoned.status_code == 200
+        body = abandoned.json()
+        assert body["status"] == "abandoned"
+        assert body["tracks"] == {
+            track: {
+                "track": track,
+                "stage": None,
+                "status": None,
+                "created": False,
+            }
+            for track in ("quality_discount", "deep_value", "garp")
+        }
+        assert client.get("/api/discoveries/current").status_code == 404
+
+
+def test_three_tracks_advance_independently_with_injected_executor(
+    tmp_path: Path,
+) -> None:
+    from fastapi.testclient import TestClient
+    from sqlalchemy import select
+
+    from app.discovery_models import DiscoveryResult, DiscoveryStage
+    from app.main import create_app
+    from app.models import RulerVersion
+    from discovery.snapshot import canonical_json
+    from market.quotes import FakeQuoteClient
+
+    db_path = tmp_path / "discovery-tracks.db"
+    _seed_api_snapshot(db_path)
+    engine = init_db(db_path)
+    SessionLocal = create_session_factory(engine)
+    with SessionLocal() as session:
+        for track in ("quality_discount", "deep_value", "garp"):
+            session.add(
+                RulerVersion(
+                    user_id=1,
+                    digest=f"{track}-v1",
+                    reason="测试尺子",
+                    payload_json=canonical_json(
+                        {
+                            "scope": "weekly-discovery",
+                            "track": track,
+                            "algorithm_version": "discovery-v1",
+                        }
+                    ),
+                    activated_at=SNAPSHOT_AT,
+                )
+            )
+        session.commit()
+    engine.dispose()
+
+    executed: list[tuple[str, str]] = []
+
+    def execute(session, stage_id: int) -> None:
+        stage = session.get(DiscoveryStage, stage_id)
+        assert stage is not None
+        executed.append((stage.track, stage.stage))
+        session.add(
+            DiscoveryResult(
+                run_id=stage.run_id,
+                track=stage.track,
+                stage=stage.stage,
+                attempt=stage.attempt,
+                code="600000.SH",
+                verdict="pass",
+                reason=None,
+                metrics_json='{"score":"1"}',
+                rank=1,
+                created_at=SNAPSHOT_AT,
+            )
+        )
+        stage.total_count = 1
+        stage.pass_count = 1
+        stage.status = "waiting_confirmation"
+        stage.updated_at = SNAPSHOT_AT
+
+    app = create_app(
+        db_path=db_path,
+        quote_client=FakeQuoteClient(),
+        env_path=tmp_path / ".env",
+        allow_sync=True,
+        discovery_clock=lambda: SNAPSHOT_AT,
+        discovery_track_executor=execute,
+    )
+    with TestClient(app) as client:
+        run = client.post(
+            "/api/discoveries", json={"sync": True}
+        ).json()
+        run_id = run["id"]
+        client.post(
+            f"/api/discoveries/{run_id}/stages/safety/confirm",
+            json={"sync": True},
+        )
+        assert executed == [
+            ("quality_discount", "track_gate"),
+            ("deep_value", "track_gate"),
+            ("garp", "track_gate"),
+        ]
+        for track in ("quality_discount", "deep_value", "garp"):
+            gate = client.get(
+                f"/api/discoveries/{run_id}/tracks/{track}"
+                "/stages/track_gate"
+            ).json()
+            assert gate["current"]["status"] == "waiting_confirmation"
+            assert gate["pass"][0]["metrics"] == {"score": "1"}
+            client.post(
+                f"/api/discoveries/{run_id}/tracks/{track}"
+                "/stages/track_gate/confirm",
+                json={"sync": True},
+            )
+            assert client.get(
+                f"/api/discoveries/{run_id}/tracks/{track}"
+                "/stages/competition"
+            ).json()["current"]["status"] == "waiting_confirmation"
+            client.post(
+                f"/api/discoveries/{run_id}/tracks/{track}"
+                "/stages/competition/confirm",
+                json={"sync": True},
+            )
+            assert client.get(
+                f"/api/discoveries/{run_id}/tracks/{track}"
+                "/stages/adjudication"
+            ).json()["current"]["status"] == "waiting_confirmation"
+        assert len(executed) == 9
+
+    with SessionLocal() as session:
+        stages = session.scalars(
+            select(DiscoveryStage).order_by(DiscoveryStage.id)
+        ).all()
+        assert len(stages) == 9
+        assert all(stage.attempt == 1 for stage in stages)
+
+
+def test_startup_resumes_confirmed_upstream_queued_stage_once(
+    tmp_path: Path,
+) -> None:
+    from fastapi.testclient import TestClient
+    from sqlalchemy import select
+
+    from app.discovery_models import (
+        DiscoveryCommonStage,
+        DiscoveryRun,
+        DiscoveryStage,
+    )
+    from app.main import create_app
+    from app.models import RulerVersion
+    from discovery.snapshot import canonical_json
+    from market.quotes import FakeQuoteClient
+
+    db_path = tmp_path / "discovery-resume.db"
+    _seed_api_snapshot(db_path)
+    engine = init_db(db_path)
+    SessionLocal = create_session_factory(engine)
+    with SessionLocal() as session:
+        session.add(
+            RulerVersion(
+                user_id=1,
+                digest="garp-v1",
+                reason="测试尺子",
+                payload_json=canonical_json(
+                    {
+                        "scope": "weekly-discovery",
+                        "track": "garp",
+                        "algorithm_version": "discovery-v1",
+                    }
+                ),
+                activated_at=SNAPSHOT_AT,
+            )
+        )
+        session.commit()
+    engine.dispose()
+
+    base = dict(
+        db_path=db_path,
+        quote_client=FakeQuoteClient(),
+        env_path=tmp_path / ".env",
+        allow_sync=True,
+        discovery_clock=lambda: SNAPSHOT_AT,
+    )
+    with TestClient(create_app(**base)) as client:
+        run_id = client.post(
+            "/api/discoveries", json={"sync": True}
+        ).json()["id"]
+
+    with SessionLocal() as session:
+        run = session.get(DiscoveryRun, run_id)
+        common = session.scalar(
+            select(DiscoveryCommonStage).where(
+                DiscoveryCommonStage.run_id == run_id
+            )
+        )
+        assert run is not None and common is not None
+        common.status = "confirmed"
+        common.confirmed_at = SNAPSHOT_AT
+        run.status = "running"
+        session.add(
+            DiscoveryStage(
+                run_id=run_id,
+                track="garp",
+                stage="track_gate",
+                attempt=1,
+                status="queued",
+                total_count=0,
+                pass_count=0,
+                drop_count=0,
+                insufficient_count=0,
+                input_fingerprint=run.input_fingerprint,
+                ruler_version_id=run.garp_ruler_version_id,
+                algorithm_version=run.algorithm_version,
+                created_at=SNAPSHOT_AT,
+                updated_at=SNAPSHOT_AT,
+            )
+        )
+        session.commit()
+
+    executed: list[int] = []
+
+    def execute(session, stage_id: int) -> None:
+        stage = session.get(DiscoveryStage, stage_id)
+        assert stage is not None
+        executed.append(stage_id)
+        stage.status = "waiting_confirmation"
+        stage.updated_at = SNAPSHOT_AT
+
+    with TestClient(
+        create_app(**base, discovery_track_executor=execute)
+    ) as client:
+        assert client.get(
+            f"/api/discoveries/{run_id}/tracks/garp/stages/track_gate"
+        ).json()["current"]["status"] == "waiting_confirmation"
+    assert len(executed) == 1
+
+
+def test_concurrent_create_and_confirm_are_idempotent(tmp_path: Path) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    from fastapi.testclient import TestClient
+    from sqlalchemy import func, select
+
+    from app.discovery_models import (
+        DiscoveryCommonStage,
+        DiscoveryRun,
+        DiscoveryStage,
+    )
+    from app.main import create_app
+    from market.quotes import FakeQuoteClient
+
+    db_path = tmp_path / "discovery-concurrent.db"
+    _seed_api_snapshot(db_path)
+    app = create_app(
+        db_path=db_path,
+        quote_client=FakeQuoteClient(),
+        env_path=tmp_path / ".env",
+        allow_sync=True,
+        discovery_clock=lambda: SNAPSHOT_AT,
+    )
+    with TestClient(app) as client, ThreadPoolExecutor(max_workers=2) as pool:
+        creates = list(
+            pool.map(
+                lambda _: client.post(
+                    "/api/discoveries", json={"sync": True}
+                ),
+                range(2),
+            )
+        )
+        assert [response.status_code for response in creates] == [200, 200]
+        run_ids = {response.json()["id"] for response in creates}
+        assert len(run_ids) == 1
+        run_id = run_ids.pop()
+        confirms = list(
+            pool.map(
+                lambda _: client.post(
+                    f"/api/discoveries/{run_id}/stages/safety/confirm",
+                    json={"sync": True},
+                ),
+                range(2),
+            )
+        )
+        assert [response.status_code for response in confirms] == [200, 200]
+
+    engine = init_db(db_path)
+    SessionLocal = create_session_factory(engine)
+    with SessionLocal() as session:
+        assert session.scalar(
+            select(func.count()).select_from(DiscoveryRun)
+        ) == 1
+        common = session.scalars(select(DiscoveryCommonStage)).all()
+        assert len(common) == 1 and common[0].status == "confirmed"
+        stages = session.scalars(select(DiscoveryStage)).all()
+        assert len(stages) == 3
+        assert {stage.track for stage in stages} == {
+            "quality_discount",
+            "deep_value",
+            "garp",
+        }
+    engine.dispose()
+
+
+def test_confirmation_lock_conflict_does_not_mutate_stage(
+    tmp_path: Path,
+) -> None:
+    from fastapi.testclient import TestClient
+    from sqlalchemy import select
+
+    from app.discovery_models import DiscoveryCommonStage
+    from app.main import create_app
+    from jobs.lock import JOB_TYPE_FUNNEL, release, try_acquire
+    from market.quotes import FakeQuoteClient
+
+    db_path = tmp_path / "discovery-lock-conflict.db"
+    _seed_api_snapshot(db_path)
+    app = create_app(
+        db_path=db_path,
+        quote_client=FakeQuoteClient(),
+        env_path=tmp_path / ".env",
+        allow_sync=True,
+        discovery_clock=lambda: SNAPSHOT_AT,
+    )
+    with TestClient(app) as client:
+        run_id = client.post(
+            "/api/discoveries", json={"sync": True}
+        ).json()["id"]
+        factory = app.state.session_factory
+        with factory() as owner:
+            assert try_acquire(owner, 999, JOB_TYPE_FUNNEL)
+            owner.commit()
+        response = client.post(
+            f"/api/discoveries/{run_id}/stages/safety/confirm", json={}
+        )
+        assert response.status_code == 409
+        assert response.json()["code"] == "JOB_LOCKED"
+        with factory() as session:
+            stage = session.scalar(select(DiscoveryCommonStage))
+            assert stage is not None and stage.status == "waiting_confirmation"
+            release(session, 999, JOB_TYPE_FUNNEL)
+            session.commit()
+
+
+def test_current_discovery_uses_china_week_and_allows_rollover(
+    tmp_path: Path,
+) -> None:
+    from fastapi.testclient import TestClient
+    from sqlalchemy import func, select
+
+    from app.discovery_models import DiscoveryRun
+    from app.main import create_app
+    from market.quotes import FakeQuoteClient
+
+    db_path = tmp_path / "discovery-rollover.db"
+    _seed_api_snapshot(db_path)
+    clock = [SNAPSHOT_AT]
+    app = create_app(
+        db_path=db_path,
+        quote_client=FakeQuoteClient(),
+        env_path=tmp_path / ".env",
+        allow_sync=True,
+        discovery_clock=lambda: clock[0],
+    )
+    with TestClient(app) as client:
+        first = client.post(
+            "/api/discoveries", json={"sync": True}
+        ).json()
+        assert first["week_key"] == "2026-W38"
+        assert client.get("/api/discoveries/current").json()["id"] == first["id"]
+
+        clock[0] += timedelta(days=7)
+        assert client.get("/api/discoveries/current").status_code == 404
+        second = client.post(
+            "/api/discoveries", json={"sync": True}
+        ).json()
+        assert second["week_key"] == "2026-W39"
+        assert second["id"] != first["id"]
+        current = client.get("/api/discoveries/current").json()
+        assert current["id"] == second["id"]
+        assert current["status"] == "waiting_confirmation"
+
+    with app.state.session_factory() as session:
+        assert session.scalar(
+            select(func.count()).select_from(DiscoveryRun)
+        ) == 2
+
+
+def test_newer_nonready_fill_blocks_older_ready_snapshot(tmp_path: Path) -> None:
+    from fastapi.testclient import TestClient
+    from sqlalchemy import func, select
+
+    from app.discovery_models import DiscoveryRun
+    from app.main import create_app
+    from app.models import DiscoveryDataFill
+    from market.quotes import FakeQuoteClient
+
+    db_path = tmp_path / "newer-paused-fill.db"
+    _seed_api_snapshot(db_path)
+    engine = init_db(db_path)
+    SessionLocal = create_session_factory(engine)
+    newer_row_time = SNAPSHOT_AT - timedelta(hours=1)
+    with SessionLocal() as session:
+        session.add(
+            DiscoveryDataFill(
+                status="paused",
+                total=1,
+                completed=0,
+                failed=0,
+                request_count=0,
+                daily_budget=100,
+                budget_day="2026-09-17",
+                daily_requests=0,
+                started_at=newer_row_time,
+                updated_at=newer_row_time,
+                snapshot_status="ready",
+            )
+        )
+        session.commit()
+    engine.dispose()
+
+    app = create_app(
+        db_path=db_path,
+        quote_client=FakeQuoteClient(),
+        env_path=tmp_path / ".env",
+        allow_sync=True,
+        discovery_clock=lambda: SNAPSHOT_AT,
+    )
+    with TestClient(app) as client:
+        response = client.post("/api/discoveries", json={"sync": True})
+        assert response.status_code == 409
+        assert response.json()["code"] == "DATA_NOT_READY"
+    with app.state.session_factory() as session:
+        assert session.scalar(
+            select(func.count()).select_from(DiscoveryRun)
+        ) == 0
+
+
+def test_failed_checkpoint_cannot_leak_stale_global_data(
+    tmp_path: Path,
+) -> None:
+    from fastapi.testclient import TestClient
+
+    from app.main import create_app
+    from app.models import DiscoveryDataCheckpoint
+    from discovery.snapshot import load_frozen_inputs
+    from market.quotes import FakeQuoteClient
+
+    db_path = tmp_path / "failed-checkpoint.db"
+    _seed_api_snapshot(db_path)
+    engine = init_db(db_path)
+    SessionLocal = create_session_factory(engine)
+    with SessionLocal() as session:
+        session.execute(
+            text(
+                "DROP TRIGGER IF EXISTS "
+                "trg_discovery_checkpoint_payload_immutable"
+            )
+        )
+        session.execute(
+            text(
+                "DROP TRIGGER IF EXISTS "
+                "trg_discovery_checkpoint_status_immutable"
+            )
+        )
+        checkpoint = session.get(
+            DiscoveryDataCheckpoint, (1, "600000.SH")
+        )
+        assert checkpoint is not None
+        checkpoint.status = "failed"
+        checkpoint.error = "upstream failed"
+        checkpoint.payload_json = None
+        checkpoint.payload_digest = None
+        session.commit()
+    engine.dispose()
+
+    app = create_app(
+        db_path=db_path,
+        quote_client=FakeQuoteClient(),
+        env_path=tmp_path / ".env",
+        allow_sync=True,
+        discovery_clock=lambda: SNAPSHOT_AT,
+    )
+    with TestClient(app) as client:
+        run = client.post(
+            "/api/discoveries", json={"sync": True}
+        ).json()
+        assert client.get(
+            f"/api/discoveries/{run['id']}/stages/safety"
+        ).json()["insufficient"][0]["reason"] == "price_missing"
+    with app.state.session_factory() as session:
+        frozen = load_frozen_inputs(session, run["id"]).companies[0]
+        assert frozen.fields["price"] is None
+        assert frozen.fields["financial_history"] == ()
+        assert frozen.fields["valuation_history"] == ()
+
+
+def test_snapshot_ignores_future_and_unproven_global_data(
+    tmp_path: Path,
+) -> None:
+    from fastapi.testclient import TestClient
+    from sqlalchemy import delete
+
+    from app.main import create_app
+    from app.models import (
+        Financial,
+        FinancialFieldProvenance,
+        ValuationHistory,
+    )
+    from discovery.snapshot import load_frozen_inputs
+    from market.quotes import FakeQuoteClient
+
+    db_path = tmp_path / "snapshot-contamination.db"
+    _seed_api_snapshot(db_path)
+    engine = init_db(db_path)
+    SessionLocal = create_session_factory(engine)
+    with SessionLocal() as session:
+        session.execute(
+            delete(FinancialFieldProvenance).where(
+                FinancialFieldProvenance.code == "600000.SH",
+                FinancialFieldProvenance.period == "2025",
+            )
+        )
+        session.add(
+            Financial(
+                code="600000.SH",
+                period="2026",
+                period_type="annual",
+                net_income=Decimal("777"),
+                source_as_of="2026-12-31",
+            )
+        )
+        session.add(
+            FinancialFieldProvenance(
+                code="600000.SH",
+                period="2026",
+                period_type="annual",
+                field="net_income",
+                source="discovery",
+            )
+        )
+        session.add(
+            ValuationHistory(
+                code="600000.SH",
+                month="2026-10",
+                trade_date="2026-10-01",
+                pe=Decimal("1"),
+                pb=Decimal("0.1"),
+                price=Decimal("99"),
+                source="future",
+                ratio_method="PE_TTM/PB_MRQ",
+                fetched_at=SNAPSHOT_AT + timedelta(seconds=1),
+            )
+        )
+        session.commit()
+    engine.dispose()
+
+    app = create_app(
+        db_path=db_path,
+        quote_client=FakeQuoteClient(),
+        env_path=tmp_path / ".env",
+        allow_sync=True,
+        discovery_clock=lambda: SNAPSHOT_AT,
+    )
+    with TestClient(app) as client:
+        run_id = client.post(
+            "/api/discoveries", json={"sync": True}
+        ).json()["id"]
+    with app.state.session_factory() as session:
+        frozen = load_frozen_inputs(session, run_id).companies[0]
+    history = frozen.fields["financial_history"]
+    assert len(history) == 1
+    assert history[0]["period"] == "2025"
+    assert history[0]["values"]["net_income"] == "100"
+    assert history[0]["provenance"] == {"net_income": ("discovery",)}
+    valuations = frozen.fields["valuation_history"]
+    assert [row["month"] for row in valuations] == ["2026-09"]
+    assert frozen.fields["price"] == "10"
+
+
+def test_create_dispatch_failure_retries_existing_queued_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fastapi.testclient import TestClient
+
+    from app.main import create_app
+    from jobs.lock import lock_status
+    from market.quotes import FakeQuoteClient
+
+    db_path = tmp_path / "create-dispatch-retry.db"
+    _seed_api_snapshot(db_path)
+    app = create_app(
+        db_path=db_path,
+        quote_client=FakeQuoteClient(),
+        env_path=tmp_path / ".env",
+        allow_sync=False,
+        discovery_clock=lambda: SNAPSHOT_AT,
+    )
+    starts: list[int] = []
+
+    def flaky_start(_app, target, args):
+        starts.append(1)
+        if len(starts) == 1:
+            return RuntimeError("thread unavailable")
+        target(*args)
+        return None
+
+    with TestClient(app) as client:
+        monkeypatch.setattr(
+            "app.discovery_routes._start_discovery_worker", flaky_start
+        )
+        first = client.post("/api/discoveries", json={})
+        assert first.status_code == 500
+        with app.state.session_factory() as session:
+            assert lock_status(session) is None
+
+        retried = client.post("/api/discoveries", json={})
+        assert retried.status_code == 200
+        assert retried.json()["status"] == "waiting_confirmation"
+        assert len(starts) == 2
+
+
+def test_confirm_dispatch_failure_retries_confirmed_queued_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fastapi.testclient import TestClient
+
+    from app.main import create_app
+    from jobs.lock import lock_status
+    from market.quotes import FakeQuoteClient
+
+    db_path = tmp_path / "confirm-dispatch-retry.db"
+    _seed_api_snapshot(db_path)
+    app = create_app(
+        db_path=db_path,
+        quote_client=FakeQuoteClient(),
+        env_path=tmp_path / ".env",
+        allow_sync=True,
+        discovery_clock=lambda: SNAPSHOT_AT,
+    )
+    starts: list[int] = []
+
+    def flaky_start(_app, target, args):
+        starts.append(1)
+        if len(starts) == 1:
+            return RuntimeError("thread unavailable")
+        target(*args)
+        return None
+
+    with TestClient(app) as client:
+        run_id = client.post(
+            "/api/discoveries", json={"sync": True}
+        ).json()["id"]
+        app.state.allow_sync = False
+        monkeypatch.setattr(
+            "app.discovery_routes._start_discovery_worker", flaky_start
+        )
+        first = client.post(
+            f"/api/discoveries/{run_id}/stages/safety/confirm", json={}
+        )
+        assert first.status_code == 500
+        with app.state.session_factory() as session:
+            assert lock_status(session) is None
+
+        retried = client.post(
+            f"/api/discoveries/{run_id}/stages/safety/confirm", json={}
+        )
+        assert retried.status_code == 200
+        assert retried.json()["status"] == "failed"
+        assert len(starts) == 2
+
+
+def test_sync_flag_is_ignored_when_sync_mode_is_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fastapi.testclient import TestClient
+
+    from app.main import create_app
+    from market.quotes import FakeQuoteClient
+
+    db_path = tmp_path / "async-only.db"
+    _seed_api_snapshot(db_path)
+    app = create_app(
+        db_path=db_path,
+        quote_client=FakeQuoteClient(),
+        env_path=tmp_path / ".env",
+        allow_sync=False,
+        discovery_clock=lambda: SNAPSHOT_AT,
+    )
+    pending = []
+
+    class DeferredThread:
+        def __init__(self, *, target, args=(), daemon=None):
+            self.target = target
+            self.args = args
+
+        def start(self):
+            pending.append(self)
+
+    with TestClient(app) as client:
+        monkeypatch.setattr(
+            "app.discovery_routes.threading.Thread", DeferredThread
+        )
+        response = client.post(
+            "/api/discoveries", json={"sync": True}
+        )
+        assert response.status_code == 200
+        assert response.json()["status"] == "queued"
+        assert len(pending) == 1
+        worker = pending.pop()
+        worker.target(*worker.args)
+        assert client.get("/api/discoveries/current").json()["status"] == (
+            "waiting_confirmation"
+        )
+
+
+def test_stage_reads_preserve_zero_result_attempts_and_partitions(
+    tmp_path: Path,
+) -> None:
+    from fastapi.testclient import TestClient
+
+    from app.discovery_models import (
+        DiscoveryCommonResult,
+        DiscoveryCommonStage,
+        DiscoveryResult,
+        DiscoveryStage,
+    )
+    from app.main import create_app
+    from market.quotes import FakeQuoteClient
+
+    db_path = tmp_path / "stage-attempt-reads.db"
+    _seed_api_snapshot(db_path)
+    app = create_app(
+        db_path=db_path,
+        quote_client=FakeQuoteClient(),
+        env_path=tmp_path / ".env",
+        allow_sync=True,
+        discovery_clock=lambda: SNAPSHOT_AT,
+    )
+    with TestClient(app) as client:
+        run_id = client.post(
+            "/api/discoveries", json={"sync": True}
+        ).json()["id"]
+        client.post(
+            f"/api/discoveries/{run_id}/stages/safety/confirm",
+            json={"sync": True},
+        )
+        with app.state.session_factory() as session:
+            common = session.query(DiscoveryCommonStage).filter_by(
+                run_id=run_id
+            ).one()
+            common.superseded_at = SNAPSHOT_AT
+            session.add_all(
+                [
+                    DiscoveryCommonResult(
+                        run_id=run_id,
+                        attempt=1,
+                        code="000001.SZ",
+                        verdict="drop",
+                        reason="test-drop",
+                        metrics_json='{"score":0}',
+                        created_at=SNAPSHOT_AT,
+                    ),
+                    DiscoveryCommonResult(
+                        run_id=run_id,
+                        attempt=1,
+                        code="000002.SZ",
+                        verdict="insufficient",
+                        reason="test-insufficient",
+                        metrics_json='{"score":null}',
+                        created_at=SNAPSHOT_AT,
+                    ),
+                    DiscoveryCommonStage(
+                        run_id=run_id,
+                        attempt=2,
+                        status="failed",
+                        total_count=0,
+                        pass_count=0,
+                        drop_count=0,
+                        insufficient_count=0,
+                        error="zero-result failure",
+                        input_fingerprint=common.input_fingerprint,
+                        algorithm_version=common.algorithm_version,
+                        failure_kind="permanent",
+                        created_at=SNAPSHOT_AT,
+                        updated_at=SNAPSHOT_AT,
+                    ),
+                ]
+            )
+            gate = session.query(DiscoveryStage).filter_by(
+                run_id=run_id,
+                track="garp",
+                stage="track_gate",
+            ).one()
+            gate.superseded_at = SNAPSHOT_AT
+            second_gate = DiscoveryStage(
+                run_id=run_id,
+                track="garp",
+                stage="track_gate",
+                attempt=2,
+                status="waiting_confirmation",
+                total_count=3,
+                pass_count=1,
+                drop_count=1,
+                insufficient_count=1,
+                input_fingerprint=gate.input_fingerprint,
+                ruler_version_id=gate.ruler_version_id,
+                algorithm_version=gate.algorithm_version,
+                created_at=SNAPSHOT_AT,
+                updated_at=SNAPSHOT_AT,
+            )
+            session.add(second_gate)
+            session.flush()
+            session.add_all(
+                DiscoveryResult(
+                    run_id=run_id,
+                    track="garp",
+                    stage="track_gate",
+                    attempt=2,
+                    code=code,
+                    verdict=verdict,
+                    reason=f"test-{verdict}",
+                    metrics_json=f'{{"bucket":"{verdict}"}}',
+                    rank=rank,
+                    created_at=SNAPSHOT_AT,
+                )
+                for rank, (code, verdict) in enumerate(
+                    [
+                        ("000001.SZ", "pass"),
+                        ("000002.SZ", "drop"),
+                        ("000003.SZ", "insufficient"),
+                    ],
+                    start=1,
+                )
+            )
+            session.commit()
+
+        safety = client.get(
+            f"/api/discoveries/{run_id}/stages/safety"
+        ).json()
+        assert [row["attempt"] for row in safety["attempts"]] == [1, 2]
+        assert safety["attempts"][1]["status"] == "failed"
+        assert all(
+            safety["attempts"][1][bucket] == []
+            for bucket in ("pass", "drop", "insufficient")
+        )
+        assert [len(safety["attempts"][0][bucket]) for bucket in (
+            "pass",
+            "drop",
+            "insufficient",
+        )] == [1, 1, 1]
+
+        track = client.get(
+            f"/api/discoveries/{run_id}/tracks/garp/stages/track_gate"
+        ).json()
+        assert [row["attempt"] for row in track["attempts"]] == [1, 2]
+        assert all(
+            track["attempts"][0][bucket] == []
+            for bucket in ("pass", "drop", "insufficient")
+        )
+        assert [len(track[bucket]) for bucket in (
+            "pass",
+            "drop",
+            "insufficient",
+        )] == [1, 1, 1]
+
+
+@pytest.mark.parametrize(
+    "metrics_json",
+    ["{", '{"bad":NaN}', '{"bad":1e999}', "[]"],
+)
+def test_corrupt_persisted_metrics_return_stable_error(
+    tmp_path: Path, metrics_json: str
+) -> None:
+    from fastapi.testclient import TestClient
+    from sqlalchemy import select
+
+    from app.discovery_models import DiscoveryCommonResult
+    from app.main import create_app
+    from market.quotes import FakeQuoteClient
+
+    db_path = tmp_path / f"corrupt-metrics-{len(metrics_json)}.db"
+    _seed_api_snapshot(db_path)
+    app = create_app(
+        db_path=db_path,
+        quote_client=FakeQuoteClient(),
+        env_path=tmp_path / ".env",
+        allow_sync=True,
+        discovery_clock=lambda: SNAPSHOT_AT,
+    )
+    with TestClient(app, raise_server_exceptions=False) as client:
+        run_id = client.post(
+            "/api/discoveries", json={"sync": True}
+        ).json()["id"]
+        with app.state.session_factory() as session:
+            result = session.scalar(select(DiscoveryCommonResult))
+            assert result is not None
+            result.metrics_json = metrics_json
+            session.commit()
+        response = client.get(
+            f"/api/discoveries/{run_id}/stages/safety"
+        )
+        assert response.status_code == 500
+        assert response.json()["code"] == "DISCOVERY_RESULT_CORRUPT"
+
+
+@pytest.mark.parametrize("body", [b"{", b"null", b"[]", b'"text"'])
+def test_all_discovery_mutations_reject_malformed_nonobjects(
+    tmp_path: Path, body: bytes
+) -> None:
+    from fastapi.testclient import TestClient
+    from sqlalchemy import func, select
+
+    from app.discovery_models import DiscoveryStage
+    from app.main import create_app
+    from market.quotes import FakeQuoteClient
+
+    db_path = tmp_path / f"bad-bodies-{len(body)}.db"
+    _seed_api_snapshot(db_path)
+    app = create_app(
+        db_path=db_path,
+        quote_client=FakeQuoteClient(),
+        env_path=tmp_path / ".env",
+        allow_sync=True,
+        discovery_clock=lambda: SNAPSHOT_AT,
+    )
+    headers = {"content-type": "application/json"}
+    with TestClient(app) as client:
+        assert client.post(
+            "/api/discoveries", content=body, headers=headers
+        ).status_code == 400
+        run_id = client.post(
+            "/api/discoveries", json={"sync": True}
+        ).json()["id"]
+        paths = (
+            f"/api/discoveries/{run_id}/stages/safety/confirm",
+            f"/api/discoveries/{run_id}/tracks/garp"
+            "/stages/track_gate/confirm",
+            f"/api/discoveries/{run_id}/abandon",
+        )
+        for path in paths:
+            assert client.post(
+                path, content=body, headers=headers
+            ).status_code == 400
+        assert client.get(
+            f"/api/discoveries/{run_id}/stages/safety"
+        ).json()["current"]["status"] == "waiting_confirmation"
+        with app.state.session_factory() as session:
+            assert session.scalar(
+                select(func.count()).select_from(DiscoveryStage)
+            ) == 0
+
+
+def test_foreign_discovery_run_is_not_visible_or_mutable(
+    tmp_path: Path,
+) -> None:
+    from fastapi.testclient import TestClient
+
+    from app.main import create_app
+    from app.models import User
+    from market.quotes import FakeQuoteClient
+
+    db_path = tmp_path / "foreign-discovery.db"
+    engine = init_db(db_path)
+    SessionLocal = create_session_factory(engine)
+    with SessionLocal() as session:
+        session.add(User(id=2, name="其他用户"))
+        session.flush()
+        run_id = _insert_run(
+            session,
+            user_id=2,
+            week_key="2026-W38",
+            current=True,
+        )
+        _add_common_stage(session, run_id)
+        session.commit()
+    engine.dispose()
+    app = create_app(
+        db_path=db_path,
+        quote_client=FakeQuoteClient(),
+        env_path=tmp_path / ".env",
+        allow_sync=True,
+        discovery_clock=lambda: SNAPSHOT_AT,
+    )
+    with TestClient(app) as client:
+        assert client.get("/api/discoveries/current").status_code == 404
+        for method, path in (
+            ("get", f"/api/discoveries/{run_id}/stages/safety"),
+            (
+                "get",
+                f"/api/discoveries/{run_id}/tracks/garp/stages/track_gate",
+            ),
+            (
+                "post",
+                f"/api/discoveries/{run_id}/stages/safety/confirm",
+            ),
+            ("post", f"/api/discoveries/{run_id}/abandon"),
+        ):
+            response = (
+                client.post(path, json={})
+                if method == "post"
+                else client.get(path)
+            )
+            assert response.status_code == 404
+
+
+def test_abandon_prevents_later_confirmation_and_queue_mutation(
+    tmp_path: Path,
+) -> None:
+    from fastapi.testclient import TestClient
+    from sqlalchemy import func, select
+
+    from app.discovery_models import DiscoveryCommonStage, DiscoveryStage
+    from app.main import create_app
+    from market.quotes import FakeQuoteClient
+
+    db_path = tmp_path / "abandon-immutable.db"
+    _seed_api_snapshot(db_path)
+    app = create_app(
+        db_path=db_path,
+        quote_client=FakeQuoteClient(),
+        env_path=tmp_path / ".env",
+        allow_sync=True,
+        discovery_clock=lambda: SNAPSHOT_AT,
+    )
+    with TestClient(app) as client:
+        run_id = client.post(
+            "/api/discoveries", json={"sync": True}
+        ).json()["id"]
+        assert client.post(
+            f"/api/discoveries/{run_id}/abandon", json={}
+        ).status_code == 200
+        rejected = client.post(
+            f"/api/discoveries/{run_id}/stages/safety/confirm", json={}
+        )
+        assert rejected.status_code == 409
+        assert rejected.json()["code"] == "DISCOVERY_RUN_IMMUTABLE"
+    with app.state.session_factory() as session:
+        common = session.scalar(select(DiscoveryCommonStage))
+        assert common is not None and common.status == "waiting_confirmation"
+        assert session.scalar(
+            select(func.count()).select_from(DiscoveryStage)
+        ) == 0
+
+
+def test_startup_marks_running_transient_failed_without_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fastapi.testclient import TestClient
+    from sqlalchemy import func, select
+
+    from app.discovery_models import DiscoveryCommonStage
+    from app.main import create_app
+    from jobs.lock import JOB_TYPE_DISCOVERY, release
+    from market.quotes import FakeQuoteClient
+
+    db_path = tmp_path / "interrupted-running.db"
+    _seed_api_snapshot(db_path)
+    app = create_app(
+        db_path=db_path,
+        quote_client=FakeQuoteClient(),
+        env_path=tmp_path / ".env",
+        allow_sync=False,
+        discovery_clock=lambda: SNAPSHOT_AT,
+    )
+
+    class LostThread:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    with TestClient(app) as client:
+        monkeypatch.setattr(
+            "app.discovery_routes.threading.Thread", LostThread
+        )
+        run_id = client.post("/api/discoveries", json={}).json()["id"]
+        with app.state.session_factory() as session:
+            stage = session.scalar(select(DiscoveryCommonStage))
+            assert stage is not None
+            stage.status = "running"
+            release(session, run_id, JOB_TYPE_DISCOVERY)
+            session.commit()
+
+    restarted = create_app(
+        db_path=db_path,
+        quote_client=FakeQuoteClient(),
+        env_path=tmp_path / ".env",
+        allow_sync=True,
+        discovery_clock=lambda: SNAPSHOT_AT,
+    )
+    with TestClient(restarted):
+        pass
+    with restarted.state.session_factory() as session:
+        stages = session.scalars(select(DiscoveryCommonStage)).all()
+        assert len(stages) == 1
+        assert (stages[0].status, stages[0].failure_kind) == (
+            "failed",
+            "transient",
+        )
+        assert session.scalar(
+            select(func.count()).select_from(DiscoveryCommonStage)
+        ) == 1
+
+
+def test_exact_discovery_endpoint_surface(tmp_path: Path) -> None:
+    from app.main import create_app
+    from market.quotes import FakeQuoteClient
+
+    app = create_app(
+        db_path=tmp_path / "surface.db",
+        quote_client=FakeQuoteClient(),
+        env_path=tmp_path / ".env",
+    )
+    included = next(
+        route for route in app.routes if hasattr(route, "original_router")
+    )
+    surface = {
+        (method, route.path)
+        for route in included.original_router.routes
+        for method in route.methods
+    }
+    assert surface == {
+        ("POST", "/api/discoveries"),
+        ("GET", "/api/discoveries/current"),
+        ("GET", "/api/discoveries/{run_id}/stages/safety"),
+        (
+            "POST",
+            "/api/discoveries/{run_id}/stages/safety/confirm",
+        ),
+        (
+            "GET",
+            "/api/discoveries/{run_id}/tracks/{track}/stages/{stage}",
+        ),
+        (
+            "POST",
+            "/api/discoveries/{run_id}/tracks/{track}/stages/{stage}/confirm",
+        ),
+        ("POST", "/api/discoveries/{run_id}/abandon"),
+    }
+
+
+def test_track_confirmation_duplicate_and_two_session_race(
+    tmp_path: Path,
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    from fastapi.testclient import TestClient
+    from sqlalchemy import func, select
+
+    from app.discovery_models import DiscoveryStage
+    from app.main import create_app
+    from app.models import RulerVersion
+    from discovery.snapshot import canonical_json
+    from market.quotes import FakeQuoteClient
+
+    db_path = tmp_path / "track-confirm-race.db"
+    _seed_api_snapshot(db_path)
+    engine = init_db(db_path)
+    SessionLocal = create_session_factory(engine)
+    with SessionLocal() as session:
+        session.add_all(
+            RulerVersion(
+                user_id=1,
+                digest=f"{track}-race",
+                reason="并发测试",
+                payload_json=canonical_json(
+                    {
+                        "scope": "weekly-discovery",
+                        "track": track,
+                        "algorithm_version": "discovery-v1",
+                    }
+                ),
+                activated_at=SNAPSHOT_AT,
+            )
+            for track in ("quality_discount", "deep_value", "garp")
+        )
+        session.commit()
+    engine.dispose()
+
+    def execute(session, stage_id: int) -> None:
+        stage = session.get(DiscoveryStage, stage_id)
+        assert stage is not None
+        stage.status = "waiting_confirmation"
+        stage.updated_at = SNAPSHOT_AT
+
+    app = create_app(
+        db_path=db_path,
+        quote_client=FakeQuoteClient(),
+        env_path=tmp_path / ".env",
+        allow_sync=True,
+        discovery_clock=lambda: SNAPSHOT_AT,
+        discovery_track_executor=execute,
+    )
+    with TestClient(app) as client:
+        run_id = client.post(
+            "/api/discoveries", json={"sync": True}
+        ).json()["id"]
+        client.post(
+            f"/api/discoveries/{run_id}/stages/safety/confirm",
+            json={"sync": True},
+        )
+        path = (
+            f"/api/discoveries/{run_id}/tracks/garp"
+            "/stages/track_gate/confirm"
+        )
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            responses = list(
+                pool.map(
+                    lambda _: client.post(path, json={"sync": True}),
+                    range(2),
+                )
+            )
+        assert [response.status_code for response in responses] == [200, 200]
+        assert client.post(path, json={"sync": True}).status_code == 200
+
+    with app.state.session_factory() as session:
+        assert session.scalar(
+            select(func.count())
+            .select_from(DiscoveryStage)
+            .where(
+                DiscoveryStage.run_id == run_id,
+                DiscoveryStage.track == "garp",
+                DiscoveryStage.stage == "competition",
+            )
+        ) == 1
+
+
+def test_checkpoint_security_set_mismatch_is_data_not_ready(
+    tmp_path: Path,
+) -> None:
+    from fastapi.testclient import TestClient
+    from sqlalchemy import delete
+
+    from app.main import create_app
+    from app.models import DiscoveryDataCheckpoint
+    from market.quotes import FakeQuoteClient
+
+    db_path = tmp_path / "snapshot-set-mismatch.db"
+    _seed_api_snapshot(db_path)
+    engine = init_db(db_path)
+    SessionLocal = create_session_factory(engine)
+    with SessionLocal() as session:
+        session.execute(delete(DiscoveryDataCheckpoint))
+        session.commit()
+    engine.dispose()
+    app = create_app(
+        db_path=db_path,
+        quote_client=FakeQuoteClient(),
+        env_path=tmp_path / ".env",
+        allow_sync=True,
+        discovery_clock=lambda: SNAPSHOT_AT,
+    )
+    with TestClient(app) as client:
+        response = client.post("/api/discoveries", json={"sync": True})
+        assert response.status_code == 409
+        assert response.json()["code"] == "DATA_NOT_READY"
+
+
+def test_drain_observes_forced_abandon_before_queued_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fastapi.testclient import TestClient
+    from sqlalchemy import select
+
+    from app.discovery_models import DiscoveryCommonStage, DiscoveryRun
+    from app.main import create_app
+    from jobs.lock import lock_status
+    from market.quotes import FakeQuoteClient
+
+    db_path = tmp_path / "abandon-before-drain.db"
+    _seed_api_snapshot(db_path)
+    app = create_app(
+        db_path=db_path,
+        quote_client=FakeQuoteClient(),
+        env_path=tmp_path / ".env",
+        allow_sync=False,
+        discovery_clock=lambda: SNAPSHOT_AT,
+    )
+    pending = []
+
+    class DeferredThread:
+        def __init__(self, *, target, args=(), daemon=None):
+            self.target = target
+            self.args = args
+
+        def start(self):
+            pending.append(self)
+
+    with TestClient(app) as client:
+        monkeypatch.setattr(
+            "app.discovery_routes.threading.Thread", DeferredThread
+        )
+        run_id = client.post("/api/discoveries", json={}).json()["id"]
+        with app.state.session_factory() as session:
+            run = session.get(DiscoveryRun, run_id)
+            assert run is not None
+            run.current = False
+            run.status = "abandoned"
+            session.commit()
+        worker = pending.pop()
+        worker.target(*worker.args)
+
+    with app.state.session_factory() as session:
+        run = session.get(DiscoveryRun, run_id)
+        stage = session.scalar(select(DiscoveryCommonStage))
+        assert run is not None and run.status == "abandoned"
+        assert stage is not None and stage.status == "queued"
+        assert lock_status(session) is None
+
+
+def test_new_fill_zero_counts_never_inherits_prior_global_data(
+    tmp_path: Path,
+) -> None:
+    from fastapi.testclient import TestClient
+
+    from app.main import create_app
+    from discovery.snapshot import load_frozen_inputs
+    from market.quotes import FakeQuoteClient
+
+    db_path = tmp_path / "fill-affiliation-zero.db"
+    _seed_api_snapshot(db_path)
+    _started, completed = _add_second_api_fill(db_path, valuation_points=0)
+    app = create_app(
+        db_path=db_path,
+        quote_client=FakeQuoteClient(),
+        env_path=tmp_path / ".env",
+        allow_sync=True,
+        discovery_clock=lambda: completed,
+    )
+    with TestClient(app) as client:
+        run_id = client.post("/api/discoveries", json={"sync": True}).json()["id"]
+    with app.state.session_factory() as session:
+        company = load_frozen_inputs(session, run_id).companies[0]
+    assert company.fields["financial_history"] == ()
+    assert company.fields["valuation_history"] == ()
+    assert company.fields["price"] is None
+
+
+def test_new_fill_exact_payload_includes_data(
+    tmp_path: Path,
+) -> None:
+    from fastapi.testclient import TestClient
+
+    from app.main import create_app
+    from discovery.snapshot import load_frozen_inputs
+    from market.quotes import FakeQuoteClient
+    from market.types import FinancialRow, ValuationPoint
+
+    db_path = tmp_path / "fill-affiliation-valid.db"
+    _seed_api_snapshot(db_path)
+    completed_at = SNAPSHOT_AT + timedelta(hours=2)
+    payload = _api_payload(
+        completed_at,
+        financial_rows=(
+            FinancialRow(
+                code="600000.SH",
+                period="2025",
+                period_type="annual",
+                net_income=Decimal("100"),
+                source_as_of="2026-03-31",
+            ),
+        ),
+        valuation_points=(
+            ValuationPoint(
+                code="600000.SH",
+                month="2026-09",
+                trade_date="2026-09-17",
+                pe=Decimal("8"),
+                pb=Decimal("0.8"),
+                price=Decimal("10"),
+                source="eastmoney",
+                ratio_method="PE_TTM/PB_MRQ",
+            ),
+        ),
+    )
+    _started, completed = _add_second_api_fill(
+        db_path,
+        valuation_points=1,
+        payload_json=payload,
+    )
+    app = create_app(
+        db_path=db_path,
+        quote_client=FakeQuoteClient(),
+        env_path=tmp_path / ".env",
+        allow_sync=True,
+        discovery_clock=lambda: completed,
+    )
+    with TestClient(app) as client:
+        run_id = client.post("/api/discoveries", json={"sync": True}).json()["id"]
+    with app.state.session_factory() as session:
+        company = load_frozen_inputs(session, run_id).companies[0]
+    assert company.fields["financial_history"][0]["values"]["net_income"] == "100"
+    assert [row["month"] for row in company.fields["valuation_history"]] == ["2026-09"]
+    assert company.fields["price"] == "10"
+
+
+def test_post_cutoff_done_checkpoint_is_not_affiliated(
+    tmp_path: Path,
+) -> None:
+    from fastapi.testclient import TestClient
+
+    from app.main import create_app
+    from app.models import DiscoveryDataCheckpoint
+    from market.quotes import FakeQuoteClient
+
+    db_path = tmp_path / "checkpoint-after-cutoff.db"
+    _seed_api_snapshot(db_path)
+    engine = init_db(db_path)
+    SessionLocal = create_session_factory(engine)
+    with SessionLocal() as session:
+        checkpoint = session.get(DiscoveryDataCheckpoint, (1, "600000.SH"))
+        assert checkpoint is not None
+        checkpoint.updated_at = SNAPSHOT_AT + timedelta(seconds=1)
+        session.commit()
+    engine.dispose()
+    app = create_app(
+        db_path=db_path,
+        quote_client=FakeQuoteClient(),
+        env_path=tmp_path / ".env",
+        allow_sync=True,
+        discovery_clock=lambda: SNAPSHOT_AT,
+    )
+    with TestClient(app) as client:
+        response = client.post("/api/discoveries", json={"sync": True})
+        assert response.status_code == 409
+        assert response.json()["code"] == "DATA_NOT_READY"
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_mutation_bodies_reject_nonfinite_json_constants(
+    tmp_path: Path, constant: str
+) -> None:
+    from fastapi.testclient import TestClient
+
+    from app.main import create_app
+    from market.quotes import FakeQuoteClient
+
+    db_path = tmp_path / f"nonfinite-body-{constant}.db"
+    _seed_api_snapshot(db_path)
+    app = create_app(
+        db_path=db_path,
+        quote_client=FakeQuoteClient(),
+        env_path=tmp_path / ".env",
+        allow_sync=True,
+        discovery_clock=lambda: SNAPSHOT_AT,
+    )
+    headers = {"content-type": "application/json"}
+    with TestClient(app) as client:
+        assert (
+            client.post(
+                "/api/discoveries",
+                content=f'{{"sync":{constant}}}',
+                headers=headers,
+            ).status_code
+            == 400
+        )
+        run_id = client.post("/api/discoveries", json={"sync": True}).json()["id"]
+        for path in (
+            f"/api/discoveries/{run_id}/stages/safety/confirm",
+            f"/api/discoveries/{run_id}/abandon",
+        ):
+            response = client.post(
+                path,
+                content=f'{{"sync":{constant}}}',
+                headers=headers,
+            )
+            assert response.status_code == 400
+
+
+def test_track_executor_failure_does_not_strand_sibling_tracks(
+    tmp_path: Path,
+) -> None:
+    from fastapi.testclient import TestClient
+
+    from app.discovery_models import DiscoveryStage
+    from app.main import create_app
+    from app.models import RulerVersion
+    from discovery.snapshot import canonical_json
+    from jobs.lock import lock_status
+    from market.quotes import FakeQuoteClient
+
+    db_path = tmp_path / "track-failure-independence.db"
+    _seed_api_snapshot(db_path)
+    engine = init_db(db_path)
+    SessionLocal = create_session_factory(engine)
+    with SessionLocal() as session:
+        session.add_all(
+            RulerVersion(
+                user_id=1,
+                digest=f"{track}-failure",
+                reason="失败隔离测试",
+                payload_json=canonical_json(
+                    {
+                        "scope": "weekly-discovery",
+                        "track": track,
+                        "algorithm_version": "discovery-v1",
+                    }
+                ),
+                activated_at=SNAPSHOT_AT,
+            )
+            for track in ("quality_discount", "deep_value", "garp")
+        )
+        session.commit()
+    engine.dispose()
+
+    executed: list[str] = []
+
+    def execute(session, stage_id: int) -> None:
+        stage = session.get(DiscoveryStage, stage_id)
+        assert stage is not None
+        executed.append(stage.track)
+        if stage.track == "deep_value":
+            raise RuntimeError("deep value failed")
+        stage.status = "waiting_confirmation"
+        stage.updated_at = SNAPSHOT_AT
+
+    app = create_app(
+        db_path=db_path,
+        quote_client=FakeQuoteClient(),
+        env_path=tmp_path / ".env",
+        allow_sync=True,
+        discovery_clock=lambda: SNAPSHOT_AT,
+        discovery_track_executor=execute,
+    )
+    with TestClient(app) as client:
+        run_id = client.post("/api/discoveries", json={"sync": True}).json()["id"]
+        response = client.post(
+            f"/api/discoveries/{run_id}/stages/safety/confirm",
+            json={"sync": True},
+        )
+        assert response.status_code == 200
+        assert response.json()["status"] == "waiting_confirmation"
+    assert set(executed) == {"quality_discount", "deep_value", "garp"}
+    with app.state.session_factory() as session:
+        stages = {
+            row.track: row
+            for row in session.query(DiscoveryStage).filter_by(
+                run_id=run_id, stage="track_gate"
+            )
+        }
+        assert stages["deep_value"].status == "failed"
+        assert stages["deep_value"].failure_kind == "permanent"
+        assert stages["quality_discount"].status == "waiting_confirmation"
+        assert stages["garp"].status == "waiting_confirmation"
+        assert lock_status(session) is None
+
+
+def test_integrity_race_winner_redispatches_failed_original_queue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier, Event, Lock
+
+    from fastapi.testclient import TestClient
+    from sqlalchemy.orm import Session
+    from starlette.requests import Request
+
+    from app import discovery_routes
+    from app.discovery_routes import create_discovery_router
+    from app.main import create_app
+    from market.quotes import FakeQuoteClient
+
+    db_path = tmp_path / "integrity-winner-redispatch.db"
+    _seed_api_snapshot(db_path)
+    app = create_app(
+        db_path=db_path,
+        quote_client=FakeQuoteClient(),
+        env_path=tmp_path / ".env",
+        allow_sync=False,
+        discovery_clock=lambda: SNAPSHOT_AT,
+    )
+    starts: list[int] = []
+
+    def flaky_start(_app, target, args):
+        starts.append(1)
+        if len(starts) == 1:
+            return RuntimeError("thread unavailable")
+        target(*args)
+        return None
+
+    with TestClient(app), ThreadPoolExecutor(max_workers=2) as pool:
+        warm = Event()
+        all_ready = Event()
+        ready = 0
+        ready_lock = Lock()
+
+        def occupy() -> None:
+            nonlocal ready
+            with ready_lock:
+                ready += 1
+                if ready == 2:
+                    all_ready.set()
+            assert warm.wait(5)
+
+        warmed = [pool.submit(occupy) for _ in range(2)]
+        assert all_ready.wait(5)
+        warm.set()
+        for future in warmed:
+            future.result()
+
+        original_scalar = Session.scalar
+        initial_reads = 0
+        read_lock = Lock()
+        both_read = Barrier(2)
+        release_complete = Event()
+        original_release = discovery_routes._release_committed_lock
+
+        def observed_release(*args, **kwargs):
+            original_release(*args, **kwargs)
+            release_complete.set()
+
+        def synchronized_scalar(self, statement, *args, **kwargs):
+            nonlocal initial_reads
+            result = original_scalar(self, statement, *args, **kwargs)
+            sql = str(statement)
+            if (
+                "discovery_runs.week_key" not in sql
+                or "discovery_runs.current" not in sql
+            ):
+                return result
+            with read_lock:
+                if initial_reads >= 2:
+                    assert release_complete.wait(5)
+                    return result
+                initial_reads += 1
+            both_read.wait(5)
+            return result
+
+        monkeypatch.setattr(Session, "scalar", synchronized_scalar)
+        monkeypatch.setattr(
+            discovery_routes, "_release_committed_lock", observed_release
+        )
+        monkeypatch.setattr(
+            discovery_routes, "_start_discovery_worker", flaky_start
+        )
+        endpoint = next(
+            route.endpoint
+            for route in create_discovery_router().routes
+            if route.path == "/api/discoveries"
+        )
+
+        def invoke():
+            async def receive():
+                return {
+                    "type": "http.request",
+                    "body": b"{}",
+                    "more_body": False,
+                }
+
+            request = Request(
+                {"type": "http", "method": "POST", "app": app},
+                receive,
+            )
+            return asyncio.run(endpoint(request))
+
+        first = pool.submit(invoke)
+        second = pool.submit(invoke)
+        responses = [first.result(), second.result()]
+
+    assert sorted(getattr(response, "status_code", 200) for response in responses) == [
+        200,
+        500,
+    ]
+    winner = next(response for response in responses if isinstance(response, dict))
+    assert winner["status"] == "waiting_confirmation"
+    assert len(starts) == 2
+
+
+def test_lifespan_waits_for_discovery_workers_before_dispose(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from threading import Event, Thread
+
+    from fastapi.testclient import TestClient
+
+    from app.main import create_app
+    from jobs import discovery as discovery_job
+    from market.quotes import FakeQuoteClient
+
+    db_path = tmp_path / "discovery-worker-shutdown.db"
+    _seed_api_snapshot(db_path)
+    entered = Event()
+    release_worker = Event()
+    original = discovery_job.classify_common
+
+    def blocked_classifier(*args, **kwargs):
+        entered.set()
+        assert release_worker.wait(5)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(discovery_job, "classify_common", blocked_classifier)
+    first_app = create_app(
+        db_path=db_path,
+        quote_client=FakeQuoteClient(),
+        env_path=tmp_path / ".env",
+        allow_sync=False,
+        discovery_clock=lambda: SNAPSHOT_AT,
+    )
+    first_client = TestClient(first_app)
+    first_client.__enter__()
+    closed = Event()
+    try:
+        response = first_client.post("/api/discoveries", json={})
+        assert response.status_code == 200
+        assert entered.wait(5)
+        with first_app.state.discovery_workers_lock:
+            assert len(first_app.state.discovery_workers) == 1
+
+        shutdown_finished = Event()
+
+        def shutdown() -> None:
+            first_client.__exit__(None, None, None)
+            closed.set()
+            shutdown_finished.set()
+
+        closer = Thread(target=shutdown)
+        closer.start()
+        assert not shutdown_finished.wait(0.1)
+        release_worker.set()
+        assert shutdown_finished.wait(5)
+        closer.join()
+        with first_app.state.discovery_workers_lock:
+            assert not first_app.state.discovery_workers
+    finally:
+        release_worker.set()
+        if not closed.is_set():
+            first_client.__exit__(None, None, None)
+
+    second_app = create_app(
+        db_path=db_path,
+        quote_client=FakeQuoteClient(),
+        env_path=tmp_path / ".env",
+        allow_sync=False,
+        discovery_clock=lambda: SNAPSHOT_AT,
+    )
+    with TestClient(second_app) as second_client:
+        current = second_client.get("/api/discoveries/current")
+        assert current.status_code == 200
+        assert current.json()["status"] == "waiting_confirmation"
+        with second_app.state.discovery_workers_lock:
+            assert not second_app.state.discovery_workers
+
+
+def test_worker_start_registration_is_atomic_with_shutdown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from threading import Event
+    from threading import Thread as RealThread
+
+    from fastapi.testclient import TestClient
+
+    from app.discovery_routes import _start_discovery_worker
+    from app.main import create_app
+    from market.quotes import FakeQuoteClient
+
+    db_path = tmp_path / "atomic-worker-registration.db"
+    _seed_api_snapshot(db_path)
+    start_entered = Event()
+    allow_start_return = Event()
+    start_returned = Event()
+    target_finished = Event()
+    joined_unstarted: list[bool] = []
+
+    class BlockingStartThread:
+        def __init__(self, *, target, args=(), daemon=None):
+            self.target = target
+            self.args = args
+            self.ran = False
+
+        def start(self):
+            start_entered.set()
+            assert allow_start_return.wait(5)
+            start_returned.set()
+
+        def join(self):
+            joined_unstarted.append(not start_returned.is_set())
+            if not self.ran and start_returned.is_set():
+                self.ran = True
+                self.target(*self.args)
+                target_finished.set()
+
+    app = create_app(
+        db_path=db_path,
+        quote_client=FakeQuoteClient(),
+        env_path=tmp_path / ".env",
+        allow_sync=False,
+        discovery_clock=lambda: SNAPSHOT_AT,
+    )
+    client = TestClient(app)
+    client.__enter__()
+    monkeypatch.setattr(
+        "app.discovery_routes.threading.Thread", BlockingStartThread
+    )
+    starter_finished = Event()
+    teardown_finished = Event()
+
+    def target() -> None:
+        target_finished.set()
+
+    def start_worker() -> None:
+        assert _start_discovery_worker(app, target, ()) is None
+        starter_finished.set()
+
+    def teardown() -> None:
+        with app.state.discovery_workers_lock:
+            app.state.discovery_shutting_down = True
+            workers = tuple(app.state.discovery_workers)
+        for worker in workers:
+            worker.join()
+        teardown_finished.set()
+
+    starter = RealThread(target=start_worker)
+    starter.start()
+    assert start_entered.wait(5)
+    teardown_thread = RealThread(target=teardown)
+    teardown_thread.start()
+    assert not teardown_finished.wait(0.1)
+    assert joined_unstarted == []
+    allow_start_return.set()
+    starter.join(5)
+    teardown_thread.join(5)
+    assert starter_finished.is_set()
+    assert teardown_finished.is_set()
+    assert target_finished.is_set()
+    assert joined_unstarted == [False]
+    with app.state.discovery_workers_lock:
+        assert not app.state.discovery_workers
+    client.__exit__(None, None, None)
+
+
+def test_latest_fill_payload_omits_prior_financial_periods_and_values(
+    tmp_path: Path,
+) -> None:
+    from fastapi.testclient import TestClient
+
+    from app.main import create_app
+    from app.models import Financial, FinancialFieldProvenance
+    from discovery.snapshot import load_frozen_inputs
+    from market.quotes import FakeQuoteClient
+    from market.types import FinancialRow
+
+    db_path = tmp_path / "exact-fill-financial-payload.db"
+    _seed_api_snapshot(db_path)
+    engine = init_db(db_path)
+    SessionLocal = create_session_factory(engine)
+    with SessionLocal() as session:
+        session.add(
+            Financial(
+                code="600000.SH",
+                period="2024",
+                period_type="annual",
+                net_income=Decimal("999"),
+                source_as_of="2025-03-31",
+            )
+        )
+        session.add(
+            FinancialFieldProvenance(
+                code="600000.SH",
+                period="2024",
+                period_type="annual",
+                field="net_income",
+                source="discovery",
+            )
+        )
+        session.commit()
+    engine.dispose()
+    completed_at = SNAPSHOT_AT + timedelta(hours=2)
+    payload = _api_payload(
+        completed_at,
+        financial_rows=(
+            FinancialRow(
+                code="600000.SH",
+                period="2025",
+                period_type="annual",
+                net_income=Decimal("222"),
+                source_as_of="2026-03-31",
+            ),
+        ),
+        valuation_points=(),
+    )
+    _started, completed = _add_second_api_fill(
+        db_path, valuation_points=0, payload_json=payload
+    )
+    app = create_app(
+        db_path=db_path,
+        quote_client=FakeQuoteClient(),
+        env_path=tmp_path / ".env",
+        allow_sync=True,
+        discovery_clock=lambda: completed,
+    )
+    with TestClient(app) as client:
+        run_id = client.post(
+            "/api/discoveries", json={"sync": True}
+        ).json()["id"]
+    with app.state.session_factory() as session:
+        history = load_frozen_inputs(session, run_id).companies[0].fields[
+            "financial_history"
+        ]
+    assert [row["period"] for row in history] == ["2025"]
+    assert history[0]["values"]["net_income"] == "222"
+
+
+def test_production_snapshot_never_queries_shared_company_caches(
+    tmp_path: Path,
+) -> None:
+    from sqlalchemy import event
+
+    from discovery.snapshot import build_production_snapshot
+
+    db_path = tmp_path / "no-shared-cache-reads.db"
+    _seed_api_snapshot(db_path)
+    engine = init_db(db_path)
+    forbidden = {
+        "financials",
+        "financial_field_provenance",
+        "financial_fetch_completeness",
+        "valuation_history",
+    }
+
+    def reject_cache_read(
+        _conn, _cursor, statement, _parameters, _context, _executemany
+    ) -> None:
+        sql = statement.lower()
+        if sql.lstrip().startswith("select") and any(
+            table in sql for table in forbidden
+        ):
+            raise AssertionError(f"shared cache queried: {statement}")
+
+    event.listen(engine, "before_cursor_execute", reject_cache_read)
+    SessionLocal = create_session_factory(engine)
+    with SessionLocal() as session:
+        company = build_production_snapshot(session).companies[0]
+    assert company.fields["financial_history"][0]["values"]["net_income"] == (
+        "100"
+    )
+    assert company.fields["price"] == "10"
+    event.remove(engine, "before_cursor_execute", reject_cache_read)
+    engine.dispose()
+
+
+def test_snapshot_versions_hash_exact_checkpoint_payload_content(
+    tmp_path: Path,
+) -> None:
+    from app.models import DiscoveryDataCheckpoint
+    from discovery.company_payload import company_payload_digest
+    from discovery.snapshot import build_production_snapshot
+    from market.types import FinancialRow
+
+    paths = [tmp_path / "payload-a.db", tmp_path / "payload-b.db"]
+    for path in paths:
+        _seed_api_snapshot(path)
+    engine = init_db(paths[1])
+    SessionLocal = create_session_factory(engine)
+    with SessionLocal() as session:
+        checkpoint = session.get(
+            DiscoveryDataCheckpoint, (1, "600000.SH")
+        )
+        assert checkpoint is not None
+        session.execute(
+            text(
+                "DROP TRIGGER IF EXISTS "
+                "trg_discovery_checkpoint_payload_immutable"
+            )
+        )
+        payload_json = _api_payload(
+            SNAPSHOT_AT,
+            financial_rows=(
+                FinancialRow(
+                    code="600000.SH",
+                    period="2025",
+                    period_type="annual",
+                    net_income=Decimal("101"),
+                    source_as_of="2026-03-31",
+                ),
+            ),
+        )
+        checkpoint.payload_json = payload_json
+        checkpoint.payload_digest = company_payload_digest(payload_json)
+        session.commit()
+    engine.dispose()
+
+    snapshots = []
+    for path in paths:
+        engine = init_db(path)
+        with create_session_factory(engine)() as session:
+            snapshots.append(build_production_snapshot(session))
+        engine.dispose()
+    assert snapshots[0].versions.data_version != snapshots[1].versions.data_version
+    assert (
+        snapshots[0].versions.financial_version
+        != snapshots[1].versions.financial_version
+    )
+    assert (
+        snapshots[0].versions.valuation_version
+        == snapshots[1].versions.valuation_version
+    )
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "missing",
+        "malformed",
+        "count",
+        "digest_missing",
+        "digest_malformed",
+        "digest_mismatch",
+    ],
+)
+def test_latest_done_checkpoint_rejects_unreproducible_payload(
+    tmp_path: Path, tamper: str
+) -> None:
+    from fastapi.testclient import TestClient
+
+    from app.main import create_app
+    from app.models import DiscoveryDataCheckpoint
+    from market.quotes import FakeQuoteClient
+
+    db_path = tmp_path / f"unreproducible-{tamper}.db"
+    _seed_api_snapshot(db_path)
+    engine = init_db(db_path)
+    SessionLocal = create_session_factory(engine)
+    with SessionLocal() as session:
+        if tamper != "count":
+            session.execute(
+                text(
+                    "DROP TRIGGER IF EXISTS "
+                    "trg_discovery_checkpoint_payload_immutable"
+                )
+            )
+        checkpoint = session.get(
+            DiscoveryDataCheckpoint, (1, "600000.SH")
+        )
+        assert checkpoint is not None
+        if tamper == "missing":
+            checkpoint.payload_json = None
+        elif tamper == "malformed":
+            checkpoint.payload_json = '{"code":"600000.SH","x":NaN}'
+        elif tamper == "count":
+            checkpoint.valuation_points = 2
+        elif tamper == "digest_missing":
+            checkpoint.payload_digest = None
+        elif tamper == "digest_malformed":
+            checkpoint.payload_digest = "ABC"
+        else:
+            checkpoint.payload_digest = "0" * 64
+        session.commit()
+    engine.dispose()
+    app = create_app(
+        db_path=db_path,
+        quote_client=FakeQuoteClient(),
+        env_path=tmp_path / ".env",
+        allow_sync=True,
+        discovery_clock=lambda: SNAPSHOT_AT,
+    )
+    with TestClient(app) as client:
+        response = client.post("/api/discoveries", json={"sync": True})
+    assert response.status_code == 409
+    assert response.json()["code"] == "DATA_NOT_READY"
+    detail = response.json()["detail"].lower()
+    assert "restart" in detail or "start a new fill" in detail
+
+
+@pytest.mark.parametrize(
+    "future_part",
+    ["calendar", "universe_snapshot", "universe_source", "checkpoint"],
+)
+def test_production_snapshot_rejects_future_fill_timestamps(
+    tmp_path: Path, future_part: str
+) -> None:
+    from fastapi.testclient import TestClient
+
+    from app.main import create_app
+    from app.models import (
+        DiscoveryDataCheckpoint,
+        DiscoveryFillTradingDate,
+        DiscoveryUniverseSecurity,
+    )
+    from market.quotes import FakeQuoteClient
+
+    db_path = tmp_path / f"future-fill-{future_part}.db"
+    _seed_api_snapshot(db_path)
+    engine = init_db(db_path)
+    SessionLocal = create_session_factory(engine)
+    with SessionLocal() as session:
+        if future_part == "calendar":
+            calendar = session.get(
+                DiscoveryFillTradingDate, (1, "2026-09-17")
+            )
+            assert calendar is not None
+            session.delete(calendar)
+            session.add(
+                DiscoveryFillTradingDate(fill_id=1, trade_date="2099-01-01")
+            )
+        elif future_part == "universe_snapshot":
+            security = session.get(
+                DiscoveryUniverseSecurity, (1, "600000.SH")
+            )
+            assert security is not None
+            security.snapshot_at = datetime(
+                2099, 1, 1, tzinfo=timezone.utc
+            )
+        elif future_part == "universe_source":
+            security = session.get(
+                DiscoveryUniverseSecurity, (1, "600000.SH")
+            )
+            assert security is not None
+            security.source_as_of = "2099-01-01"
+        else:
+            session.execute(
+                text(
+                    "DROP TRIGGER IF EXISTS "
+                    "trg_discovery_checkpoint_payload_immutable"
+                )
+            )
+            checkpoint = session.get(
+                DiscoveryDataCheckpoint, (1, "600000.SH")
+            )
+            assert checkpoint is not None
+            checkpoint.updated_at = datetime(
+                2099, 1, 1, tzinfo=timezone.utc
+            )
+        session.commit()
+    engine.dispose()
+
+    app = create_app(
+        db_path=db_path,
+        quote_client=FakeQuoteClient(),
+        env_path=tmp_path / ".env",
+        allow_sync=True,
+        discovery_clock=lambda: SNAPSHOT_AT,
+    )
+    with TestClient(app) as client:
+        response = client.post("/api/discoveries", json={"sync": True})
+    assert response.status_code == 409
+    assert response.json()["code"] == "DATA_NOT_READY"
+
+
+@pytest.mark.parametrize(
+    ("market_date", "expected_status"),
+    [("2026-09-17", 200), ("2026-09-18", 409)],
+)
+def test_snapshot_date_cutoff_uses_china_market_day(
+    tmp_path: Path,
+    market_date: str,
+    expected_status: int,
+) -> None:
+    from fastapi.testclient import TestClient
+
+    from app.main import create_app
+    from app.models import (
+        DiscoveryDataCheckpoint,
+        DiscoveryDataFill,
+        DiscoveryFillTradingDate,
+        DiscoveryUniverseSecurity,
+    )
+    from discovery.company_payload import company_payload_digest
+    from market.quotes import FakeQuoteClient
+
+    db_path = tmp_path / f"china-cutoff-{market_date}.db"
+    _seed_api_snapshot(db_path)
+    cutoff = datetime(2026, 9, 16, 17, tzinfo=timezone.utc)
+    engine = init_db(db_path)
+    SessionLocal = create_session_factory(engine)
+    with SessionLocal() as session:
+        session.execute(
+            text(
+                "DROP TRIGGER IF EXISTS "
+                "trg_discovery_checkpoint_payload_immutable"
+            )
+        )
+        fill = session.get(DiscoveryDataFill, 1)
+        checkpoint = session.get(
+            DiscoveryDataCheckpoint, (1, "600000.SH")
+        )
+        security = session.get(
+            DiscoveryUniverseSecurity, (1, "600000.SH")
+        )
+        calendar = session.get(
+            DiscoveryFillTradingDate, (1, "2026-09-17")
+        )
+        assert all(
+            row is not None
+            for row in (fill, checkpoint, security, calendar)
+        )
+        fill.started_at = cutoff - timedelta(hours=1)
+        fill.updated_at = cutoff
+        checkpoint.updated_at = cutoff
+        security.snapshot_at = cutoff
+        payload_json = _api_payload(cutoff)
+        checkpoint.payload_json = payload_json
+        checkpoint.payload_digest = company_payload_digest(payload_json)
+        if market_date != "2026-09-17":
+            session.delete(calendar)
+            session.add(
+                DiscoveryFillTradingDate(
+                    fill_id=1,
+                    trade_date=market_date,
+                )
+            )
+        session.commit()
+    engine.dispose()
+
+    app = create_app(
+        db_path=db_path,
+        quote_client=FakeQuoteClient(),
+        env_path=tmp_path / ".env",
+        allow_sync=True,
+        discovery_clock=lambda: cutoff,
+    )
+    with TestClient(app) as client:
+        response = client.post("/api/discoveries", json={"sync": True})
+    assert response.status_code == expected_status
+    if expected_status == 409:
+        assert response.json()["code"] == "DATA_NOT_READY"
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_nonfinite_tagged_discovery_ruler_is_ignored(
+    tmp_path: Path, constant: str
+) -> None:
+    from fastapi.testclient import TestClient
+
+    from app.main import create_app
+    from app.models import RulerVersion
+    from market.quotes import FakeQuoteClient
+
+    db_path = tmp_path / f"nonfinite-ruler-{constant}.db"
+    _seed_api_snapshot(db_path)
+    engine = init_db(db_path)
+    SessionLocal = create_session_factory(engine)
+    with SessionLocal() as session:
+        session.add(
+            RulerVersion(
+                user_id=1,
+                digest="nonfinite",
+                reason="非法尺子",
+                payload_json=(
+                    '{"algorithm_version":"discovery-v1","scope":'
+                    f'"weekly-discovery","threshold":{constant},'
+                    '"track":"quality_discount"}'
+                ),
+                activated_at=SNAPSHOT_AT,
+            )
+        )
+        session.commit()
+    engine.dispose()
+    app = create_app(
+        db_path=db_path,
+        quote_client=FakeQuoteClient(),
+        env_path=tmp_path / ".env",
+        allow_sync=True,
+        discovery_clock=lambda: SNAPSHOT_AT,
+    )
+    with TestClient(app) as client:
+        run = client.post(
+            "/api/discoveries", json={"sync": True}
+        ).json()
+    assert run["ruler_version_ids"]["quality_discount"] is None

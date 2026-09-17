@@ -1,5 +1,11 @@
 """Shared vocabulary for the weekly discovery workflow."""
 
+from datetime import timedelta, timezone
+
+CHINA_MARKET_TIMEZONE = timezone(
+    timedelta(hours=8),
+    name="China Standard Time",
+)
 TRACKS = frozenset({"quality_discount", "deep_value", "garp"})
 COMMON_STAGE = "common"
 TRACK_STAGES = ("track_gate", "competition", "adjudication")

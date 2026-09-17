@@ -15,6 +15,10 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from app.db import PROJECT_ROOT, create_session_factory, init_db
+from app.discovery_routes import (
+    create_discovery_router,
+    resume_discovery_queues,
+)
 from app.envfile import (
     OPENAI_API_KEY,
     OPENAI_BASE_URL,
@@ -43,6 +47,7 @@ from discovery.data_readiness import (
     TrackReadiness,
     discovery_data_readiness,
 )
+from discovery.snapshot import build_production_snapshot
 from jobs.cheap import (
     begin_cheap_fill,
     cheap_fill_running,
@@ -745,6 +750,9 @@ def create_app(
     allow_sync: bool = False,
     llm_client=None,
     reports_dir: Path | str | None = None,
+    discovery_track_executor=None,
+    discovery_snapshot_provider=None,
+    discovery_clock=None,
 ) -> FastAPI:
     resolved_dist = dist_path if dist_path is not None else DEFAULT_DIST_PATH
     resolved_quote_client = quote_client if quote_client is not None else TencentQuoteClient()
@@ -770,6 +778,16 @@ def create_app(
         app.state.reports_dir = resolved_reports
         app.state.env_path = resolved_env
         app.state.allow_sync = allow_sync
+        app.state.discovery_track_executor = discovery_track_executor
+        app.state.discovery_snapshot_provider = (
+            discovery_snapshot_provider or build_production_snapshot
+        )
+        app.state.discovery_clock = discovery_clock or (
+            lambda: datetime.now(timezone.utc)
+        )
+        app.state.discovery_workers_lock = threading.Lock()
+        app.state.discovery_workers = set()
+        app.state.discovery_shutting_down = False
         load_env_key(resolved_env, OPENAI_API_KEY)
         load_env_key(resolved_env, OPENAI_BASE_URL)
         load_env_key(resolved_env, TAVILY_API_KEY)
@@ -805,10 +823,22 @@ def create_app(
             except Exception:
                 session.rollback()
                 logger.exception("启动清理任务锁失败")
+        try:
+            resume_discovery_queues(app)
+        except Exception:
+            logger.exception("启动恢复发现队列失败")
         yield
+        with app.state.discovery_workers_lock:
+            app.state.discovery_shutting_down = True
+            discovery_workers = tuple(app.state.discovery_workers)
+        for worker in discovery_workers:
+            join = getattr(worker, "join", None)
+            if callable(join):
+                join()
         engine.dispose()
 
     app = FastAPI(title="本机工作台", lifespan=lifespan)
+    app.include_router(create_discovery_router())
 
     @app.get("/api/health")
     def health(request: Request) -> dict[str, object]:

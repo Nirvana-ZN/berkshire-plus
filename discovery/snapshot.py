@@ -8,17 +8,18 @@ text; their original Python runtime types are not downstream input semantics.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
-import hashlib
-import json
 from math import isfinite
 from types import MappingProxyType
 from typing import TypeAlias
 
-from sqlalchemy import case, func, inspect as sa_inspect, select
+from sqlalchemy import case, func, select
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.orm import Session
 
 from app.discovery_models import (
@@ -31,7 +32,20 @@ from app.discovery_models import (
     DiscoveryRun,
     DiscoveryStage,
 )
-
+from app.models import (
+    DiscoveryDataCheckpoint,
+    DiscoveryDataFill,
+    DiscoveryFillTradingDate,
+    DiscoveryUniverseSecurity,
+    JobLock,
+    RulerVersion,
+)
+from discovery.builds import AVAILABLE_BUILDS, BUILD_VERSION
+from discovery.company_payload import (
+    parse_company_payload,
+    verify_company_payload_digest,
+)
+from discovery.constants import CHINA_MARKET_TIMEZONE
 
 TRACKS = ("quality_discount", "deep_value", "garp")
 JsonScalar: TypeAlias = None | bool | int | float | str
@@ -57,7 +71,7 @@ class SnapshotVersions:
     data_version: str
     financial_version: str
     valuation_version: str
-    ruler_version_ids: Mapping[str, int]
+    ruler_version_ids: Mapping[str, int | None]
     algorithm_version: str
 
 
@@ -73,7 +87,7 @@ class FrozenCompanyInput:
     data_version: str
     financial_version: str
     valuation_version: str
-    ruler_version_ids: Mapping[str, int]
+    ruler_version_ids: Mapping[str, int | None]
     algorithm_version: str
     input_fingerprint: str
     snapshot_at: datetime
@@ -86,7 +100,7 @@ class FrozenRunInputs:
     data_version: str
     financial_version: str
     valuation_version: str
-    ruler_version_ids: Mapping[str, int]
+    ruler_version_ids: Mapping[str, int | None]
     algorithm_version: str
     trading_dates: Mapping[str, tuple[str, ...]]
     snapshot_at: datetime
@@ -101,6 +115,15 @@ class HistoricalReplay:
     track_results: tuple[Mapping[str, FrozenValue], ...]
     decisions: tuple[Mapping[str, FrozenValue], ...]
     evidence: tuple[Mapping[str, FrozenValue], ...]
+
+
+@dataclass(frozen=True)
+class ProductionSnapshot:
+    fill_id: int
+    companies: tuple[CompanySnapshotInput, ...]
+    versions: SnapshotVersions
+    trading_dates: Mapping[str, tuple[str, ...]]
+    snapshot_at: datetime
 
 
 def _decimal_text(value: Decimal) -> str:
@@ -184,9 +207,12 @@ def _validated_versions(versions: SnapshotVersions) -> dict[str, object]:
     }
     ruler_ids = dict(versions.ruler_version_ids)
     if set(ruler_ids) != set(TRACKS) or any(
-        type(value) is not int or value <= 0 for value in ruler_ids.values()
+        value is not None and (type(value) is not int or value <= 0)
+        for value in ruler_ids.values()
     ):
-        raise ValueError("ruler_version_ids must contain three positive IDs")
+        raise ValueError(
+            "ruler_version_ids must contain three positive IDs or nulls"
+        )
     values["ruler_version_ids"] = {
         track: ruler_ids[track] for track in TRACKS
     }
@@ -393,15 +419,18 @@ def _object_json(text: str, label: str) -> Mapping[str, FrozenValue]:
     return frozen
 
 
-def _run_ruler_ids(run: DiscoveryRun) -> Mapping[str, int]:
+def _run_ruler_ids(run: DiscoveryRun) -> Mapping[str, int | None]:
     values = {
         "quality_discount": run.quality_discount_ruler_version_id,
         "deep_value": run.deep_value_ruler_version_id,
         "garp": run.garp_ruler_version_id,
     }
-    if any(type(value) is not int or value <= 0 for value in values.values()):
-        raise ValueError("frozen run has incomplete ruler metadata")
-    return MappingProxyType(values)  # type: ignore[arg-type]
+    if any(
+        value is not None and (type(value) is not int or value <= 0)
+        for value in values.values()
+    ):
+        raise ValueError("frozen run has invalid ruler metadata")
+    return MappingProxyType(values)
 
 
 def _require_utc(value: object, label: str) -> datetime:
@@ -526,7 +555,10 @@ def load_frozen_inputs(session: Session, run_id: int) -> FrozenRunInputs:
                 financial_version=row.financial_version,
                 valuation_version=row.valuation_version,
                 ruler_version_ids=MappingProxyType(
-                    {key: int(value) for key, value in row_rulers.items()}
+                    {
+                        key: int(value) if value is not None else None
+                        for key, value in row_rulers.items()
+                    }
                 ),
                 algorithm_version=row.algorithm_version,
                 input_fingerprint=row.input_fingerprint,
@@ -560,6 +592,438 @@ def load_frozen_inputs(session: Session, run_id: int) -> FrozenRunInputs:
         trading_dates=MappingProxyType(trading_dates),
         snapshot_at=run_snapshot_at,
         companies=tuple(companies),
+    )
+
+
+def resolve_discovery_rulers(
+    session: Session,
+    *,
+    algorithm_version: str = BUILD_VERSION,
+    user_id: int = 1,
+) -> Mapping[str, int | None]:
+    """Resolve only explicitly scoped, build-compatible discovery rulers."""
+
+    resolved: dict[str, int | None] = {track: None for track in TRACKS}
+
+    def reject_constant(value: str) -> None:
+        raise ValueError(f"non-finite JSON constant: {value}")
+
+    rows = session.scalars(
+        select(RulerVersion)
+        .where(RulerVersion.user_id == user_id)
+        .order_by(RulerVersion.id.desc())
+    ).all()
+    if algorithm_version not in AVAILABLE_BUILDS:
+        return MappingProxyType(resolved)
+    for row in rows:
+        try:
+            payload = json.loads(
+                row.payload_json,
+                parse_constant=reject_constant,
+            )
+        except (TypeError, json.JSONDecodeError, ValueError):
+            continue
+        if (
+            type(payload) is not dict
+            or payload.get("scope") != "weekly-discovery"
+            or payload.get("track") not in TRACKS
+            or payload.get("algorithm_version") != algorithm_version
+        ):
+            continue
+        track = payload["track"]
+        if resolved[track] is None:
+            resolved[track] = row.id
+    return MappingProxyType(resolved)
+
+
+def _snapshot_version(prefix: str, value: object) -> str:
+    return f"{prefix}:{_sha256(value)[:20]}"
+
+
+def build_production_snapshot(
+    session: Session,
+    *,
+    algorithm_version: str = BUILD_VERSION,
+    expected_lock_job_id: int | None = None,
+    snapshot_at: datetime | None = None,
+) -> ProductionSnapshot:
+    """Bulk-read the latest completed discovery fill without hiding gaps."""
+
+    lock = session.get(JobLock, 1)
+    if lock is not None and lock.job_id is not None:
+        adopted = (
+            expected_lock_job_id is not None
+            and lock.job_id == expected_lock_job_id
+            and lock.job_type == "discovery"
+        )
+        if not adopted:
+            raise ValueError("discovery data is being mutated")
+    fill = session.scalars(
+        select(DiscoveryDataFill)
+        .order_by(DiscoveryDataFill.id.desc())
+        .limit(1)
+    ).first()
+    if (
+        fill is not None
+        and fill.status == "snapshot_unavailable"
+        and fill.last_error
+    ):
+        raise ValueError(fill.last_error)
+    if (
+        fill is None
+        or fill.status != "done"
+        or fill.snapshot_status != "ready"
+    ):
+        raise ValueError("latest discovery data fill is not ready")
+
+    securities = session.scalars(
+        select(DiscoveryUniverseSecurity)
+        .where(DiscoveryUniverseSecurity.fill_id == fill.id)
+        .order_by(DiscoveryUniverseSecurity.code)
+    ).all()
+    if not securities:
+        raise ValueError("completed discovery data snapshot is empty")
+    checkpoints = session.scalars(
+        select(DiscoveryDataCheckpoint)
+        .where(DiscoveryDataCheckpoint.fill_id == fill.id)
+        .order_by(DiscoveryDataCheckpoint.code)
+    ).all()
+    security_codes = {row.code for row in securities}
+    checkpoint_codes = {row.code for row in checkpoints}
+    if security_codes != checkpoint_codes:
+        raise ValueError(
+            "discovery checkpoint and security snapshots do not match"
+        )
+    cutoff = fill.updated_at.astimezone(timezone.utc)
+    cutoff_date = cutoff.astimezone(CHINA_MARKET_TIMEZONE).date()
+    fill_start = fill.started_at.astimezone(timezone.utc)
+    payload_by_code: dict[str, dict[str, object]] = {}
+    payload_text_by_code: dict[str, str] = {}
+    payload_captured_at: dict[str, datetime] = {}
+    restart_guidance = (
+        "latest discovery fill checkpoint payload is not reproducible; "
+        "restart discovery data fill"
+    )
+
+    def valid_financial_date(value: object) -> bool:
+        if type(value) is not str or not value:
+            return False
+        try:
+            return date.fromisoformat(value).isoformat() == value and (
+                date.fromisoformat(value) <= cutoff_date
+            )
+        except ValueError:
+            return False
+
+    def valid_period(value: object) -> bool:
+        if type(value) is not str or not value:
+            return False
+        try:
+            return date.fromisoformat(value) <= cutoff_date
+        except ValueError:
+            pass
+        if len(value) == 4 and value.isdigit():
+            return int(value) <= cutoff_date.year
+        if len(value) == 7 and value[4] == "-":
+            try:
+                year, month = (int(part) for part in value.split("-", 1))
+                return date(year, month, 1) <= cutoff_date
+            except ValueError:
+                return False
+        if (
+            len(value) == 6
+            and value[:4].isdigit()
+            and value[4] == "Q"
+            and value[5] in "1234"
+        ):
+            quarter_month = int(value[5]) * 3
+            return date(int(value[:4]), quarter_month, 1) <= cutoff_date
+        return False
+
+    def valid_payload_date(value: object, *, nullable: bool = False) -> bool:
+        if nullable and value is None:
+            return True
+        return valid_financial_date(value)
+
+    if any(
+        not (
+            fill_start
+            <= security.snapshot_at.astimezone(timezone.utc)
+            <= cutoff
+        )
+        or not valid_payload_date(security.listing_date, nullable=True)
+        or not valid_payload_date(security.last_trade_date, nullable=True)
+        or not valid_payload_date(security.source_as_of, nullable=True)
+        for security in securities
+    ) or any(
+        not (
+            fill_start
+            <= checkpoint.updated_at.astimezone(timezone.utc)
+            <= cutoff
+        )
+        for checkpoint in checkpoints
+    ):
+        raise ValueError("discovery fill timestamps exceed fill cutoff")
+
+    for checkpoint in checkpoints:
+        if checkpoint.status != "done":
+            continue
+        if not verify_company_payload_digest(
+            checkpoint.payload_json,
+            checkpoint.payload_digest,
+        ):
+            raise ValueError(restart_guidance)
+        try:
+            payload = parse_company_payload(
+                checkpoint.payload_json,
+                expected_code=checkpoint.code,
+            )
+            captured_at = datetime.fromisoformat(
+                payload["captured_at"]
+            ).astimezone(timezone.utc)
+            checkpoint_at = checkpoint.updated_at.astimezone(timezone.utc)
+            if captured_at != checkpoint_at or captured_at > cutoff:
+                raise ValueError("payload capture is outside fill cutoff")
+            source_as_of = payload["source_as_of"]
+            security_state = payload["security_state"]
+            if not all(
+                (
+                    valid_payload_date(source_as_of["security"]),
+                    valid_payload_date(
+                        source_as_of["financial"], nullable=True
+                    ),
+                    valid_payload_date(
+                        source_as_of["valuation"], nullable=True
+                    ),
+                    valid_payload_date(security_state["listing_date"]),
+                    valid_payload_date(security_state["last_trade_date"]),
+                    valid_payload_date(security_state["industry_as_of"]),
+                )
+            ):
+                raise ValueError("payload source dates exceed fill cutoff")
+            for financial in payload["financial_rows"]:
+                if not (
+                    valid_period(financial["period"])
+                    and valid_payload_date(
+                        financial["source_as_of"], nullable=True
+                    )
+                ):
+                    raise ValueError("payload financial dates exceed fill cutoff")
+            for valuation in payload["valuation_points"]:
+                if not (
+                    valid_period(valuation["month"])
+                    and valid_payload_date(valuation["trade_date"])
+                ):
+                    raise ValueError("payload valuation dates exceed fill cutoff")
+            if (
+                len(payload["valuation_points"])
+                != checkpoint.valuation_points
+            ):
+                raise ValueError("payload valuation count mismatch")
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(restart_guidance) from error
+        payload_by_code[checkpoint.code] = payload
+        payload_text_by_code[checkpoint.code] = checkpoint.payload_json
+        payload_captured_at[checkpoint.code] = captured_at
+
+    dates = tuple(
+        session.scalars(
+            select(DiscoveryFillTradingDate.trade_date)
+            .where(DiscoveryFillTradingDate.fill_id == fill.id)
+            .order_by(DiscoveryFillTradingDate.trade_date)
+        ).all()
+    )
+    if not dates:
+        raise ValueError("completed discovery data calendar is empty")
+    try:
+        normalized_dates = tuple(
+            date.fromisoformat(value).isoformat() for value in dates
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError("discovery fill calendar is invalid") from error
+    if (
+        normalized_dates != dates
+        or tuple(sorted(set(normalized_dates))) != dates
+        or any(value > cutoff_date.isoformat() for value in normalized_dates)
+    ):
+        raise ValueError("discovery fill calendar exceeds fill cutoff")
+
+    financial_by_code: dict[str, list[dict[str, object]]] = {
+        code: [] for code in security_codes
+    }
+    valuation_by_code: dict[str, list[dict[str, object]]] = {
+        code: [] for code in security_codes
+    }
+    for code, payload in payload_by_code.items():
+        for row in payload["financial_rows"]:
+            field_sources = row["field_sources"]
+            trusted = {
+                field: metadata
+                for field, metadata in field_sources.items()
+                if metadata["trusted"] is True
+            }
+            financial_by_code[code].append(
+                {
+                    "period": row["period"],
+                    "period_type": row["period_type"],
+                    "source_as_of": row["source_as_of"],
+                    "values": {
+                        field: value if field in trusted else None
+                        for field, value in row["values"].items()
+                    },
+                    "provenance": {
+                        field: ["discovery"] for field in trusted
+                    },
+                    "field_sources": trusted,
+                }
+            )
+        financial_by_code[code].sort(
+            key=lambda row: (row["period"], row["period_type"])
+        )
+        captured_at = payload_captured_at[code]
+        valuation_by_code[code] = sorted(
+            (
+                {
+                    **point,
+                    "fetched_at": captured_at,
+                }
+                for point in payload["valuation_points"]
+            ),
+            key=lambda row: (row["trade_date"], row["month"]),
+        )
+
+    companies: list[CompanySnapshotInput] = []
+    for security in securities:
+        financial_history = financial_by_code[security.code]
+        valuation_history = valuation_by_code[security.code]
+        latest = valuation_history[-1] if valuation_history else None
+        price = None if latest is None else latest["price"]
+        price_source = None if latest is None else latest["source"]
+        price_as_of = None if latest is None else latest["trade_date"]
+        payload = payload_by_code.get(security.code)
+        source_as_of = (
+            {"financial": None, "valuation": None}
+            if payload is None
+            else payload["source_as_of"]
+        )
+        valuation_fetched_at = (
+            None
+            if payload is None
+            else payload_captured_at[security.code]
+        )
+        companies.append(
+            CompanySnapshotInput(
+                code=security.code,
+                name=security.name,
+                industry=security.industry,
+                security_status={
+                    "exchange": security.exchange,
+                    "listing_date": security.listing_date,
+                    "is_st": security.is_st,
+                    "is_delisting": security.is_delisting,
+                    "trading_status": security.trading_status,
+                    "is_suspended": security.is_suspended,
+                    "last_trade_date": security.last_trade_date,
+                    "industry_version": security.industry_version,
+                    "industry_as_of": security.source_as_of,
+                    "security_source": security.provenance,
+                    "market_status_code": security.market_status_code,
+                    "snapshot_at": security.snapshot_at,
+                },
+                fields={
+                    "price": price,
+                    "pe": None if latest is None else latest["pe"],
+                    "pb": None if latest is None else latest["pb"],
+                    "listing_date": security.listing_date,
+                    "financial_history": financial_history,
+                    "valuation_history": valuation_history,
+                },
+                sources={
+                    "price": price_source,
+                    "security": security.provenance,
+                    "financial_history": "checkpoint_payload:field_sources",
+                    "valuation_history": sorted(
+                        {
+                            str(row["source"])
+                            for row in valuation_history
+                        }
+                    ),
+                },
+                as_of={
+                    "price": price_as_of,
+                    "security": security.source_as_of,
+                    "financial": source_as_of["financial"],
+                    "valuation": source_as_of["valuation"],
+                    "valuation_fetched_at": valuation_fetched_at,
+                    "fill": fill.updated_at,
+                },
+            )
+        )
+
+    exchanges = {
+        exchange
+        for row in securities
+        if (exchange := row.exchange or row.code.rsplit(".", 1)[-1])
+        in {"SH", "SZ"}
+    }
+    if not exchanges:
+        raise ValueError("completed discovery data has no supported exchange")
+    trading_dates = MappingProxyType(
+        {exchange: dates for exchange in sorted(exchanges)}
+    )
+    rulers = resolve_discovery_rulers(
+        session, algorithm_version=algorithm_version
+    )
+    boundary = {
+        "fill_id": fill.id,
+        "cutoff": cutoff,
+        "checkpoints": [
+            {
+                "code": row.code,
+                "status": row.status,
+                "valuation_points": row.valuation_points,
+                "payload_json": payload_text_by_code.get(row.code),
+            }
+            for row in checkpoints
+        ],
+        "securities": [
+            {
+                column.name: getattr(row, column.name)
+                for column in DiscoveryUniverseSecurity.__table__.columns
+            }
+            for row in securities
+        ],
+        "trading_dates": dates,
+    }
+    versions = SnapshotVersions(
+        data_version=(
+            f"discovery-fill:{fill.id}:{cutoff.isoformat()}:"
+            f"{_sha256(boundary)[:20]}"
+        ),
+        financial_version=_snapshot_version(
+            f"financial:fill:{fill.id}:{cutoff.isoformat()}",
+            {
+                code: payload["financial_rows"]
+                for code, payload in sorted(payload_by_code.items())
+            },
+        ),
+        valuation_version=_snapshot_version(
+            f"valuation:fill:{fill.id}:{cutoff.isoformat()}",
+            {
+                code: payload["valuation_points"]
+                for code, payload in sorted(payload_by_code.items())
+            },
+        ),
+        ruler_version_ids=rulers,
+        algorithm_version=algorithm_version,
+    )
+    captured_at = cutoff
+    return ProductionSnapshot(
+        fill_id=fill.id,
+        companies=tuple(companies),
+        versions=versions,
+        trading_dates=trading_dates,
+        snapshot_at=captured_at,
     )
 
 

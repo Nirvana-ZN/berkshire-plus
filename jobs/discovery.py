@@ -21,7 +21,10 @@ from app.discovery_models import (
     DiscoveryRun,
     DiscoveryStage,
 )
+from app.models import JobLock
+from discovery.aggregate import aggregate_run_status
 from discovery.common import CommonVerdict, classify_common
+from discovery.constants import TRACKS
 from discovery.snapshot import canonical_json, load_frozen_inputs
 from jobs.lock import JOB_TYPE_DISCOVERY, release, try_acquire
 
@@ -44,6 +47,10 @@ class QueueStalledError(RuntimeError):
 
 class TrackExecutorContractError(PermanentDiscoveryError):
     """The injected track executor violated drain-owned transactions."""
+
+
+class DiscoveryLockLostError(RuntimeError):
+    """The drain no longer owns its exact committed global lock."""
 
 
 @dataclass(frozen=True)
@@ -84,6 +91,22 @@ def _failure_kind(error: BaseException) -> str:
     return "permanent"
 
 
+def _verify_run_lock(session: Session, run_id: int) -> None:
+    if session.info.get("discovery_lock_run_id") != run_id:
+        return
+    lock = session.scalar(
+        select(JobLock)
+        .where(JobLock.id == 1)
+        .execution_options(populate_existing=True)
+    )
+    if (
+        lock is None
+        or lock.job_id != run_id
+        or lock.job_type != JOB_TYPE_DISCOVERY
+    ):
+        raise DiscoveryLockLostError("discovery run lock ownership was lost")
+
+
 def _persist_failure(
     session: Session, stage_id: int, error: BaseException
 ) -> StageExecutionOutcome:
@@ -97,6 +120,7 @@ def _persist_failure(
     stage.error = _safe_error(error)
     stage.failure_kind = _failure_kind(error)
     stage.updated_at = _now()
+    _verify_run_lock(session, stage.run_id)
     session.commit()
     return StageExecutionOutcome(stage_id, "failed", True)
 
@@ -123,6 +147,9 @@ def execute_common_stage(
             updated_at=claimed_at,
         )
     )
+    owned_run_id = session.info.get("discovery_lock_run_id")
+    if type(owned_run_id) is int:
+        _verify_run_lock(session, owned_run_id)
     session.commit()
     if int(claim.rowcount or 0) != 1:
         session.expire_all()
@@ -207,6 +234,7 @@ def execute_common_stage(
         stage.failure_kind = None
         stage.updated_at = completed_at
         session.flush()
+        _verify_run_lock(session, stage.run_id)
         session.commit()
         return StageExecutionOutcome(
             stage_id,
@@ -275,6 +303,7 @@ def _persist_track_failure(
             stage.error = _safe_error(error)
             stage.failure_kind = _failure_kind(error)
             stage.updated_at = _now()
+            _verify_run_lock(session, stage.run_id)
             session.commit()
     except BaseException:
         try:
@@ -335,6 +364,10 @@ def _execute_track_stage(
             raise TrackExecutorContractError(
                 f"track stage {stage_id} has invalid completion state"
             )
+        stage = session.get(DiscoveryStage, stage_id)
+        if stage is None:
+            raise QueueStalledError(f"track stage {stage_id} disappeared")
+        _verify_run_lock(session, stage.run_id)
         session.commit()
     except BaseException as error:
         if event.contains(session, "before_commit", reject_callback_commit):
@@ -366,25 +399,93 @@ def _release_run_lock(session: Session, run_id: int) -> None:
         raise cleanup_error
 
 
+def _sync_run_status_while_locked(session: Session, run_id: int) -> None:
+    session.rollback()
+    _verify_run_lock(session, run_id)
+    run = session.get(DiscoveryRun, run_id)
+    if run is None or run.current is not True or run.status == "abandoned":
+        return
+    common = session.scalars(
+        select(DiscoveryCommonStage)
+        .where(
+            DiscoveryCommonStage.run_id == run_id,
+            DiscoveryCommonStage.superseded_at.is_(None),
+        )
+        .order_by(
+            DiscoveryCommonStage.attempt.desc(),
+            DiscoveryCommonStage.id.desc(),
+        )
+        .limit(1)
+    ).first()
+    stage_order = {"track_gate": 0, "competition": 1, "adjudication": 2}
+    stages = session.scalars(
+        select(DiscoveryStage).where(
+            DiscoveryStage.run_id == run_id,
+            DiscoveryStage.superseded_at.is_(None),
+        )
+    ).all()
+    track_statuses: dict[str, str] = {}
+    for track in TRACKS:
+        candidates = [row for row in stages if row.track == track]
+        track_statuses[track] = (
+            "queued"
+            if not candidates
+            else max(
+                candidates,
+                key=lambda row: (
+                    stage_order.get(row.stage, -1),
+                    row.attempt,
+                    row.id,
+                ),
+            ).status
+        )
+    status = aggregate_run_status(
+        run.status,
+        "queued" if common is None else common.status,
+        track_statuses,
+    )
+    session.execute(
+        update(DiscoveryRun)
+        .where(
+            DiscoveryRun.id == run_id,
+            DiscoveryRun.current.is_(True),
+            DiscoveryRun.status != "abandoned",
+        )
+        .values(status=status, updated_at=_now())
+    )
+    session.commit()
+
+
 def drain_run_queue(
     session: Session,
     run_id: int,
     *,
     track_executor: TrackExecutor | None = None,
+    lock_already_held: bool = False,
 ) -> DrainOutcome:
     """Drain queued common/track stages under the one global job lock."""
 
     if type(run_id) is not int or run_id < 1:
         raise ValueError("run_id must be a positive integer")
-    if not try_acquire(session, run_id, JOB_TYPE_DISCOVERY):
-        session.rollback()
-        return DrainOutcome(run_id, False, 0)
-    session.commit()
+    if lock_already_held:
+        lock = session.get(JobLock, 1)
+        if lock is None or lock.job_id != run_id or lock.job_type != JOB_TYPE_DISCOVERY:
+            session.rollback()
+            raise ValueError("discovery run lock cannot be adopted")
+    else:
+        if not try_acquire(session, run_id, JOB_TYPE_DISCOVERY):
+            session.rollback()
+            return DrainOutcome(run_id, False, 0)
+        session.commit()
 
     executed = 0
+    session.info["discovery_lock_run_id"] = run_id
     try:
         while True:
             session.expire_all()
+            run = session.get(DiscoveryRun, run_id)
+            if run is None or run.current is not True or run.status == "abandoned":
+                return DrainOutcome(run_id, True, executed)
             selected = _next_queued_stage(session, run_id)
             if selected is None:
                 return DrainOutcome(run_id, True, executed)
@@ -392,15 +493,39 @@ def drain_run_queue(
             if kind == "common":
                 outcome = execute_common_stage(session, stage_id)
                 if not outcome.claimed or outcome.status == "running":
-                    raise QueueStalledError(
-                        f"common stage {stage_id} did not advance"
-                    )
+                    raise QueueStalledError(f"common stage {stage_id} did not advance")
+                if outcome.status == "failed":
+                    return DrainOutcome(run_id, True, executed + 1)
             else:
-                if track_executor is None:
-                    raise QueueStalledError(
-                        f"track stage {stage_id} has no executor"
+                stage = session.get(DiscoveryStage, stage_id)
+                if stage is None:
+                    raise QueueStalledError(f"track stage {stage_id} disappeared")
+                if stage.ruler_version_id is None or track_executor is None:
+                    stage.status = "ruler_not_ready"
+                    stage.error = (
+                        "轨道尺子尚未就绪"
+                        if stage.ruler_version_id is None
+                        else "当前构建未注册轨道执行器"
                     )
-                _execute_track_stage(session, stage_id, track_executor)
+                    stage.failure_kind = None
+                    stage.updated_at = _now()
+                    _verify_run_lock(session, run_id)
+                    session.commit()
+                else:
+                    try:
+                        _execute_track_stage(session, stage_id, track_executor)
+                    except Exception:
+                        session.expire_all()
+                        failed = session.get(DiscoveryStage, stage_id)
+                        if failed is None or failed.status in {
+                            "queued",
+                            "running",
+                        }:
+                            raise
             executed += 1
     finally:
-        _release_run_lock(session, run_id)
+        try:
+            _sync_run_status_while_locked(session, run_id)
+        finally:
+            session.info.pop("discovery_lock_run_id", None)
+            _release_run_lock(session, run_id)

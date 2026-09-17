@@ -743,8 +743,8 @@ def test_drain_rolls_back_flushed_track_writes_then_marks_failed(
             worker.flush()
             raise RuntimeError("track programmer bug")
 
-        with pytest.raises(RuntimeError, match="track programmer bug"):
-            drain_run_queue(session, run_id, track_executor=execute)
+        outcome = drain_run_queue(session, run_id, track_executor=execute)
+        assert outcome.executed == 1
 
     with SessionLocal() as verify:
         stage = verify.get(DiscoveryStage, stage_id)
@@ -764,7 +764,6 @@ def test_drain_integrity_error_rolls_back_and_releases_lock(tmp_path) -> None:
     from app.discovery_models import DiscoveryResult, DiscoveryStage
     from app.models import JobLock
     from jobs.discovery import drain_run_queue
-    from sqlalchemy.exc import IntegrityError
 
     engine = init_db(tmp_path / "track-integrity.db")
     SessionLocal = create_session_factory(engine)
@@ -787,8 +786,8 @@ def test_drain_integrity_error_rolls_back_and_releases_lock(tmp_path) -> None:
             selected.status = "waiting_confirmation"
             worker.flush()
 
-        with pytest.raises(IntegrityError):
-            drain_run_queue(session, run_id, track_executor=execute)
+        outcome = drain_run_queue(session, run_id, track_executor=execute)
+        assert outcome.executed == 1
 
     with SessionLocal() as verify:
         stage = verify.get(DiscoveryStage, stage_id)
@@ -801,7 +800,7 @@ def test_drain_integrity_error_rolls_back_and_releases_lock(tmp_path) -> None:
 def test_drain_rejects_track_callback_commit(tmp_path) -> None:
     from app.discovery_models import DiscoveryResult, DiscoveryStage
     from app.models import JobLock
-    from jobs.discovery import TrackExecutorContractError, drain_run_queue
+    from jobs.discovery import drain_run_queue
 
     engine = init_db(tmp_path / "track-commit.db")
     SessionLocal = create_session_factory(engine)
@@ -823,8 +822,8 @@ def test_drain_rejects_track_callback_commit(tmp_path) -> None:
             selected.status = "waiting_confirmation"
             worker.commit()
 
-        with pytest.raises(TrackExecutorContractError):
-            drain_run_queue(session, run_id, track_executor=execute)
+        outcome = drain_run_queue(session, run_id, track_executor=execute)
+        assert outcome.executed == 1
 
     with SessionLocal() as verify:
         stage = verify.get(DiscoveryStage, stage_id)
@@ -862,7 +861,7 @@ def test_drain_does_nothing_when_global_lock_is_held(tmp_path) -> None:
 
 def test_drain_fails_safely_if_track_executor_does_not_advance(tmp_path) -> None:
     from app.models import JobLock
-    from jobs.discovery import QueueStalledError, drain_run_queue
+    from jobs.discovery import drain_run_queue
 
     engine = init_db(tmp_path / "stall.db")
     SessionLocal = create_session_factory(engine)
@@ -876,10 +875,10 @@ def test_drain_fails_safely_if_track_executor_does_not_advance(tmp_path) -> None
         )
         run_id = run.id
         session.commit()
-        with pytest.raises(QueueStalledError):
-            drain_run_queue(
-                session, run_id, track_executor=lambda _session, _id: None
-            )
+        outcome = drain_run_queue(
+            session, run_id, track_executor=lambda _session, _id: None
+        )
+        assert outcome.executed == 1
         session.expire_all()
         lock = session.get(JobLock, 1)
         assert lock is not None

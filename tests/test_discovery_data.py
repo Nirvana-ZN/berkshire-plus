@@ -49,7 +49,6 @@ from market.types import (
     ValuationPoint,
 )
 
-
 NEW_FINANCIAL_VALUES = {
     "revenue": Decimal("1000.01"),
     "deducted_net_income": Decimal("90.02"),
@@ -903,8 +902,8 @@ def test_persist_valuation_history_rejects_mixed_method_without_partial_write(
 
 
 def test_ratio_method_claim_is_atomic_across_sessions(tmp_path) -> None:
-    from jobs.discovery_data import persist_valuation_history
     from app.models import ValuationSeries
+    from jobs.discovery_data import persist_valuation_history
 
     engine = init_db(tmp_path / "valuation-concurrent.db")
     now = datetime.now(timezone.utc)
@@ -2702,6 +2701,525 @@ def _bundle(
     )
 
 
+def _complete_checkpoint_payload(
+    checkpoint: DiscoveryDataCheckpoint,
+    now: datetime,
+) -> None:
+    from discovery.company_payload import (
+        company_payload_digest,
+        serialize_company_payload,
+    )
+
+    checkpoint.payload_json = serialize_company_payload(
+        _bundle(checkpoint.code),
+        captured_at=now,
+    )
+    checkpoint.payload_digest = company_payload_digest(
+        checkpoint.payload_json
+    )
+    checkpoint.status = "done"
+    checkpoint.updated_at = now
+
+
+def test_checkpoint_payload_schema_migrates_additively_and_idempotently(
+    tmp_path,
+) -> None:
+    db_path = tmp_path / "checkpoint-payload-migration.db"
+    old_engine = create_engine(f"sqlite:///{db_path.resolve().as_posix()}")
+    with old_engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE discovery_data_checkpoints (
+                    fill_id INTEGER NOT NULL,
+                    code VARCHAR NOT NULL,
+                    status VARCHAR NOT NULL,
+                    attempts INTEGER NOT NULL,
+                    next_retry_at DATETIME,
+                    valuation_points INTEGER NOT NULL,
+                    error TEXT,
+                    updated_at DATETIME NOT NULL,
+                    PRIMARY KEY (fill_id, code)
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                INSERT INTO discovery_data_checkpoints
+                VALUES (7, '600000.SH', 'done', 1, NULL, 0, NULL,
+                        '2026-09-16 12:00:00')
+                """
+            )
+        )
+    old_engine.dispose()
+
+    for _ in range(2):
+        engine = init_db(db_path)
+        with engine.connect() as conn:
+            columns = {
+                row[1]: row[3]
+                for row in conn.exec_driver_sql(
+                    "PRAGMA table_info(discovery_data_checkpoints)"
+                )
+            }
+            assert columns["payload_json"] == 0
+            assert columns["payload_digest"] == 0
+            assert conn.execute(
+                text(
+                    "SELECT payload_json, payload_digest "
+                    "FROM discovery_data_checkpoints "
+                    "WHERE fill_id = 7 AND code = '600000.SH'"
+                )
+            ).one() == (None, None)
+        engine.dispose()
+
+
+def test_discovery_company_payload_round_trips_exact_strict_bundle() -> None:
+    from discovery.company_payload import (
+        parse_company_payload,
+        serialize_company_payload,
+    )
+
+    captured_at = datetime(2026, 9, 16, 12, 34, 56, 123456, tzinfo=timezone.utc)
+    bundle = DiscoveryCompanyData(
+        code="600036.SH",
+        security_state=_security("600036.SH"),
+        financial_rows=(
+            FinancialRow(
+                code="600036.SH",
+                period="2025",
+                period_type="annual",
+                revenue=Decimal("337532000000.123456789012345678"),
+                net_income=None,
+                capital_adequacy=Decimal("18.24"),
+                core_tier1_capital_adequacy=Decimal("14.16"),
+                nonperforming_loan_balance=Decimal("68206000000"),
+                source_as_of="2026-03-28",
+            ),
+        ),
+        valuation_points=(
+            ValuationPoint(
+                code="600036.SH",
+                month="2026-08",
+                trade_date="2026-08-31",
+                pe=Decimal("6.123456789012345678"),
+                pb=Decimal("0.9"),
+                price=Decimal("42.01"),
+                source="eastmoney:RPT_VALUEANALYSIS_DET",
+                ratio_method="PE_TTM/PB_MRQ",
+            ),
+        ),
+        request_count=9,
+        source_as_of=DiscoverySourceAsOf(
+            security="2026-09-16",
+            financial="2026-03-28",
+            valuation="2026-08-31",
+        ),
+    )
+
+    encoded = serialize_company_payload(bundle, captured_at=captured_at)
+    parsed = parse_company_payload(encoded)
+    from discovery.company_payload import company_payload_digest
+
+    assert company_payload_digest(encoded) == (
+        "16a5a6940ab6aa8c1c43d2d75f31e15fe62cb1ff1c7120bf593e1fd777f4607b"
+    )
+    row = parsed["financial_rows"][0]
+    assert row["values"]["revenue"] == "337532000000.123456789012345678"
+    assert row["values"]["net_income"] is None
+    assert row["field_sources"]["capital_adequacy"] == {
+        "consolidated_basis": "consolidated",
+        "field": "NEWCAPITALADER",
+        "financial_sector_substitute": "NEWCAPITALADER",
+        "period_type": "period_end",
+        "report": "RPT_F10_FINANCE_MAINFINADATA",
+        "source": "discovery",
+        "source_as_of": "NOTICE_DATE/UPDATE_DATE",
+        "trusted": True,
+        "unit": "percent",
+    }
+    assert parsed["valuation_points"][0]["pe"] == "6.123456789012345678"
+    assert parsed["captured_at"] == "2026-09-16T12:34:56.123456Z"
+    assert serialize_company_payload(bundle, captured_at=captured_at) == encoded
+
+    missing = json.loads(encoded)
+    del missing["financial_rows"][0]["values"]["net_income"]
+    with pytest.raises(ValueError, match="financial values"):
+        parse_company_payload(json.dumps(missing, separators=(",", ":"), sort_keys=True))
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "{",
+        '{"captured_at":"2026-09-16T12:00:00Z","code":"600000.SH","x":NaN}',
+        '{"captured_at":"2026-09-16T12:00:00Z","code":"600000.SH"}',
+    ],
+)
+def test_discovery_company_payload_rejects_malformed_or_nonfinite(
+    payload: str,
+) -> None:
+    from discovery.company_payload import parse_company_payload
+
+    with pytest.raises(ValueError):
+        parse_company_payload(payload)
+
+
+def test_discovery_company_payload_rejects_nonfinite_decimal() -> None:
+    from discovery.company_payload import serialize_company_payload
+
+    bundle = replace(
+        _bundle("600000.SH"),
+        financial_rows=(
+            FinancialRow(
+                code="600000.SH",
+                period="2025",
+                period_type="annual",
+                net_income=Decimal("NaN"),
+            ),
+        ),
+    )
+    with pytest.raises(ValueError, match="finite"):
+        serialize_company_payload(
+            bundle,
+            captured_at=datetime(2026, 9, 16, 12, tzinfo=timezone.utc),
+        )
+
+
+def test_company_persistence_crash_rolls_back_payload_and_global_rows(
+    tmp_path, monkeypatch
+) -> None:
+    from jobs import discovery_data
+
+    engine = init_db(tmp_path / "checkpoint-payload-rollback.db")
+    factory = create_session_factory(engine)
+    now = datetime(2026, 9, 16, 12, tzinfo=timezone.utc)
+    code = "600000.SH"
+    with factory() as session:
+        fill_id = _fill(session, [code], now=now).id
+
+    def crash(*_args, **_kwargs):
+        raise RuntimeError("valuation persistence crashed")
+
+    monkeypatch.setattr(discovery_data, "persist_valuation_history", crash)
+    with factory() as session:
+        checkpoint = session.get(DiscoveryDataCheckpoint, (fill_id, code))
+        assert checkpoint is not None
+        checkpoint.status = "running"
+        bundle = replace(
+            _bundle(code),
+            financial_rows=(
+                FinancialRow(
+                    code=code,
+                    period="2025",
+                    period_type="annual",
+                    net_income=Decimal("100.123456789012345678"),
+                ),
+            ),
+        )
+        with pytest.raises(RuntimeError, match="crashed"):
+            discovery_data._persist_company(session, checkpoint, bundle, now)
+        session.rollback()
+
+    with factory() as session:
+        checkpoint = session.get(DiscoveryDataCheckpoint, (fill_id, code))
+        assert checkpoint is not None
+        assert checkpoint.status == "pending"
+        assert checkpoint.payload_json is None
+        assert session.get(Financial, (code, "2025", "annual")) is None
+    engine.dispose()
+
+
+def test_real_fill_execution_payload_feeds_weekly_snapshot(tmp_path) -> None:
+    from discovery.snapshot import build_production_snapshot
+    from jobs.discovery_data import RequestPolicy, execute_discovery_data_fill
+
+    engine = init_db(tmp_path / "execute-to-weekly-snapshot.db")
+    factory = create_session_factory(engine)
+    now = datetime(2026, 9, 16, 12, tzinfo=timezone.utc)
+    code = "600000.SH"
+    point = ValuationPoint(
+        code=code,
+        month="2026-08",
+        trade_date="2026-08-31",
+        pe=Decimal("7.123456789"),
+        pb=Decimal("0.8"),
+        price=Decimal("12.34"),
+    )
+    bundle = replace(
+        _bundle(code, valuation_points=(point,)),
+        financial_rows=(
+            FinancialRow(
+                code=code,
+                period="2025",
+                period_type="annual",
+                net_income=Decimal("123.456789012345678"),
+                capital_adequacy=Decimal("18.24"),
+                source_as_of="2026-03-31",
+            ),
+        ),
+        source_as_of=DiscoverySourceAsOf(
+            security="2026-09-16",
+            financial="2026-03-31",
+            valuation="2026-08-31",
+        ),
+    )
+    with factory() as session:
+        fill_id = _fill(session, [code], now=now).id
+        execute_discovery_data_fill(
+            session,
+            FakeMarketClient(discovery_data={code: bundle}),
+            fill_id,
+            policy=RequestPolicy(
+                requests_per_second=100,
+                max_attempts=1,
+                daily_budget=100,
+                max_runtime_seconds=60,
+            ),
+            clock=FakeClock(now),
+        )
+    with factory() as session:
+        checkpoint = session.get(DiscoveryDataCheckpoint, (fill_id, code))
+        assert checkpoint is not None and checkpoint.payload_json is not None
+        assert checkpoint.payload_digest is not None
+        company = build_production_snapshot(session).companies[0]
+    assert company.fields["financial_history"][0]["values"]["net_income"] == (
+        "123.456789012345678"
+    )
+    assert company.fields["financial_history"][0]["values"][
+        "capital_adequacy"
+    ] == "18.24"
+    assert company.fields["valuation_history"][0]["price"] == "12.34"
+    engine.dispose()
+
+
+@pytest.mark.parametrize("legacy_status", ["paused", "done"])
+def test_init_rejects_legacy_done_checkpoint_without_payload_digest_and_replaces(
+    tmp_path, legacy_status: str
+) -> None:
+    from jobs.discovery_data import start_discovery_data_fill
+
+    db_path = tmp_path / f"legacy-{legacy_status}.db"
+    engine = init_db(db_path)
+    factory = create_session_factory(engine)
+    now = datetime(2026, 9, 16, 12, tzinfo=timezone.utc)
+    with factory() as session:
+        fill = _fill(session, ["600000.SH"], now=now, status=legacy_status)
+        fill.completed = 1
+        checkpoint = session.get(
+            DiscoveryDataCheckpoint, (fill.id, "600000.SH")
+        )
+        assert checkpoint is not None
+        checkpoint.status = "done"
+        checkpoint.payload_json = None
+        checkpoint.payload_digest = None
+        session.commit()
+        legacy_id = fill.id
+    engine.dispose()
+
+    for _ in range(2):
+        engine = init_db(db_path)
+        with create_session_factory(engine)() as session:
+            legacy = session.get(DiscoveryDataFill, legacy_id)
+            assert legacy is not None
+            assert legacy.status == "snapshot_unavailable"
+            assert legacy.snapshot_status == "unavailable"
+            assert legacy.last_error == (
+                "snapshot unavailable or mismatched; start a new fill"
+            )
+        engine.dispose()
+
+    engine = init_db(db_path)
+    with create_session_factory(engine)() as session:
+        replacement, dispatch = start_discovery_data_fill(session, now=now)
+        assert replacement is not None and replacement.id != legacy_id
+        assert dispatch is True
+    engine.dispose()
+
+
+def test_start_replaces_active_fill_with_incomplete_done_payload(tmp_path) -> None:
+    from jobs.discovery_data import start_discovery_data_fill
+
+    engine = init_db(tmp_path / "active-incomplete-payload.db")
+    factory = create_session_factory(engine)
+    now = datetime(2026, 9, 16, 12, tzinfo=timezone.utc)
+    with factory() as session:
+        legacy = _fill(
+            session, ["600000.SH"], now=now, status="paused"
+        )
+        checkpoint = session.get(
+            DiscoveryDataCheckpoint, (legacy.id, "600000.SH")
+        )
+        assert checkpoint is not None
+        checkpoint.status = "done"
+        legacy.completed = 1
+        session.commit()
+        legacy_id = legacy.id
+
+        replacement, dispatch = start_discovery_data_fill(session, now=now)
+        assert replacement is not None and replacement.id != legacy_id
+        assert dispatch is True
+        legacy = session.get(DiscoveryDataFill, legacy_id)
+        assert legacy is not None
+        assert legacy.status == "snapshot_unavailable"
+    engine.dispose()
+
+
+def test_done_checkpoint_payload_and_digest_are_database_immutable(
+    tmp_path,
+) -> None:
+    from sqlalchemy.exc import IntegrityError
+
+    from discovery.company_payload import (
+        company_payload_digest,
+        serialize_company_payload,
+    )
+
+    db_path = tmp_path / "immutable-checkpoint-payload.db"
+    engine = init_db(db_path)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "DROP TRIGGER IF EXISTS "
+                "trg_discovery_checkpoint_payload_immutable"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE TRIGGER "
+                "trg_discovery_checkpoint_payload_immutable "
+                "BEFORE UPDATE OF payload_json, payload_digest "
+                "ON discovery_data_checkpoints "
+                "WHEN OLD.status = 'done' "
+                "AND OLD.payload_json IS NOT NULL "
+                "AND OLD.payload_digest IS NOT NULL "
+                "AND (NEW.payload_json IS NOT OLD.payload_json "
+                "OR NEW.payload_digest IS NOT OLD.payload_digest) "
+                "BEGIN SELECT RAISE(ABORT, "
+                "'completed discovery payload is immutable'); END"
+            )
+        )
+    engine.dispose()
+    for _ in range(2):
+        engine = init_db(db_path)
+        engine.dispose()
+    engine = init_db(db_path)
+    factory = create_session_factory(engine)
+    now = datetime(2026, 9, 16, 12, tzinfo=timezone.utc)
+    code = "600000.SH"
+    with factory() as session:
+        fill_id = _fill(session, [code], now=now).id
+        checkpoint = session.get(DiscoveryDataCheckpoint, (fill_id, code))
+        assert checkpoint is not None
+        checkpoint.payload_json = serialize_company_payload(
+            _bundle(code), captured_at=now
+        )
+        checkpoint.payload_digest = company_payload_digest(
+            checkpoint.payload_json
+        )
+        checkpoint.status = "done"
+        session.commit()
+        original_payload = checkpoint.payload_json
+        original_digest = checkpoint.payload_digest
+
+        checkpoint.error = "must roll back"
+        checkpoint.payload_json = f"{original_payload} "
+        with pytest.raises(IntegrityError, match="immutable"):
+            session.commit()
+        session.rollback()
+
+        with pytest.raises(IntegrityError, match="immutable"):
+            session.execute(
+                text(
+                    "UPDATE discovery_data_checkpoints "
+                    "SET payload_digest = :digest "
+                    "WHERE fill_id = :fill_id AND code = :code"
+                ),
+                {
+                    "digest": "0" * 64,
+                    "fill_id": fill_id,
+                    "code": code,
+                },
+            )
+        session.rollback()
+
+        with pytest.raises(IntegrityError, match="immutable"):
+            session.execute(
+                text(
+                    "UPDATE discovery_data_checkpoints SET status = 'running' "
+                    "WHERE fill_id = :fill_id AND code = :code"
+                ),
+                {"fill_id": fill_id, "code": code},
+            )
+        session.rollback()
+
+        with pytest.raises(IntegrityError, match="immutable"):
+            session.execute(
+                text(
+                    "UPDATE discovery_data_checkpoints "
+                    "SET status = 'running', payload_json = :payload "
+                    "WHERE fill_id = :fill_id AND code = :code"
+                ),
+                {
+                    "payload": f"{original_payload} ",
+                    "fill_id": fill_id,
+                    "code": code,
+                },
+            )
+        session.rollback()
+
+        session.execute(
+            text(
+                "UPDATE discovery_data_checkpoints SET payload_json = payload_json "
+                "WHERE fill_id = :fill_id AND code = :code"
+            ),
+            {"fill_id": fill_id, "code": code},
+        )
+        session.commit()
+
+    with factory() as session:
+        checkpoint = session.get(DiscoveryDataCheckpoint, (fill_id, code))
+        assert checkpoint is not None
+        assert checkpoint.payload_json == original_payload
+        assert checkpoint.payload_digest == original_digest
+        assert checkpoint.status == "done"
+        assert checkpoint.error is None
+    engine.dispose()
+
+
+@pytest.mark.parametrize("sealed_field", ["payload_json", "payload_digest"])
+def test_partial_checkpoint_identity_cannot_be_rewritten(
+    tmp_path, sealed_field: str
+) -> None:
+    from sqlalchemy.exc import IntegrityError
+
+    engine = init_db(tmp_path / f"partial-seal-{sealed_field}.db")
+    now = datetime(2026, 9, 16, 12, tzinfo=timezone.utc)
+    with Session(engine) as session:
+        fill = _fill(session, [], now=now)
+        checkpoint = DiscoveryDataCheckpoint(
+            fill_id=fill.id,
+            code="600000.SH",
+            status="running",
+            attempts=1,
+            next_retry_at=None,
+            valuation_points=0,
+            error=None,
+            payload_json="{}" if sealed_field == "payload_json" else None,
+            payload_digest="0" * 64 if sealed_field == "payload_digest" else None,
+            updated_at=now,
+        )
+        session.add(checkpoint)
+        session.commit()
+        setattr(checkpoint, sealed_field, "1" * 64)
+        with pytest.raises(IntegrityError, match="immutable"):
+            session.commit()
+        session.rollback()
+    engine.dispose()
+
+
 def _snapshot_security(
     fill_id: int,
     code: str,
@@ -2857,7 +3375,7 @@ def test_discovery_fill_resume_skips_completed_and_retries_due_checkpoint(
         done = session.get(DiscoveryDataCheckpoint, (fill_id, done_code))
         retry = session.get(DiscoveryDataCheckpoint, (fill_id, retry_code))
         assert done is not None and retry is not None
-        done.status = "done"
+        _complete_checkpoint_payload(done, now)
         done.attempts = 1
         retry.status = "retryable"
         retry.attempts = 1
@@ -2928,7 +3446,7 @@ def test_resumable_fill_rejects_checkpoint_snapshot_mismatch(
             DiscoveryDataCheckpoint, (fill_id, checkpoint_codes[0])
         )
         assert done is not None
-        done.status = "done"
+        _complete_checkpoint_payload(done, now)
         done.attempts = 2
         done.valuation_points = 60
         fill.completed = 1
@@ -3229,8 +3747,19 @@ def test_discovery_data_duplicate_start_is_idempotent_and_lock_conflicts(
     from market.cheap import CheapRow
 
     code = "000001.SZ"
-    gate = Event()
-    market = FakeMarketClient(
+    entered = Event()
+    release_fetch = Event()
+
+    class BlockingMarket(FakeMarketClient):
+        def fetch_discovery_data(self, code, *, before_request=None):
+            entered.set()
+            assert release_fetch.wait(30)
+            return super().fetch_discovery_data(
+                code,
+                before_request=before_request,
+            )
+
+    market = BlockingMarket(
         cheap_universe=[
             CheapRow(
                 code=code,
@@ -3245,18 +3774,19 @@ def test_discovery_data_duplicate_start_is_idempotent_and_lock_conflicts(
         ],
         trading_dates=["2026-09-15", "2026-09-16"],
         discovery_data={code: _bundle(code)},
-        discovery_gate=gate,
     )
-    db_path = tmp_path / "app.db"
     with _discovery_client(tmp_path, market, allow_sync=False) as client:
         first = client.post("/api/discovery-data/fill", json={})
         assert first.status_code == 200
-        second = client.post("/api/discovery-data/fill", json={})
-        assert second.status_code == 200
-        assert second.json()["id"] == first.json()["id"]
-        with client.app.state.session_factory() as session:
-            assert session.query(DiscoveryDataFill).count() == 1
-        gate.set()
+        assert entered.wait(5)
+        try:
+            second = client.post("/api/discovery-data/fill", json={})
+            assert second.status_code == 200
+            assert second.json()["id"] == first.json()["id"]
+            with client.app.state.session_factory() as session:
+                assert session.query(DiscoveryDataFill).count() == 1
+        finally:
+            release_fetch.set()
         for _ in range(400):
             if client.get("/api/discovery-data/status").json()["status"] == "done":
                 break
@@ -3294,7 +3824,7 @@ def test_startup_pauses_interrupted_discovery_fill_and_preserves_done(
         done = session.get(DiscoveryDataCheckpoint, (fill.id, "000002.SZ"))
         assert running is not None and done is not None
         running.status = "running"
-        done.status = "done"
+        _complete_checkpoint_payload(done, now)
         fill.completed = 1
         lock = session.get(JobLock, 1)
         if lock is None:

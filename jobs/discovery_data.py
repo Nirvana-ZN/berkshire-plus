@@ -23,6 +23,12 @@ from app.models import (
     ValuationHistory,
     ValuationSeries,
 )
+from discovery.company_payload import (
+    company_payload_digest,
+    serialize_company_payload,
+    verify_company_payload_digest,
+)
+from discovery.constants import CHINA_MARKET_TIMEZONE
 from jobs.lock import JOB_TYPE_DISCOVERY_DATA, lock_status, release, try_acquire
 from market.types import (
     DiscoveryCompanyData,
@@ -38,7 +44,6 @@ from market.types import (
 # boundary. Task 1/2 probes justify the conservative 0.5 req/s, 1,000/day,
 # and 15-minute run cap without a full-market live calibration.
 FILL_CHUNK = 20
-POLICY_TIMEZONE = timezone(timedelta(hours=8))
 
 
 @dataclass(frozen=True)
@@ -162,7 +167,12 @@ def _aware_utc(value: datetime) -> datetime:
 
 
 def _policy_day(now: datetime) -> str:
-    return _aware_utc(now).astimezone(POLICY_TIMEZONE).date().isoformat()
+    return (
+        _aware_utc(now)
+        .astimezone(CHINA_MARKET_TIMEZONE)
+        .date()
+        .isoformat()
+    )
 
 
 def _latest_fill(session: Session) -> DiscoveryDataFill | None:
@@ -174,13 +184,20 @@ def _latest_fill(session: Session) -> DiscoveryDataFill | None:
 def _snapshot_parts(
     session: Session,
     fill_id: int,
-) -> tuple[set[str], set[str], bool]:
-    checkpoints = set(
-        session.scalars(
-            select(DiscoveryDataCheckpoint.code).where(
-                DiscoveryDataCheckpoint.fill_id == fill_id
-            )
+) -> tuple[set[str], set[str], bool, bool]:
+    checkpoint_rows = session.scalars(
+        select(DiscoveryDataCheckpoint).where(
+            DiscoveryDataCheckpoint.fill_id == fill_id
         )
+    ).all()
+    checkpoints = {row.code for row in checkpoint_rows}
+    payloads_complete = all(
+        row.status != "done"
+        or verify_company_payload_digest(
+            row.payload_json,
+            row.payload_digest,
+        )
+        for row in checkpoint_rows
     )
     snapshots = set(
         session.scalars(
@@ -197,7 +214,7 @@ def _snapshot_parts(
         ).first()
         is not None
     )
-    return checkpoints, snapshots, has_dates
+    return checkpoints, snapshots, has_dates, payloads_complete
 
 
 def _mark_snapshot_unavailable(
@@ -225,7 +242,7 @@ def start_discovery_data_fill(
         .order_by(DiscoveryDataFill.id.desc())
     ).first()
     if active is not None:
-        checkpoints, snapshots, has_dates = _snapshot_parts(
+        checkpoints, snapshots, has_dates, payloads_complete = _snapshot_parts(
             session, active.id
         )
         invalid_snapshot = (
@@ -234,6 +251,7 @@ def start_discovery_data_fill(
                 active.snapshot_status != "ready"
                 or checkpoints != snapshots
                 or not has_dates
+                or not payloads_complete
             )
         ) or (
             not checkpoints
@@ -296,12 +314,15 @@ def _initialize_checkpoints(
     fill: DiscoveryDataFill,
     request_gate: DiscoveryRequestGate,
 ) -> bool:
-    checkpoints, snapshots, has_dates = _snapshot_parts(session, fill.id)
+    checkpoints, snapshots, has_dates, payloads_complete = _snapshot_parts(
+        session, fill.id
+    )
     if checkpoints:
         if (
             fill.snapshot_status != "ready"
             or checkpoints != snapshots
             or not has_dates
+            or not payloads_complete
         ):
             _mark_snapshot_unavailable(fill, request_gate.clock.now())
             session.commit()
@@ -436,6 +457,7 @@ def claim_pending_checkpoints(
     ).all()
     for row in rows:
         row.status = "running"
+        row.payload_json = None
         row.updated_at = stamp
     session.commit()
     return rows
@@ -511,12 +533,16 @@ def _persist_company(
         for row in (*result.financial_rows, *result.valuation_points)
     ):
         raise ValueError(f"{checkpoint.code} result code mismatch")
+    payload_json = serialize_company_payload(result, captured_at=now)
+    payload_digest = company_payload_digest(payload_json)
     persist_discovery_financials(session, result.financial_rows)
     persist_valuation_history(session, result.valuation_points, fetched_at=now)
     checkpoint.status = "done"
     checkpoint.next_retry_at = None
     checkpoint.valuation_points = len(result.valuation_points)
     checkpoint.error = None
+    checkpoint.payload_json = payload_json
+    checkpoint.payload_digest = payload_digest
     checkpoint.updated_at = now
 
 
@@ -535,7 +561,7 @@ def execute_discovery_data_fill(
         if fill is None:
             return
         if fill.status == "paused" and fill.snapshot_status is None:
-            checkpoints, _snapshots, _has_dates = _snapshot_parts(
+            checkpoints, _snapshots, _has_dates, _payloads_complete = _snapshot_parts(
                 session, fill.id
             )
             if not checkpoints:

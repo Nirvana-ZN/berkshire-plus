@@ -286,28 +286,102 @@ def _ensure_discovery_fill_columns(engine: Engine) -> None:
                 )
 
 
+def _ensure_discovery_checkpoint_columns(engine: Engine) -> None:
+    """Add fill-scoped payload storage without blessing legacy checkpoints."""
+
+    from sqlalchemy import text
+
+    with engine.begin() as conn:
+        names = {
+            row[1]
+            for row in conn.execute(
+                text("PRAGMA table_info(discovery_data_checkpoints)")
+            ).fetchall()
+        }
+        columns = {"payload_json": "TEXT", "payload_digest": "VARCHAR(64)"}
+        for column, sql_type in columns.items():
+            if names and column not in names:
+                conn.execute(
+                    text(
+                        "ALTER TABLE discovery_data_checkpoints "
+                        f"ADD COLUMN {column} {sql_type}"
+                    )
+                )
+        if names:
+            conn.execute(
+                text(
+                    "DROP TRIGGER IF EXISTS "
+                    "trg_discovery_checkpoint_payload_immutable"
+                )
+            )
+            conn.execute(
+                text(
+                    "DROP TRIGGER IF EXISTS "
+                    "trg_discovery_checkpoint_status_immutable"
+                )
+            )
+            conn.execute(
+                text(
+                    "CREATE TRIGGER "
+                    "trg_discovery_checkpoint_payload_immutable "
+                    "BEFORE UPDATE OF payload_json, payload_digest "
+                    "ON discovery_data_checkpoints "
+                    "WHEN (OLD.payload_json IS NOT NULL "
+                    "OR OLD.payload_digest IS NOT NULL) "
+                    "AND (NEW.payload_json IS NOT OLD.payload_json "
+                    "OR NEW.payload_digest IS NOT OLD.payload_digest) "
+                    "BEGIN "
+                    "SELECT RAISE(ABORT, "
+                    "'completed discovery payload is immutable'); "
+                    "END"
+                )
+            )
+            conn.execute(
+                text(
+                    "CREATE TRIGGER "
+                    "trg_discovery_checkpoint_status_immutable "
+                    "BEFORE UPDATE OF status "
+                    "ON discovery_data_checkpoints "
+                    "WHEN OLD.status = 'done' "
+                    "AND OLD.payload_json IS NOT NULL "
+                    "AND OLD.payload_digest IS NOT NULL "
+                    "AND NEW.status IS NOT OLD.status "
+                    "BEGIN "
+                    "SELECT RAISE(ABORT, "
+                    "'completed discovery status is immutable'); "
+                    "END"
+                )
+            )
+
+
 def _classify_discovery_fill_snapshots(engine: Engine) -> None:
     from sqlalchemy import text
+
+    from discovery.company_payload import verify_company_payload_digest
 
     guidance = "snapshot unavailable or mismatched; start a new fill"
     with engine.begin() as conn:
         fills = conn.execute(
             text(
-                "SELECT id, status, total FROM discovery_data_fills "
-                "WHERE snapshot_status IS NULL"
+                "SELECT id, status, total, snapshot_status "
+                "FROM discovery_data_fills"
             )
         ).all()
-        for fill_id, status, total in fills:
-            checkpoints = {
-                row[0]
-                for row in conn.execute(
-                    text(
-                        "SELECT code FROM discovery_data_checkpoints "
-                        "WHERE fill_id = :fill_id"
-                    ),
-                    {"fill_id": fill_id},
-                )
-            }
+        for fill_id, status, total, snapshot_status in fills:
+            checkpoint_rows = conn.execute(
+                text(
+                    "SELECT code, status, payload_json, payload_digest "
+                    "FROM discovery_data_checkpoints "
+                    "WHERE fill_id = :fill_id"
+                ),
+                {"fill_id": fill_id},
+            ).all()
+            checkpoints = {row[0] for row in checkpoint_rows}
+            payloads_complete = all(
+                row[1] != "done"
+                or verify_company_payload_digest(row[2], row[3])
+                for row in checkpoint_rows
+            )
             snapshots = {
                 row[0]
                 for row in conn.execute(
@@ -329,9 +403,15 @@ def _classify_discovery_fill_snapshots(engine: Engine) -> None:
                 is not None
             )
             if checkpoints:
-                ready = checkpoints == snapshots and has_dates
+                ready = (
+                    checkpoints == snapshots
+                    and has_dates
+                    and payloads_complete
+                )
             else:
                 ready = int(total or 0) == 0 and not snapshots and has_dates
+            if snapshot_status is not None and ready:
+                continue
             conn.execute(
                 text(
                     "UPDATE discovery_data_fills SET "
@@ -518,8 +598,8 @@ def _infer_legacy_financial_completeness(engine: Engine) -> None:
 
 
 def init_db(db_path: Path | None = None) -> Engine:
-    from app import models as _models  # noqa: F401
     from app import discovery_models as _discovery_models  # noqa: F401
+    from app import models as _models  # noqa: F401
 
     engine = create_db_engine(db_path)
     Base.metadata.create_all(engine)
@@ -529,6 +609,7 @@ def init_db(db_path: Path | None = None) -> Engine:
     _ensure_listed_year(engine)
     _ensure_financial_columns(engine)
     _ensure_discovery_fill_columns(engine)
+    _ensure_discovery_checkpoint_columns(engine)
     _classify_discovery_fill_snapshots(engine)
     _ensure_financial_text_storage(engine)
     _ensure_valuation_series(engine)
