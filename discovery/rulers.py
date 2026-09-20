@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import InitVar, dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from math import isfinite
@@ -23,6 +23,9 @@ from ledger.positions import LOCAL_USER_ID
 
 DISCOVERY_PAYLOAD_SCOPE = "weekly-discovery"
 RULER_NOT_READY = "ruler_not_ready"
+DISCOVERY_DECIMAL_COMPONENT_LIMIT = 4096
+# Bounds source text, coefficient digits, and exponent before any fixed-point
+# formatting. Accepted values therefore format to at most roughly twice this.
 
 JsonScalar: TypeAlias = None | bool | int | float | str
 FrozenJson: TypeAlias = JsonScalar | tuple["FrozenJson", ...] | Mapping[
@@ -61,12 +64,23 @@ def _text(value: object, label: str) -> str:
 def _canonical_decimal(value: object, label: str) -> str:
     if type(value) is not str:
         raise TypeError(f"{label} must be a decimal string")
+    if len(value) > DISCOVERY_DECIMAL_COMPONENT_LIMIT:
+        raise ValueError(f"{label} exceeds the decimal component limit")
     try:
         amount = Decimal(value)
     except InvalidOperation as error:
         raise ValueError(f"{label} must be a decimal string") from error
     if not amount.is_finite():
         raise ValueError(f"{label} must be finite")
+    digits = amount.as_tuple().digits
+    exponent = amount.as_tuple().exponent
+    if (
+        not isinstance(exponent, int)
+        or len(digits) > DISCOVERY_DECIMAL_COMPONENT_LIMIT
+        or abs(exponent) > DISCOVERY_DECIMAL_COMPONENT_LIMIT
+        or abs(amount.adjusted()) > DISCOVERY_DECIMAL_COMPONENT_LIMIT
+    ):
+        raise ValueError(f"{label} exceeds the decimal component limit")
     if amount == 0:
         canonical = "0"
     else:
@@ -177,8 +191,11 @@ class TrackRuler:
     order: tuple[tuple[str, str, str], ...]
     industry_version: str
     algorithm_version: str
+    _allow_retired_algorithm: InitVar[bool] = False
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, _allow_retired_algorithm: bool) -> None:
+        if type(_allow_retired_algorithm) is not bool:
+            raise TypeError("allow_retired_algorithm must be a boolean")
         scope = _scope(self.scope)
         fields = tuple(self.fields)
         if not fields:
@@ -269,7 +286,10 @@ class TrackRuler:
         algorithm_version = _text(
             self.algorithm_version, "algorithm_version"
         )
-        if algorithm_version not in AVAILABLE_BUILDS:
+        if (
+            not _allow_retired_algorithm
+            and algorithm_version not in AVAILABLE_BUILDS
+        ):
             raise ValueError(
                 f"algorithm build is unavailable: {algorithm_version}"
             )
@@ -311,7 +331,12 @@ class TrackRuler:
         )
 
     @classmethod
-    def from_payload(cls, payload: Mapping[str, object]) -> "TrackRuler":
+    def from_payload(
+        cls,
+        payload: Mapping[str, object],
+        *,
+        allow_retired_algorithm: bool = False,
+    ) -> "TrackRuler":
         if not isinstance(payload, Mapping):
             raise TypeError("ruler payload must be an object")
         _reject_aliases_and_cycles(payload, active=set(), seen=set())
@@ -342,10 +367,16 @@ class TrackRuler:
             order=payload["order"],  # type: ignore[arg-type]
             industry_version=payload["industry_version"],  # type: ignore[arg-type]
             algorithm_version=payload["algorithm_version"],  # type: ignore[arg-type]
+            _allow_retired_algorithm=allow_retired_algorithm,
         )
 
     @classmethod
-    def from_json(cls, payload_json: str) -> "TrackRuler":
+    def from_json(
+        cls,
+        payload_json: str,
+        *,
+        allow_retired_algorithm: bool = False,
+    ) -> "TrackRuler":
         if type(payload_json) is not str:
             raise TypeError("ruler payload JSON must be text")
 
@@ -370,21 +401,25 @@ class TrackRuler:
             raise ValueError("ruler payload is not valid JSON") from error
         if type(value) is not dict:
             raise TypeError("ruler payload must be a JSON object")
-        return cls.from_payload(value)
+        return cls.from_payload(
+            value,
+            allow_retired_algorithm=allow_retired_algorithm,
+        )
 
 
 def parse_payload(value: TrackRuler | Mapping[str, object] | str) -> TrackRuler:
     if isinstance(value, TrackRuler):
+        if value.algorithm_version not in AVAILABLE_BUILDS:
+            raise ValueError(
+                f"algorithm build is unavailable: {value.algorithm_version}"
+            )
         return value
     if isinstance(value, str):
         return TrackRuler.from_json(value)
     return TrackRuler.from_payload(value)
 
 
-def canonical_payload(
-    value: TrackRuler | Mapping[str, object] | str,
-) -> str:
-    ruler = parse_payload(value)
+def _canonical_ruler_payload(ruler: TrackRuler) -> str:
     return json.dumps(
         _plain(ruler.payload()),
         ensure_ascii=False,
@@ -392,6 +427,12 @@ def canonical_payload(
         separators=(",", ":"),
         allow_nan=False,
     )
+
+
+def canonical_payload(
+    value: TrackRuler | Mapping[str, object] | str,
+) -> str:
+    return _canonical_ruler_payload(parse_payload(value))
 
 
 def payload_digest(
@@ -405,18 +446,22 @@ def validate_ruler_version(
     *,
     expected_track: str | None = None,
     expected_algorithm_version: str | None = None,
+    allow_retired_algorithm: bool = False,
 ) -> TrackRuler:
     """Parse and validate one persisted discovery ruler end-to-end."""
 
     if row.scope not in SCOPE_TRACKS:
         raise ValueError("persisted discovery ruler integrity mismatch")
     try:
-        ruler = TrackRuler.from_json(row.payload_json)
+        ruler = TrackRuler.from_json(
+            row.payload_json,
+            allow_retired_algorithm=allow_retired_algorithm,
+        )
     except (TypeError, ValueError) as error:
         raise ValueError(
             "persisted discovery ruler integrity mismatch"
         ) from error
-    canonical = canonical_payload(ruler)
+    canonical = _canonical_ruler_payload(ruler)
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     if (
         ruler.scope != row.scope

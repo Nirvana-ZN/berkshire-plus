@@ -21,6 +21,7 @@ from discovery.metrics import (
     cagr,
     cash_conversion,
     coefficient_of_variation,
+    empirical_percentile_rank,
     finite_values,
     mean,
     median,
@@ -182,6 +183,18 @@ def test_percentile_rank_has_deterministic_endpoints_and_ties(
     expected: Decimal,
 ) -> None:
     assert percentile_rank(current, history) == expected
+
+
+@pytest.mark.parametrize(
+    ("current", "expected"),
+    [(D("-5"), D("0")), (D("-1"), D("50")), (D("1"), D("75"))],
+)
+def test_empirical_percentile_rank_supports_signed_values(
+    current: Decimal, expected: Decimal
+) -> None:
+    assert empirical_percentile_rank(
+        current, [D("-5"), D("-1"), D("3")]
+    ) == expected
 
 
 def test_percentile_rank_accepts_generator_and_requires_positive_finite_current() -> None:

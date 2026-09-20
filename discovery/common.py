@@ -7,10 +7,79 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from math import isfinite
+from types import MappingProxyType
 
+from discovery.builds import BUILD_VERSION
 from discovery.snapshot import FrozenCompanyInput, FrozenValue
 from ledger.quotes import is_a_share_code
-from market.cheap import CheapRow, security_state_eligible
+from market.cheap import (
+    SUSPENSION_MAX_TRADING_DAYS,
+    CheapRow,
+    security_state_eligible,
+)
+
+@dataclass(frozen=True)
+class CommonSafetyContract:
+    algorithm_version: str
+    price_floor: Decimal
+    suspension_max_trading_days: int
+    rules: tuple[tuple[str, str], ...]
+    metric_names: frozenset[str]
+
+
+COMMON_SAFETY_CONTRACTS: Mapping[str, CommonSafetyContract] = MappingProxyType(
+    {
+        BUILD_VERSION: CommonSafetyContract(
+            algorithm_version=BUILD_VERSION,
+            price_floor=Decimal("0"),
+            suspension_max_trading_days=SUSPENSION_MAX_TRADING_DAYS,
+            rules=(
+                (
+                    "common.a_share_scope",
+                    "仅接受代码与交易所一致的沪深 A 股。",
+                ),
+                (
+                    "common.security_state",
+                    "排除 ST、退市整理证券；未知证券状态按数据不足处理。",
+                ),
+                (
+                    "common.frozen_provenance",
+                    "价格、行业、交易日与来源必须来自本批次冻结快照且不晚于快照日。",
+                ),
+                (
+                    "common.trading_recency",
+                    "交易证券须使用最新交易日；停牌证券最后交易日须在允许的交易日窗口内。",
+                ),
+            ),
+            metric_names=frozenset(
+                {
+                    "exchange",
+                    "industry",
+                    "last_trade_date",
+                    "latest_trading_date",
+                    "price",
+                    "price_as_of",
+                    "suspension_trading_days",
+                    "trading_status",
+                }
+            ),
+        )
+    }
+)
+
+
+def common_safety_contract(algorithm_version: str) -> CommonSafetyContract:
+    try:
+        return COMMON_SAFETY_CONTRACTS[algorithm_version]
+    except (KeyError, TypeError) as error:
+        raise ValueError("common safety contract is unavailable") from error
+
+
+_CURRENT_COMMON_CONTRACT = common_safety_contract(BUILD_VERSION)
+COMMON_PRICE_FLOOR = _CURRENT_COMMON_CONTRACT.price_floor
+COMMON_SUSPENSION_MAX_TRADING_DAYS = (
+    _CURRENT_COMMON_CONTRACT.suspension_max_trading_days
+)
 
 
 class _ImmutableMetrics(dict[str, object]):
@@ -94,7 +163,11 @@ def _price(value: FrozenValue | None) -> Decimal | None:
         parsed = Decimal(str(value))
     except (InvalidOperation, ValueError):
         return None
-    return parsed if parsed.is_finite() and parsed > 0 else None
+    return (
+        parsed
+        if parsed.is_finite() and parsed > COMMON_PRICE_FLOOR
+        else None
+    )
 
 
 def _decimal_text(value: Decimal) -> str:
@@ -326,7 +399,11 @@ def classify_common(
             else None
         ),
     )
-    if not security_state_eligible(row, calendar):
+    if not security_state_eligible(
+        row,
+        calendar,
+        suspension_max_trading_days=COMMON_SUSPENSION_MAX_TRADING_DAYS,
+    ):
         reason = (
             "trading_date_not_current"
             if status == "trading"

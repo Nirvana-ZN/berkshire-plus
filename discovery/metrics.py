@@ -286,6 +286,53 @@ def normalized_earnings(
     return median(usable) if len(usable) >= minimum else None
 
 
+def empirical_percentile_rank(
+    current: Decimal,
+    history: DecimalValues,
+) -> Decimal | None:
+    """Rank any finite signed Decimal from zero through one hundred.
+
+    Ties use average rank with ``(rank - 1) / (n - 1)`` semantics. Against
+    one observation, lower/equal/higher maps to 0/50/100.
+    """
+
+    if not isinstance(current, Decimal):
+        raise TypeError("current must be a Decimal")
+    supplied = _values(history)
+    if not current.is_finite():
+        return None
+    usable = tuple(
+        value
+        for value in supplied
+        if value is not None and value.is_finite()
+    )
+    if not usable:
+        return None
+    if len(usable) == 1:
+        constant = 0 if current < usable[0] else 100 if current > usable[0] else 50
+        with localcontext(_context(34)) as context:
+            return context.create_decimal(constant)
+    below = sum(value < current for value in usable)
+    equal = sum(value == current for value in usable)
+    numerator = (2 * below + equal - 1) * 100
+    denominator = 2 * (len(usable) - 1)
+    precision = max(
+        34,
+        _integer_digits_upper(abs(numerator)),
+        _integer_digits_upper(denominator),
+    )
+    if precision > FINANCIAL_PRECISION_CEILING:
+        return None
+    with localcontext(_context(precision)) as context:
+        zero = context.create_decimal(0)
+        hundred = context.create_decimal(100)
+        result = context.divide(
+            context.create_decimal(numerator),
+            context.create_decimal(denominator),
+        )
+        return min(hundred, max(zero, result))
+
+
 def percentile_rank(
     current: Decimal,
     history: DecimalValues,

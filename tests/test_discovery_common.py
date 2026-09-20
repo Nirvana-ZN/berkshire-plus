@@ -37,15 +37,23 @@ TRADING_DATES = {
 }
 
 
-def _freeze_run(session, companies, *, week_key="2026-W38"):
+def _freeze_run(
+    session,
+    companies,
+    *,
+    week_key="2026-W38",
+    ruler_ids=None,
+):
     from discovery.snapshot import freeze_inputs
 
-    run = add_unfrozen_run(session, week_key=week_key)
+    run = add_unfrozen_run(
+        session, week_key=week_key, ruler_ids=ruler_ids
+    )
     freeze_inputs(
         session,
         run,
         companies,
-        versions(),
+        versions(ruler_ids=ruler_ids),
         TRADING_DATES,
         snapshot_at=SNAPSHOT_AT,
     )
@@ -2063,7 +2071,23 @@ def test_track_rollover_after_executor_commits_only_running_claim(
     factory = create_session_factory(engine)
     now = [SNAPSHOT_AT]
     with factory() as session:
-        run = _freeze_run(session, [company("600000.SH")])
+        from discovery.rulers import activate
+        from tests.discovery_helpers import discovery_ruler_payload
+
+        ruler = activate(
+            session,
+            discovery_ruler_payload("quality_discount"),
+            "rollover fixture",
+        )
+        run = _freeze_run(
+            session,
+            [company("600000.SH")],
+            ruler_ids={
+                "quality_discount": ruler.id,
+                "deep_value": 1,
+                "garp": 1,
+            },
+        )
         stage = _add_track_stage(
             session,
             run,

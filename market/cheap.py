@@ -19,6 +19,7 @@ SORTS = frozenset({"pe", "pb"})
 SCOPE = "hs_a"
 SCOPE_LABEL = "沪深A股（不含北交所）"
 METHOD = "v5"
+SUSPENSION_MAX_TRADING_DAYS = 5
 INDUSTRY_MAPPING_VERSION = "eastmoney:push2delay:clist:f100:v1"
 DELISTING_NAME_METHOD = "exchange-rules:sh-prefix-tuishi:sz-suffix-tui:v1"
 _SECURITY_FIELDS = frozenset(
@@ -96,7 +97,10 @@ def eligible_cheap(rows: list[CheapRow], *, sort: str = "pe") -> list[CheapRow]:
 
 
 def security_state_eligible(
-    row: CheapRow, frozen_trading_dates: Sequence[str]
+    row: CheapRow,
+    frozen_trading_dates: Sequence[str],
+    *,
+    suspension_max_trading_days: int = SUSPENSION_MAX_TRADING_DAYS,
 ) -> bool:
     if (
         row.exchange not in {"SH", "SZ"}
@@ -115,7 +119,9 @@ def security_state_eligible(
     if row.trading_status == "trading":
         return row.last_trade_date == frozen_trading_dates[-1]
     if row.trading_status == "suspended":
-        return row.last_trade_date in frozen_trading_dates[-5:]
+        return row.last_trade_date in frozen_trading_dates[
+            -suspension_max_trading_days:
+        ]
     return False
 
 

@@ -4754,6 +4754,14 @@ def test_stage_reads_preserve_zero_result_attempts_and_partitions(
                 track="garp",
                 stage="track_gate",
             ).one()
+            from discovery.rulers import activate
+            from tests.discovery_helpers import discovery_ruler_payload
+
+            garp_ruler = activate(
+                session,
+                discovery_ruler_payload("garp"),
+                "route partition fixture",
+            )
             second_gate = DiscoveryStage(
                 run_id=run_id,
                 track="garp",
@@ -4765,7 +4773,7 @@ def test_stage_reads_preserve_zero_result_attempts_and_partitions(
                 drop_count=1,
                 insufficient_count=1,
                 input_fingerprint=gate.input_fingerprint,
-                ruler_version_id=gate.ruler_version_id,
+                ruler_version_id=garp_ruler.id,
                 algorithm_version=gate.algorithm_version,
                 common_stage_id=common.id,
                 predecessor_stage_id=None,
@@ -4775,6 +4783,10 @@ def test_stage_reads_preserve_zero_result_attempts_and_partitions(
             )
             session.add(second_gate)
             session.flush()
+            common.total_count = 3
+            common.pass_count = 1
+            common.drop_count = 1
+            common.insufficient_count = 1
             common.superseded_at = SNAPSHOT_AT
             gate.superseded_at = SNAPSHOT_AT
             session.add_all(

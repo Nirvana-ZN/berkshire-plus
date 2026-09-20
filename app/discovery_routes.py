@@ -24,6 +24,7 @@ from app.discovery_models import (
     DiscoveryRun,
     DiscoveryStage,
 )
+from app.models import RulerVersion
 from discovery.aggregate import aggregate_run_status
 from discovery.builds import AVAILABLE_BUILDS, BUILD_VERSION, _is_build_available
 from discovery.constants import (
@@ -33,6 +34,7 @@ from discovery.constants import (
     china_week_key,
 )
 from discovery.overrides import OVERRIDE_ACTIONS
+from discovery.summaries import DiscoverySummaryError, build_stage_summary
 from discovery.snapshot import (
     ProductionSnapshot,
     canonical_json,
@@ -487,15 +489,24 @@ def _common_payload(session: Session, run: DiscoveryRun):
     if current is None:
         current = stages[-1]
     attempts = []
+    summaries: dict[int, dict[str, object]] = {}
     for stage in stages:
+        rows = by_attempt.get(stage.attempt, [])
+        summary = build_stage_summary(stage, rows)
+        summaries[stage.id] = summary
         attempts.append(
-            _common_stage_json(stage) | _partition(by_attempt.get(stage.attempt, []))
+            _common_stage_json(stage)
+            | _partition(rows)
+            | {"summary": summary}
         )
+    current_rows = by_attempt.get(current.attempt, [])
+    current_summary = summaries[current.id]
     return {
         "run": _run_payload(session, run),
-        "current": _common_stage_json(current),
+        "current": _common_stage_json(current) | {"summary": current_summary},
         "attempts": attempts,
-        **_partition(by_attempt.get(current.attempt, [])),
+        **_partition(current_rows),
+        "summary": current_summary,
     }
 
 
@@ -543,9 +554,24 @@ def _track_payload(
             DiscoveryOverride.id,
         )
     ).all()
-    overrides_by_attempt: dict[int, dict[str, DiscoveryOverride]] = {}
+    override_rows_by_attempt: dict[int, list[DiscoveryOverride]] = {}
     for row in override_rows:
-        overrides_by_attempt.setdefault(row.attempt, {})[row.code] = row
+        override_rows_by_attempt.setdefault(row.attempt, []).append(row)
+    ruler_ids = {
+        row.ruler_version_id
+        for row in stages
+        if row.ruler_version_id is not None
+    }
+    rulers_by_id = (
+        {
+            row.id: row
+            for row in session.scalars(
+                select(RulerVersion).where(RulerVersion.id.in_(ruler_ids))
+            ).all()
+        }
+        if ruler_ids
+        else {}
+    )
     decision_rows = session.scalars(
         select(DiscoveryDecision)
         .where(
@@ -578,31 +604,47 @@ def _track_payload(
     if current is None:
         current = stages[-1]
     attempts = []
+    summaries: dict[int, dict[str, object]] = {}
     for attempt in stages:
-        attempt_overrides = overrides_by_attempt.get(attempt.attempt, {})
+        rows = by_attempt.get(attempt.attempt, [])
+        attempt_override_rows = override_rows_by_attempt.get(
+            attempt.attempt, []
+        )
+        attempt_overrides = {
+            row.code: row for row in attempt_override_rows
+        }
+        summary = build_stage_summary(
+            attempt,
+            rows,
+            attempt_override_rows,
+            rulers_by_id.get(attempt.ruler_version_id),
+        )
+        summaries[attempt.id] = summary
         attempts.append(
             _track_stage_json(attempt)
-            | _partition(
-                by_attempt.get(attempt.attempt, []), attempt_overrides
-            )
+            | _partition(rows, attempt_overrides)
             | {
                 "overrides": [
-                    _override_json(row)
-                    for row in attempt_overrides.values()
-                ]
+                    _override_json(row) for row in attempt_override_rows
+                ],
+                "summary": summary,
             }
         )
-    current_overrides = overrides_by_attempt.get(current.attempt, {})
+    current_override_rows = override_rows_by_attempt.get(current.attempt, [])
+    current_overrides = {row.code: row for row in current_override_rows}
+    current_rows = by_attempt.get(current.attempt, [])
+    current_summary = summaries[current.id]
     return {
         "run": _run_payload(session, run),
-        "current": _track_stage_json(current),
+        "current": _track_stage_json(current) | {"summary": current_summary},
         "attempts": attempts,
-        **_partition(by_attempt.get(current.attempt, []), current_overrides),
+        **_partition(current_rows, current_overrides),
         "overrides": [
-            _override_json(row) for row in current_overrides.values()
+            _override_json(row) for row in current_override_rows
         ],
         "decisions": [_decision_json(row) for row in decision_rows],
         "evidence": [_evidence_json(row) for row in evidence_rows],
+        "summary": current_summary,
     }
 
 
@@ -1695,7 +1737,7 @@ def create_discovery_router() -> APIRouter:
                 )
             try:
                 body = _common_payload(session, run)
-            except CorruptDiscoveryResult:
+            except (CorruptDiscoveryResult, DiscoverySummaryError):
                 return _error(
                     500,
                     error="结果损坏",
@@ -1959,7 +2001,7 @@ def create_discovery_router() -> APIRouter:
                 )
             try:
                 body = _track_payload(session, run, track, stage)
-            except CorruptDiscoveryResult:
+            except (CorruptDiscoveryResult, DiscoverySummaryError):
                 return _error(
                     500,
                     error="结果损坏",

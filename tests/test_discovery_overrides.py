@@ -896,6 +896,16 @@ def test_retry_and_reopen_preserve_exact_attempt_chains(tmp_path) -> None:
             competition.status = "failed"
             competition.failure_kind = "transient"
             competition.error = "network"
+            competition.total_count = 0
+            competition.pass_count = 0
+            competition.drop_count = 0
+            competition.insufficient_count = 0
+            session.query(DiscoveryResult).filter_by(
+                run_id=run_id,
+                track="garp",
+                stage="competition",
+                attempt=competition.attempt,
+            ).delete(synchronize_session=False)
             session.commit()
         retried = client.post(
             f"/api/discoveries/{run_id}/tracks/garp"
@@ -984,7 +994,7 @@ def test_retry_and_reopen_preserve_exact_attempt_chains(tmp_path) -> None:
                     DiscoveryResult.stage == "competition",
                     DiscoveryResult.attempt == 1,
                 )
-            ) is not None
+                ) is None
             assert chains[-1].created_at == SNAPSHOT_AT
 
 
