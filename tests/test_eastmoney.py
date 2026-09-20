@@ -266,12 +266,13 @@ def test_clist_persistent_fetch_failure_is_bounded(monkeypatch) -> None:
     def get(_url: str):
         nonlocal calls
         calls += 1
-        raise OSError("disconnected")
+        raise OSError("GET https://secret.example/clist disconnected")
 
     _install_clist_transport(monkeypatch, get)
-    with pytest.raises(MarketError, match=r"page 1.*attempt 3/3"):
+    with pytest.raises(MarketError, match=r"page 1.*attempt 3/3") as caught:
         EastMoneyClient()._clist_diff(fs="test", fields="f12", fid="f12")
     assert calls == len(CLIST_HOSTS) * CLIST_PAGE_RETRY_ROUNDS
+    assert "https://" not in str(caught.value)
 
 
 def test_clist_nonobject_json_is_permanent_after_one_request(monkeypatch) -> None:

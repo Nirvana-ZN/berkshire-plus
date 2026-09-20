@@ -7,6 +7,7 @@ from pathlib import Path
 from threading import Event
 from urllib.parse import parse_qs, urlsplit
 
+import httpx2
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, delete, inspect, select, text
@@ -42,10 +43,13 @@ from market.eastmoney import BOARD_LIST_URL, EastMoneyClient, FakeMarketClient
 from market.types import (
     DiscoveryCompanyData,
     DiscoveryCompanyError,
+    DiscoveryRequestBudgetExhausted,
+    DiscoveryRequestRuntimeExhausted,
     DiscoverySourceAsOf,
     FinancialRow,
     MarketError,
     SecurityState,
+    TransientMarketError,
     ValuationPoint,
 )
 
@@ -1516,7 +1520,7 @@ def test_priced_suspension_candidates_are_probed_and_request_gated(
                 {"data": {"klines": ["2026-09-20,1,2,3,4,5,6"]}}
             )
         assert "secid=1.600003" in url
-        raise RuntimeError("stock kline unavailable")
+        return _HttpResponse({"data": {"klines": []}})
 
     _install_http_transport(monkeypatch, get)
     client = EastMoneyClient()
@@ -1635,13 +1639,14 @@ def test_calendar_failure_does_not_store_degraded_universe() -> None:
             }
 
         def _get_json_direct(self, _url: str) -> dict:
-            raise RuntimeError("calendar unavailable")
+            raise RuntimeError("GET https://secret.example/calendar unavailable")
 
     engine = create_engine("sqlite://")
     Setting.__table__.create(engine)
     with Session(engine) as session:
-        with pytest.raises(MarketError, match="calendar unavailable"):
+        with pytest.raises(MarketError, match="calendar fetch failed") as caught:
             load_cheap_universe(session, Stub())
+        assert "https://" not in str(caught.value)
         assert session.get(Setting, CACHE_KEY) is None
 
 
@@ -2178,13 +2183,17 @@ class FakeClock:
 
 
 class _HttpResponse:
-    def __init__(self, payload: dict | None = None) -> None:
-        self.payload = payload or {"ok": True}
+    def __init__(
+        self, payload: object | None = None, *, status_code: int = 200
+    ) -> None:
+        self.payload = {"ok": True} if payload is None else payload
+        self.status_code = status_code
 
     def raise_for_status(self) -> None:
-        pass
+        if not 200 <= self.status_code < 300:
+            raise RuntimeError(f"HTTP {self.status_code}")
 
-    def json(self) -> dict:
+    def json(self) -> object:
         return self.payload
 
 
@@ -2205,6 +2214,175 @@ def _install_http_transport(monkeypatch, get) -> None:
             return get(url)
 
     monkeypatch.setattr(httpx2, "Client", Client)
+
+
+def test_direct_json_transport_and_decode_failures_are_transient(
+    monkeypatch,
+) -> None:
+    failures = [httpx2.ConnectError("disconnected"), ValueError("invalid json")]
+
+    def get(_url: str):
+        failure = failures.pop(0)
+        if isinstance(failure, httpx2.TransportError):
+            raise failure
+
+        class InvalidJsonResponse(_HttpResponse):
+            def json(self) -> object:
+                raise failure
+
+        return InvalidJsonResponse()
+
+    _install_http_transport(monkeypatch, get)
+    client = EastMoneyClient()
+    for expected in ("ConnectError", "ValueError"):
+        with pytest.raises(TransientMarketError, match=expected):
+            client._get_json_direct("https://example.test/private-path")
+    assert client.request_count == 2
+
+
+def test_direct_json_valid_nonobject_is_permanent_and_not_retried(
+    monkeypatch,
+) -> None:
+    calls = 0
+
+    def get(_url: str):
+        nonlocal calls
+        calls += 1
+
+        class NonObjectResponse(_HttpResponse):
+            def json(self) -> object:
+                return []
+
+        return NonObjectResponse()
+
+    _install_http_transport(monkeypatch, get)
+    with pytest.raises(MarketError, match="接口返回不是对象") as caught:
+        EastMoneyClient()._get_json_direct_retry(
+            "https://example.test/private-path"
+        )
+    assert not isinstance(caught.value, TransientMarketError)
+    assert calls == 1
+
+
+def test_direct_json_404_is_permanent_and_not_retried(monkeypatch) -> None:
+    calls = 0
+
+    def get(_url: str):
+        nonlocal calls
+        calls += 1
+        return _HttpResponse(status_code=404)
+
+    _install_http_transport(monkeypatch, get)
+    with pytest.raises(MarketError, match="HTTP 404") as caught:
+        EastMoneyClient()._get_json_direct_retry(
+            "https://example.test/private-path"
+        )
+    assert not isinstance(caught.value, TransientMarketError)
+    assert calls == 1
+
+
+@pytest.mark.parametrize("status_code", [429, 503])
+def test_direct_json_retry_retries_only_retryable_http_statuses(
+    monkeypatch, status_code
+) -> None:
+    calls = 0
+
+    def get(_url: str):
+        nonlocal calls
+        calls += 1
+        return _HttpResponse(status_code=status_code if calls < 3 else 200)
+
+    _install_http_transport(monkeypatch, get)
+    assert EastMoneyClient()._get_json_direct_retry(
+        "https://example.test/private-path"
+    ) == {"ok": True}
+    assert calls == 3
+
+
+def test_direct_json_retry_counts_each_transport(monkeypatch) -> None:
+    callbacks = 0
+    transports = 0
+
+    def before_request() -> None:
+        nonlocal callbacks
+        callbacks += 1
+
+    def get(_url: str):
+        nonlocal transports
+        transports += 1
+        if transports < 3:
+            raise httpx2.ConnectError("disconnected")
+        return _HttpResponse()
+
+    _install_http_transport(monkeypatch, get)
+    client = EastMoneyClient()
+    assert client._get_json_direct_retry(
+        "https://example.test/private-path",
+        before_request=before_request,
+    ) == {"ok": True}
+    assert callbacks == transports == client.request_count == 3
+
+
+def test_company_security_fallback_does_not_retry_calendar(
+    monkeypatch,
+) -> None:
+    calendar_calls = 0
+
+    def get(url: str):
+        nonlocal calendar_calls
+        if "stock/get" in url:
+            return _HttpResponse(
+                {
+                    "data": {
+                        "f57": "600000",
+                        "f58": "浦发银行",
+                        "f107": 1,
+                        "f127": "银行",
+                        "f189": 19991110,
+                        "f292": 2,
+                    }
+                }
+            )
+        assert "secid=0.399317" in url
+        calendar_calls += 1
+        return _HttpResponse(status_code=503)
+
+    _install_http_transport(monkeypatch, get)
+    client = EastMoneyClient()
+    with pytest.raises(TransientMarketError, match="calendar"):
+        client._security_state_for("600000.SH", as_of=date(2026, 9, 16))
+    assert calendar_calls == 1
+    assert client.request_count == 2
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    [DiscoveryRequestBudgetExhausted, DiscoveryRequestRuntimeExhausted],
+)
+def test_direct_json_retry_stops_before_transport_on_gate_error(
+    monkeypatch, error_type
+) -> None:
+    callbacks = 0
+    transported = False
+
+    def before_request() -> None:
+        nonlocal callbacks
+        callbacks += 1
+        raise error_type("request stopped")
+
+    def get(_url: str):
+        nonlocal transported
+        transported = True
+        return _HttpResponse()
+
+    _install_http_transport(monkeypatch, get)
+    with pytest.raises(error_type, match="request stopped"):
+        EastMoneyClient()._get_json_direct_retry(
+            "https://example.test/private-path",
+            before_request=before_request,
+        )
+    assert callbacks == 1
+    assert transported is False
 
 
 def test_discovery_request_gate_persists_and_spaces_every_fallback_attempt(
@@ -2521,6 +2699,183 @@ def _universe_row(code: str, *, suspended: bool = False) -> dict[str, object]:
         "f100": "测试",
         "f292": 6 if suspended else None,
     }
+
+
+def test_live_universe_retries_calendar_without_refetching_56_pages(
+    monkeypatch,
+) -> None:
+    page_calls: dict[int, int] = {}
+    calendar_calls = 0
+
+    def get(url: str):
+        nonlocal calendar_calls
+        if "clist/get" in url:
+            page = int(parse_qs(urlsplit(url).query)["pn"][0])
+            page_calls[page] = page_calls.get(page, 0) + 1
+            size = 100 if page < 56 else 1
+            return _HttpResponse(
+                {
+                    "data": {
+                        "diff": [
+                            {
+                                **_universe_row(
+                                    f"{600000 + (page - 1) * 100 + index:06d}"
+                                ),
+                                "f2": "10",
+                                "f292": 2,
+                            }
+                            for index in range(size)
+                        ]
+                    }
+                }
+            )
+        assert "secid=0.399317" in url
+        calendar_calls += 1
+        if calendar_calls == 1:
+            raise httpx2.ConnectError("disconnected")
+        return _HttpResponse(
+            {
+                "data": {
+                    "klines": [
+                        "2026-09-15,1,2,3,4,5,6",
+                        "2026-09-16,1,2,3,4,5,6",
+                    ]
+                }
+            }
+        )
+
+    _install_http_transport(monkeypatch, get)
+    client = EastMoneyClient()
+    rows = client.fetch_cheap_universe(as_of=date(2026, 9, 16))
+
+    assert len(rows) == 5501
+    assert page_calls == {page: 1 for page in range(1, 57)}
+    assert calendar_calls == 2
+    assert client.request_count == 58
+
+
+def test_calendar_transient_failure_is_bounded_and_contextual(
+    monkeypatch,
+) -> None:
+    calls = 0
+
+    def get(_url: str):
+        nonlocal calls
+        calls += 1
+        raise httpx2.ConnectError(
+            "GET https://secret.example/calendar disconnected"
+        )
+
+    _install_http_transport(monkeypatch, get)
+    with pytest.raises(TransientMarketError, match="calendar") as caught:
+        EastMoneyClient().fetch_trading_dates(
+            "2026-09-16", retry_transient=True
+        )
+    assert calls == 3
+    assert "https://" not in str(caught.value)
+
+
+def test_malformed_calendar_payload_is_not_retried(monkeypatch) -> None:
+    calls = 0
+
+    def get(_url: str):
+        nonlocal calls
+        calls += 1
+        return _HttpResponse({"data": {"klines": "not-a-list"}})
+
+    _install_http_transport(monkeypatch, get)
+    with pytest.raises(MarketError, match="交易日接口返回格式错误") as caught:
+        EastMoneyClient().fetch_trading_dates("2026-09-16")
+    assert not isinstance(caught.value, TransientMarketError)
+    assert calls == 1
+
+
+def test_suspended_kline_transient_exhaustion_pauses_universe(
+    monkeypatch,
+) -> None:
+    stock_kline_calls = 0
+
+    def get(url: str):
+        nonlocal stock_kline_calls
+        if "clist/get" in url:
+            return _HttpResponse(
+                {"data": {"diff": [_universe_row("601999", suspended=True)]}}
+            )
+        if "secid=0.399317" in url:
+            return _HttpResponse(
+                {
+                    "data": {
+                        "klines": [
+                            "2026-09-15,1,2,3,4,5,6",
+                            "2026-09-16,1,2,3,4,5,6",
+                        ]
+                    }
+                }
+            )
+        assert "secid=1.601999" in url
+        stock_kline_calls += 1
+        raise httpx2.ConnectError("disconnected")
+
+    _install_http_transport(monkeypatch, get)
+    client = EastMoneyClient()
+    with pytest.raises(TransientMarketError, match="suspended K-line"):
+        client.fetch_cheap_universe(as_of=date(2026, 9, 16))
+    assert stock_kline_calls == 3
+    assert client.request_count == 5
+
+
+def test_universe_status_names_calendar_without_leaking_url(
+    tmp_path, monkeypatch
+) -> None:
+    from jobs.discovery_data import RequestPolicy, execute_discovery_data_fill
+
+    engine = init_db(tmp_path / "universe-calendar-error.db")
+    factory = create_session_factory(engine)
+    now = datetime(2026, 9, 16, 12, tzinfo=timezone.utc)
+    with factory() as session:
+        fill_id = _fill(session, [], now=now, daily_budget=10).id
+
+    def get(url: str):
+        if "clist/get" in url:
+            return _HttpResponse(
+                {
+                    "data": {
+                        "diff": [
+                            {
+                                **_universe_row("600000"),
+                                "f2": "10",
+                                "f292": 2,
+                            }
+                        ]
+                    }
+                }
+            )
+        raise httpx2.ConnectError(
+            "GET https://secret.example/calendar disconnected"
+        )
+
+    _install_http_transport(monkeypatch, get)
+    with factory() as session:
+        execute_discovery_data_fill(
+            session,
+            EastMoneyClient(),
+            fill_id,
+            policy=RequestPolicy(
+                requests_per_second=100,
+                max_attempts=2,
+                daily_budget=10,
+                max_runtime_seconds=60,
+            ),
+            clock=FakeClock(now),
+        )
+    with factory() as session:
+        fill = session.get(DiscoveryDataFill, fill_id)
+        assert fill is not None
+        assert (fill.status, fill.request_count) == ("paused", 4)
+        assert fill.last_error is not None
+        assert "universe: calendar" in fill.last_error
+        assert "https://" not in fill.last_error
+    engine.dispose()
 
 
 def test_first_run_universe_gates_pages_calendar_and_suspended_kline(

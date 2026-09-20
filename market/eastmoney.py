@@ -71,6 +71,7 @@ CLIST_HOSTS = (
     "https://82.push2.eastmoney.com",
 )
 CLIST_PAGE_RETRY_ROUNDS = 3
+DIRECT_RETRY_ATTEMPTS = 3
 _HTTP_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -1100,6 +1101,7 @@ class EastMoneyClient:
         limit: int = 6,
         *,
         before_request: DiscoveryPreRequest | None = None,
+        retry_transient: bool = False,
     ) -> list[str]:
         if limit <= 0:
             return []
@@ -1109,21 +1111,36 @@ class EastMoneyClient:
         from market.sentiment import parse_kline
 
         try:
+            request = (
+                self._get_json_direct_retry
+                if retry_transient
+                else self._get_json_direct
+            )
             parsed = parse_kline(
-                self._get_json_direct(_kline_url(limit, end=compact_end))
+                request(_kline_url(limit, end=compact_end))
                 if before_request is None
-                else self._get_json_direct(
+                else request(
                     _kline_url(limit, end=compact_end),
                     before_request=before_request,
                 )
             )
-        except MarketError:
+        except DiscoveryRequestStopped:
             raise
+        except TransientMarketError as exc:
+            attempts = DIRECT_RETRY_ATTEMPTS if retry_transient else 1
+            raise TransientMarketError(
+                f"calendar fetch failed after {attempts} attempt"
+                f"{'s' if attempts != 1 else ''}"
+            ) from exc
+        except MarketError as exc:
+            raise MarketError(f"calendar response invalid: {exc}") from exc
         except Exception as exc:
-            raise MarketError(str(exc)) from exc
+            raise MarketError(
+                f"calendar fetch failed: {type(exc).__name__}"
+            ) from exc
         dates = parsed.get("dates")
         if not isinstance(dates, list) or not dates:
-            raise MarketError("交易日接口返回格式错误")
+            raise MarketError("calendar response invalid: 交易日接口返回格式错误")
         return [str(day)[:10] for day in dates][-limit:]
 
     def fetch_notices(self, code: str) -> list[dict[str, str]]:
@@ -1195,11 +1212,14 @@ class EastMoneyClient:
             for item in diff
         ):
             exchange_dates = (
-                self.fetch_trading_dates(snapshot_date)
+                self.fetch_trading_dates(
+                    snapshot_date, retry_transient=True
+                )
                 if before_request is None
                 else self.fetch_trading_dates(
                     snapshot_date,
                     before_request=before_request,
+                    retry_transient=True,
                 )
             )
         latest_exchange_date = exchange_dates[-1] if exchange_dates else None
@@ -1221,12 +1241,17 @@ class EastMoneyClient:
             # exchange date; uninterpreted statuses without price stay unknown.
             if market_status == 6 and latest_exchange_date is not None:
                 probed_last_trade_date = (
-                    self._last_trade_date(code, latest_exchange_date)
+                    self._last_trade_date(
+                        code,
+                        latest_exchange_date,
+                        retry_transient=True,
+                    )
                     if before_request is None
                     else self._last_trade_date(
                         code,
                         latest_exchange_date,
                         before_request=before_request,
+                        retry_transient=True,
                     )
                 )
                 if (
@@ -1356,6 +1381,7 @@ class EastMoneyClient:
         end: str,
         *,
         before_request: DiscoveryPreRequest | None = None,
+        retry_transient: bool = False,
     ) -> str | None:
         from market.sentiment import parse_kline
 
@@ -1365,16 +1391,26 @@ class EastMoneyClient:
                 end=end.replace("-", ""),
                 secid=_secid(code),
             )
+            request = (
+                self._get_json_direct_retry
+                if retry_transient
+                else self._get_json_direct
+            )
             payload = (
-                self._get_json_direct(url)
+                request(url)
                 if before_request is None
-                else self._get_json_direct(
-                    url, before_request=before_request
-                )
+                else request(url, before_request=before_request)
             )
             parsed = parse_kline(payload)
         except DiscoveryRequestStopped:
             raise
+        except TransientMarketError as exc:
+            if retry_transient:
+                raise TransientMarketError(
+                    f"suspended K-line probe failed for {code} "
+                    f"after {DIRECT_RETRY_ATTEMPTS} attempts"
+                ) from exc
+            return None
         except Exception:
             return None
         dates = parsed.get("dates")
@@ -1408,16 +1444,76 @@ class EastMoneyClient:
     ) -> dict:
         import httpx2
 
-        with httpx2.Client(timeout=self.timeout, headers=_HTTP_HEADERS) as client:
-            if before_request is not None:
-                before_request()
-            self._request_count += 1
-            response = client.get(url)
-            response.raise_for_status()
+        if before_request is not None:
+            before_request()
+        self._request_count += 1
+        try:
+            with httpx2.Client(timeout=self.timeout, headers=_HTTP_HEADERS) as client:
+                response = client.get(url)
+        except DiscoveryRequestStopped:
+            raise
+        except httpx2.TransportError as exc:
+            raise TransientMarketError(
+                f"direct request failed: {type(exc).__name__}"
+            ) from exc
+        except Exception as exc:
+            raise MarketError(
+                f"direct request failed: {type(exc).__name__}"
+            ) from exc
+
+        status_code = int(response.status_code)
+        if not 200 <= status_code < 300:
+            try:
+                response.raise_for_status()
+            except Exception as exc:
+                cause = exc
+            else:
+                cause = None
+            # Retry exactly HTTP 408, 429, and the complete 500-599 range.
+            error_type = (
+                TransientMarketError
+                if status_code in {408, 429} or 500 <= status_code <= 599
+                else MarketError
+            )
+            raise error_type(f"direct request HTTP {status_code}") from cause
+        try:
             payload = response.json()
+        except (ValueError, httpx2.DecodingError) as exc:
+            raise TransientMarketError(
+                f"direct response JSON decode failed: {type(exc).__name__}"
+            ) from exc
+        except Exception as exc:
+            raise MarketError(
+                f"direct response parse failed: {type(exc).__name__}"
+            ) from exc
         if not isinstance(payload, dict):
             raise MarketError("接口返回不是对象")
         return payload
+
+    def _get_json_direct_retry(
+        self,
+        url: str,
+        *,
+        before_request: DiscoveryPreRequest | None = None,
+    ) -> dict:
+        last_error: TransientMarketError | None = None
+        for _attempt in range(DIRECT_RETRY_ATTEMPTS):
+            try:
+                return (
+                    self._get_json_direct(url)
+                    if before_request is None
+                    else self._get_json_direct(
+                        url, before_request=before_request
+                    )
+                )
+            except DiscoveryRequestStopped:
+                raise
+            except TransientMarketError as exc:
+                last_error = exc
+        raise TransientMarketError(
+            f"direct request failed after {DIRECT_RETRY_ATTEMPTS} attempts: "
+            f"{type(last_error.__cause__).__name__ if last_error else 'unknown'}"
+        ) from last_error
 
     def fetch_valuation(self, code: str) -> dict[str, object]:
         # BPS/不良用最新一期；EPS 只用年报，避免季报把市盈率抬高一倍
@@ -1518,7 +1614,11 @@ class EastMoneyClient:
                 return payload
             raise MarketError("接口返回不是对象")
         raise TransientMarketError(
-            str(last_error) if last_error else "接口请求失败"
+            (
+                f"clist transport failed: {type(last_error).__name__}"
+                if last_error
+                else "clist transport failed"
+            )
         ) from last_error
 
     def _clist_diff(
