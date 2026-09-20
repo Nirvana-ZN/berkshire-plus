@@ -18,6 +18,8 @@ from sqlalchemy.orm import Session
 
 from app.models import RulerVersion
 from discovery.builds import AVAILABLE_BUILDS
+from discovery.industry import classify_industry_branch
+from discovery.quality_contract import quality_ruler_branch_policies
 from discovery.tracks import SCOPE_TRACKS, TRACKS, scope_for_track, track_for_scope
 from ledger.positions import LOCAL_USER_ID
 
@@ -49,6 +51,191 @@ _PAYLOAD_KEYS = frozenset(
 )
 _DIRECTIONS = frozenset({"asc", "desc"})
 _NULL_ORDERS = frozenset({"nulls_first", "nulls_last"})
+QUALITY_DISCOUNT_FIELDS = (
+    "listing_years",
+    "roe_mean",
+    "roe_cv",
+    "positive_net_income_observations",
+    "latest_net_income",
+    "latest_net_assets",
+    "cash_conversion",
+    "dilution_rate",
+    "debt_to_equity",
+    "interest_coverage",
+    "margin_change",
+    "pe_percentile",
+    "pe_median_ratio",
+    "pb_percentile",
+    "pb_median_ratio",
+    "normalized_earnings",
+    "normalized_pe",
+    "bank_capital_adequacy",
+    "bank_core_tier1_capital_adequacy",
+    "bank_npl",
+    "code",
+)
+QUALITY_DISCOUNT_FORMULAS = MappingProxyType(
+    {
+        "roe_mean": "mean(annual.roe)",
+        "roe_cv": "coefficient_of_variation(annual.roe)",
+        "positive_net_income_observations": (
+            "count(annual.net_income>0)"
+        ),
+        "latest_net_income": "latest(annual.net_income)",
+        "latest_net_assets": "latest(annual.net_assets)",
+        "cash_conversion": (
+            "cash_conversion(annual.ocf,annual.net_income>0)"
+        ),
+        "dilution_rate": "latest(annual.shares)/earliest(annual.shares)-1",
+        "debt_to_equity": (
+            "latest(annual.interest_debt)/latest(annual.net_assets)"
+        ),
+        "interest_coverage": (
+            "latest(annual.ebit)/copy_abs(latest(annual.interest))"
+        ),
+        "margin_change": (
+            "latest(annual.gross_margin)-earliest(annual.gross_margin)"
+        ),
+        "pe_percentile": "percentile_rank(current.pe,monthly.pe)",
+        "pe_median_ratio": "current.pe/median(monthly.pe)",
+        "pb_percentile": "percentile_rank(current.pb,monthly.pb)",
+        "pb_median_ratio": "current.pb/median(monthly.pb)",
+        "normalized_earnings": (
+            "normalized_earnings(annual.deducted_net_income)"
+        ),
+        "normalized_pe": (
+            "current.price*latest(annual.shares)/normalized_earnings"
+        ),
+    }
+)
+QUALITY_DISCOUNT_THRESHOLDS = frozenset(
+    {
+        "listing_years_min",
+        "roe_mean_min",
+        "roe_cv_max",
+        "net_income_positive_min",
+        "net_assets_positive_min",
+        "cash_conversion_min",
+        "dilution_rate_max",
+        "debt_to_equity_max",
+        "interest_coverage_min",
+        "margin_deterioration_max",
+        "pe_percentile_max",
+        "pe_median_ratio_max",
+        "pb_percentile_max",
+        "pb_median_ratio_max",
+        "normalized_pe_max",
+        "normalized_earnings_min",
+        "bank_roe_min",
+        "bank_capital_adequacy_min",
+        "bank_core_tier1_min",
+        "bank_npl_max",
+        "readiness_min",
+    }
+)
+QUALITY_DISCOUNT_MINIMUMS = frozenset(
+    {
+        "roe",
+        "positive_net_income",
+        "net_assets",
+        "cash_conversion",
+        "dilution",
+        "leverage",
+        "interest_coverage",
+        "margin",
+        "valuation_pe",
+        "valuation_pb",
+        "normalized_earnings",
+        "bank_roe",
+        "bank_capital",
+        "bank_npl",
+    }
+)
+_QUALITY_BRANCH_KEYS = frozenset(
+    {
+        "common",
+        "branch_policies",
+        "industry_map",
+        "nonfinancial",
+        "cyclical",
+        "bank",
+    }
+)
+QUALITY_FIELD_DOMAIN_POLICY = "quality-domain-v1"
+_QUALITY_COMMON_CONFIG_KEYS = frozenset(
+    {
+        "valuation_ratio_method",
+        "field_domain_policy",
+        "lookback_windows",
+        "latest_annual_staleness_years",
+    }
+)
+_QUALITY_LOOKBACK_KEYS = frozenset(
+    {
+        "roe",
+        "profitability",
+        "cash_conversion",
+        "dilution",
+        "positive_equity",
+        "leverage",
+        "interest_coverage",
+        "margin",
+        "normalized_earnings",
+        "bank_capital",
+        "bank_npl",
+    }
+)
+_QUALITY_BRANCH_CONFIG_KEYS = frozenset(
+    {
+        "gate_order",
+        "valuation_policy",
+        "margin_deterioration_policy",
+        "latest_net_income_policy",
+    }
+)
+_QUALITY_GATE_SETS = MappingProxyType({
+    "nonfinancial": frozenset(
+        {
+            "listing_age",
+            "roe_mean",
+            "roe_stability",
+            "profitability",
+            "positive_equity",
+            "cash_conversion",
+            "dilution",
+            "leverage",
+            "interest_coverage",
+            "margin",
+            "valuation",
+        }
+    ),
+    "cyclical": frozenset(
+        {
+            "listing_age",
+            "roe_mean",
+            "roe_stability",
+            "profitability",
+            "positive_equity",
+            "cash_conversion",
+            "dilution",
+            "leverage",
+            "interest_coverage",
+            "margin",
+            "normalized_earnings_positive",
+            "cyclical_valuation",
+        }
+    ),
+    "bank": frozenset(
+        {
+            "listing_age",
+            "bank_roe",
+            "positive_equity",
+            "bank_capital",
+            "bank_npl",
+            "bank_valuation",
+        }
+    ),
+})
 
 
 class RulerNotReadyError(ValueError):
@@ -419,6 +606,224 @@ def parse_payload(value: TrackRuler | Mapping[str, object] | str) -> TrackRuler:
     return TrackRuler.from_payload(value)
 
 
+def validate_quality_discount_ruler(ruler: TrackRuler) -> TrackRuler:
+    """Require the complete, explicitly supported quality ruler schema."""
+
+    if not isinstance(ruler, TrackRuler) or ruler.track != "quality_discount":
+        raise ValueError("quality discount ruler scope is required")
+    if ruler.fields != QUALITY_DISCOUNT_FIELDS:
+        raise ValueError("quality discount fields do not match the supported schema")
+    if dict(ruler.formulas) != dict(QUALITY_DISCOUNT_FORMULAS):
+        raise ValueError("quality discount formulas do not match the supported schema")
+    if set(ruler.thresholds) != QUALITY_DISCOUNT_THRESHOLDS:
+        raise ValueError("quality discount thresholds must be complete and exact")
+    if set(ruler.min_observations) != QUALITY_DISCOUNT_MINIMUMS:
+        raise ValueError(
+            "quality discount observation minimums must be complete and exact"
+        )
+    if set(ruler.missing_policy) != set(QUALITY_DISCOUNT_FIELDS) or any(
+        policy not in {"insufficient", "skip"}
+        for policy in ruler.missing_policy.values()
+    ):
+        raise ValueError("quality discount missing policies are invalid")
+    if ruler.missing_policy["code"] != "insufficient":
+        raise ValueError("quality discount code policy must be insufficient")
+
+    branches = ruler.sector_branches
+    if set(branches) != _QUALITY_BRANCH_KEYS:
+        raise ValueError("quality discount sector branches must be complete and exact")
+    common = branches["common"]
+    if (
+        not isinstance(common, Mapping)
+        or set(common) != _QUALITY_COMMON_CONFIG_KEYS
+        or type(common["valuation_ratio_method"]) is not str
+        or not common["valuation_ratio_method"]
+        or common["valuation_ratio_method"]
+        != common["valuation_ratio_method"].strip()
+        or common["field_domain_policy"] != QUALITY_FIELD_DOMAIN_POLICY
+    ):
+        raise ValueError("quality discount common config is invalid")
+    windows = common["lookback_windows"]
+    if (
+        not isinstance(windows, Mapping)
+        or set(windows) != _QUALITY_LOOKBACK_KEYS
+        or any(
+            type(value) is not int or value <= 0 or value > 128
+            for value in windows.values()
+        )
+        or type(common["latest_annual_staleness_years"]) is not int
+        or common["latest_annual_staleness_years"] < 0
+        or common["latest_annual_staleness_years"] > 128
+    ):
+        raise ValueError("quality discount calendar lookbacks are invalid")
+    policies = branches["branch_policies"]
+    if (
+        not isinstance(policies, Mapping)
+        or dict(policies)
+        != dict(quality_ruler_branch_policies(ruler.algorithm_version))
+    ):
+        raise ValueError("quality discount branch policies are invalid")
+    industry_map = branches["industry_map"]
+    if not isinstance(industry_map, Mapping) or set(industry_map) != {
+        "nonfinancial",
+        "cyclical",
+        "bank",
+    }:
+        raise ValueError("quality discount industry map is invalid")
+    seen_industries: set[str] = set()
+    for branch in ("nonfinancial", "cyclical", "bank"):
+        industries = industry_map[branch]
+        if (
+            isinstance(industries, (str, bytes))
+            or not isinstance(industries, Sequence)
+            or not industries
+            or any(
+                type(industry) is not str
+                or not industry
+                or industry != industry.strip()
+                for industry in industries
+            )
+            or len(set(industries)) != len(industries)
+            or seen_industries.intersection(industries)
+        ):
+            raise ValueError(f"quality discount {branch} industries are invalid")
+        expected_shared_branch = (
+            "bank" if branch == "bank" else "nonfinancial"
+        )
+        if any(
+            classify_industry_branch(industry) != expected_shared_branch
+            for industry in industries
+        ):
+            raise ValueError(
+                f"quality discount {branch} industries cross branch policy"
+            )
+        seen_industries.update(industries)
+
+        config = branches[branch]
+        if not isinstance(config, Mapping) or set(config) != _QUALITY_BRANCH_CONFIG_KEYS:
+            raise ValueError(f"quality discount {branch} branch is invalid")
+        gate_order = config["gate_order"]
+        expected_gates = _QUALITY_GATE_SETS[branch]
+        if (
+            isinstance(gate_order, (str, bytes))
+            or not isinstance(gate_order, Sequence)
+            or len(gate_order) != len(expected_gates)
+            or set(gate_order) != expected_gates
+            or any(type(gate) is not str for gate in gate_order)
+        ):
+            raise ValueError(f"quality discount {branch} gate order is invalid")
+        if config["valuation_policy"] not in {"both", "either", "pe", "pb"}:
+            raise ValueError(f"quality discount {branch} valuation policy is invalid")
+        if branch == "bank" and config["valuation_policy"] != "pb":
+            raise ValueError("quality discount bank valuation policy must be pb")
+        if config["margin_deterioration_policy"] not in {"evidence", "drop"}:
+            raise ValueError(f"quality discount {branch} margin policy is invalid")
+        if config["latest_net_income_policy"] not in {
+            "require_positive",
+            "ignore",
+        }:
+            raise ValueError(
+                f"quality discount {branch} latest income policy is invalid"
+            )
+        if branch == "bank":
+            if config["latest_net_income_policy"] != "ignore":
+                raise ValueError(
+                    "quality discount bank latest income policy must be ignore"
+                )
+            if any(
+                gate_order.index("positive_equity")
+                > gate_order.index(gate)
+                for gate in (
+                    "bank_roe",
+                    "bank_capital",
+                    "bank_npl",
+                    "bank_valuation",
+                )
+            ):
+                raise ValueError(
+                    "quality discount bank equity gate order is invalid"
+                )
+        elif (
+            gate_order.index("profitability")
+            > gate_order.index("positive_equity")
+            or gate_order.index("positive_equity")
+            > gate_order.index("cash_conversion")
+            or gate_order.index("positive_equity")
+            > gate_order.index("leverage")
+        ):
+            raise ValueError(
+                f"quality discount {branch} sign gate order is invalid"
+            )
+
+    parsed_thresholds = {
+        key: Decimal(value) for key, value in ruler.thresholds.items()
+    }
+    if any(value < 0 for value in parsed_thresholds.values()):
+        raise ValueError("quality discount thresholds cannot be negative")
+    readiness = parsed_thresholds["readiness_min"]
+    if readiness < 0 or readiness > 1:
+        raise ValueError("quality discount readiness threshold must be within [0, 1]")
+    if any(
+        parsed_thresholds[key] > 100
+        for key in ("pe_percentile_max", "pb_percentile_max")
+    ):
+        raise ValueError("quality discount percentile thresholds exceed 100")
+    if any(
+        minimum > (240 if key.startswith("valuation_") else 128)
+        for key, minimum in ruler.min_observations.items()
+    ):
+        raise ValueError("quality discount observation minimum exceeds work bounds")
+    observation_windows = {
+        "roe": "roe",
+        "bank_roe": "roe",
+        "positive_net_income": "profitability",
+        "net_assets": "positive_equity",
+        "cash_conversion": "cash_conversion",
+        "dilution": "dilution",
+        "leverage": "leverage",
+        "interest_coverage": "interest_coverage",
+        "margin": "margin",
+        "normalized_earnings": "normalized_earnings",
+        "bank_capital": "bank_capital",
+        "bank_npl": "bank_npl",
+    }
+    if any(
+        ruler.min_observations[minimum] > windows[window]
+        for minimum, window in observation_windows.items()
+    ):
+        raise ValueError(
+            "quality discount observation minimum exceeds its calendar window"
+        )
+    if parsed_thresholds["normalized_earnings_min"] != 0:
+        raise ValueError(
+            "quality discount normalized earnings threshold must be exactly zero"
+        )
+    if (
+        parsed_thresholds["net_income_positive_min"] != 0
+        or parsed_thresholds["net_assets_positive_min"] != 0
+    ):
+        raise ValueError(
+            "quality discount profitability/equity thresholds must be zero"
+        )
+    return ruler
+
+
+def quality_discount_ruler(
+    value: TrackRuler | Mapping[str, object] | str,
+) -> TrackRuler:
+    """Build and semantically validate one supplied quality ruler."""
+
+    return validate_quality_discount_ruler(parse_payload(value))
+
+
+def _validate_track_semantics(ruler: TrackRuler) -> TrackRuler:
+    """Dispatch only semantics implemented by this build."""
+
+    if ruler.track == "quality_discount":
+        return validate_quality_discount_ruler(ruler)
+    return ruler
+
+
 def _canonical_ruler_payload(ruler: TrackRuler) -> str:
     return json.dumps(
         _plain(ruler.payload()),
@@ -457,6 +862,7 @@ def validate_ruler_version(
             row.payload_json,
             allow_retired_algorithm=allow_retired_algorithm,
         )
+        ruler = _validate_track_semantics(ruler)
     except (TypeError, ValueError) as error:
         raise ValueError(
             "persisted discovery ruler integrity mismatch"
@@ -545,7 +951,7 @@ def activate(
     reason_text = str(reason or "").strip()
     if not reason_text:
         raise ValueError("ruler activation reason must not be blank")
-    ruler = parse_payload(value)
+    ruler = _validate_track_semantics(parse_payload(value))
     payload_json = canonical_payload(ruler)
     digest = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
     existing = _newest_valid(

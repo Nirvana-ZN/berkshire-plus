@@ -253,6 +253,14 @@ def _run_payload(session: Session, run: DiscoveryRun) -> dict[str, object]:
             "deep_value": run.deep_value_ruler_version_id,
             "garp": run.garp_ruler_version_id,
         },
+        "ruler_readiness": {
+            track: (
+                "ready"
+                if getattr(run, f"{track}_ruler_version_id") is not None
+                else "ruler_not_ready"
+            )
+            for track in _TRACK_ORDER
+        },
         "algorithm_version": run.algorithm_version,
         "input_fingerprint": run.input_fingerprint,
         "error": run.error,

@@ -39,6 +39,10 @@ from screen.ruler import GATE_ACK_KEY, current_hash
 
 
 def _payload(track: str = "quality_discount") -> dict[str, object]:
+    if track == "quality_discount":
+        from tests.test_discovery_tracks_quality import quality_payload
+
+        return quality_payload()
     return {
         "scope": DISCOVERY_PAYLOAD_SCOPE,
         "track": track,
@@ -450,6 +454,55 @@ def test_fresh_init_does_not_activate_discovery_rulers(tmp_path: Path) -> None:
         assert readiness(session, "quality_discount")["status"] == "ruler_not_ready"
 
 
+def test_quality_semantics_guard_activation_resolution_and_freeze(
+    tmp_path: Path,
+) -> None:
+    from tests.test_discovery_tracks_quality import quality_payload
+
+    engine = init_db(tmp_path / "semantic-quality.db")
+    factory = create_session_factory(engine)
+    invalid = quality_payload()
+    invalid["thresholds"].pop("roe_mean_min")
+    payload_json = canonical_payload(invalid)
+    digest = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+    with factory() as session:
+        with pytest.raises(ValueError, match="quality"):
+            activate(session, invalid, "must never persist")
+        session.rollback()
+        assert session.scalar(
+            select(func.count())
+            .select_from(RulerVersion)
+            .where(RulerVersion.scope == QUALITY_DISCOUNT_SCOPE)
+        ) == 0
+
+        raw = RulerVersion(
+            user_id=1,
+            scope=QUALITY_DISCOUNT_SCOPE,
+            digest=digest,
+            reason="raw semantic corruption",
+            payload_json=payload_json,
+            activated_at=datetime.now(timezone.utc),
+        )
+        session.add(raw)
+        session.flush()
+        raw_id = raw.id
+        with pytest.raises(ValueError, match="integrity"):
+            validate_ruler_version(raw, expected_track="quality_discount")
+        assert latest(session, "quality_discount") is None
+        assert readiness(session, "quality_discount")["status"] == "ruler_not_ready"
+        assert resolve_discovery_rulers(session)["quality_discount"] is None
+        with pytest.raises(ValueError, match="incompatible"):
+            freeze_discovery_ruler_payloads(
+                session,
+                {
+                    "quality_discount": raw_id,
+                    "deep_value": None,
+                    "garp": None,
+                },
+                BUILD_VERSION,
+            )
+
+
 def test_legacy_funnel_row_with_spoofed_payload_is_never_discovery(
     tmp_path: Path,
 ) -> None:
@@ -810,7 +863,7 @@ def test_track_ruler_is_deeply_immutable_and_canonical() -> None:
     ruler = TrackRuler.from_payload(_payload())
     assert ruler.scope == QUALITY_DISCOUNT_SCOPE
     assert ruler.track == "quality_discount"
-    assert ruler.thresholds["roe_floor"] == "12"
+    assert ruler.thresholds["roe_mean_min"] == "12"
     assert ruler.order[-1] == ("code", "asc", "nulls_last")
     text = canonical_payload(ruler)
     assert text == canonical_payload(deepcopy(_payload()))
@@ -819,9 +872,9 @@ def test_track_ruler_is_deeply_immutable_and_canonical() -> None:
         text.encode("utf-8")
     ).hexdigest()
     with pytest.raises(TypeError):
-        ruler.thresholds["roe_floor"] = "10"  # type: ignore[index]
+        ruler.thresholds["roe_mean_min"] = "10"  # type: ignore[index]
     with pytest.raises(TypeError):
-        ruler.sector_branches["financial"]["fields"] = ()  # type: ignore[index]
+        ruler.sector_branches["bank"]["gate_order"] = ()  # type: ignore[index]
 
 
 @pytest.mark.parametrize(

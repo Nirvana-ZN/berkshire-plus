@@ -1,0 +1,20 @@
+{
+  "algorithm_build": "discovery-v1",
+  "approval_ready": false,
+  "blocked_reasons": [
+    "missing_schema"
+  ],
+  "candidate_counts": null,
+  "distributions": null,
+  "field_coverage": null,
+  "field_domain_policy": "quality-domain-v1",
+  "industry_versions": null,
+  "note": "Calibration checkpoint only; no ruler was activated or persisted.",
+  "proposal": null,
+  "proposed_readiness_threshold": null,
+  "schema_version": 1,
+  "source_as_of": null,
+  "status": "blocked",
+  "track": "quality_discount",
+  "universe": null
+}

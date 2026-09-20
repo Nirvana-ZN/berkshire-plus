@@ -5,7 +5,8 @@ from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
-from decimal import Decimal
+from decimal import Context, Decimal, ROUND_HALF_EVEN
+from fractions import Fraction
 
 from sqlalchemy import and_, case, func, select
 from sqlalchemy.orm import Session
@@ -19,7 +20,10 @@ from app.models import (
     FinancialFieldProvenance,
     ValuationHistory,
 )
+from discovery.builds import BUILD_VERSION
 from discovery.field_dictionary import FIELD_DICTIONARY
+from discovery.industry import IndustryBranch, classify_industry_branch
+from discovery.quality_contract import quality_branch_data_contract
 from market.cheap import CheapRow, security_state_eligible
 
 QUALITY_DISCOUNT = "quality_discount"
@@ -27,6 +31,7 @@ DEEP_VALUE = "deep_value"
 GARP = "garp"
 TRACKS = (QUALITY_DISCOUNT, DEEP_VALUE, GARP)
 MIN_VALUATION_MONTHS = 60
+_READINESS_DISPLAY_PRECISION = 28
 
 _FINANCIAL_FIELDS = (
     "roe",
@@ -48,7 +53,6 @@ _MEASUREMENT_MINIMUMS = {
 }
 _VALUATION_POLICIES = frozenset({"both", "either", "pe", "pb"})
 _SECTOR_POLICIES = frozenset({"exclude_financial", "roe_fallback"})
-_OTHER_FINANCIAL_TOKENS = ("证券", "多元金融", "信托", "期货", "金融")
 _FINANCIAL_DEEP_FIELDS = tuple(
     field
     for field in ("capital_adequacy",)
@@ -84,7 +88,7 @@ class ValuationObservationCounts:
 
 @dataclass(frozen=True)
 class CompanyObservationCounts:
-    branch: str
+    branch: IndustryBranch
     financial: Mapping[str, int]
     aligned: Mapping[str, int]
     valuation: Mapping[str, ValuationObservationCounts]
@@ -281,19 +285,6 @@ def _persisted_universe(
         else None
     )
     return rows, tuple(sorted(trading_dates)), snapshot_at
-
-
-def _industry_branch(industry: str | None) -> str:
-    value = (industry or "").strip()
-    if not value or value == "-":
-        return "unknown"
-    if "保险" in value:
-        return "insurance"
-    if "银行" in value and "非银行" not in value:
-        return "bank"
-    if any(token in value for token in _OTHER_FINANCIAL_TOKENS):
-        return "other_financial"
-    return "nonfinancial"
 
 
 def _listing_age(value: str | None, as_of: date) -> str:
@@ -541,8 +532,18 @@ def _effective_minimums(
 def _observation_aggregates(
     observations: Mapping[str, CompanyObservationCounts],
 ) -> dict[str, dict[str, ObservationAggregate]]:
+    quality_branches = quality_branch_data_contract(BUILD_VERSION)
+    unsupported_reasons = tuple(
+        contract.insufficient_reason
+        for contract in quality_branches.values()
+        if not contract.supported and contract.insufficient_reason is not None
+    )
     counts: dict[str, dict[str, list[int]]] = {
-        QUALITY_DISCOUNT: {"pe": [], "pb": []},
+        QUALITY_DISCOUNT: {
+            "pe": [],
+            "pb": [],
+            **{reason: [] for reason in unsupported_reasons},
+        },
         DEEP_VALUE: {
             field: [] for field in ("capex", "capital_adequacy", "npl")
         },
@@ -555,6 +556,13 @@ def _observation_aggregates(
         counts[QUALITY_DISCOUNT]["pb"].append(
             max((row.pb for row in company.valuation.values()), default=0)
         )
+        company_reason = quality_branches[
+            company.branch
+        ].insufficient_reason
+        for reason in unsupported_reasons:
+            counts[QUALITY_DISCOUNT][reason].append(
+                int(company_reason == reason)
+            )
         for track in (DEEP_VALUE, GARP):
             for field in counts[track]:
                 counts[track][field].append(company.financial[field])
@@ -616,10 +624,28 @@ def _track(
     threshold: Decimal | None,
     activated: bool,
 ) -> TrackReadiness:
-    coverage = (
-        Decimal(complete) / Decimal(eligible) if eligible else Decimal("0")
+    exact_coverage = (
+        Fraction(complete, eligible) if eligible else Fraction(0)
     )
-    ready = bool(activated and threshold is not None and coverage >= threshold)
+    coverage = (
+        Context(
+            prec=_READINESS_DISPLAY_PRECISION,
+            rounding=ROUND_HALF_EVEN,
+            Emin=-999999,
+            Emax=999999,
+            capitals=1,
+            clamp=0,
+            flags=[],
+            traps=[],
+        ).divide(Decimal(complete), Decimal(eligible))
+        if eligible
+        else Decimal("0")
+    )
+    ready = bool(
+        activated
+        and threshold is not None
+        and exact_coverage >= Fraction(threshold)
+    )
     reason = (
         "not_activated"
         if not activated
@@ -682,9 +708,11 @@ def discovery_data_readiness(
     missing = {track: Counter[str]() for track in TRACKS}
     insufficient = {track: Counter[str]() for track in TRACKS}
     observations: dict[str, CompanyObservationCounts] = {}
+    quality_branches = quality_branch_data_contract(BUILD_VERSION)
 
     for company in candidates:
-        branch = _industry_branch(company.industry)
+        branch = classify_industry_branch(company.industry)
+        quality_branch = quality_branches[branch]
         financial_counts = _financial_counts(financials[company.code])
         aligned: dict[str, int] = {}
 
@@ -693,20 +721,32 @@ def discovery_data_readiness(
             insufficient[QUALITY_DISCOUNT]["recent_listing"] += 1
         else:
             eligible[QUALITY_DISCOUNT] += 1
-            quality_missing: tuple[str, ...]
+            quality_missing: tuple[str, ...] = ()
             if listing_age == "invalid":
                 quality_missing = ("listing_date",)
                 insufficient[QUALITY_DISCOUNT]["invalid_listing_date"] += 1
-            else:
+            if not quality_branch.supported:
+                branch_reason = quality_branch.insufficient_reason
+                if branch_reason is None:
+                    raise ValueError("unsupported quality branch needs a reason")
+                quality_missing += (branch_reason,)
+                insufficient[QUALITY_DISCOUNT][branch_reason] += 1
+            elif listing_age != "invalid":
                 quality_minimums = _effective_minimums(
                     configured_minimums, QUALITY_DISCOUNT
                 )
-                quality_policy = policies.get(QUALITY_DISCOUNT, "both")
-                _, quality_missing = _valuation_complete(
+                configured_policy = policies.get(QUALITY_DISCOUNT, "both")
+                quality_policy = (
+                    configured_policy
+                    if quality_branch.valuation_policy == "configured"
+                    else quality_branch.valuation_policy
+                )
+                _, valuation_missing = _valuation_complete(
                     valuations[company.code],
                     quality_minimums,
                     quality_policy,
                 )
+                quality_missing += valuation_missing
             if quality_missing:
                 missing[QUALITY_DISCOUNT].update(quality_missing)
             else:
@@ -790,7 +830,7 @@ def discovery_data_readiness(
         )
 
     has_financial_companies = any(
-        _industry_branch(company.industry)
+        classify_industry_branch(company.industry)
         in {"bank", "insurance", "other_financial"}
         for company in candidates
     )

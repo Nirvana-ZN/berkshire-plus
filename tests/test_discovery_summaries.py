@@ -91,7 +91,7 @@ def _override(
 ):
     return SimpleNamespace(
         run_id=1,
-        track="quality_discount",
+        track="deep_value",
         stage="track_gate",
         attempt=attempt,
         code=code,
@@ -109,13 +109,13 @@ def _ruler(
     from app.models import RulerVersion
     from discovery.rulers import canonical_payload, payload_digest
 
-    payload = discovery_ruler_payload("quality_discount")
+    payload = discovery_ruler_payload("deep_value")
     if thresholds is not None:
         payload["thresholds"] = thresholds
     return RulerVersion(
         id=row_id,
         user_id=1,
-        scope="discovery:quality_discount",
+        scope="discovery:deep_value",
         digest=payload_digest(payload),
         reason=reason,
         payload_json=canonical_payload(payload),
@@ -133,7 +133,7 @@ def _summary(
     ruler = _ruler(thresholds=thresholds)
     return build_stage_summary(
         _stage(
-            track="quality_discount",
+            track="deep_value",
             stage="track_gate",
             counts=(len(values), len(values), 0, 0),
             ruler_version_id=ruler.id,
@@ -142,7 +142,7 @@ def _summary(
             _result(
                 f"{index:06d}.SZ",
                 {"metric": value},
-                track="quality_discount",
+                track="deep_value",
                 stage="track_gate",
             )
             for index, value in enumerate(values, start=1)
@@ -161,7 +161,7 @@ def test_common_and_track_share_schema_rules_ruler_and_effective_counts() -> Non
     ruler = _ruler()
     track = build_stage_summary(
         _stage(
-            track="quality_discount",
+            track="deep_value",
             stage="track_gate",
             counts=(2, 1, 0, 1),
             ruler_version_id=ruler.id,
@@ -170,14 +170,14 @@ def test_common_and_track_share_schema_rules_ruler_and_effective_counts() -> Non
             _result(
                 "600000.SH",
                 {"metric": "1"},
-                track="quality_discount",
+                track="deep_value",
                 stage="track_gate",
             ),
             _result(
                 "600001.SH",
                 {"metric": None},
                 verdict="insufficient",
-                track="quality_discount",
+                track="deep_value",
                 stage="track_gate",
             ),
         ],
@@ -268,7 +268,7 @@ def test_empty_null_bool_date_and_text_metrics_stay_visible_unavailable() -> Non
     ruler = _ruler()
     empty = build_stage_summary(
         _stage(
-            track="quality_discount",
+            track="deep_value",
             stage="track_gate",
             status="failed",
             ruler_version_id=ruler.id,
@@ -388,7 +388,7 @@ def test_duplicate_results_or_impossible_overrides_are_corruption() -> None:
 
     ruler = _ruler()
     stage = _stage(
-        track="quality_discount",
+        track="deep_value",
         stage="track_gate",
         counts=(1, 1, 0, 0),
         ruler_version_id=ruler.id,
@@ -396,7 +396,7 @@ def test_duplicate_results_or_impossible_overrides_are_corruption() -> None:
     row = _result(
         "600000.SH",
         {"metric": "1"},
-        track="quality_discount",
+        track="deep_value",
         stage="track_gate",
     )
     with pytest.raises(DiscoverySummaryError):
@@ -422,7 +422,7 @@ def test_malformed_persisted_ruler_is_corruption() -> None:
     with pytest.raises(DiscoverySummaryError):
         build_stage_summary(
             _stage(
-                track="quality_discount",
+                track="deep_value",
                 stage="track_gate",
                 status="failed",
                 ruler_version_id=ruler.id,
@@ -438,7 +438,7 @@ def test_ruler_decimal_exponent_bombs_fail_before_formatting() -> None:
     from app.models import RulerVersion
     from discovery.rulers import TrackRuler, validate_ruler_version
 
-    payload = discovery_ruler_payload("quality_discount")
+    payload = discovery_ruler_payload("deep_value")
     payload["thresholds"] = {"metric_floor": "1e100000000"}
     with pytest.raises(ValueError):
         TrackRuler.from_payload(payload)
@@ -452,7 +452,7 @@ def test_ruler_decimal_exponent_bombs_fail_before_formatting() -> None:
     row = RulerVersion(
         id=88,
         user_id=1,
-        scope="discovery:quality_discount",
+        scope="discovery:deep_value",
         digest=hashlib.sha256(payload_json.encode()).hexdigest(),
         reason="corrupt exponent",
         payload_json=payload_json,
@@ -505,7 +505,7 @@ def test_track_state_ruler_and_lineage_matrix_is_strict() -> None:
     with pytest.raises(DiscoverySummaryError):
         build_stage_summary(
             _stage(
-                track="quality_discount",
+                track="deep_value",
                 stage="track_gate",
                 status="confirmed",
                 ruler_version_id=None,
@@ -515,7 +515,7 @@ def test_track_state_ruler_and_lineage_matrix_is_strict() -> None:
     with pytest.raises(DiscoverySummaryError):
         build_stage_summary(
             _stage(
-                track="quality_discount",
+                track="deep_value",
                 stage="track_gate",
                 status="ruler_not_ready",
                 ruler_version_id=ruler.id,
@@ -524,7 +524,7 @@ def test_track_state_ruler_and_lineage_matrix_is_strict() -> None:
             ruler_version=ruler,
         )
     broken_lineage = _stage(
-        track="quality_discount",
+        track="deep_value",
         stage="competition",
         status="data_not_ready",
         ruler_version_id=ruler.id,
@@ -709,7 +709,7 @@ def test_known_ruler_metrics_count_toward_unique_cap(
 ) -> None:
     from discovery import summaries
 
-    payload = discovery_ruler_payload("quality_discount")
+    payload = discovery_ruler_payload("deep_value")
     payload["fields"] = ["a", "b", "code"]
     payload["formulas"] = {"a": "a", "b": "b"}
     payload["missing_policy"] = {
@@ -727,7 +727,7 @@ def test_known_ruler_metrics_count_toward_unique_cap(
     ruler = RulerVersion(
         id=9,
         user_id=1,
-        scope="discovery:quality_discount",
+        scope="discovery:deep_value",
         digest=payload_digest(payload),
         reason="many metrics",
         payload_json=canonical_payload(payload),
@@ -737,7 +737,7 @@ def test_known_ruler_metrics_count_toward_unique_cap(
     with pytest.raises(summaries.DiscoverySummaryError):
         summaries.build_stage_summary(
             _stage(
-                track="quality_discount",
+                track="deep_value",
                 stage="track_gate",
                 status="failed",
                 ruler_version_id=ruler.id,
@@ -755,7 +755,7 @@ def test_retired_build_historical_summaries_remain_identical(
 
     ruler = _ruler()
     stage = _stage(
-        track="quality_discount",
+        track="deep_value",
         stage="track_gate",
         counts=(1, 1, 0, 0),
         ruler_version_id=ruler.id,
@@ -764,7 +764,7 @@ def test_retired_build_historical_summaries_remain_identical(
         _result(
             "600000.SH",
             {"metric": "2"},
-            track="quality_discount",
+            track="deep_value",
             stage="track_gate",
         )
     ]
@@ -823,7 +823,10 @@ def _activate(session, track: str, threshold: str, reason: str):
     from discovery.rulers import activate
 
     payload = discovery_ruler_payload(track)
-    payload["thresholds"] = {"metric_floor": threshold}
+    if track == "quality_discount":
+        payload["thresholds"]["roe_mean_min"] = threshold
+    else:
+        payload["thresholds"] = {"metric_floor": threshold}
     return activate(session, payload, reason)
 
 

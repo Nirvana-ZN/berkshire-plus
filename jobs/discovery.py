@@ -13,6 +13,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 import json
 from math import isfinite
 import sys
@@ -46,6 +47,12 @@ from discovery.snapshot import (
     FrozenValue,
     canonical_json,
     load_frozen_inputs,
+)
+from discovery.rulers import quality_discount_ruler
+from discovery.tracks.quality_discount import (
+    bounded_ratio,
+    classify as classify_quality_discount,
+    decimal_string,
 )
 from jobs.lock import (
     JOB_TYPE_DISCOVERY,
@@ -157,6 +164,67 @@ class TrackExecutionOutcome:
 
 
 TrackExecutor = Callable[[TrackExecutionContext], TrackExecutionOutcome]
+
+
+def builtin_track_executor(
+    context: TrackExecutionContext,
+) -> TrackExecutionOutcome:
+    """Dispatch only production track gates implemented by this build."""
+
+    if context.track != "quality_discount" or context.stage != "track_gate":
+        return TrackExecutionOutcome(
+            status="ruler_not_ready",
+            error="当前构建尚未实现该轨道阶段",
+        )
+    try:
+        ruler = quality_discount_ruler(context.ruler_payload)
+    except (TypeError, ValueError):
+        return TrackExecutionOutcome(
+            status="ruler_not_ready",
+            error="冻结的质量折价尺子不完整或不兼容",
+        )
+    companies = {
+        company.code: company for company in context.frozen_inputs.companies
+    }
+    if (
+        len(companies) != len(context.frozen_inputs.companies)
+        or len(context.candidate_codes) != len(set(context.candidate_codes))
+        or not set(context.candidate_codes) <= set(companies)
+    ):
+        raise TrackExecutorContractError(
+            "quality gate candidates do not match frozen companies"
+        )
+    verdicts = tuple(
+        classify_quality_discount(companies[candidate.code], ruler)
+        for candidate in context.candidates
+    )
+    complete = sum(verdict.verdict != "insufficient" for verdict in verdicts)
+    coverage = bounded_ratio(complete, len(verdicts)) if verdicts else Decimal("1")
+    if coverage is None:
+        raise TrackExecutorContractError("quality coverage ratio is unavailable")
+    required = Decimal(ruler.thresholds["readiness_min"])
+    if coverage < required:
+        return TrackExecutionOutcome(
+            status="data_not_ready",
+            error=(
+                "quality_discount coverage "
+                f"{decimal_string(coverage)} is below approved "
+                f"{ruler.thresholds['readiness_min']}"
+            ),
+        )
+    return TrackExecutionOutcome(
+        status="waiting_confirmation",
+        results=tuple(
+            TrackExecutionResult(
+                code=verdict.code,
+                verdict=verdict.verdict,
+                reason=verdict.primary_reason,
+                metrics_json=canonical_json(verdict.metrics),
+                rank=None,
+            )
+            for verdict in verdicts
+        ),
+    )
 
 
 def _now(now_provider: NowProvider = utc_now) -> datetime:

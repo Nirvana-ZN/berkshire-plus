@@ -62,6 +62,7 @@ from jobs.discovery_data import (
     start_discovery_data_fill,
 )
 from jobs.funnel import execute_funnel
+from jobs.discovery import builtin_track_executor
 from jobs.lock import (
     JOB_TYPE_DISCOVERY,
     JOB_TYPE_DISCOVERY_DATA,
@@ -780,7 +781,9 @@ def create_app(
         app.state.reports_dir = resolved_reports
         app.state.env_path = resolved_env
         app.state.allow_sync = allow_sync
-        app.state.discovery_track_executor = discovery_track_executor
+        app.state.discovery_track_executor = (
+            discovery_track_executor or builtin_track_executor
+        )
         app.state.discovery_snapshot_provider = (
             discovery_snapshot_provider or build_production_snapshot
         )

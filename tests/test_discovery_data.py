@@ -4819,6 +4819,122 @@ def test_readiness_quality_uses_eligible_denominator_and_one_ratio_method(
     engine.dispose()
 
 
+def test_quality_readiness_keeps_unsupported_insurer_in_denominator(
+    tmp_path,
+) -> None:
+    from discovery.data_readiness import discovery_data_readiness
+
+    engine = init_db(tmp_path / "readiness-quality-branches.db")
+    industrial = "000001.SZ"
+    insurer = "600001.SH"
+    with Session(engine) as session:
+        _store_readiness_universe(
+            session,
+            [
+                _readiness_row(industrial, industry="制造业"),
+                _readiness_row(insurer, industry="保险Ⅱ"),
+            ],
+        )
+        _store_readiness_valuations(session, industrial)
+        _store_readiness_valuations(session, insurer)
+        session.commit()
+        strict = discovery_data_readiness(
+            session,
+            as_of=date(2026, 9, 16),
+            approved_thresholds={"quality_discount": Decimal("0.75")},
+            minimum_observations={
+                "quality_discount": {"pe": 60, "pb": 60}
+            },
+            valuation_policies={"quality_discount": "both"},
+        )
+        approved = discovery_data_readiness(
+            session,
+            as_of=date(2026, 9, 16),
+            approved_thresholds={"quality_discount": Decimal("0.5")},
+            minimum_observations={
+                "quality_discount": {"pe": 60, "pb": 60}
+            },
+            valuation_policies={"quality_discount": "both"},
+        )
+
+    quality = strict.tracks["quality_discount"]
+    assert quality.eligible == 2
+    assert quality.complete == 1
+    assert quality.coverage == Decimal("0.5")
+    assert quality.ready is False
+    assert quality.reason == "data_not_ready"
+    assert strict.missing_counts["quality_discount"] == {
+        "industry_branch_insurance_unsupported": 1
+    }
+    assert strict.company_insufficient["quality_discount"] == {
+        "industry_branch_insurance_unsupported": 1
+    }
+    unsupported = strict.observation_aggregates["quality_discount"][
+        "industry_branch_insurance_unsupported"
+    ]
+    assert unsupported.companies == 1
+    assert unsupported.observations == 1
+    assert unsupported.maximum == 1
+    assert strict.observations[industrial].branch == "nonfinancial"
+    assert strict.observations[insurer].branch == "insurance"
+    assert approved.tracks["quality_discount"].ready is True
+    assert approved.tracks["quality_discount"].coverage == Decimal("0.5")
+    engine.dispose()
+
+
+def test_quality_readiness_applies_build_branch_contract(tmp_path) -> None:
+    from discovery.data_readiness import discovery_data_readiness
+
+    engine = init_db(tmp_path / "readiness-quality-contract.db")
+    codes = {
+        "bank": "600001.SH",
+        "insurance": "600002.SH",
+        "other_financial": "600003.SH",
+        "nonfinancial": "000001.SZ",
+    }
+    with Session(engine) as session:
+        _store_readiness_universe(
+            session,
+            [
+                _readiness_row(codes["bank"], industry="银行Ⅱ"),
+                _readiness_row(codes["insurance"], industry="保险Ⅱ"),
+                _readiness_row(codes["other_financial"], industry="证券Ⅱ"),
+                _readiness_row(codes["nonfinancial"], industry="制造业"),
+            ],
+        )
+        _store_readiness_valuations(session, codes["bank"], pe=None)
+        for branch in ("insurance", "other_financial", "nonfinancial"):
+            _store_readiness_valuations(session, codes[branch])
+        session.commit()
+        report = discovery_data_readiness(
+            session,
+            as_of=date(2026, 9, 16),
+            approved_thresholds={"quality_discount": Decimal("0.5")},
+            minimum_observations={
+                "quality_discount": {"pe": 60, "pb": 60}
+            },
+            valuation_policies={"quality_discount": "both"},
+        )
+
+    quality = report.tracks["quality_discount"]
+    assert quality.eligible == 4
+    assert quality.complete == 2
+    assert quality.coverage == Decimal("0.5")
+    assert quality.ready is True
+    assert report.missing_counts["quality_discount"] == {
+        "industry_branch_insurance_unsupported": 1,
+        "industry_branch_other_financial_unsupported": 1,
+    }
+    assert report.company_insufficient["quality_discount"] == {
+        "industry_branch_insurance_unsupported": 1,
+        "industry_branch_other_financial_unsupported": 1,
+    }
+    assert {
+        observation.branch for observation in report.observations.values()
+    } == {"bank", "insurance", "other_financial", "nonfinancial"}
+    engine.dispose()
+
+
 def test_readiness_fields_are_track_and_financial_branch_specific(tmp_path) -> None:
     from discovery.data_readiness import discovery_data_readiness
 
@@ -4893,8 +5009,18 @@ def test_readiness_fields_are_track_and_financial_branch_specific(tmp_path) -> N
     quality = report.tracks["quality_discount"]
     deep_value = report.tracks["deep_value"]
     garp = report.tracks["garp"]
-    assert quality.complete == quality.eligible == 4
-    assert quality.missing_fields == ()
+    assert quality.eligible == 4
+    assert quality.complete == 3
+    assert quality.coverage == Decimal("0.75")
+    assert quality.missing_fields == (
+        "industry_branch_insurance_unsupported",
+    )
+    assert report.missing_counts["quality_discount"] == {
+        "industry_branch_insurance_unsupported": 1
+    }
+    assert report.company_insufficient["quality_discount"] == {
+        "industry_branch_insurance_unsupported": 1
+    }
     assert deep_value.missing_fields == (
         "capex",
         "capital_adequacy",
@@ -4943,6 +5069,94 @@ def test_readiness_zero_eligible_has_exact_zero_coverage(tmp_path) -> None:
         assert track.reason == "not_activated"
     assert report.status == "not_activated"
     engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "track", ["quality_discount", "deep_value", "garp"]
+)
+def test_readiness_ratio_is_exact_and_context_isolated(
+    track: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from collections import Counter
+    from decimal import DefaultContext, Inexact, ROUND_DOWN, localcontext
+
+    from discovery.data_readiness import _track
+
+    monkeypatch.setattr(DefaultContext, "prec", 1)
+    monkeypatch.setattr(DefaultContext, "rounding", ROUND_DOWN)
+    monkeypatch.setitem(DefaultContext.traps, Inexact, True)
+    monkeypatch.setitem(DefaultContext.flags, Inexact, True)
+    default_before = DefaultContext.flags.copy()
+    with localcontext() as hostile:
+        hostile.prec = 1
+        hostile.rounding = ROUND_DOWN
+        hostile.traps[Inexact] = True
+        hostile.clear_flags()
+        before = hostile.flags.copy()
+        strict = _track(
+            track,
+            eligible=3,
+            complete=2,
+            missing=Counter(),
+            threshold=Decimal("0.68"),
+            activated=True,
+        )
+        permissive = _track(
+            track,
+            eligible=3,
+            complete=2,
+            missing=Counter(),
+            threshold=Decimal("0.66"),
+            activated=True,
+        )
+        rounded_boundary = _track(
+            track,
+            eligible=3,
+            complete=2,
+            missing=Counter(),
+            threshold=Decimal("0.6666666666666666666666666667"),
+            activated=True,
+        )
+        exact_endpoint = _track(
+            track,
+            eligible=2,
+            complete=1,
+            missing=Counter(),
+            threshold=Decimal("0.5"),
+            activated=True,
+        )
+        full = _track(
+            track,
+            eligible=3,
+            complete=3,
+            missing=Counter(),
+            threshold=Decimal("1"),
+            activated=True,
+        )
+        zero = _track(
+            track,
+            eligible=0,
+            complete=0,
+            missing=Counter(),
+            threshold=Decimal("0"),
+            activated=True,
+        )
+        assert hostile.flags == before
+        assert DefaultContext.flags == default_before
+
+    assert strict.coverage == Decimal("0.6666666666666666666666666667")
+    assert strict.ready is False
+    assert strict.reason == "data_not_ready"
+    assert permissive.coverage == strict.coverage
+    assert permissive.ready is True
+    assert rounded_boundary.coverage == rounded_boundary.threshold
+    assert rounded_boundary.ready is False
+    assert exact_endpoint.coverage == Decimal("0.5")
+    assert exact_endpoint.ready is True
+    assert full.coverage == Decimal("1")
+    assert full.ready is True
+    assert zero.coverage == Decimal("0")
+    assert zero.ready is True
 
 
 def test_discovery_status_serializes_decimal_readiness_without_dispatch(

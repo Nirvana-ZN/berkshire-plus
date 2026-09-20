@@ -19,6 +19,10 @@ def decimal_series(*values: str | None) -> tuple[Decimal | None, ...]:
 
 
 def discovery_ruler_payload(track: str) -> dict[str, object]:
+    if track == "quality_discount":
+        from tests.test_discovery_tracks_quality import quality_payload
+
+        return quality_payload()
     return {
         "scope": "weekly-discovery",
         "track": track,
