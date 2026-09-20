@@ -2610,7 +2610,7 @@ def test_freeze_loads_only_copied_persisted_inputs(tmp_path: Path) -> None:
             daily_budget=100,
             started_at=SNAPSHOT_AT,
             updated_at=SNAPSHOT_AT,
-            snapshot_status="ready",
+            snapshot_status=None,
         )
         session.add(fill)
         session.flush()
@@ -2665,6 +2665,8 @@ def test_freeze_loads_only_copied_persisted_inputs(tmp_path: Path) -> None:
             ),
         ]
         session.add_all([*financials, *securities])
+        session.flush()
+        fill.snapshot_status = "ready"
         run = add_unfrozen_run(session, week_key="2026-W40")
         inputs = [
             CompanySnapshotInput(
@@ -2704,9 +2706,12 @@ def test_freeze_loads_only_copied_persisted_inputs(tmp_path: Path) -> None:
         session.commit()
 
         financials[0].net_income = Decimal("999")
+        session.commit()
         securities[0].name = "被修改"
         securities[1].listing_date = None
-        session.commit()
+        with pytest.raises(IntegrityError, match="immutable"):
+            session.commit()
+        session.rollback()
 
         loaded = load_frozen_inputs(session, run_id)
         assert [item.code for item in loaded.companies] == [
@@ -3698,7 +3703,7 @@ def _seed_api_snapshot(db_path: Path) -> None:
             daily_requests=1,
             started_at=SNAPSHOT_AT,
             updated_at=SNAPSHOT_AT,
-            snapshot_status="ready",
+            snapshot_status=None,
         )
         session.add(fill)
         session.flush()
@@ -3786,6 +3791,8 @@ def _seed_api_snapshot(db_path: Path) -> None:
                 activated_at=SNAPSHOT_AT,
             )
         )
+        session.flush()
+        fill.snapshot_status = "ready"
         session.commit()
     engine.dispose()
 
@@ -3821,7 +3828,7 @@ def _add_second_api_fill(
             started_at=started,
             run_started_at=started,
             updated_at=completed,
-            snapshot_status="ready",
+            snapshot_status=None,
         )
         session.add(fill)
         session.flush()
@@ -3871,6 +3878,8 @@ def _add_second_api_fill(
                 ),
             ]
         )
+        session.flush()
+        fill.snapshot_status = "ready"
         session.commit()
     engine.dispose()
     return started, completed
@@ -6113,6 +6122,12 @@ def test_production_snapshot_rejects_future_fill_timestamps(
             checkpoint.updated_at = datetime(
                 2099, 1, 1, tzinfo=timezone.utc
             )
+        if future_part in {"universe_snapshot", "universe_source"}:
+            with pytest.raises(IntegrityError, match="immutable"):
+                session.commit()
+            session.rollback()
+            engine.dispose()
+            return
         session.commit()
     engine.dispose()
 
@@ -6160,6 +6175,12 @@ def test_snapshot_date_cutoff_uses_china_market_day(
             text(
                 "DROP TRIGGER IF EXISTS "
                 "trg_discovery_checkpoint_payload_immutable"
+            )
+        )
+        session.execute(
+            text(
+                "DROP TRIGGER IF EXISTS "
+                "trg_discovery_universe_security_immutable"
             )
         )
         fill = session.get(DiscoveryDataFill, 1)

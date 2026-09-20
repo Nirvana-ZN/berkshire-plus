@@ -682,6 +682,99 @@ def _ensure_discovery_fill_columns(engine: Engine) -> None:
                 )
 
 
+def _ensure_discovery_universe_seals(engine: Engine) -> None:
+    """Seal ready universe rows; unfinished fills remain cascade-deletable."""
+
+    from sqlalchemy import text
+
+    with engine.begin() as conn:
+        if not {
+            "discovery_data_fills",
+            "discovery_universe_securities",
+        } <= {
+            row[0]
+            for row in conn.execute(
+                text(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            )
+        }:
+            return
+        conn.execute(
+            text(
+                "CREATE TRIGGER IF NOT EXISTS "
+                "trg_discovery_universe_security_insert_immutable "
+                "BEFORE INSERT ON discovery_universe_securities "
+                "WHEN EXISTS ("
+                "SELECT 1 FROM discovery_data_fills AS fill "
+                "WHERE fill.id = NEW.fill_id "
+                "AND fill.snapshot_status IN ('ready', 'unavailable')"
+                ") BEGIN SELECT RAISE(ABORT, "
+                "'ready discovery universe security is immutable'); END"
+            )
+        )
+        conn.execute(
+            text(
+                "DROP TRIGGER IF EXISTS "
+                "trg_discovery_universe_security_immutable"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE TRIGGER "
+                "trg_discovery_universe_security_immutable "
+                "BEFORE UPDATE ON discovery_universe_securities "
+                "WHEN EXISTS ("
+                "SELECT 1 FROM discovery_data_fills AS fill "
+                "WHERE fill.id = OLD.fill_id "
+                "AND fill.snapshot_status IN ('ready', 'unavailable')"
+                ") OR EXISTS ("
+                "SELECT 1 FROM discovery_data_fills AS fill "
+                "WHERE fill.id = NEW.fill_id "
+                "AND fill.snapshot_status IN ('ready', 'unavailable')"
+                ") BEGIN SELECT RAISE(ABORT, "
+                "'ready discovery universe security is immutable'); END"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE TRIGGER IF NOT EXISTS "
+                "trg_discovery_universe_security_delete_immutable "
+                "BEFORE DELETE ON discovery_universe_securities "
+                "WHEN EXISTS ("
+                "SELECT 1 FROM discovery_data_fills AS fill "
+                "WHERE fill.id = OLD.fill_id "
+                "AND fill.snapshot_status IN ('ready', 'unavailable')"
+                ") BEGIN SELECT RAISE(ABORT, "
+                "'ready discovery universe security is immutable'); END"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE TRIGGER IF NOT EXISTS "
+                "trg_discovery_ready_fill_snapshot_immutable "
+                "BEFORE UPDATE OF snapshot_status ON discovery_data_fills "
+                "WHEN (OLD.snapshot_status = 'ready' "
+                "AND (NEW.snapshot_status IS NULL OR "
+                "NEW.snapshot_status NOT IN ('ready', 'unavailable'))) "
+                "OR (OLD.snapshot_status = 'unavailable' "
+                "AND NEW.snapshot_status IS NOT OLD.snapshot_status) "
+                "BEGIN SELECT RAISE(ABORT, "
+                "'ready discovery fill snapshot is immutable'); END"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE TRIGGER IF NOT EXISTS "
+                "trg_discovery_ready_fill_append_only "
+                "BEFORE DELETE ON discovery_data_fills "
+                "WHEN OLD.snapshot_status IN ('ready', 'unavailable') "
+                "BEGIN SELECT RAISE(ABORT, "
+                "'ready discovery fill is append-only'); END"
+            )
+        )
+
+
 def _ensure_discovery_checkpoint_columns(engine: Engine) -> None:
     """Add fill-scoped payload storage without blessing legacy checkpoints."""
 
@@ -747,80 +840,6 @@ def _ensure_discovery_checkpoint_columns(engine: Engine) -> None:
                     "'completed discovery status is immutable'); "
                     "END"
                 )
-            )
-
-
-def _classify_discovery_fill_snapshots(engine: Engine) -> None:
-    from sqlalchemy import text
-
-    from discovery.company_payload import verify_company_payload_digest
-
-    guidance = "snapshot unavailable or mismatched; start a new fill"
-    with engine.begin() as conn:
-        fills = conn.execute(
-            text(
-                "SELECT id, status, total, snapshot_status "
-                "FROM discovery_data_fills"
-            )
-        ).all()
-        for fill_id, status, total, snapshot_status in fills:
-            checkpoint_rows = conn.execute(
-                text(
-                    "SELECT code, status, payload_json, payload_digest "
-                    "FROM discovery_data_checkpoints "
-                    "WHERE fill_id = :fill_id"
-                ),
-                {"fill_id": fill_id},
-            ).all()
-            checkpoints = {row[0] for row in checkpoint_rows}
-            payloads_complete = all(
-                row[1] != "done"
-                or verify_company_payload_digest(row[2], row[3])
-                for row in checkpoint_rows
-            )
-            snapshots = {
-                row[0]
-                for row in conn.execute(
-                    text(
-                        "SELECT code FROM discovery_universe_securities "
-                        "WHERE fill_id = :fill_id"
-                    ),
-                    {"fill_id": fill_id},
-                )
-            }
-            has_dates = (
-                conn.execute(
-                    text(
-                        "SELECT 1 FROM discovery_fill_trading_dates "
-                        "WHERE fill_id = :fill_id LIMIT 1"
-                    ),
-                    {"fill_id": fill_id},
-                ).first()
-                is not None
-            )
-            if checkpoints:
-                ready = (
-                    checkpoints == snapshots
-                    and has_dates
-                    and payloads_complete
-                )
-            else:
-                ready = int(total or 0) == 0 and not snapshots and has_dates
-            if snapshot_status is not None and ready:
-                continue
-            conn.execute(
-                text(
-                    "UPDATE discovery_data_fills SET "
-                    "snapshot_status = :snapshot_status, "
-                    "status = :status, last_error = :last_error "
-                    "WHERE id = :fill_id"
-                ),
-                {
-                    "fill_id": fill_id,
-                    "snapshot_status": "ready" if ready else "unavailable",
-                    "status": status if ready else "snapshot_unavailable",
-                    "last_error": None if ready else guidance,
-                },
             )
 
 
@@ -1009,7 +1028,7 @@ def init_db(db_path: Path | None = None) -> Engine:
     _ensure_financial_columns(engine)
     _ensure_discovery_fill_columns(engine)
     _ensure_discovery_checkpoint_columns(engine)
-    _classify_discovery_fill_snapshots(engine)
+    _ensure_discovery_universe_seals(engine)
     _ensure_financial_text_storage(engine)
     _ensure_valuation_series(engine)
     _reset_stale_financials(engine)

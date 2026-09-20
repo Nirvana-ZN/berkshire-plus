@@ -1457,6 +1457,96 @@ def test_cheap_universe_freezes_fields_and_live_row_is_eligible() -> None:
     )
 
 
+def test_priced_suspension_candidates_are_probed_and_request_gated(
+    monkeypatch,
+) -> None:
+    callbacks = 0
+    urls: list[str] = []
+
+    def before_request() -> None:
+        nonlocal callbacks
+        callbacks += 1
+
+    def get(url: str):
+        urls.append(url)
+        if "clist/get" in url:
+            return _HttpResponse(
+                {
+                    "data": {
+                        "diff": [
+                            {
+                                "f12": code,
+                                "f13": 1,
+                                "f14": code,
+                                "f2": "10",
+                                "f9": "5",
+                                "f23": "1",
+                                "f20": "100",
+                                "f26": 20000101,
+                                "f100": "测试",
+                                "f292": status,
+                            }
+                            for code, status in (
+                                ("600001", 6),
+                                ("600002", 6),
+                                ("600003", 6),
+                                ("600004", 2),
+                            )
+                        ]
+                    }
+                }
+            )
+        if "secid=0.399317" in url:
+            return _HttpResponse(
+                {
+                    "data": {
+                        "klines": [
+                            "2026-09-19,1,2,3,4,5,6",
+                            "2026-09-20,1,2,3,4,5,6",
+                        ]
+                    }
+                }
+            )
+        if "secid=1.600001" in url:
+            return _HttpResponse(
+                {"data": {"klines": ["2026-09-19,1,2,3,4,5,6"]}}
+            )
+        if "secid=1.600002" in url:
+            return _HttpResponse(
+                {"data": {"klines": ["2026-09-20,1,2,3,4,5,6"]}}
+            )
+        assert "secid=1.600003" in url
+        raise RuntimeError("stock kline unavailable")
+
+    _install_http_transport(monkeypatch, get)
+    client = EastMoneyClient()
+    rows = {
+        row.code: row
+        for row in client.fetch_cheap_universe(
+            as_of=date(2026, 9, 20),
+            before_request=before_request,
+        )
+    }
+
+    assert (
+        rows["600001.SH"].trading_status,
+        rows["600001.SH"].last_trade_date,
+    ) == ("suspended", "2026-09-19")
+    assert (
+        rows["600002.SH"].trading_status,
+        rows["600002.SH"].last_trade_date,
+    ) == ("trading", "2026-09-20")
+    assert (
+        rows["600003.SH"].trading_status,
+        rows["600003.SH"].last_trade_date,
+    ) == (None, None)
+    assert (
+        rows["600004.SH"].trading_status,
+        rows["600004.SH"].last_trade_date,
+    ) == ("trading", "2026-09-20")
+    assert callbacks == client.request_count == len(urls) == 5
+
+
 def test_suspended_security_uses_latest_five_frozen_exchange_dates() -> None:
     dates = [
         "2026-09-08",
@@ -2679,6 +2769,29 @@ def _security(code: str) -> SecurityState:
     )
 
 
+def _complete_cheap_row(code: str) -> CheapRow:
+    state = _security(code)
+    return CheapRow(
+        code=code,
+        name=state.name,
+        price=Decimal("10"),
+        pe=Decimal("5"),
+        pb=Decimal("1"),
+        mcap=Decimal("100"),
+        industry=state.industry,
+        exchange=state.exchange,
+        listing_date=state.listing_date,
+        is_st=state.is_st,
+        is_delisting=state.is_delisting,
+        trading_status=state.trading_status,
+        last_trade_date=state.last_trade_date,
+        industry_version=state.industry_version,
+        industry_as_of=state.industry_as_of,
+        security_source=state.source,
+        market_status_code=state.market_status_code,
+    )
+
+
 def _bundle(
     code: str,
     *,
@@ -2996,7 +3109,7 @@ def test_real_fill_execution_payload_feeds_weekly_snapshot(tmp_path) -> None:
 
 
 @pytest.mark.parametrize("legacy_status", ["paused", "done"])
-def test_init_rejects_legacy_done_checkpoint_without_payload_digest_and_replaces(
+def test_init_preserves_legacy_snapshot_and_explicit_start_replaces(
     tmp_path, legacy_status: str
 ) -> None:
     from jobs.discovery_data import start_discovery_data_fill
@@ -3024,11 +3137,9 @@ def test_init_rejects_legacy_done_checkpoint_without_payload_digest_and_replaces
         with create_session_factory(engine)() as session:
             legacy = session.get(DiscoveryDataFill, legacy_id)
             assert legacy is not None
-            assert legacy.status == "snapshot_unavailable"
-            assert legacy.snapshot_status == "unavailable"
-            assert legacy.last_error == (
-                "snapshot unavailable or mismatched; start a new fill"
-            )
+            assert legacy.status == legacy_status
+            assert legacy.snapshot_status == "ready"
+            assert legacy.last_error is None
         engine.dispose()
 
     engine = init_db(db_path)
@@ -3036,6 +3147,13 @@ def test_init_rejects_legacy_done_checkpoint_without_payload_digest_and_replaces
         replacement, dispatch = start_discovery_data_fill(session, now=now)
         assert replacement is not None and replacement.id != legacy_id
         assert dispatch is True
+        legacy = session.get(DiscoveryDataFill, legacy_id)
+        assert legacy is not None
+        assert legacy.status == (
+            "snapshot_unavailable"
+            if legacy_status == "paused"
+            else "done"
+        )
     engine.dispose()
 
 
@@ -3267,7 +3385,7 @@ def _fill(
         started_at=now,
         updated_at=now,
         last_error=None,
-        snapshot_status="ready" if codes and with_snapshot else None,
+        snapshot_status=None,
     )
     session.add(fill)
     session.flush()
@@ -3308,6 +3426,8 @@ def _fill(
                 )
             ]
         )
+        session.flush()
+        fill.snapshot_status = "ready"
     session.commit()
     return fill
 
@@ -3440,6 +3560,7 @@ def test_resumable_fill_rejects_checkpoint_snapshot_mismatch(
             list(checkpoint_codes),
             now=now,
             status="paused",
+            with_snapshot=False,
         )
         fill_id = fill.id
         done = session.get(
@@ -3450,17 +3571,22 @@ def test_resumable_fill_rejects_checkpoint_snapshot_mismatch(
         done.attempts = 2
         done.valuation_points = 60
         fill.completed = 1
-        session.execute(
-            delete(DiscoveryUniverseSecurity).where(
-                DiscoveryUniverseSecurity.fill_id == fill_id
-            )
-        )
         session.add_all(
             [
                 _snapshot_security(fill_id, code, now)
                 for code in snapshot_codes
             ]
         )
+        session.add_all(
+            [
+                DiscoveryFillTradingDate(
+                    fill_id=fill_id, trade_date=trade_date
+                )
+                for trade_date in ("2026-09-15", "2026-09-16")
+            ]
+        )
+        session.flush()
+        fill.snapshot_status = "ready"
         session.commit()
 
     market = FakeMarketClient(
@@ -3713,18 +3839,8 @@ def test_discovery_data_api_start_status_and_get_is_read_only(tmp_path) -> None:
 
     code = "000001.SZ"
     market = FakeMarketClient(
-        cheap_universe=[
-            CheapRow(
-                code=code,
-                name="平安银行",
-                price=Decimal("10"),
-                pe=Decimal("5"),
-                pb=Decimal("1"),
-                mcap=Decimal("100"),
-                industry="银行",
-                exchange="SZ",
-            )
-        ],
+        cheap_universe=[_complete_cheap_row(code)],
+        trading_dates=["2026-09-15", "2026-09-16"],
         discovery_data={code: _bundle(code)},
     )
     with _discovery_client(tmp_path, market) as client:
@@ -3760,18 +3876,7 @@ def test_discovery_data_duplicate_start_is_idempotent_and_lock_conflicts(
             )
 
     market = BlockingMarket(
-        cheap_universe=[
-            CheapRow(
-                code=code,
-                name="平安银行",
-                price=Decimal("10"),
-                pe=Decimal("5"),
-                pb=Decimal("1"),
-                mcap=Decimal("100"),
-                industry="银行",
-                exchange="SZ",
-            )
-        ],
+        cheap_universe=[_complete_cheap_row(code)],
         trading_dates=["2026-09-15", "2026-09-16"],
         discovery_data={code: _bundle(code)},
     )
@@ -3996,6 +4101,894 @@ def test_immediate_resume_waits_from_persisted_last_request(
         )
     assert clock.sleeps == [1.5]
     assert transport_times == [first_request + timedelta(seconds=2)]
+    engine.dispose()
+
+
+def test_discovery_bundle_reuses_verified_security_without_security_http(
+    monkeypatch,
+) -> None:
+    state = replace(_security("000001.SZ"), industry="银行")
+    callbacks = 0
+    urls: list[str] = []
+
+    def before_request() -> None:
+        nonlocal callbacks
+        callbacks += 1
+
+    def get(url: str):
+        urls.append(url)
+        assert "stock/get" not in url
+        assert "stock/kline/get" not in url
+        if "RPT_VALUEANALYSIS_DET" in url:
+            return _HttpResponse(
+                {
+                    "success": True,
+                    "result": {
+                        "pages": 1,
+                        "data": [
+                            {
+                                "TRADE_DATE": "2026-09-16",
+                                "PE_TTM": "10",
+                                "PB_MRQ": "1",
+                            },
+                            {
+                                "TRADE_DATE": "2020-01-01",
+                                "PE_TTM": "9",
+                                "PB_MRQ": "0.9",
+                            },
+                        ],
+                    },
+                }
+            )
+        return _HttpResponse(
+            {
+                "success": True,
+                "result": {
+                    "data": [
+                        {
+                            "REPORT_TYPE": "年报",
+                            "REPORT_YEAR": "2025",
+                            "REPORT_DATE": "2025-12-31",
+                            "DATE_TYPE_CODE": "001",
+                            "NOTICE_DATE": "2026-03-31",
+                            "TOTAL_OPERATE_INCOME": "100",
+                        }
+                    ]
+                },
+            }
+        )
+
+    _install_http_transport(monkeypatch, get)
+    result = EastMoneyClient().fetch_discovery_data(
+        state.code,
+        security_state=state,
+        before_request=before_request,
+    )
+
+    assert result.security_state is state
+    assert result.source_as_of.security == state.industry_as_of
+    assert result.request_count == callbacks == len(urls) == 6
+    assert any("MAINFINADATA" in url for url in urls)
+    assert any("RPT_VALUEANALYSIS_DET" in url for url in urls)
+    assert not any("RPT_F10_FINANCE_GBALANCE" in url for url in urls)
+    assert not any("RPT_F10_FINANCE_GCASHFLOW" in url for url in urls)
+
+
+def test_discovery_bundle_rejects_invalid_supplied_security_without_http() -> None:
+    invalid = replace(_security("000001.SZ"), exchange="SH")
+    client = EastMoneyClient()
+
+    with pytest.raises(DiscoveryCompanyError, match="exchange") as caught:
+        client.fetch_discovery_data(
+            invalid.code,
+            security_state=invalid,
+            before_request=lambda: pytest.fail("must not request"),
+        )
+
+    assert caught.value.stage == "security_state"
+    assert caught.value.request_count == client.request_count == 0
+
+
+def test_worker_persists_exact_fill_security_and_supports_legacy_client(
+    tmp_path,
+) -> None:
+    from discovery.company_payload import parse_company_payload
+    from jobs.discovery_data import RequestPolicy, execute_discovery_data_fill
+
+    engine = init_db(tmp_path / "frozen-security.db")
+    factory = create_session_factory(engine)
+    now = datetime(2026, 9, 16, 12, tzinfo=timezone.utc)
+    code = "000001.SZ"
+    with factory() as session:
+        fill = _fill(session, [code], now=now, with_snapshot=False)
+        fill_id = fill.id
+        snapshot = _snapshot_security(fill_id, code, now)
+        snapshot.name = "冻结名称"
+        snapshot.industry = "银行"
+        session.add(snapshot)
+        session.add(
+            DiscoveryFillTradingDate(
+                fill_id=fill_id, trade_date="2026-09-16"
+            )
+        )
+        session.flush()
+        fill.snapshot_status = "ready"
+        session.commit()
+
+    market = FakeMarketClient(
+        discovery_data={code: _bundle(code, request_count=1)}
+    )
+    policy = RequestPolicy(
+        requests_per_second=100,
+        max_attempts=1,
+        daily_budget=10,
+        max_runtime_seconds=60,
+    )
+    with factory() as session:
+        execute_discovery_data_fill(
+            session, market, fill_id, policy=policy, clock=FakeClock(now)
+        )
+    with factory() as session:
+        checkpoint = session.get(DiscoveryDataCheckpoint, (fill_id, code))
+        assert checkpoint is not None and checkpoint.payload_json is not None
+        payload = parse_company_payload(
+            checkpoint.payload_json, expected_code=code
+        )
+        assert payload["security_state"]["name"] == "冻结名称"
+        assert payload["security_state"]["industry"] == "银行"
+        assert len(market.discovery_security_states) == 1
+        supplied = market.discovery_security_states[0]
+        assert supplied is not None
+        assert (supplied.name, supplied.industry) == ("冻结名称", "银行")
+
+    class LegacyMarket:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def fetch_discovery_data(
+            self, requested: str, *, before_request=None
+        ) -> DiscoveryCompanyData:
+            self.calls += 1
+            assert before_request is not None
+            before_request()
+            return _bundle(requested)
+
+    with factory() as session:
+        second_fill = _fill(session, ["000002.SZ"], now=now)
+        second_id = second_fill.id
+    legacy = LegacyMarket()
+    with factory() as session:
+        execute_discovery_data_fill(
+            session, legacy, second_id, policy=policy, clock=FakeClock(now)
+        )
+    assert legacy.calls == 1
+    engine.dispose()
+
+
+def test_worker_rejects_frozen_security_mutation_race(tmp_path) -> None:
+    from jobs.discovery_data import RequestPolicy, execute_discovery_data_fill
+
+    engine = init_db(tmp_path / "security-race.db")
+    factory = create_session_factory(engine)
+    now = datetime(2026, 9, 16, 12, tzinfo=timezone.utc)
+    code = "000001.SZ"
+    with factory() as session:
+        fill_id = _fill(session, [code], now=now).id
+
+    class MutatingMarket:
+        def fetch_discovery_data(
+            self,
+            requested: str,
+            *,
+            before_request=None,
+            security_state=None,
+        ) -> DiscoveryCompanyData:
+            assert security_state is not None
+            with factory() as other:
+                row = other.get(
+                    DiscoveryUniverseSecurity, (fill_id, requested)
+                )
+                assert row is not None
+                row.industry = "被篡改"
+                other.commit()
+            return replace(
+                _bundle(requested, request_count=0),
+                security_state=security_state,
+                source_as_of=replace(
+                    _bundle(requested).source_as_of,
+                    security=security_state.industry_as_of,
+                ),
+            )
+
+    with factory() as session:
+        execute_discovery_data_fill(
+            session,
+            MutatingMarket(),
+            fill_id,
+            policy=RequestPolicy(
+                requests_per_second=100,
+                max_attempts=1,
+                daily_budget=10,
+                max_runtime_seconds=60,
+            ),
+            clock=FakeClock(now),
+        )
+    with factory() as session:
+        checkpoint = session.get(DiscoveryDataCheckpoint, (fill_id, code))
+        assert checkpoint is not None
+        assert checkpoint.status == "failed"
+        assert checkpoint.error and "immutable" in checkpoint.error
+        assert session.get(Financial, (code, "2025", "annual")) is None
+    engine.dispose()
+
+
+def test_worker_keeps_frozen_security_fill_scoped_and_does_not_retry_typeerror(
+    tmp_path,
+) -> None:
+    from jobs.discovery_data import RequestPolicy, execute_discovery_data_fill
+
+    engine = init_db(tmp_path / "security-fill-scope.db")
+    factory = create_session_factory(engine)
+    now = datetime(2026, 9, 16, 12, tzinfo=timezone.utc)
+    code = "000001.SZ"
+    fill_ids: list[int] = []
+    for name in ("第一批", "第二批"):
+        with factory() as session:
+            fill = _fill(
+                session, [code], now=now, with_snapshot=False
+            )
+            row = _snapshot_security(fill.id, code, now)
+            row.name = name
+            session.add(row)
+            session.add(
+                DiscoveryFillTradingDate(
+                    fill_id=fill.id, trade_date="2026-09-16"
+                )
+            )
+            session.flush()
+            fill.snapshot_status = "ready"
+            session.commit()
+            fill_ids.append(fill.id)
+
+    policy = RequestPolicy(
+        requests_per_second=100,
+        max_attempts=1,
+        daily_budget=10,
+        max_runtime_seconds=60,
+    )
+    market = FakeMarketClient(
+        discovery_data={code: _bundle(code, request_count=0)}
+    )
+    for fill_id in fill_ids:
+        with factory() as session:
+            execute_discovery_data_fill(
+                session,
+                market,
+                fill_id,
+                policy=policy,
+                clock=FakeClock(now),
+            )
+    assert [
+        state.name
+        for state in market.discovery_security_states
+        if state is not None
+    ] == ["第一批", "第二批"]
+
+    class TypeErrorMarket:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def fetch_discovery_data(
+            self,
+            requested: str,
+            *,
+            before_request=None,
+            security_state=None,
+        ) -> DiscoveryCompanyData:
+            self.calls += 1
+            assert security_state is not None
+            raise TypeError("raised inside market client")
+
+    with factory() as session:
+        bad_fill_id = _fill(session, ["000002.SZ"], now=now).id
+    bad = TypeErrorMarket()
+    with factory() as session:
+        execute_discovery_data_fill(
+            session,
+            bad,
+            bad_fill_id,
+            policy=policy,
+            clock=FakeClock(now),
+        )
+    with factory() as session:
+        checkpoint = session.get(
+            DiscoveryDataCheckpoint, (bad_fill_id, "000002.SZ")
+        )
+        assert checkpoint is not None
+        assert checkpoint.status == "failed"
+        assert checkpoint.error and "raised inside market client" in checkpoint.error
+    assert bad.calls == 1
+    engine.dispose()
+
+
+def test_ready_universe_security_is_database_immutable_and_fill_append_only(
+    tmp_path,
+) -> None:
+    engine = init_db(tmp_path / "sealed-universe.db")
+    init_db(tmp_path / "sealed-universe.db").dispose()
+    now = datetime(2026, 9, 16, 12, tzinfo=timezone.utc)
+    code = "000001.SZ"
+    with Session(engine) as session:
+        fill = _fill(
+            session, [code], now=now, with_snapshot=False
+        )
+        row = _snapshot_security(fill.id, code, now)
+        session.add(row)
+        session.commit()
+
+        row.name = "初始化可改"
+        session.commit()
+        fill.snapshot_status = "ready"
+        session.commit()
+        fill_id = fill.id
+
+    with Session(engine) as session:
+        row = session.get(DiscoveryUniverseSecurity, (fill_id, code))
+        assert row is not None
+        row.name = "ORM 篡改"
+        with pytest.raises(IntegrityError, match="immutable"):
+            session.commit()
+        session.rollback()
+        row = session.get(DiscoveryUniverseSecurity, (fill_id, code))
+        assert row is not None
+        session.delete(row)
+        with pytest.raises(IntegrityError, match="immutable"):
+            session.commit()
+        session.rollback()
+        session.add(_snapshot_security(fill_id, "000002.SZ", now))
+        with pytest.raises(IntegrityError, match="immutable"):
+            session.commit()
+        session.rollback()
+
+    updates = {
+        "fill_id": "fill_id + 1000",
+        "code": "'000002.SZ'",
+        "name": "'篡改'",
+        "industry": "'篡改行业'",
+        "exchange": "'SH'",
+        "listing_date": "'2002-01-01'",
+        "is_st": "1",
+        "is_delisting": "1",
+        "trading_status": "'suspended'",
+        "is_suspended": "1",
+        "last_trade_date": "'2026-09-15'",
+        "industry_version": "'tampered:v2'",
+        "source_as_of": "'2026-09-15'",
+        "provenance": "'tampered'",
+        "market_status_code": "99",
+        "snapshot_at": "'2026-09-15 00:00:00'",
+    }
+    for column, value in updates.items():
+        with pytest.raises(IntegrityError, match="immutable"):
+            with engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "UPDATE discovery_universe_securities "
+                        f"SET {column} = {value} "
+                        "WHERE fill_id = :fill_id AND code = :code"
+                    ),
+                    {"fill_id": fill_id, "code": code},
+                )
+
+    with pytest.raises(IntegrityError, match="immutable"):
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "DELETE FROM discovery_universe_securities "
+                    "WHERE fill_id = :fill_id AND code = :code"
+                ),
+                {"fill_id": fill_id, "code": code},
+            )
+    with pytest.raises(IntegrityError, match="append-only"):
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "DELETE FROM discovery_data_fills WHERE id = :fill_id"
+                ),
+                {"fill_id": fill_id},
+            )
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "UPDATE discovery_data_fills "
+                "SET snapshot_status = 'unavailable' WHERE id = :fill_id"
+            ),
+            {"fill_id": fill_id},
+        )
+    with pytest.raises(IntegrityError, match="immutable"):
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "UPDATE discovery_universe_securities SET name = 'still sealed' "
+                    "WHERE fill_id = :fill_id AND code = :code"
+                ),
+                {"fill_id": fill_id, "code": code},
+            )
+
+    with Session(engine) as session:
+        pending = _fill(
+            session, ["000002.SZ"], now=now, with_snapshot=False
+        )
+        session.add(_snapshot_security(pending.id, "000002.SZ", now))
+        session.commit()
+        pending_id = pending.id
+    with engine.begin() as conn:
+        conn.execute(
+            text("DELETE FROM discovery_data_fills WHERE id = :fill_id"),
+            {"fill_id": pending_id},
+        )
+        assert conn.execute(
+            text(
+                "SELECT COUNT(*) FROM discovery_universe_securities "
+                "WHERE fill_id = :fill_id"
+            ),
+            {"fill_id": pending_id},
+        ).scalar_one() == 0
+    engine.dispose()
+
+
+def test_universe_security_update_seal_checks_old_and_new_parent(
+    tmp_path,
+) -> None:
+    engine = init_db(tmp_path / "universe-move-seal.db")
+    now = datetime(2026, 9, 16, 12, tzinfo=timezone.utc)
+    with Session(engine) as session:
+        pending_a = _fill(session, [], now=now)
+        pending_b = _fill(session, [], now=now)
+        pending_c = _fill(session, [], now=now)
+        ready_a = _fill(session, ["000001.SZ"], now=now)
+        ready_b = _fill(session, ["000002.SZ"], now=now)
+        unavailable = _fill(session, ["000003.SZ"], now=now)
+        unavailable.snapshot_status = "unavailable"
+        session.commit()
+        session.add_all(
+            [
+                _snapshot_security(
+                    pending_a.id, "000010.SZ", now
+                ),
+                _snapshot_security(
+                    pending_c.id, "000020.SZ", now
+                ),
+                _snapshot_security(
+                    pending_c.id, "000030.SZ", now
+                ),
+            ]
+        )
+        session.commit()
+        ids = {
+            "pending_a": pending_a.id,
+            "pending_b": pending_b.id,
+            "pending_c": pending_c.id,
+            "ready_a": ready_a.id,
+            "ready_b": ready_b.id,
+            "unavailable": unavailable.id,
+        }
+
+    # Pending -> pending, including PK/code changes, is initialization work.
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "UPDATE discovery_universe_securities "
+                "SET fill_id = :new_fill, code = '000011.SZ' "
+                "WHERE fill_id = :old_fill AND code = '000010.SZ'"
+            ),
+            {
+                "old_fill": ids["pending_a"],
+                "new_fill": ids["pending_b"],
+            },
+        )
+
+    moves = (
+        # pending -> ready
+        (ids["pending_c"], "000020.SZ", ids["ready_a"]),
+        # ready -> pending
+        (ids["ready_a"], "000001.SZ", ids["pending_a"]),
+        # ready -> ready, different fill
+        (ids["ready_b"], "000002.SZ", ids["ready_a"]),
+        # pending -> immutable terminal snapshot
+        (ids["pending_c"], "000030.SZ", ids["unavailable"]),
+        # immutable terminal snapshot -> pending
+        (ids["unavailable"], "000003.SZ", ids["pending_a"]),
+    )
+    for old_fill, code, new_fill in moves:
+        with pytest.raises(IntegrityError, match="immutable"):
+            with engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "UPDATE discovery_universe_securities "
+                        "SET fill_id = :new_fill "
+                        "WHERE fill_id = :old_fill AND code = :code"
+                    ),
+                    {
+                        "old_fill": old_fill,
+                        "new_fill": new_fill,
+                        "code": code,
+                    },
+                )
+
+    # Missing parents are still rejected by the FK, not treated as mutable.
+    with pytest.raises(IntegrityError, match="FOREIGN KEY"):
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "UPDATE discovery_universe_securities "
+                    "SET fill_id = 999999 "
+                    "WHERE fill_id = :fill_id AND code = '000011.SZ'"
+                ),
+                {"fill_id": ids["pending_b"]},
+            )
+    engine.dispose()
+
+
+def test_upgrade_seals_existing_ready_snapshot_without_rewriting_it(
+    tmp_path,
+) -> None:
+    db_path = tmp_path / "upgrade-sealed-universe.db"
+    engine = init_db(db_path)
+    trigger_names = (
+        "trg_discovery_universe_security_insert_immutable",
+        "trg_discovery_universe_security_immutable",
+        "trg_discovery_universe_security_delete_immutable",
+        "trg_discovery_ready_fill_snapshot_immutable",
+        "trg_discovery_ready_fill_append_only",
+    )
+    with engine.begin() as conn:
+        for name in trigger_names:
+            conn.execute(text(f'DROP TRIGGER IF EXISTS "{name}"'))
+        conn.execute(
+            text(
+                "CREATE TRIGGER "
+                "trg_discovery_universe_security_immutable "
+                "BEFORE UPDATE ON discovery_universe_securities "
+                "WHEN EXISTS ("
+                "SELECT 1 FROM discovery_data_fills AS fill "
+                "WHERE fill.id = OLD.fill_id "
+                "AND fill.snapshot_status IN ('ready', 'unavailable')"
+                ") BEGIN SELECT RAISE(ABORT, "
+                "'ready discovery universe security is immutable'); END"
+            )
+        )
+    now = datetime(2026, 9, 16, 12, tzinfo=timezone.utc)
+    with Session(engine) as session:
+        fill = _fill(session, ["000001.SZ"], now=now)
+        fill_id = fill.id
+    engine.dispose()
+
+    init_db(db_path).dispose()
+    engine = init_db(db_path)
+    with Session(engine) as session:
+        fill = session.get(DiscoveryDataFill, fill_id)
+        row = session.get(
+            DiscoveryUniverseSecurity, (fill_id, "000001.SZ")
+        )
+        assert fill is not None and row is not None
+        assert fill.snapshot_status == "ready"
+        assert row.name == "000001.SZ"
+    with engine.connect() as conn:
+        trigger_sql = conn.execute(
+            text(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type = 'trigger' AND name = "
+                "'trg_discovery_universe_security_immutable'"
+            )
+        ).scalar_one()
+        assert "NEW.fill_id" in trigger_sql
+    with pytest.raises(IntegrityError, match="immutable"):
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "UPDATE discovery_universe_securities SET name = 'changed' "
+                    "WHERE fill_id = :fill_id"
+                ),
+                {"fill_id": fill_id},
+            )
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("name", ""),
+        ("industry", ""),
+        ("exchange", None),
+        ("listing_date", None),
+        ("is_st", None),
+        ("is_delisting", None),
+        ("trading_status", None),
+        ("last_trade_date", None),
+        ("industry_version", None),
+        ("source_as_of", None),
+        ("provenance", None),
+        ("is_suspended", None),
+    ],
+)
+def test_incomplete_frozen_security_fails_permanently_without_requests(
+    tmp_path,
+    field: str,
+    value: object,
+) -> None:
+    from jobs.discovery_data import RequestPolicy, execute_discovery_data_fill
+
+    engine = init_db(
+        tmp_path / f"incomplete-frozen-security-{field}.db"
+    )
+    factory = create_session_factory(engine)
+    now = datetime(2026, 9, 16, 12, tzinfo=timezone.utc)
+    code = "000001.SZ"
+    with factory() as session:
+        fill = _fill(session, [code], now=now, with_snapshot=False)
+        row = _snapshot_security(fill.id, code, now)
+        setattr(row, field, value)
+        session.add(row)
+        session.add(
+            DiscoveryFillTradingDate(
+                fill_id=fill.id, trade_date="2026-09-16"
+            )
+        )
+        session.flush()
+        fill.snapshot_status = "ready"
+        session.commit()
+        fill_id = fill.id
+
+    market = FakeMarketClient(
+        discovery_data={code: _bundle(code, request_count=1)}
+    )
+    with factory() as session:
+        execute_discovery_data_fill(
+            session,
+            market,
+            fill_id,
+            policy=RequestPolicy(
+                requests_per_second=100,
+                max_attempts=3,
+                daily_budget=10,
+                max_runtime_seconds=60,
+            ),
+            clock=FakeClock(now),
+        )
+    with factory() as session:
+        checkpoint = session.get(DiscoveryDataCheckpoint, (fill_id, code))
+        fill = session.get(DiscoveryDataFill, fill_id)
+        assert checkpoint is not None and fill is not None
+        assert checkpoint.status == "failed"
+        assert checkpoint.attempts == 1
+        assert checkpoint.payload_json is None
+        assert checkpoint.error and "security_snapshot_incomplete" in checkpoint.error
+        assert (fill.total, fill.failed, fill.request_count) == (1, 1, 0)
+        assert session.get(Financial, (code, "2025", "annual")) is None
+    assert market.calls == []
+    engine.dispose()
+
+
+def test_legacy_client_security_mismatch_is_permanent_and_not_persisted(
+    tmp_path,
+) -> None:
+    from jobs.discovery_data import RequestPolicy, execute_discovery_data_fill
+
+    engine = init_db(tmp_path / "legacy-security-mismatch.db")
+    factory = create_session_factory(engine)
+    now = datetime(2026, 9, 16, 12, tzinfo=timezone.utc)
+    code = "000001.SZ"
+    with factory() as session:
+        fill_id = _fill(session, [code], now=now).id
+
+    class LegacyMismatch:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def fetch_discovery_data(
+            self, requested: str, *, before_request=None
+        ) -> DiscoveryCompanyData:
+            self.calls += 1
+            assert before_request is not None
+            before_request()
+            return replace(
+                _bundle(requested),
+                security_state=replace(
+                    _security(requested), industry="实时行业"
+                ),
+            )
+
+    market = LegacyMismatch()
+    with factory() as session:
+        execute_discovery_data_fill(
+            session,
+            market,
+            fill_id,
+            policy=RequestPolicy(
+                requests_per_second=100,
+                max_attempts=3,
+                daily_budget=10,
+                max_runtime_seconds=60,
+            ),
+            clock=FakeClock(now),
+        )
+    with factory() as session:
+        checkpoint = session.get(DiscoveryDataCheckpoint, (fill_id, code))
+        fill = session.get(DiscoveryDataFill, fill_id)
+        assert checkpoint is not None and fill is not None
+        assert checkpoint.status == "failed"
+        assert checkpoint.attempts == 1
+        assert checkpoint.payload_json is None
+        assert checkpoint.error and "security_snapshot_mismatch" in checkpoint.error
+        assert fill.request_count == 1
+        assert session.get(Financial, (code, "2025", "annual")) is None
+    assert market.calls == 1
+    engine.dispose()
+
+
+def test_china_market_date_drives_universe_and_snapshot_cutoff(tmp_path) -> None:
+    from discovery.constants import china_market_date
+    from jobs.discovery_data import RequestPolicy, execute_discovery_data_fill
+
+    midnight = datetime(2026, 9, 19, 16, tzinfo=timezone.utc)
+    early_morning = datetime(2026, 9, 19, 23, 59, tzinfo=timezone.utc)
+    assert china_market_date(midnight) == date(2026, 9, 20)
+    assert china_market_date(early_morning) == date(2026, 9, 20)
+
+    engine = init_db(tmp_path / "china-date.db")
+    factory = create_session_factory(engine)
+    code = "000001.SZ"
+    with factory() as session:
+        fill_id = _fill(session, [], now=midnight).id
+    state = replace(
+        _security(code),
+        last_trade_date="2026-09-20",
+        industry_as_of="2026-09-20",
+    )
+    market = FakeMarketClient(
+        cheap_universe=[
+            CheapRow(
+                code=code,
+                name=state.name,
+                price=Decimal("10"),
+                pe=Decimal("5"),
+                pb=Decimal("1"),
+                mcap=Decimal("100"),
+                industry=state.industry,
+                exchange=state.exchange,
+                listing_date=state.listing_date,
+                is_st=state.is_st,
+                is_delisting=state.is_delisting,
+                trading_status=state.trading_status,
+                last_trade_date=state.last_trade_date,
+                industry_version=state.industry_version,
+                industry_as_of=state.industry_as_of,
+                security_source=state.source,
+            )
+        ],
+        trading_dates=["2026-09-20"],
+        discovery_data={
+            code: replace(
+                _bundle(code, request_count=1),
+                security_state=state,
+                source_as_of=replace(
+                    _bundle(code).source_as_of,
+                    security=state.industry_as_of,
+                ),
+            )
+        },
+    )
+    with factory() as session:
+        execute_discovery_data_fill(
+            session,
+            market,
+            fill_id,
+            policy=RequestPolicy(
+                requests_per_second=100,
+                max_attempts=1,
+                daily_budget=10,
+                max_runtime_seconds=60,
+            ),
+            clock=FakeClock(midnight),
+        )
+    assert market.cheap_as_of == [date(2026, 9, 20)]
+    with factory() as session:
+        checkpoint = session.get(DiscoveryDataCheckpoint, (fill_id, code))
+        assert checkpoint is not None and checkpoint.status == "done"
+
+        future_code = "000002.SZ"
+        future = _fill(
+            session, [future_code], now=midnight, with_snapshot=False
+        )
+        row = _snapshot_security(future.id, future_code, midnight)
+        row.last_trade_date = "2026-09-20"
+        row.source_as_of = "2026-09-21"
+        session.add(row)
+        session.add(
+            DiscoveryFillTradingDate(
+                fill_id=future.id, trade_date="2026-09-20"
+            )
+        )
+        session.flush()
+        future.snapshot_status = "ready"
+        session.commit()
+        future_id = future.id
+    future_market = FakeMarketClient(
+        discovery_data={future_code: _bundle(future_code)}
+    )
+    with factory() as session:
+        execute_discovery_data_fill(
+            session,
+            future_market,
+            future_id,
+            policy=RequestPolicy(
+                requests_per_second=100,
+                max_attempts=3,
+                daily_budget=10,
+                max_runtime_seconds=60,
+            ),
+            clock=FakeClock(midnight),
+        )
+    with factory() as session:
+        checkpoint = session.get(
+            DiscoveryDataCheckpoint, (future_id, future_code)
+        )
+        assert checkpoint is not None
+        assert checkpoint.status == "failed"
+        assert checkpoint.error and "fill cutoff" in checkpoint.error
+    assert future_market.calls == []
+    engine.dispose()
+
+
+def test_legacy_universe_client_without_as_of_remains_compatible(
+    tmp_path,
+) -> None:
+    from jobs.discovery_data import RequestPolicy, execute_discovery_data_fill
+
+    now = datetime(2026, 9, 16, 12, tzinfo=timezone.utc)
+    code = "000001.SZ"
+    engine = init_db(tmp_path / "legacy-universe-as-of.db")
+    factory = create_session_factory(engine)
+    with factory() as session:
+        fill_id = _fill(session, [], now=now).id
+
+    class LegacyUniverse(FakeMarketClient):
+        def __init__(self) -> None:
+            super().__init__(
+                cheap_universe=[_complete_cheap_row(code)],
+                trading_dates=["2026-09-16"],
+                discovery_data={code: _bundle(code)},
+            )
+            self.legacy_calls = 0
+
+        def fetch_cheap_universe(
+            self, *, before_request=None
+        ) -> list[CheapRow]:
+            self.legacy_calls += 1
+            return super().fetch_cheap_universe(
+                before_request=before_request,
+                as_of=date(2026, 9, 16),
+            )
+
+    market = LegacyUniverse()
+    with factory() as session:
+        execute_discovery_data_fill(
+            session,
+            market,
+            fill_id,
+            policy=RequestPolicy(
+                requests_per_second=100,
+                max_attempts=1,
+                daily_budget=10,
+                max_runtime_seconds=60,
+            ),
+            clock=FakeClock(now),
+        )
+    with factory() as session:
+        checkpoint = session.get(DiscoveryDataCheckpoint, (fill_id, code))
+        assert checkpoint is not None and checkpoint.status == "done"
+    assert market.legacy_calls == 1
     engine.dispose()
 
 
@@ -4364,7 +5357,7 @@ def test_init_db_adds_discovery_request_timing_columns(tmp_path) -> None:
     engine.dispose()
 
 
-def test_init_db_marks_completed_presnapshot_fill_restart_required(
+def test_init_db_preserves_completed_presnapshot_fill_but_requires_restart(
     tmp_path,
 ) -> None:
     from discovery.data_readiness import discovery_data_readiness
@@ -4449,8 +5442,8 @@ def test_init_db_marks_completed_presnapshot_fill_restart_required(
     with Session(engine) as session:
         legacy = session.get(DiscoveryDataFill, 42)
         assert legacy is not None
-        assert legacy.status == "snapshot_unavailable"
-        assert legacy.snapshot_status == "unavailable"
+        assert legacy.status == "done"
+        assert legacy.snapshot_status is None
         status = discovery_data_status(session, now=now)
         assert status["restart_required"] is True
         assert "new fill" in str(status["guidance"])
@@ -4519,7 +5512,7 @@ def _store_readiness_universe(
         started_at=stamp,
         updated_at=stamp,
         last_error=None,
-        snapshot_status="ready",
+        snapshot_status=None,
     )
     session.add(fill)
     session.flush()
@@ -4535,6 +5528,7 @@ def _store_readiness_universe(
                 is_st=row.is_st,
                 is_delisting=row.is_delisting,
                 trading_status=row.trading_status,
+                is_suspended=row.trading_status == "suspended",
                 last_trade_date=row.last_trade_date,
                 industry_version=row.industry_version,
                 source_as_of=row.industry_as_of,
@@ -4566,6 +5560,8 @@ def _store_readiness_universe(
             for row in rows
         ]
     )
+    session.flush()
+    fill.snapshot_status = "ready"
     session.commit()
 
 

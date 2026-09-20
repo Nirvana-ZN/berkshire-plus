@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 from decimal import Decimal
 from typing import Callable
 
@@ -26,6 +27,10 @@ class DiscoveryCompanyError(MarketError):
         self.code = code
         self.stage = stage
         self.request_count = request_count
+
+
+class DiscoveryPermanentCompanyError(DiscoveryCompanyError):
+    pass
 
 
 class DiscoveryRequestStopped(MarketError):
@@ -122,6 +127,60 @@ class SecurityState:
     industry_as_of: str
     source: str
     market_status_code: int | None = None
+
+
+def validate_security_state(
+    state: SecurityState,
+    code: str,
+    *,
+    cutoff: date | None = None,
+) -> None:
+    """Validate a complete immutable A-share security snapshot."""
+
+    if type(state) is not SecurityState:
+        raise ValueError("security_state must be an immutable SecurityState")
+    expected = (code or "").strip().upper()
+    if state.code != expected:
+        raise ValueError("security_state code mismatch")
+    if (
+        len(expected) != 9
+        or expected[6] != "."
+        or not expected[:6].isdigit()
+        or expected[7:] not in {"SH", "SZ"}
+    ):
+        raise ValueError("security_state code is not a canonical A-share code")
+    if state.exchange != expected[7:]:
+        raise ValueError("security_state exchange does not match code")
+    for field in ("name", "industry", "industry_version", "source"):
+        value = getattr(state, field)
+        if type(value) is not str or not value or value != value.strip():
+            raise ValueError(f"security_state {field} is invalid")
+    if type(state.is_st) is not bool or type(state.is_delisting) is not bool:
+        raise ValueError("security_state flags must be booleans")
+    if state.trading_status not in {"trading", "suspended"}:
+        raise ValueError("security_state trading_status is invalid")
+    if state.market_status_code is not None and (
+        type(state.market_status_code) is not int
+    ):
+        raise ValueError("security_state market_status_code is invalid")
+
+    parsed: dict[str, date] = {}
+    for field in ("listing_date", "last_trade_date", "industry_as_of"):
+        value = getattr(state, field)
+        if type(value) is not str:
+            raise ValueError(f"security_state {field} is invalid")
+        try:
+            parsed[field] = date.fromisoformat(value)
+        except ValueError as exc:
+            raise ValueError(f"security_state {field} is invalid") from exc
+        if parsed[field].isoformat() != value:
+            raise ValueError(f"security_state {field} is invalid")
+    if parsed["listing_date"] > parsed["last_trade_date"]:
+        raise ValueError("security_state listing_date follows last_trade_date")
+    if parsed["last_trade_date"] > parsed["industry_as_of"]:
+        raise ValueError("security_state last_trade_date exceeds source as-of")
+    if cutoff is not None and parsed["industry_as_of"] > cutoff:
+        raise ValueError("security_state source as-of exceeds fill cutoff")
 
 
 @dataclass(frozen=True)

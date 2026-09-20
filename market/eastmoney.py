@@ -8,6 +8,7 @@ from threading import Event
 from typing import Protocol
 from urllib.parse import quote
 
+from discovery.constants import china_market_date
 from discovery.field_dictionary import FIELD_DICTIONARY
 from market.cheap import (
     INDUSTRY_MAPPING_VERSION,
@@ -26,6 +27,7 @@ from market.types import (
     MarketError,
     SecurityState,
     ValuationPoint,
+    validate_security_state,
 )
 
 BOARD_LIST_URL = "https://push2delay.eastmoney.com/api/qt/clist/get"
@@ -127,6 +129,7 @@ class MarketClient(Protocol):
         self,
         *,
         before_request: DiscoveryPreRequest | None = None,
+        as_of: date | None = None,
     ) -> list[CheapRow]:
         """沪深 A 股截面：现价 / PE / PB / 市值 / 行业。"""
 
@@ -141,6 +144,8 @@ class MarketClient(Protocol):
         code: str,
         *,
         before_request: DiscoveryPreRequest | None = None,
+        security_state: SecurityState | None = None,
+        as_of: date | None = None,
     ) -> DiscoveryCompanyData:
         """Return one verified company bundle or raise DiscoveryCompanyError."""
 
@@ -198,6 +203,8 @@ class FakeMarketClient:
         self.discovery_errors = dict(discovery_errors or {})
         self.discovery_request_counts = dict(discovery_request_counts or {})
         self.discovery_gate = discovery_gate
+        self.discovery_security_states: list[SecurityState | None] = []
+        self.cheap_as_of: list[date] = []
         self._request_count = 0
 
     @property
@@ -239,14 +246,21 @@ class FakeMarketClient:
         self,
         *,
         before_request: DiscoveryPreRequest | None = None,
+        as_of: date | None = None,
     ) -> list[CheapRow]:
+        snapshot_date = as_of or china_market_date()
+        self.cheap_as_of.append(snapshot_date)
         if before_request is not None:
             before_request()
         self._request_count += 1
         self.calls.append(("cheap",))
         if self.cheap_error is not None:
             raise MarketError(self.cheap_error)
-        self._last_cheap_trading_dates = tuple(self.trading_dates[-6:])
+        self._last_cheap_trading_dates = tuple(
+            day
+            for day in self.trading_dates
+            if day <= snapshot_date.isoformat()
+        )[-6:]
         return list(self.cheap_universe)
 
     def fetch_valuation_history(self, code: str) -> list[ValuationPoint]:
@@ -262,7 +276,18 @@ class FakeMarketClient:
         code: str,
         *,
         before_request: DiscoveryPreRequest | None = None,
+        security_state: SecurityState | None = None,
+        as_of: date | None = None,
     ) -> DiscoveryCompanyData:
+        normalized = (code or "").strip().upper()
+        if security_state is not None:
+            try:
+                validate_security_state(security_state, normalized)
+            except ValueError as exc:
+                raise DiscoveryCompanyError(
+                    normalized, "security_state", str(exc)
+                ) from exc
+        self.discovery_security_states.append(security_state)
         request_count = self.discovery_request_counts.get(code)
         if code in self.discovery_errors:
             used = 0 if request_count is None else request_count
@@ -304,6 +329,15 @@ class FakeMarketClient:
         self.calls.append(("discovery_data", code))
         if self.discovery_gate is not None:
             self.discovery_gate.wait(timeout=10)
+        if security_state is not None:
+            result = replace(
+                result,
+                security_state=security_state,
+                source_as_of=replace(
+                    result.source_as_of,
+                    security=security_state.industry_as_of,
+                ),
+            )
         return result if used == result.request_count else replace(result, request_count=used)
 
     def list_boards(self, scope_type: str, query: str = "") -> list[dict[str, str]]:
@@ -793,6 +827,8 @@ class EastMoneyClient:
         code: str,
         *,
         before_request: DiscoveryPreRequest | None = None,
+        security_state: SecurityState | None = None,
+        as_of: date | None = None,
     ) -> DiscoveryCompanyData:
         normalized = (code or "").strip().upper()
         started = self._request_count
@@ -819,23 +855,48 @@ class EastMoneyClient:
             _secid(normalized)
         except ValueError as exc:
             raise DiscoveryCompanyError(normalized, "validate", str(exc)) from exc
-        try:
-            security = (
-                self._security_state_for(normalized)
-                if request_gate is None
-                else self._security_state_for(
-                    normalized, before_request=request_gate
-                )
-            )
-        except DiscoveryRequestStopped:
-            raise
-        except Exception as exc:
-            raise DiscoveryCompanyError(
-                normalized,
-                "security_state",
-                str(exc),
-                request_count=request_count(),
-            ) from exc
+        if security_state is not None:
+            try:
+                validate_security_state(security_state, normalized)
+                security = security_state
+            except ValueError as exc:
+                raise DiscoveryCompanyError(
+                    normalized,
+                    "security_state",
+                    str(exc),
+                    request_count=request_count(),
+                ) from exc
+        else:
+            try:
+                if request_gate is None:
+                    security = (
+                        self._security_state_for(normalized)
+                        if as_of is None
+                        else self._security_state_for(
+                            normalized, as_of=as_of
+                        )
+                    )
+                else:
+                    security = (
+                        self._security_state_for(
+                            normalized, before_request=request_gate
+                        )
+                        if as_of is None
+                        else self._security_state_for(
+                            normalized,
+                            before_request=request_gate,
+                            as_of=as_of,
+                        )
+                    )
+            except DiscoveryRequestStopped:
+                raise
+            except Exception as exc:
+                raise DiscoveryCompanyError(
+                    normalized,
+                    "security_state",
+                    str(exc),
+                    request_count=request_count(),
+                ) from exc
         try:
             financials = (
                 self._discovery_financials_for(
@@ -1095,9 +1156,10 @@ class EastMoneyClient:
         self,
         *,
         before_request: DiscoveryPreRequest | None = None,
+        as_of: date | None = None,
     ) -> list[CheapRow]:
         # ponytail: 东财截面约 50–80 页；历史分位另存每日快照
-        snapshot_date = date.today().isoformat()
+        snapshot_date = (as_of or china_market_date()).isoformat()
         try:
             diff = (
                 self._clist_diff(
@@ -1152,17 +1214,10 @@ class EastMoneyClient:
                 continue
             price = _as_decimal(item.get("f2"))
             market_status = _status_code(item.get("f292"))
-            # f292=6 only selects suspension candidates. A priced row plus the
-            # frozen exchange date verifies active trading; a lagging stock kline
-            # verifies suspension. Other raw status values remain uninterpreted.
-            if (
-                price is not None
-                and price > 0
-                and latest_exchange_date is not None
-            ):
-                trading_status = "trading"
-                last_trade_date = latest_exchange_date
-            elif market_status == 6 and latest_exchange_date is not None:
+            # f292=6 is only a suspension candidate, so even a retained price
+            # needs a stock-kline check. Other positive rows use the frozen
+            # exchange date; uninterpreted statuses without price stay unknown.
+            if market_status == 6 and latest_exchange_date is not None:
                 probed_last_trade_date = (
                     self._last_trade_date(code, latest_exchange_date)
                     if before_request is None
@@ -1178,9 +1233,19 @@ class EastMoneyClient:
                 ):
                     trading_status = "suspended"
                     last_trade_date = probed_last_trade_date
+                elif probed_last_trade_date == latest_exchange_date:
+                    trading_status = "trading"
+                    last_trade_date = latest_exchange_date
                 else:
                     trading_status = None
                     last_trade_date = None
+            elif (
+                price is not None
+                and price > 0
+                and latest_exchange_date is not None
+            ):
+                trading_status = "trading"
+                last_trade_date = latest_exchange_date
             else:
                 trading_status = None
                 last_trade_date = None
@@ -1216,7 +1281,9 @@ class EastMoneyClient:
         code: str,
         *,
         before_request: DiscoveryPreRequest | None = None,
+        as_of: date | None = None,
     ) -> SecurityState:
+        snapshot_date = as_of or china_market_date()
         fields = "f57,f58,f107,f127,f189,f292"
         url = f"{STOCK_URL}?secid={_secid(code)}&fields={fields}"
         payload = (
@@ -1242,10 +1309,10 @@ class EastMoneyClient:
         ):
             raise MarketError("个股状态缺少名称、行业、上市日期或交易所不匹配")
         trading_dates = (
-            self.fetch_trading_dates(date.today().isoformat())
+            self.fetch_trading_dates(snapshot_date.isoformat())
             if before_request is None
             else self.fetch_trading_dates(
-                date.today().isoformat(),
+                snapshot_date.isoformat(),
                 before_request=before_request,
             )
         )
@@ -1276,7 +1343,7 @@ class EastMoneyClient:
             last_trade_date=last_trade_date,
             industry=industry,
             industry_version=INDUSTRY_MAPPING_VERSION,
-            industry_as_of=date.today().isoformat(),
+            industry_as_of=snapshot_date.isoformat(),
             source="eastmoney:stock/get:f57,f58,f107,f127,f189,f292",
             market_status_code=_status_code(item.get("f292")),
         )

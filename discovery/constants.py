@@ -1,7 +1,7 @@
 """Shared vocabulary for the weekly discovery workflow."""
 
 from collections.abc import Callable
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 NowProvider = Callable[[], datetime]
 
@@ -24,6 +24,19 @@ def aware_utc_now(now_provider: NowProvider = utc_now) -> datetime:
     ):
         raise ValueError("discovery clock must return an aware datetime")
     return value.astimezone(timezone.utc)
+
+
+def china_market_date(
+    value: datetime | None = None,
+    *,
+    now_provider: NowProvider = utc_now,
+) -> date:
+    current = (
+        aware_utc_now(now_provider)
+        if value is None
+        else aware_utc_now(lambda: value)
+    )
+    return current.astimezone(CHINA_MARKET_TIMEZONE).date()
 
 
 def china_week_key(

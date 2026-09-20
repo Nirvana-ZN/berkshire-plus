@@ -40,3 +40,17 @@ uv run berkshire-plus
 | `reports/` | 评估与审视 Markdown |
 
 三者均不进版本库。改 YAML 后若要重新迁入，需先停进程并删除 `data/app.db`。
+
+## 发现数据快照升级
+
+本版本会原样封存所有已经标记为 `ready` 的全市场证券快照；迁移不会补字段、修值或追认旧数据正确。升级前已经初始化的发现数据填充不得继续复用，需停掉工作进程，将旧填充标记为 `snapshot_unavailable` 后重新发起填充：
+
+```sql
+UPDATE discovery_data_fills
+SET snapshot_status = 'unavailable',
+    status = 'snapshot_unavailable',
+    last_error = 'pre-fix snapshot; start a new fill'
+WHERE id = <旧填充 ID> AND snapshot_status = 'ready';
+```
+
+随后调用 `POST /api/discovery-data/fill` 创建新填充。旧快照继续保持只读，不能逐行删除或修改。

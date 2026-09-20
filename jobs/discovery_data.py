@@ -28,16 +28,19 @@ from discovery.company_payload import (
     serialize_company_payload,
     verify_company_payload_digest,
 )
-from discovery.constants import CHINA_MARKET_TIMEZONE
+from discovery.constants import CHINA_MARKET_TIMEZONE, china_market_date
 from jobs.lock import JOB_TYPE_DISCOVERY_DATA, lock_status, release, try_acquire
 from market.types import (
     DiscoveryCompanyData,
     DiscoveryCompanyError,
+    DiscoveryPermanentCompanyError,
     DiscoveryRequestBudgetExhausted,
     DiscoveryRequestRuntimeExhausted,
     DiscoveryRequestStopped,
     FinancialRow,
+    SecurityState,
     ValuationPoint,
+    validate_security_state,
 )
 
 # Universe and company fetches are charged exactly at each HTTP request
@@ -84,6 +87,34 @@ class SystemClock:
 
     def sleep(self, seconds: float) -> None:
         sleep(seconds)
+
+
+_SECURITY_SNAPSHOT_FIELDS = (
+    "fill_id",
+    "code",
+    "name",
+    "industry",
+    "exchange",
+    "listing_date",
+    "is_st",
+    "is_delisting",
+    "trading_status",
+    "is_suspended",
+    "last_trade_date",
+    "industry_version",
+    "source_as_of",
+    "provenance",
+    "market_status_code",
+    "snapshot_at",
+)
+
+
+@dataclass(frozen=True)
+class FrozenSecuritySnapshot:
+    fill_id: int
+    code: str
+    state: SecurityState
+    identity: tuple[object, ...]
 
 
 class DiscoveryRequestGate:
@@ -334,12 +365,17 @@ def _initialize_checkpoints(
         return False
     try:
         fetch = getattr(market, "fetch_cheap_universe")
-        rows = list(fetch(before_request=request_gate))
+        as_of = china_market_date(request_gate.clock.now())
+        rows = list(
+            fetch(before_request=request_gate, as_of=as_of)
+            if _supports_keyword(fetch, "as_of")
+            else fetch(before_request=request_gate)
+        )
         if hasattr(market, "_last_cheap_trading_dates"):
             trading_dates = list(market._last_cheap_trading_dates)
         else:
             fetch_dates = getattr(market, "fetch_trading_dates")
-            end = _aware_utc(request_gate.clock.now()).date().isoformat()
+            end = as_of.isoformat()
             if "before_request" in signature(fetch_dates).parameters:
                 trading_dates = list(
                     fetch_dates(end, limit=6, before_request=request_gate)
@@ -426,6 +462,8 @@ def _initialize_checkpoints(
     )
     fill.total = len(codes)
     fill.updated_at = stamp
+    # Universe rows and trading dates must exist before the parent seal flips.
+    session.flush()
     fill.snapshot_status = "ready"
     if not codes:
         fill.status = "done"
@@ -522,6 +560,125 @@ def _wait_until(
         clock.sleep(delay)
 
 
+def _security_snapshot_identity(
+    row: DiscoveryUniverseSecurity,
+) -> tuple[object, ...]:
+    return tuple(getattr(row, field) for field in _SECURITY_SNAPSHOT_FIELDS)
+
+
+def _load_frozen_security(
+    session: Session,
+    fill: DiscoveryDataFill,
+    checkpoint: DiscoveryDataCheckpoint,
+) -> FrozenSecuritySnapshot:
+    row = session.get(
+        DiscoveryUniverseSecurity, (fill.id, checkpoint.code)
+    )
+    if row is None:
+        raise DiscoveryPermanentCompanyError(
+            checkpoint.code,
+            "security_snapshot_incomplete",
+            "fill security snapshot is missing",
+        )
+    required = (
+        row.name,
+        row.industry,
+        row.exchange,
+        row.listing_date,
+        row.trading_status,
+        row.last_trade_date,
+        row.industry_version,
+        row.source_as_of,
+        row.provenance,
+    )
+    if (
+        any(type(value) is not str or not value for value in required)
+        or type(row.is_st) is not bool
+        or type(row.is_delisting) is not bool
+        or type(row.is_suspended) is not bool
+    ):
+        raise DiscoveryPermanentCompanyError(
+            checkpoint.code,
+            "security_snapshot_incomplete",
+            "fill security snapshot lacks required trusted fields",
+        )
+    try:
+        if row.fill_id != fill.id or row.code != checkpoint.code:
+            raise ValueError("snapshot belongs to another fill or code")
+        if row.is_suspended != (row.trading_status == "suspended"):
+            raise ValueError("snapshot suspension fields disagree")
+        snapshot_at = _aware_utc(row.snapshot_at)
+        cutoff = china_market_date(fill.started_at)
+        if china_market_date(snapshot_at) > cutoff:
+            raise ValueError("snapshot date exceeds fill cutoff")
+        state = SecurityState(
+            code=row.code,
+            name=row.name,
+            exchange=row.exchange,  # type: ignore[arg-type]
+            listing_date=row.listing_date,  # type: ignore[arg-type]
+            is_st=row.is_st,  # type: ignore[arg-type]
+            is_delisting=row.is_delisting,  # type: ignore[arg-type]
+            trading_status=row.trading_status,  # type: ignore[arg-type]
+            last_trade_date=row.last_trade_date,  # type: ignore[arg-type]
+            industry=row.industry,
+            industry_version=row.industry_version,  # type: ignore[arg-type]
+            industry_as_of=row.source_as_of,  # type: ignore[arg-type]
+            source=row.provenance,  # type: ignore[arg-type]
+            market_status_code=row.market_status_code,
+        )
+        validate_security_state(state, checkpoint.code, cutoff=cutoff)
+    except (TypeError, ValueError) as exc:
+        raise DiscoveryPermanentCompanyError(
+            checkpoint.code,
+            "security_snapshot_invalid",
+            str(exc),
+        ) from exc
+    return FrozenSecuritySnapshot(
+        fill_id=fill.id,
+        code=checkpoint.code,
+        state=state,
+        identity=_security_snapshot_identity(row),
+    )
+
+
+def _revalidate_frozen_security(
+    session: Session,
+    snapshot: FrozenSecuritySnapshot,
+) -> None:
+    columns = tuple(
+        getattr(DiscoveryUniverseSecurity, field)
+        for field in _SECURITY_SNAPSHOT_FIELDS
+    )
+    current = session.execute(
+        select(*columns).where(
+            DiscoveryUniverseSecurity.fill_id == snapshot.fill_id,
+            DiscoveryUniverseSecurity.code == snapshot.code,
+        )
+    ).one_or_none()
+    if current is None or tuple(current) != snapshot.identity:
+        raise DiscoveryPermanentCompanyError(
+            snapshot.code,
+            "security_snapshot_mutated",
+            "fill security snapshot changed during company fetch",
+        )
+
+
+def _supports_keyword(fetch: object, name: str) -> bool:
+    try:
+        parameters = signature(fetch).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == name
+        or parameter.kind == parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+
+
+def _supports_security_state(fetch: object) -> bool:
+    return _supports_keyword(fetch, "security_state")
+
+
 def _persist_company(
     session: Session,
     checkpoint: DiscoveryDataCheckpoint,
@@ -611,20 +768,34 @@ def execute_discovery_data_fill(
                     stop = True
                     break
                 attempts_before = request_gate.attempts
+                attempt_number = checkpoint.attempts + 1
                 failure: Exception | None = None
+                frozen_security: FrozenSecuritySnapshot | None = None
                 try:
-                    result = market.fetch_discovery_data(
-                        checkpoint.code,
-                        before_request=request_gate,
+                    frozen_security = _load_frozen_security(
+                        session, fill, checkpoint
                     )
+                    fetch = market.fetch_discovery_data
+                    supports_security_state = _supports_security_state(fetch)
+                    if supports_security_state:
+                        result = fetch(
+                            checkpoint.code,
+                            before_request=request_gate,
+                            security_state=frozen_security.state,
+                        )
+                    else:
+                        result = fetch(
+                            checkpoint.code,
+                            before_request=request_gate,
+                        )
                 except DiscoveryRequestStopped:
                     stop = True
                     break
                 except Exception as exc:
-                    checkpoint.attempts += 1
+                    checkpoint.attempts = attempt_number
                     failure = exc
                 else:
-                    checkpoint.attempts += 1
+                    checkpoint.attempts = attempt_number
                     actual = request_gate.attempts - attempts_before
                     if result.request_count != actual:
                         failure = DiscoveryCompanyError(
@@ -636,8 +807,23 @@ def execute_discovery_data_fill(
                             ),
                             request_count=actual,
                         )
+                    elif frozen_security is not None and (
+                        result.security_state != frozen_security.state
+                        or result.source_as_of.security
+                        != frozen_security.state.industry_as_of
+                    ):
+                        failure = DiscoveryPermanentCompanyError(
+                            checkpoint.code,
+                            "security_snapshot_mismatch",
+                            "result security differs from fill snapshot",
+                            request_count=actual,
+                        )
                     try:
                         if failure is None:
+                            if frozen_security is not None:
+                                _revalidate_frozen_security(
+                                    session, frozen_security
+                                )
                             _persist_company(
                                 session,
                                 checkpoint,
@@ -653,12 +839,18 @@ def execute_discovery_data_fill(
                         )
                         if fill is None or checkpoint is None:
                             raise
+                        checkpoint.attempts = attempt_number
                         failure = exc
                 if failure is not None:
                     checkpoint.error = str(failure)
                     checkpoint.updated_at = _aware_utc(timer.now())
                     fill.last_error = str(failure)
-                    if checkpoint.attempts < policy.max_attempts:
+                    if (
+                        not isinstance(
+                            failure, DiscoveryPermanentCompanyError
+                        )
+                        and checkpoint.attempts < policy.max_attempts
+                    ):
                         checkpoint.status = "retryable"
                         checkpoint.next_retry_at = checkpoint.updated_at + timedelta(
                             seconds=policy.retry_delay_seconds
@@ -763,6 +955,10 @@ def discovery_data_status(
         }
     counts = _checkpoint_counts(session, fill.id)
     remaining = counts["pending"] + counts["retryable"] + counts["running"]
+    restart_required = (
+        fill.status == SNAPSHOT_UNAVAILABLE_STATUS
+        or (fill.total > 0 and fill.snapshot_status != "ready")
+    )
     return {
         "id": fill.id,
         "type": JOB_TYPE_DISCOVERY_DATA,
@@ -778,10 +974,10 @@ def discovery_data_status(
         "budget_day": fill.budget_day,
         "last_error": fill.last_error,
         "snapshot_status": fill.snapshot_status,
-        "restart_required": fill.status == SNAPSHOT_UNAVAILABLE_STATUS,
+        "restart_required": restart_required,
         "guidance": (
             SNAPSHOT_UNAVAILABLE_GUIDANCE
-            if fill.status == SNAPSHOT_UNAVAILABLE_STATUS
+            if restart_required
             else None
         ),
         **base,
