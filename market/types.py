@@ -14,6 +14,10 @@ class MarketError(Exception):
         self.message = message
 
 
+class TransientMarketError(MarketError):
+    pass
+
+
 class DiscoveryCompanyError(MarketError):
     def __init__(
         self,

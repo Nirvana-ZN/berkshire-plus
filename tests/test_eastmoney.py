@@ -1,11 +1,25 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
-from market.eastmoney import EastMoneyClient, board_code, pick_board, pick_equity
-from market.types import MarketError
+from market.eastmoney import (
+    BOARD_LIST_URL,
+    CLIST_HOSTS,
+    CLIST_PAGE_RETRY_ROUNDS,
+    EastMoneyClient,
+    board_code,
+    pick_board,
+    pick_equity,
+)
+from market.types import (
+    DiscoveryRequestBudgetExhausted,
+    DiscoveryRequestRuntimeExhausted,
+    MarketError,
+    TransientMarketError,
+)
 
 
 def _rows(*names: str) -> list[dict[str, str]]:
@@ -186,6 +200,140 @@ def test_industry_board_catalog_paginates() -> None:
     rows = Stub().fetch_constituents("行业", "印刷包装机械")
     assert rows[0].name == "京山轻机"
     assert any("pn=2" in url and "t:2" in url for url in seen)
+
+
+class _ClistResponse:
+    def __init__(self, payload: object) -> None:
+        self.payload = payload
+
+    def raise_for_status(self) -> None:
+        pass
+
+    def json(self) -> object:
+        return self.payload
+
+
+def _install_clist_transport(monkeypatch, get) -> None:
+    import httpx2
+
+    class Client:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            pass
+
+        def get(self, url: str):
+            return get(url)
+
+    monkeypatch.setattr(httpx2, "Client", Client)
+
+
+def test_clist_retries_only_transient_current_page(monkeypatch) -> None:
+    calls: dict[int, int] = {}
+
+    def get(url: str):
+        page = int(parse_qs(urlsplit(url).query)["pn"][0])
+        calls[page] = calls.get(page, 0) + 1
+        if page == 19 and calls[page] <= len(CLIST_HOSTS):
+            raise OSError("disconnected")
+        size = 100 if page < 19 else 1
+        return _ClistResponse(
+            {
+                "data": {
+                    "diff": [
+                        {"f12": f"{page:02d}{index:04d}"}
+                        for index in range(size)
+                    ]
+                }
+            }
+        )
+
+    _install_clist_transport(monkeypatch, get)
+    rows = EastMoneyClient()._clist_diff(fs="test", fields="f12", fid="f12")
+
+    assert len(rows) == 1801
+    assert [calls[page] for page in range(1, 19)] == [1] * 18
+    assert calls[19] == len(CLIST_HOSTS) + 1
+
+
+def test_clist_persistent_fetch_failure_is_bounded(monkeypatch) -> None:
+    calls = 0
+
+    def get(_url: str):
+        nonlocal calls
+        calls += 1
+        raise OSError("disconnected")
+
+    _install_clist_transport(monkeypatch, get)
+    with pytest.raises(MarketError, match=r"page 1.*attempt 3/3"):
+        EastMoneyClient()._clist_diff(fs="test", fields="f12", fid="f12")
+    assert calls == len(CLIST_HOSTS) * CLIST_PAGE_RETRY_ROUNDS
+
+
+def test_clist_nonobject_json_is_permanent_after_one_request(monkeypatch) -> None:
+    calls = 0
+
+    def get(_url: str):
+        nonlocal calls
+        calls += 1
+        return _ClistResponse([])
+
+    _install_clist_transport(monkeypatch, get)
+    with pytest.raises(MarketError, match="接口返回不是对象") as caught:
+        EastMoneyClient()._clist_diff(fs="test", fields="f12", fid="f12")
+    assert not isinstance(caught.value, TransientMarketError)
+    assert calls == 1
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    [DiscoveryRequestBudgetExhausted, DiscoveryRequestRuntimeExhausted],
+)
+def test_clist_request_stop_is_not_retried(error_type) -> None:
+    calls = 0
+
+    class Stub(EastMoneyClient):
+        def _get_json(self, _url: str) -> dict:
+            nonlocal calls
+            calls += 1
+            raise error_type("request stopped")
+
+    with pytest.raises(error_type, match="request stopped"):
+        Stub()._clist_diff(fs="test", fields="f12", fid="f12")
+    assert calls == 1
+
+
+def test_clist_malformed_payload_is_not_retried() -> None:
+    calls = 0
+
+    class Stub(EastMoneyClient):
+        def _get_json(self, _url: str) -> dict:
+            nonlocal calls
+            calls += 1
+            return {"data": {"diff": "not-a-list"}}
+
+    with pytest.raises(MarketError, match="payload"):
+        Stub()._clist_diff(fs="test", fields="f12", fid="f12")
+    assert calls == 1
+
+
+def test_clist_repeated_page_is_permanent_no_progress() -> None:
+    calls: dict[int, int] = {}
+    repeated = [{"f12": f"{index:06d}"} for index in range(100)]
+
+    class Stub(EastMoneyClient):
+        def _get_json(self, url: str) -> dict:
+            page = int(parse_qs(urlsplit(url).query)["pn"][0])
+            calls[page] = calls.get(page, 0) + 1
+            return {"data": {"diff": repeated}}
+
+    with pytest.raises(MarketError, match="no progress"):
+        Stub()._clist_diff(fs="test", fields="f12", fid="f12")
+    assert calls == {1: 1, 2: 1}
 
 
 def test_pick_equity_by_name_or_code() -> None:

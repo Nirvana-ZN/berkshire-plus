@@ -26,6 +26,7 @@ from market.types import (
     FinancialRow,
     MarketError,
     SecurityState,
+    TransientMarketError,
     ValuationPoint,
     validate_security_state,
 )
@@ -69,6 +70,7 @@ CLIST_HOSTS = (
     "https://push2.eastmoney.com",
     "https://82.push2.eastmoney.com",
 )
+CLIST_PAGE_RETRY_ROUNDS = 3
 _HTTP_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -1499,11 +1501,11 @@ class EastMoneyClient:
 
         last_error: Exception | None = None
         for candidate in _clist_urls(url):
+            if before_request is not None:
+                before_request()
+            self._request_count += 1
             try:
                 with httpx2.Client(timeout=self.timeout, headers=_HTTP_HEADERS) as client:
-                    if before_request is not None:
-                        before_request()
-                    self._request_count += 1
                     response = client.get(candidate)
                     response.raise_for_status()
                     payload = response.json()
@@ -1514,8 +1516,10 @@ class EastMoneyClient:
                 continue
             if isinstance(payload, dict):
                 return payload
-            last_error = MarketError("接口返回不是对象")
-        raise MarketError(str(last_error) if last_error else "接口返回不是对象")
+            raise MarketError("接口返回不是对象")
+        raise TransientMarketError(
+            str(last_error) if last_error else "接口请求失败"
+        ) from last_error
 
     def _clist_diff(
         self,
@@ -1535,16 +1539,43 @@ class EastMoneyClient:
                 f"{BOARD_LIST_URL}?pn={page}&pz=100&po=1&np=1&fltt=2&invt=2&fid={fid}"
                 f"&fs={encoded}&fields={fields}"
             )
-            payload = (
-                self._get_json(url)
-                if before_request is None
-                else self._get_json(
-                    url, before_request=before_request
-                )
-            )
-            diff = (payload.get("data") or {}).get("diff") or []
-            if not isinstance(diff, list) or not diff:
+            last_error: TransientMarketError | None = None
+            for attempt in range(1, CLIST_PAGE_RETRY_ROUNDS + 1):
+                try:
+                    payload = (
+                        self._get_json(url)
+                        if before_request is None
+                        else self._get_json(
+                            url, before_request=before_request
+                        )
+                    )
+                    break
+                except DiscoveryRequestStopped:
+                    raise
+                except TransientMarketError as exc:
+                    last_error = exc
+            else:
+                detail = " ".join(str(last_error).split())[:200]
+                raise MarketError(
+                    f"clist page {page} fetch failed at attempt "
+                    f"{attempt}/{CLIST_PAGE_RETRY_ROUNDS}: {detail}"
+                ) from last_error
+            data = payload.get("data")
+            if data is None:
+                diff = []
+            elif not isinstance(data, dict):
+                raise MarketError(f"clist page {page} payload data is not an object")
+            else:
+                diff = data.get("diff")
+                if diff is None:
+                    diff = []
+                elif not isinstance(diff, list):
+                    raise MarketError(
+                        f"clist page {page} payload diff is not a list"
+                    )
+            if not diff:
                 break
+            previous_count = len(rows)
             for item in diff:
                 if not isinstance(item, dict):
                     continue
@@ -1554,6 +1585,10 @@ class EastMoneyClient:
                 if key:
                     seen.add(key)
                 rows.append(item)
+            if len(rows) == previous_count:
+                raise MarketError(
+                    f"clist page {page} repeated payload made no progress"
+                )
             if len(diff) < 100:
                 break
         return rows
