@@ -80,6 +80,146 @@ def seed_local_user(session: Session) -> None:
     session.commit()
 
 
+def _ensure_ruler_scope(engine: Engine) -> None:
+    """Migrate the scoped, append-only ledger without rewriting history."""
+
+    from sqlalchemy import text
+
+    with engine.begin() as conn:
+        names = {
+            row[1]
+            for row in conn.execute(
+                text("PRAGMA table_info(ruler_versions)")
+            ).all()
+        }
+        if names and "scope" not in names:
+            conn.execute(
+                text(
+                    "ALTER TABLE ruler_versions ADD COLUMN scope VARCHAR "
+                    "NOT NULL DEFAULT 'funnel'"
+                )
+            )
+        if names:
+            conn.execute(
+                text(
+                    "UPDATE ruler_versions SET scope = 'funnel' "
+                    "WHERE scope IS NULL"
+                )
+            )
+            conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS "
+                    "ix_ruler_versions_user_scope_id "
+                    "ON ruler_versions(user_id, scope, id)"
+                )
+            )
+            unique_sql = conn.execute(
+                text(
+                    "SELECT sql FROM sqlite_master "
+                    "WHERE type = 'index' "
+                    "AND name = 'ux_ruler_versions_user_scope_digest'"
+                )
+            ).scalar()
+            if unique_sql is None or " WHERE " not in unique_sql.upper():
+                if unique_sql is not None:
+                    conn.execute(
+                        text(
+                            "DROP INDEX "
+                            "ux_ruler_versions_user_scope_digest"
+                        )
+                    )
+                cutoff = int(
+                    conn.execute(
+                        text("SELECT COALESCE(MAX(id), 0) FROM ruler_versions")
+                    ).scalar_one()
+                )
+                # ponytail: legacy IDs may already be frozen into snapshots.
+                # Exempt them forever; the persisted index SQL is the cutoff.
+                conn.execute(
+                    text(
+                        "CREATE UNIQUE INDEX "
+                        "ux_ruler_versions_user_scope_digest "
+                        "ON ruler_versions(user_id, scope, digest) "
+                        f"WHERE id > {cutoff}"
+                    )
+                )
+            conn.execute(
+                text(
+                    "CREATE TRIGGER IF NOT EXISTS "
+                    "trg_ruler_versions_scope_default "
+                    "AFTER INSERT ON ruler_versions "
+                    "WHEN NEW.scope IS NULL "
+                    "BEGIN "
+                    "UPDATE ruler_versions SET scope = 'funnel' "
+                    "WHERE id = NEW.id; "
+                    "END"
+                )
+            )
+            conn.execute(
+                text(
+                    "CREATE TRIGGER IF NOT EXISTS "
+                    "trg_ruler_versions_funnel_ack_clear "
+                    "AFTER INSERT ON ruler_versions "
+                    "WHEN NEW.scope = 'funnel' "
+                    "BEGIN "
+                    "DELETE FROM settings WHERE key = 'ruler_gate_ack'; "
+                    "END"
+                )
+            )
+            columns = tuple(
+                row[1]
+                for row in conn.execute(
+                    text("PRAGMA table_info(ruler_versions)")
+                ).all()
+            )
+            changed = " OR ".join(
+                (
+                    "(NEW.scope IS NOT OLD.scope AND NOT "
+                    "(OLD.scope IS NULL AND NEW.scope = 'funnel'))"
+                    if column == "scope"
+                    else f'NEW."{column}" IS NOT OLD."{column}"'
+                )
+                for column in columns
+            )
+            update_columns = ", ".join(f'"{column}"' for column in columns)
+            # Ruler versions are historical facts: run deletion never
+            # cascades here, and user deletion remains FK-restricted while
+            # ruler rows exist. Production only appends ledger rows.
+            conn.execute(
+                text(
+                    "DROP TRIGGER IF EXISTS "
+                    "trg_ruler_versions_immutable"
+                )
+            )
+            conn.execute(
+                text(
+                    "CREATE TRIGGER "
+                    "trg_ruler_versions_immutable "
+                    f"BEFORE UPDATE OF {update_columns} ON ruler_versions "
+                    f"WHEN {changed} "
+                    "BEGIN "
+                    "SELECT RAISE(ABORT, 'ruler version is immutable'); "
+                    "END"
+                )
+            )
+            conn.execute(
+                text(
+                    "DROP TRIGGER IF EXISTS "
+                    "trg_ruler_versions_append_only"
+                )
+            )
+            conn.execute(
+                text(
+                    "CREATE TRIGGER trg_ruler_versions_append_only "
+                    "BEFORE DELETE ON ruler_versions "
+                    "BEGIN "
+                    "SELECT RAISE(ABORT, "
+                    "'ruler version ledger is append-only'); "
+                    "END"
+                )
+            )
+
+
 def _ensure_discovery_indexes(engine: Engine) -> None:
     from sqlalchemy import text
 
@@ -859,6 +999,7 @@ def init_db(db_path: Path | None = None) -> Engine:
 
     engine = create_db_engine(db_path)
     Base.metadata.create_all(engine)
+    _ensure_ruler_scope(engine)
     _ensure_discovery_snapshot_columns(engine)
     _ensure_discovery_lineage(engine)
     _ensure_job_lock_columns(engine)

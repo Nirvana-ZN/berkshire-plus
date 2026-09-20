@@ -81,10 +81,14 @@ def _workflow_app(tmp_path, *, clock=None):
     from app.db import create_session_factory, init_db
     from app.main import create_app
     from app.models import RulerVersion
-    from discovery.snapshot import build_production_snapshot, canonical_json
+    from discovery.snapshot import build_production_snapshot
     from jobs.discovery import TrackExecutionOutcome, TrackExecutionResult
     from market.quotes import FakeQuoteClient
-    from tests.discovery_helpers import SNAPSHOT_AT, company
+    from tests.discovery_helpers import (
+        SNAPSHOT_AT,
+        company,
+        discovery_ruler_values,
+    )
     from tests.test_discovery_workflow import _seed_api_snapshot
 
     db_path = tmp_path / "task6.db"
@@ -92,22 +96,18 @@ def _workflow_app(tmp_path, *, clock=None):
     engine = init_db(db_path)
     factory = create_session_factory(engine)
     with factory() as session:
-        session.add_all(
-            RulerVersion(
-                user_id=1,
-                digest=f"{track}-task6",
-                reason="Task 6",
-                payload_json=canonical_json(
-                    {
-                        "scope": "weekly-discovery",
-                        "track": track,
-                        "algorithm_version": "discovery-v1",
-                    }
-                ),
-                activated_at=SNAPSHOT_AT,
+        for track in ("quality_discount", "deep_value", "garp"):
+            payload_json, digest = discovery_ruler_values(track)
+            session.add(
+                RulerVersion(
+                    user_id=1,
+                    scope=f"discovery:{track}",
+                    digest=digest,
+                    reason="Task 6",
+                    payload_json=payload_json,
+                    activated_at=SNAPSHOT_AT,
+                )
             )
-            for track in ("quality_discount", "deep_value", "garp")
-        )
         session.commit()
     engine.dispose()
 
@@ -1334,9 +1334,10 @@ def test_abandoned_historical_http_reads_artifacts_without_executor(
         assert deleted.json()["code"] == "DISCOVERY_RUN_IMMUTABLE"
 
 
-def test_run_freezes_ruler_payloads_independent_of_mutable_row(tmp_path) -> None:
+def test_run_freezes_ruler_payloads_and_ledger_row_is_immutable(tmp_path) -> None:
     from fastapi.testclient import TestClient
     from sqlalchemy import select
+    from sqlalchemy.exc import IntegrityError
 
     from app.discovery_models import DiscoveryRun
     from app.models import RulerVersion
@@ -1358,7 +1359,9 @@ def test_run_freezes_ruler_payloads_independent_of_mutable_row(tmp_path) -> None
         )
         assert ruler is not None
         ruler.payload_json = '{"mutated":true}'
-        session.commit()
+        with pytest.raises(IntegrityError, match="immutable"):
+            session.commit()
+        session.rollback()
         frozen = load_frozen_inputs(session, run_id)
         assert frozen.ruler_payloads["garp"]["payload"]["track"] == "garp"
         assert session.get(DiscoveryRun, run_id).ruler_payloads_json == before

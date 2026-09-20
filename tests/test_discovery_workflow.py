@@ -13,6 +13,7 @@ from tests.discovery_helpers import (
     SNAPSHOT_AT,
     add_unfrozen_run,
     company,
+    discovery_ruler_values,
     freeze_one,
     versions,
 )
@@ -4012,18 +4013,14 @@ def test_three_tracks_advance_independently_with_injected_executor(
     SessionLocal = create_session_factory(engine)
     with SessionLocal() as session:
         for track in ("quality_discount", "deep_value", "garp"):
+            payload_json, digest = discovery_ruler_values(track)
             session.add(
                 RulerVersion(
                     user_id=1,
-                    digest=f"{track}-v1",
+                    scope=f"discovery:{track}",
+                    digest=digest,
                     reason="测试尺子",
-                    payload_json=canonical_json(
-                        {
-                            "scope": "weekly-discovery",
-                            "track": track,
-                            "algorithm_version": "discovery-v1",
-                        }
-                    ),
+                    payload_json=payload_json,
                     activated_at=SNAPSHOT_AT,
                 )
             )
@@ -4128,18 +4125,14 @@ def test_startup_resumes_confirmed_upstream_queued_stage_once(
     engine = init_db(db_path)
     SessionLocal = create_session_factory(engine)
     with SessionLocal() as session:
+        payload_json, digest = discovery_ruler_values("garp")
         session.add(
             RulerVersion(
                 user_id=1,
-                digest="garp-v1",
+                scope="discovery:garp",
+                digest=digest,
                 reason="测试尺子",
-                payload_json=canonical_json(
-                    {
-                        "scope": "weekly-discovery",
-                        "track": "garp",
-                        "algorithm_version": "discovery-v1",
-                    }
-                ),
+                payload_json=payload_json,
                 activated_at=SNAPSHOT_AT,
             )
         )
@@ -5149,22 +5142,18 @@ def test_track_confirmation_duplicate_and_two_session_race(
     engine = init_db(db_path)
     SessionLocal = create_session_factory(engine)
     with SessionLocal() as session:
-        session.add_all(
-            RulerVersion(
-                user_id=1,
-                digest=f"{track}-race",
-                reason="并发测试",
-                payload_json=canonical_json(
-                    {
-                        "scope": "weekly-discovery",
-                        "track": track,
-                        "algorithm_version": "discovery-v1",
-                    }
-                ),
-                activated_at=SNAPSHOT_AT,
+        for track in ("quality_discount", "deep_value", "garp"):
+            payload_json, digest = discovery_ruler_values(track)
+            session.add(
+                RulerVersion(
+                    user_id=1,
+                    scope=f"discovery:{track}",
+                    digest=digest,
+                    reason="并发测试",
+                    payload_json=payload_json,
+                    activated_at=SNAPSHOT_AT,
+                )
             )
-            for track in ("quality_discount", "deep_value", "garp")
-        )
         session.commit()
     engine.dispose()
 
@@ -5472,22 +5461,18 @@ def test_track_executor_failure_does_not_strand_sibling_tracks(
     engine = init_db(db_path)
     SessionLocal = create_session_factory(engine)
     with SessionLocal() as session:
-        session.add_all(
-            RulerVersion(
-                user_id=1,
-                digest=f"{track}-failure",
-                reason="失败隔离测试",
-                payload_json=canonical_json(
-                    {
-                        "scope": "weekly-discovery",
-                        "track": track,
-                        "algorithm_version": "discovery-v1",
-                    }
-                ),
-                activated_at=SNAPSHOT_AT,
+        for track in ("quality_discount", "deep_value", "garp"):
+            payload_json, digest = discovery_ruler_values(track)
+            session.add(
+                RulerVersion(
+                    user_id=1,
+                    scope=f"discovery:{track}",
+                    digest=digest,
+                    reason="失败隔离测试",
+                    payload_json=payload_json,
+                    activated_at=SNAPSHOT_AT,
+                )
             )
-            for track in ("quality_discount", "deep_value", "garp")
-        )
         session.commit()
     engine.dispose()
 
@@ -6229,6 +6214,7 @@ def test_nonfinite_tagged_discovery_ruler_is_ignored(
         session.add(
             RulerVersion(
                 user_id=1,
+                scope="discovery:quality_discount",
                 digest="nonfinite",
                 reason="非法尺子",
                 payload_json=(

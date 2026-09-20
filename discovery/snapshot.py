@@ -41,14 +41,19 @@ from app.models import (
     JobLock,
     RulerVersion,
 )
-from discovery.builds import AVAILABLE_BUILDS, BUILD_VERSION
+from discovery.builds import BUILD_VERSION
 from discovery.company_payload import (
     parse_company_payload,
     verify_company_payload_digest,
 )
 from discovery.constants import CHINA_MARKET_TIMEZONE
+from discovery.rulers import (
+    canonical_payload as canonical_ruler_payload,
+    latest as latest_discovery_ruler,
+    validate_ruler_version,
+)
+from discovery.tracks import TRACKS
 
-TRACKS = ("quality_discount", "deep_value", "garp")
 JsonScalar: TypeAlias = None | bool | int | float | str
 PlainValue: TypeAlias = JsonScalar | list["PlainValue"] | dict[str, "PlainValue"]
 FrozenValue: TypeAlias = JsonScalar | tuple["FrozenValue", ...] | Mapping[
@@ -461,18 +466,23 @@ def freeze_discovery_ruler_payloads(
         row = session.get(RulerVersion, ruler_id)
         if row is None or row.user_id != user_id:
             raise ValueError(f"{track} ruler is unavailable")
-        payload = _load_json(row.payload_json)
-        if (
-            type(payload) is not dict
-            or payload.get("scope") != "weekly-discovery"
-            or payload.get("track") != track
-            or payload.get("algorithm_version") != algorithm_version
-        ):
+        try:
+            ruler = validate_ruler_version(
+                row,
+                expected_track=track,
+                expected_algorithm_version=algorithm_version,
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"{track} ruler payload is incompatible"
+            ) from error
+        payload = _load_json(canonical_ruler_payload(ruler))
+        if type(payload) is not dict:
             raise ValueError(f"{track} ruler payload is incompatible")
         frozen[track] = {
             "id": ruler_id,
             "payload": payload,
-            "sha256": _sha256(payload),
+            "sha256": row.digest,
         }
     return canonical_json(frozen)
 
@@ -698,33 +708,14 @@ def resolve_discovery_rulers(
 
     resolved: dict[str, int | None] = {track: None for track in TRACKS}
 
-    def reject_constant(value: str) -> None:
-        raise ValueError(f"non-finite JSON constant: {value}")
-
-    rows = session.scalars(
-        select(RulerVersion)
-        .where(RulerVersion.user_id == user_id)
-        .order_by(RulerVersion.id.desc())
-    ).all()
-    if algorithm_version not in AVAILABLE_BUILDS:
-        return MappingProxyType(resolved)
-    for row in rows:
-        try:
-            payload = json.loads(
-                row.payload_json,
-                parse_constant=reject_constant,
-            )
-        except (TypeError, json.JSONDecodeError, ValueError):
-            continue
-        if (
-            type(payload) is not dict
-            or payload.get("scope") != "weekly-discovery"
-            or payload.get("track") not in TRACKS
-            or payload.get("algorithm_version") != algorithm_version
-        ):
-            continue
-        track = payload["track"]
-        if resolved[track] is None:
+    for track in TRACKS:
+        row = latest_discovery_ruler(
+            session,
+            track,
+            user_id=user_id,
+            algorithm_version=algorithm_version,
+        )
+        if row is not None:
             resolved[track] = row.id
     return MappingProxyType(resolved)
 

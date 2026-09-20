@@ -5,9 +5,11 @@ import json
 from datetime import datetime, timezone
 
 from sqlalchemy import select
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 from app.models import RulerVersion, Setting
+from discovery.tracks import FUNNEL_SCOPE
 from ledger.positions import LOCAL_USER_ID
 from screen import funnel
 
@@ -70,34 +72,137 @@ def current_hash() -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
-def latest(session: Session) -> RulerVersion | None:
+def latest(
+    session: Session,
+    scope: str = FUNNEL_SCOPE,
+) -> RulerVersion | None:
+    if scope == FUNNEL_SCOPE:
+        acknowledged = session.get(Setting, GATE_ACK_KEY)
+        if acknowledged is not None and acknowledged.value.isdigit():
+            row = session.get(RulerVersion, int(acknowledged.value))
+            if (
+                row is not None
+                and row.user_id == LOCAL_USER_ID
+                and row.scope == FUNNEL_SCOPE
+            ):
+                return row
     return session.scalars(
         select(RulerVersion)
-        .where(RulerVersion.user_id == LOCAL_USER_ID)
+        .where(
+            RulerVersion.user_id == LOCAL_USER_ID,
+            RulerVersion.scope == scope,
+        )
         .order_by(RulerVersion.id.desc())
     ).first()
 
 
-def activate(session: Session, reason: object) -> RulerVersion:
+def _require_funnel_scope(scope: object) -> None:
+    if scope != FUNNEL_SCOPE:
+        raise RulerError(
+            "请求无效",
+            "RULER_SCOPE",
+            "发现尺子必须通过 discovery.rulers 激活",
+        )
+
+
+def _funnel_payload_json() -> str:
+    return json.dumps(
+        current_payload(),
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+
+def _validate_funnel_row(row: RulerVersion) -> None:
+    def reject_constant(value: str) -> None:
+        raise ValueError(f"non-finite JSON number: {value}")
+
+    try:
+        payload = json.loads(
+            row.payload_json,
+            parse_constant=reject_constant,
+        )
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise RulerError(
+            "尺子损坏",
+            "RULER_CORRUPT",
+            "已保存漏斗尺子无法验证",
+        ) from error
+    if (
+        row.user_id != LOCAL_USER_ID
+        or row.scope != FUNNEL_SCOPE
+        or row.digest != current_hash()
+        or payload != current_payload()
+    ):
+        raise RulerError(
+            "尺子损坏",
+            "RULER_CORRUPT",
+            "已保存漏斗尺子无法验证",
+        )
+
+
+def _current_funnel_row(session: Session, digest: str) -> RulerVersion | None:
+    rows = session.scalars(
+        select(RulerVersion)
+        .where(
+            RulerVersion.user_id == LOCAL_USER_ID,
+            RulerVersion.scope == FUNNEL_SCOPE,
+            RulerVersion.digest == digest,
+        )
+        .order_by(RulerVersion.id.desc())
+    ).all()
+    for row in rows:
+        try:
+            _validate_funnel_row(row)
+        except RulerError:
+            continue
+        return row
+    return None
+
+
+def activate(
+    session: Session,
+    reason: object,
+    scope: str = FUNNEL_SCOPE,
+    *,
+    payload: object | None = None,
+) -> RulerVersion:
+    _require_funnel_scope(scope)
+    if payload is not None:
+        raise RulerError(
+            "请求无效",
+            "RULER_PAYLOAD",
+            "漏斗尺子 payload 由当前代码生成",
+        )
     text = str(reason or "").strip()
     if not text:
         raise RulerError("请求无效", "RULER_REASON", "改因不能为空")
     digest = current_hash()
-    row = latest(session)
-    if row is not None and row.digest == digest:
-        _set_ack(session, row.id)
-        return row
-    version = RulerVersion(
-        user_id=LOCAL_USER_ID,
-        digest=digest,
-        reason=text,
-        payload_json=json.dumps(current_payload(), ensure_ascii=False, sort_keys=True),
-        activated_at=datetime.now(timezone.utc),
+    existing = _current_funnel_row(session, digest)
+    if existing is not None:
+        _set_ack(session, existing.id)
+        return existing
+    result = session.execute(
+        sqlite_insert(RulerVersion)
+        .prefix_with("OR IGNORE")
+        .values(
+            user_id=LOCAL_USER_ID,
+            scope=FUNNEL_SCOPE,
+            digest=digest,
+            reason=text,
+            payload_json=_funnel_payload_json(),
+            activated_at=datetime.now(timezone.utc),
+        )
     )
-    session.add(version)
-    session.flush()
-    _set_ack(session, None)
-    return version
+    row = _current_funnel_row(session, digest)
+    if row is None:
+        raise RulerError(
+            "尺子损坏",
+            "RULER_CORRUPT",
+            "已保存漏斗尺子无法验证",
+        )
+    _set_ack(session, None if result.rowcount == 1 else row.id)
+    return row
 
 
 def _set_ack(session: Session, version_id: int | None) -> None:
@@ -110,14 +215,26 @@ def _set_ack(session: Session, version_id: int | None) -> None:
 
 
 def seed_if_empty(session: Session) -> None:
-    if latest(session) is None:
-        row = activate(session, INITIAL_REASON)
+    if latest(session, FUNNEL_SCOPE) is None:
+        row = activate(session, INITIAL_REASON, FUNNEL_SCOPE)
         _set_ack(session, row.id)
         session.commit()
 
 
-def require_matched(session: Session) -> RulerVersion:
-    row = latest(session)
+def require_matched(
+    session: Session,
+    scope: str = FUNNEL_SCOPE,
+    *,
+    payload: object | None = None,
+) -> RulerVersion:
+    _require_funnel_scope(scope)
+    if payload is not None:
+        raise RulerError(
+            "请求无效",
+            "RULER_PAYLOAD",
+            "漏斗尺子 payload 由当前代码生成",
+        )
+    row = latest(session, scope)
     digest = current_hash()
     if row is None or row.digest != digest:
         raise RulerError(
@@ -137,21 +254,31 @@ def _row_payload(row: RulerVersion) -> dict[str, object]:
     }
 
 
-def status(session: Session) -> dict[str, object]:
-    digest = current_hash()
+def status(
+    session: Session,
+    scope: str = FUNNEL_SCOPE,
+    *,
+    payload: object | None = None,
+) -> dict[str, object]:
+    digest = current_hash() if scope == FUNNEL_SCOPE else None
     rows = session.scalars(
         select(RulerVersion)
-        .where(RulerVersion.user_id == LOCAL_USER_ID)
+        .where(
+            RulerVersion.user_id == LOCAL_USER_ID,
+            RulerVersion.scope == scope,
+        )
         .order_by(RulerVersion.id.desc())
     ).all()
-    active = rows[0] if rows else None
-    from screen.replay import replay_report
+    active = latest(session, scope)
 
     body: dict[str, object] = {
         "digest": digest,
-        "matched": active is not None and active.digest == digest,
+        "matched": digest is not None and active is not None and active.digest == digest,
         "active": None if active is None else _row_payload(active),
         "versions": [_row_payload(row) for row in rows],
     }
-    body.update(replay_report(session))
+    if scope == FUNNEL_SCOPE:
+        from screen.replay import replay_report
+
+        body.update(replay_report(session))
     return body

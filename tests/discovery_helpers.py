@@ -12,6 +12,35 @@ RULER_IDS = {
 }
 
 
+def discovery_ruler_payload(track: str) -> dict[str, object]:
+    return {
+        "scope": "weekly-discovery",
+        "track": track,
+        "fields": ["metric", "code"],
+        "formulas": {"metric": "identity(metric)"},
+        "thresholds": {"metric_floor": "1"},
+        "min_observations": {"metric": 1},
+        "missing_policy": {
+            "metric": "insufficient",
+            "code": "insufficient",
+        },
+        "sector_branches": {"all": {"fields": ["metric"]}},
+        "order": [
+            ["metric", "desc", "nulls_last"],
+            ["code", "asc", "nulls_last"],
+        ],
+        "industry_version": "test-industry-v1",
+        "algorithm_version": "discovery-v1",
+    }
+
+
+def discovery_ruler_values(track: str) -> tuple[str, str]:
+    from discovery.rulers import canonical_payload, payload_digest
+
+    payload = discovery_ruler_payload(track)
+    return canonical_payload(payload), payload_digest(payload)
+
+
 def ruler_payloads_json(
     ruler_ids: dict[str, int | None] | None = None,
 ) -> str:
