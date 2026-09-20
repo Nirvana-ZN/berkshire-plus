@@ -12,6 +12,12 @@ RULER_IDS = {
 }
 
 
+def decimal_series(*values: str | None) -> tuple[Decimal | None, ...]:
+    """Build compact immutable Decimal test series."""
+
+    return tuple(Decimal(value) if value is not None else None for value in values)
+
+
 def discovery_ruler_payload(track: str) -> dict[str, object]:
     return {
         "scope": "weekly-discovery",
