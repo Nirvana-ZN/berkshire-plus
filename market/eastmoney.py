@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from threading import Event
 from typing import Protocol
@@ -39,6 +39,13 @@ FINANCIALS_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
 ORGINFO_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
 STOCK_URL = "https://push2delay.eastmoney.com/api/qt/stock/get"
 VALUATION_PAGE_CAP = 20
+# Live verification 2026-09-20: one-page RPT_VALUEANALYSIS_DET queries for
+# liquid SH/SZ proxies 600519 and 000001 returned the same actual dates
+# 2026-09-18,17,16,15,14,11 while push2his consistently disconnected.
+VALUATION_CALENDAR_REPORT = "RPT_VALUEANALYSIS_DET"
+VALUATION_CALENDAR_COLUMNS = "SECURITY_CODE,TRADE_DATE"
+VALUATION_CALENDAR_PROXIES = ("600519.SH", "000001.SZ")
+VALUATION_CALENDAR_LIMIT = 64
 BREADTH_URL = (
     "https://push2delay.eastmoney.com/api/qt/ulist.np/get"
     "?fltt=2&secids=0.399317&fields=f3,f12,f104,f105,f106"
@@ -1128,10 +1135,31 @@ class EastMoneyClient:
             raise
         except TransientMarketError as exc:
             attempts = DIRECT_RETRY_ATTEMPTS if retry_transient else 1
-            raise TransientMarketError(
-                f"calendar fetch failed after {attempts} attempt"
-                f"{'s' if attempts != 1 else ''}"
-            ) from exc
+            if not retry_transient:
+                raise TransientMarketError(
+                    f"calendar fetch failed after {attempts} attempt"
+                    f"{'s' if attempts != 1 else ''}"
+                ) from exc
+            try:
+                proxy_dates = [
+                    self._valuation_trade_dates(
+                        code,
+                        end,
+                        limit=limit,
+                        before_request=before_request,
+                        retry_transient=True,
+                    )
+                    for code in VALUATION_CALENDAR_PROXIES
+                ]
+            except DiscoveryRequestStopped:
+                raise
+            except TransientMarketError as fallback_exc:
+                raise TransientMarketError(
+                    "calendar fallback failed after bounded retries"
+                ) from fallback_exc
+            if proxy_dates[0] != proxy_dates[1]:
+                raise MarketError("估值代理交易日不一致")
+            return list(reversed(proxy_dates[0]))
         except MarketError as exc:
             raise MarketError(f"calendar response invalid: {exc}") from exc
         except Exception as exc:
@@ -1142,6 +1170,91 @@ class EastMoneyClient:
         if not isinstance(dates, list) or not dates:
             raise MarketError("calendar response invalid: 交易日接口返回格式错误")
         return [str(day)[:10] for day in dates][-limit:]
+
+    def _valuation_trade_dates(
+        self,
+        code: str,
+        as_of: str,
+        *,
+        limit: int,
+        before_request: DiscoveryPreRequest | None = None,
+        retry_transient: bool = False,
+        allow_empty: bool = False,
+    ) -> list[str]:
+        if not 0 < limit <= VALUATION_CALENDAR_LIMIT:
+            raise MarketError(
+                f"估值交易日请求条数必须在 1..{VALUATION_CALENDAR_LIMIT}"
+            )
+        try:
+            cutoff = date.fromisoformat(as_of)
+            _secid(code)
+        except ValueError as exc:
+            raise MarketError(str(exc)) from exc
+        security_code = code.strip().upper()[:6]
+        filt = (
+            f'(SECURITY_CODE="{security_code}")'
+            f"(TRADE_DATE<='{cutoff.isoformat()}')"
+        )
+        page_size = limit * 2
+        url = (
+            f"{FINANCIALS_URL}?reportName={VALUATION_CALENDAR_REPORT}"
+            f"&columns={VALUATION_CALENDAR_COLUMNS}&pageSize={page_size}"
+            f"&pageNumber=1&sortColumns=TRADE_DATE&sortTypes=-1"
+            f"&filter={quote(filt)}"
+        )
+        request = (
+            self._get_json_direct_retry
+            if retry_transient
+            else self._get_json_direct
+        )
+        payload = (
+            request(url)
+            if before_request is None
+            else request(url, before_request=before_request)
+        )
+        if payload.get("success") is not True:
+            raise MarketError(
+                str(payload.get("message") or "估值交易日接口不可用")
+            )
+        result = payload.get("result")
+        if not isinstance(result, dict):
+            raise MarketError("估值交易日接口返回格式错误")
+        rows = result.get("data")
+        if not isinstance(rows, list):
+            raise MarketError("估值交易日接口返回格式错误")
+        if len(rows) > page_size:
+            raise MarketError("估值交易日接口返回记录超过请求上限")
+
+        parsed: list[date] = []
+        for row in rows:
+            if (
+                not isinstance(row, dict)
+                or row.get("SECURITY_CODE") != security_code
+            ):
+                raise MarketError("估值交易日接口证券代码不匹配")
+            raw_date = row.get("TRADE_DATE")
+            if not isinstance(raw_date, str):
+                raise MarketError("估值交易日接口包含无效交易日期")
+            canonical = raw_date[:10]
+            try:
+                parsed_date = date.fromisoformat(canonical)
+                if raw_date != canonical:
+                    datetime.fromisoformat(raw_date)
+            except ValueError as exc:
+                raise MarketError(
+                    "估值交易日接口包含无效交易日期"
+                ) from exc
+            parsed.append(parsed_date)
+        if len(set(parsed)) != len(parsed) or parsed != sorted(
+            parsed, reverse=True
+        ):
+            raise MarketError("估值交易日接口日期必须严格降序且唯一")
+        eligible = [day for day in parsed if day <= cutoff]
+        if len(eligible) < limit:
+            if allow_empty and not eligible:
+                return []
+            raise MarketError("估值交易日接口有效日期不足请求条数")
+        return [day.isoformat() for day in eligible[:limit]]
 
     def fetch_notices(self, code: str) -> list[dict[str, str]]:
         from market.cninfo import fetch_notices
@@ -1404,12 +1517,28 @@ class EastMoneyClient:
             parsed = parse_kline(payload)
         except DiscoveryRequestStopped:
             raise
-        except TransientMarketError as exc:
+        except TransientMarketError:
             if retry_transient:
-                raise TransientMarketError(
-                    f"suspended K-line probe failed for {code} "
-                    f"after {DIRECT_RETRY_ATTEMPTS} attempts"
-                ) from exc
+                try:
+                    dates = self._valuation_trade_dates(
+                        code,
+                        end,
+                        limit=1,
+                        before_request=before_request,
+                        retry_transient=True,
+                        allow_empty=True,
+                    )
+                except DiscoveryRequestStopped:
+                    raise
+                except TransientMarketError as fallback_exc:
+                    raise TransientMarketError(
+                        f"suspended date fallback failed for {code} "
+                        f"after {DIRECT_RETRY_ATTEMPTS} attempts"
+                    ) from fallback_exc
+                return dates[0] if dates else None
+            return None
+        except MarketError:
+            # A permanent malformed K-line must not switch data sources.
             return None
         except Exception:
             return None

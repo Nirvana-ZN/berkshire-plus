@@ -2757,11 +2757,10 @@ def test_live_universe_retries_calendar_without_refetching_56_pages(
 def test_calendar_transient_failure_is_bounded_and_contextual(
     monkeypatch,
 ) -> None:
-    calls = 0
+    calls: list[str] = []
 
-    def get(_url: str):
-        nonlocal calls
-        calls += 1
+    def get(url: str):
+        calls.append(url)
         raise httpx2.ConnectError(
             "GET https://secret.example/calendar disconnected"
         )
@@ -2771,8 +2770,318 @@ def test_calendar_transient_failure_is_bounded_and_contextual(
         EastMoneyClient().fetch_trading_dates(
             "2026-09-16", retry_transient=True
         )
-    assert calls == 3
+    assert len(calls) == 6
+    assert sum("push2his.eastmoney.com" in url for url in calls) == 3
+    assert sum("datacenter-web.eastmoney.com" in url for url in calls) == 3
     assert "https://" not in str(caught.value)
+
+
+def _valuation_date_payload(
+    code: str, dates: list[str]
+) -> dict[str, object]:
+    return {
+        "success": True,
+        "result": {
+            "data": [
+                {"SECURITY_CODE": code, "TRADE_DATE": f"{day} 00:00:00"}
+                for day in dates
+            ]
+        },
+    }
+
+
+def test_valuation_calendar_query_uses_verified_minimum_contract(
+    monkeypatch,
+) -> None:
+    urls: list[str] = []
+    expected = [
+        "2026-09-18",
+        "2026-09-17",
+        "2026-09-16",
+        "2026-09-15",
+        "2026-09-14",
+        "2026-09-11",
+    ]
+
+    def get(url: str):
+        urls.append(url)
+        return _HttpResponse(_valuation_date_payload("600519", expected))
+
+    _install_http_transport(monkeypatch, get)
+    assert EastMoneyClient()._valuation_trade_dates(
+        "600519.SH", "2026-09-20", limit=6, retry_transient=True
+    ) == expected
+
+    assert len(urls) == 1
+    parsed = urlsplit(urls[0])
+    query = parse_qs(parsed.query)
+    assert parsed.netloc == "datacenter-web.eastmoney.com"
+    assert query == {
+        "reportName": ["RPT_VALUEANALYSIS_DET"],
+        "columns": ["SECURITY_CODE,TRADE_DATE"],
+        "pageSize": ["12"],
+        "pageNumber": ["1"],
+        "sortColumns": ["TRADE_DATE"],
+        "sortTypes": ["-1"],
+        "filter": [
+            '(SECURITY_CODE="600519")(TRADE_DATE<=\'2026-09-20\')'
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        (
+            _valuation_date_payload(
+                "600519", ["2026-09-18", "2026-09-18"]
+            ),
+            "严格降序且唯一",
+        ),
+        (
+            {
+                "success": True,
+                "result": {
+                    "data": [
+                        {
+                            "SECURITY_CODE": "600519",
+                            "TRADE_DATE": "09/18/2026",
+                        }
+                    ]
+                },
+            },
+            "无效交易日期",
+        ),
+    ],
+)
+def test_valuation_calendar_rejects_untrusted_dates(
+    monkeypatch, payload, message
+) -> None:
+    calls = 0
+
+    def get(_url: str):
+        nonlocal calls
+        calls += 1
+        return _HttpResponse(payload)
+
+    _install_http_transport(monkeypatch, get)
+    with pytest.raises(MarketError, match=message) as caught:
+        EastMoneyClient()._valuation_trade_dates(
+            "600519.SH", "2026-09-20", limit=2, retry_transient=True
+        )
+    assert not isinstance(caught.value, TransientMarketError)
+    assert calls == 1
+
+
+def test_valuation_calendar_filters_future_rows_before_exact_limit(
+    monkeypatch,
+) -> None:
+    def get(_url: str):
+        return _HttpResponse(
+            _valuation_date_payload(
+                "600519",
+                ["2026-09-21", "2026-09-18", "2026-09-17"],
+            )
+        )
+
+    _install_http_transport(monkeypatch, get)
+    assert EastMoneyClient()._valuation_trade_dates(
+        "600519.SH", "2026-09-20", limit=2, retry_transient=True
+    ) == ["2026-09-18", "2026-09-17"]
+
+
+def test_valuation_calendar_future_filtering_shortage_fails_closed(
+    monkeypatch,
+) -> None:
+    def get(_url: str):
+        return _HttpResponse(
+            _valuation_date_payload(
+                "600519", ["2026-09-21", "2026-09-18"]
+            )
+        )
+
+    _install_http_transport(monkeypatch, get)
+    with pytest.raises(MarketError, match="不足请求条数"):
+        EastMoneyClient()._valuation_trade_dates(
+            "600519.SH", "2026-09-20", limit=2, retry_transient=True
+        )
+
+
+def test_calendar_transient_kline_uses_matching_liquid_proxies(
+    monkeypatch,
+) -> None:
+    calls: list[str] = []
+    expected = ["2026-09-18", "2026-09-17", "2026-09-16"]
+
+    def get(url: str):
+        calls.append(url)
+        if "push2his.eastmoney.com" in url:
+            raise httpx2.ConnectError("disconnected")
+        code = parse_qs(urlsplit(url).query)["filter"][0].split('"')[1]
+        return _HttpResponse(_valuation_date_payload(code, expected))
+
+    _install_http_transport(monkeypatch, get)
+    client = EastMoneyClient()
+    assert client.fetch_trading_dates(
+        "2026-09-20", limit=3, retry_transient=True
+    ) == list(reversed(expected))
+    assert len(calls) == client.request_count == 5
+    assert sum("push2his.eastmoney.com" in url for url in calls) == 3
+    assert sum("datacenter-web.eastmoney.com" in url for url in calls) == 2
+
+
+@pytest.mark.parametrize("truncated_code", [None, "000001"])
+def test_calendar_matching_or_single_truncated_proxy_fails_closed(
+    monkeypatch, truncated_code
+) -> None:
+    calls = 0
+
+    def get(url: str):
+        nonlocal calls
+        calls += 1
+        if "push2his.eastmoney.com" in url:
+            raise httpx2.ConnectError("disconnected")
+        code = parse_qs(urlsplit(url).query)["filter"][0].split('"')[1]
+        dates = ["2026-09-18", "2026-09-17", "2026-09-16"]
+        if truncated_code is None or code == truncated_code:
+            dates = dates[:2]
+        return _HttpResponse(_valuation_date_payload(code, dates))
+
+    _install_http_transport(monkeypatch, get)
+    with pytest.raises(MarketError, match="不足请求条数"):
+        EastMoneyClient().fetch_trading_dates(
+            "2026-09-20", limit=3, retry_transient=True
+        )
+    assert calls == (4 if truncated_code is None else 5)
+
+
+def test_calendar_proxy_disagreement_is_rejected(monkeypatch) -> None:
+    calls = 0
+
+    def get(url: str):
+        nonlocal calls
+        calls += 1
+        if "push2his.eastmoney.com" in url:
+            raise httpx2.ConnectError("disconnected")
+        code = parse_qs(urlsplit(url).query)["filter"][0].split('"')[1]
+        dates = (
+            ["2026-09-18", "2026-09-17"]
+            if code == "600519"
+            else ["2026-09-18", "2026-09-16"]
+        )
+        return _HttpResponse(_valuation_date_payload(code, dates))
+
+    _install_http_transport(monkeypatch, get)
+    with pytest.raises(MarketError, match="代理交易日不一致"):
+        EastMoneyClient().fetch_trading_dates(
+            "2026-09-20", limit=2, retry_transient=True
+        )
+    assert calls == 5
+
+
+def test_calendar_proxy_failure_propagates_after_bounded_retries(
+    monkeypatch,
+) -> None:
+    calls = 0
+
+    def get(url: str):
+        nonlocal calls
+        calls += 1
+        if "push2his.eastmoney.com" in url:
+            raise httpx2.ConnectError("calendar disconnected")
+        code = parse_qs(urlsplit(url).query)["filter"][0].split('"')[1]
+        if code == "000001":
+            return _HttpResponse(status_code=503)
+        return _HttpResponse(
+            _valuation_date_payload(
+                code, ["2026-09-18", "2026-09-17"]
+            )
+        )
+
+    _install_http_transport(monkeypatch, get)
+    with pytest.raises(TransientMarketError):
+        EastMoneyClient().fetch_trading_dates(
+            "2026-09-20", limit=2, retry_transient=True
+        )
+    assert calls == 7
+
+
+def test_calendar_kline_success_never_calls_valuation_fallback(
+    monkeypatch,
+) -> None:
+    calls: list[str] = []
+
+    def get(url: str):
+        calls.append(url)
+        assert "push2his.eastmoney.com" in url
+        return _HttpResponse(
+            {
+                "data": {
+                    "klines": [
+                        "2026-09-17,1,2,3,4,5,6",
+                        "2026-09-18,1,2,3,4,5,6",
+                    ]
+                }
+            }
+        )
+
+    _install_http_transport(monkeypatch, get)
+    assert EastMoneyClient().fetch_trading_dates(
+        "2026-09-20", limit=2, retry_transient=True
+    ) == ["2026-09-17", "2026-09-18"]
+    assert len(calls) == 1
+
+
+def test_calendar_permanent_kline_error_never_calls_valuation_fallback(
+    monkeypatch,
+) -> None:
+    calls: list[str] = []
+
+    def get(url: str):
+        calls.append(url)
+        assert "push2his.eastmoney.com" in url
+        return _HttpResponse({"data": {"klines": "not-a-list"}})
+
+    _install_http_transport(monkeypatch, get)
+    with pytest.raises(MarketError, match="交易日接口返回格式错误"):
+        EastMoneyClient().fetch_trading_dates(
+            "2026-09-20", limit=2, retry_transient=True
+        )
+    assert len(calls) == 1
+
+
+def test_calendar_budget_stop_aborts_between_proxies(monkeypatch) -> None:
+    gate_calls = 0
+    transports = 0
+
+    def before_request() -> None:
+        nonlocal gate_calls
+        gate_calls += 1
+        if gate_calls == 5:
+            raise DiscoveryRequestBudgetExhausted("request stopped")
+
+    def get(url: str):
+        nonlocal transports
+        transports += 1
+        if "push2his.eastmoney.com" in url:
+            raise httpx2.ConnectError("disconnected")
+        code = parse_qs(urlsplit(url).query)["filter"][0].split('"')[1]
+        return _HttpResponse(
+            _valuation_date_payload(
+                code, ["2026-09-18", "2026-09-17"]
+            )
+        )
+
+    _install_http_transport(monkeypatch, get)
+    with pytest.raises(DiscoveryRequestBudgetExhausted):
+        EastMoneyClient().fetch_trading_dates(
+            "2026-09-20",
+            limit=2,
+            retry_transient=True,
+            before_request=before_request,
+        )
+    assert gate_calls == 5
+    assert transports == 4
 
 
 def test_malformed_calendar_payload_is_not_retried(monkeypatch) -> None:
@@ -2790,7 +3099,7 @@ def test_malformed_calendar_payload_is_not_retried(monkeypatch) -> None:
     assert calls == 1
 
 
-def test_suspended_kline_transient_exhaustion_pauses_universe(
+def test_suspended_kline_transient_uses_same_stock_valuation_date(
     monkeypatch,
 ) -> None:
     stock_kline_calls = 0
@@ -2799,7 +3108,16 @@ def test_suspended_kline_transient_exhaustion_pauses_universe(
         nonlocal stock_kline_calls
         if "clist/get" in url:
             return _HttpResponse(
-                {"data": {"diff": [_universe_row("601999", suspended=True)]}}
+                {
+                    "data": {
+                        "diff": [
+                            {
+                                **_universe_row("601999", suspended=True),
+                                "f2": "10",
+                            }
+                        ]
+                    }
+                }
             )
         if "secid=0.399317" in url:
             return _HttpResponse(
@@ -2812,16 +3130,46 @@ def test_suspended_kline_transient_exhaustion_pauses_universe(
                     }
                 }
             )
+        if "datacenter-web.eastmoney.com" in url:
+            query = parse_qs(urlsplit(url).query)
+            assert 'SECURITY_CODE="601999"' in query["filter"][0]
+            return _HttpResponse(
+                _valuation_date_payload("601999", ["2026-09-15"])
+            )
         assert "secid=1.601999" in url
         stock_kline_calls += 1
         raise httpx2.ConnectError("disconnected")
 
     _install_http_transport(monkeypatch, get)
     client = EastMoneyClient()
-    with pytest.raises(TransientMarketError, match="suspended K-line"):
-        client.fetch_cheap_universe(as_of=date(2026, 9, 16))
+    rows = client.fetch_cheap_universe(as_of=date(2026, 9, 16))
+    assert [(row.trading_status, row.last_trade_date) for row in rows] == [
+        ("suspended", "2026-09-15")
+    ]
     assert stock_kline_calls == 3
-    assert client.request_count == 5
+    assert client.request_count == 6
+
+
+def test_suspended_kline_fallback_with_no_history_is_safe_none(
+    monkeypatch,
+) -> None:
+    calls = 0
+
+    def get(url: str):
+        nonlocal calls
+        calls += 1
+        if "push2his.eastmoney.com" in url:
+            raise httpx2.ConnectError("disconnected")
+        query = parse_qs(urlsplit(url).query)
+        assert query["pageSize"] == ["2"]
+        assert 'SECURITY_CODE="601999"' in query["filter"][0]
+        return _HttpResponse(_valuation_date_payload("601999", []))
+
+    _install_http_transport(monkeypatch, get)
+    assert EastMoneyClient()._last_trade_date(
+        "601999.SH", "2026-09-20", retry_transient=True
+    ) is None
+    assert calls == 4
 
 
 def test_universe_status_names_calendar_without_leaking_url(
@@ -2871,7 +3219,7 @@ def test_universe_status_names_calendar_without_leaking_url(
     with factory() as session:
         fill = session.get(DiscoveryDataFill, fill_id)
         assert fill is not None
-        assert (fill.status, fill.request_count) == ("paused", 4)
+        assert (fill.status, fill.request_count) == ("paused", 7)
         assert fill.last_error is not None
         assert "universe: calendar" in fill.last_error
         assert "https://" not in fill.last_error
