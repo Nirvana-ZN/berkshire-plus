@@ -27,6 +27,7 @@ from discovery.company_payload import (
     PAYLOAD_SCHEMA_BLOCK_REASON,
     SCHEMA_VERSION as COMPANY_PAYLOAD_SCHEMA_VERSION,
 )
+from discovery.field_dictionary import FIELD_DICTIONARY
 from discovery.industry import INDUSTRY_BRANCHES, classify_industry_branch
 from discovery.quality_contract import quality_ruler_branch_policies
 from discovery.rulers import (
@@ -65,6 +66,7 @@ from discovery.tracks.quality_discount import (
 from discovery.tracks.deep_value import classify as classify_deep_value
 from discovery.tracks.garp import _DOMAINS as GARP_DOMAINS
 from discovery.tracks.garp import classify as classify_garp
+from market.types import ValuationPoint
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DB = PROJECT_ROOT / "data" / "app.db"
@@ -915,6 +917,35 @@ def _coverage(present: int, total: int) -> dict[str, object]:
     }
 
 
+VALUATION_SOURCE = str(
+    ValuationPoint.__dataclass_fields__["source"].default
+)
+SECURITY_SOURCE = "eastmoney:push2delay"
+
+
+def _canonical_field_source(field: str) -> dict[str, object]:
+    spec = FIELD_DICTIONARY[field]
+    return {
+        "source": "discovery",
+        "report": spec.report,
+        "field": spec.field,
+        "unit": spec.unit,
+        "consolidated_basis": spec.consolidated_basis,
+        "period_type": spec.period_type,
+        "financial_sector_substitute": spec.financial_sector_substitute,
+        "source_as_of": spec.source_as_of,
+        "trusted": True,
+    }
+
+
+def _required_supported_branches(track: str) -> set[str]:
+    return {
+        "quality_discount": {"nonfinancial", "cyclical", "bank"},
+        "deep_value": {"nonfinancial", "financial"},
+        "garp": {"nonfinancial"},
+    }[track]
+
+
 def _ruler_branch(track: str, industry: str | None) -> str:
     shared = classify_industry_branch(industry)
     if track == "quality_discount":
@@ -972,8 +1003,7 @@ def _trusted_decimal(
     if (
         parsed is None
         or not isinstance(item, Mapping)
-        or item.get("trusted") is not True
-        or item.get("source") != "discovery"
+        or dict(item) != _canonical_field_source(field)
         or isinstance(field_provenance, (str, bytes))
         or not isinstance(field_provenance, Sequence)
         or "discovery" not in field_provenance
@@ -1003,7 +1033,12 @@ def _annual_rows(company: Any) -> dict[int, Mapping[str, object]]:
             continue
         year_text = period[:4]
         if len(year_text) == 4 and year_text.isdigit():
-            result[int(year_text)] = row
+            year = int(year_text)
+            if year in result:
+                raise ValueError(
+                    f"duplicate canonical annual year: {year}"
+                )
+            result[year] = row
     return result
 
 
@@ -1268,8 +1303,7 @@ def _valuation_result(
         if (
             value is not None
             and value > 0
-            and type(row.get("source")) is str
-            and bool(row.get("source"))
+            and row.get("source") == VALUATION_SOURCE
             and row.get("fetched_at") is not None
             and row.get("trade_date") is not None
         ):
@@ -1280,20 +1314,46 @@ def _valuation_result(
 def _source_coverage(
     companies: Sequence[Any],
 ) -> dict[str, dict[str, object]]:
-    keys = ("security", "financial", "valuation", "price", "fill")
-    result = {}
     total = len(companies)
-    for key in keys:
-        present = sum(
-            (
-                company.sources.get(key) is not None
-                if key in {"security", "price"}
-                else company.as_of.get(key) is not None
+    checks = {
+        "security": lambda company: (
+            company.security_status.get("security_source")
+            == SECURITY_SOURCE
+            and company.sources.get("security") == SECURITY_SOURCE
+            and company.as_of.get("security") is not None
+        ),
+        "financial": lambda company: (
+            company.sources.get("financial_history")
+            == "checkpoint_payload:field_sources"
+            and company.as_of.get("financial") is not None
+        ),
+        "valuation": lambda company: (
+            isinstance(
+                company.sources.get("valuation_history"), Sequence
             )
-            for company in companies
+            and not isinstance(
+                company.sources.get("valuation_history"), (str, bytes)
+            )
+            and bool(company.sources.get("valuation_history"))
+            and all(
+                source == VALUATION_SOURCE
+                for source in company.sources["valuation_history"]
+            )
+            and company.as_of.get("valuation") is not None
+        ),
+        "price": lambda company: (
+            company.sources.get("price") == VALUATION_SOURCE
+            and company.as_of.get("price") is not None
+        ),
+        "fill": lambda company: company.as_of.get("fill") is not None,
+    }
+    return {
+        key: _coverage(
+            sum(bool(check(company)) for company in companies),
+            total,
         )
-        result[key] = _coverage(present, total)
-    return result
+        for key, check in checks.items()
+    }
 
 
 def _coverage_audit(
@@ -1415,7 +1475,7 @@ def _coverage_audit(
                     _is_present, value = _trusted_decimal(
                         row, field, track
                     )
-                    if value is not None and value > 0:
+                    if value is not None:
                         parsed[field].append(value)
             label = selected_label or "insufficient"
             label_counts[label] += 1
@@ -1457,7 +1517,6 @@ def _coverage_audit(
                             for year, row in history.items()
                             if _trusted_decimal(row, field, track)[1]
                             is not None
-                            and _trusted_decimal(row, field, track)[1] > 0
                         ),
                         default=0,
                     )
@@ -1485,6 +1544,13 @@ def _coverage_audit(
             else:
                 missing[f"missing_trusted_{field}"] += 1
 
+    missing_branches = _required_supported_branches(track) - {
+        branch
+        for branch, count in branch_counts.items()
+        if count > 0
+    }
+    for branch in sorted(missing_branches):
+        missing[f"missing_supported_branch_{branch}"] += 1
     provenance = {
         field: {
             "present": present[field],
@@ -1526,8 +1592,13 @@ def _coverage_audit(
         )
     }
     source_coverage = _source_coverage(companies)
+    for source, row in source_coverage.items():
+        absent = int(row["total"]) - int(row["present"])
+        if absent:
+            missing[f"missing_trusted_source_{source}"] += absent
     ready = (
         supported_total > 0
+        and not missing_branches
         and all(
             row["trusted"] > 0
             and Fraction(int(row["trusted"]), int(row["total"]))
@@ -1565,7 +1636,16 @@ def _coverage_audit(
         return_coverage = {
             "policy": "roic_then_roe",
             "selected_labels": {
-                key: label_counts[key]
+                key: {
+                    "count": label_counts[key],
+                    **{
+                        coverage_key: value
+                        for coverage_key, value in _coverage(
+                            label_counts[key], supported_total
+                        ).items()
+                        if coverage_key != "present"
+                    },
+                }
                 for key in ("roic", "roe_fallback", "insufficient")
             },
             "roic": {
@@ -1607,6 +1687,20 @@ def _domain_valid(track: str, reason: str | None) -> bool:
     return not (
         reason == "annual_fiscal_year_duplicate"
         or (reason or "").endswith(("_negative", "_not_positive"))
+    )
+
+
+def _domain_readiness(
+    valid: int,
+    total: int,
+    threshold: Decimal,
+) -> tuple[bool, int]:
+    invalid = total - valid
+    return (
+        valid > 0
+        and total > 0
+        and Fraction(valid, total) >= Fraction(threshold),
+        invalid,
     )
 
 
@@ -1786,7 +1880,7 @@ def _ready_artifact(
             | {
                 str(field)
                 for field in declared_fields
-                if field != "code"
+                if field not in {"code", "return_metric_label"}
             }
         )
     }
@@ -1828,6 +1922,20 @@ def _ready_artifact(
         proposals["base"],
         selected_labels,
     )
+    readiness_threshold = Decimal(
+        proposals["base"]["thresholds"]["readiness_min"]
+    )
+    domain_ready, domain_invalid = _domain_readiness(
+        domain_valid,
+        total,
+        readiness_threshold,
+    )
+    if domain_invalid:
+        coverage_missing = {
+            **coverage_missing,
+            "field_domain_invalid": domain_invalid,
+        }
+    coverage_ready = coverage_ready and domain_ready
     domain_policy = {
         "quality_discount": QUALITY_FIELD_DOMAIN_POLICY,
         "deep_value": DEEP_VALUE_FIELD_DOMAIN_POLICY,

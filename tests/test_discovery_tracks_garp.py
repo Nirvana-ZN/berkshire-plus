@@ -942,9 +942,9 @@ def test_calibrator_garp_approves_declared_roe_fallback_separately(
     assert first["return_metric_coverage"] == {
         "policy": "roic_then_roe",
         "selected_labels": {
-            "roic": 0,
-            "roe_fallback": 1,
-            "insufficient": 0,
+            "roic": {"count": 0, "total": 1, "ratio": "0"},
+            "roe_fallback": {"count": 1, "total": 1, "ratio": "1"},
+            "insufficient": {"count": 0, "total": 1, "ratio": "0"},
         },
         "roic": {
             "companies": 0,
@@ -964,15 +964,11 @@ def test_calibrator_garp_approves_declared_roe_fallback_separately(
     assert hashlib.sha256(db.read_bytes()).hexdigest() == before
 
 
-@pytest.mark.parametrize(
-    ("roic", "expected_observations"),
-    [("0", 0), ("-1", 0)],
-)
-def test_calibrator_garp_never_counts_zero_or_invalid_roic_as_coverage(
+@pytest.mark.parametrize("roic", ["0", "-1"])
+def test_calibrator_garp_counts_finite_signed_roic_as_provenance(
     tmp_path: Path,
     monkeypatch,
     roic: str,
-    expected_observations: int,
 ) -> None:
     from scripts import calibrate_discovery
 
@@ -990,15 +986,20 @@ def test_calibrator_garp_never_counts_zero_or_invalid_roic_as_coverage(
         lambda _session: _garp_calibration_snapshot(company),
     )
     artifact = calibrate_discovery.calibrate(db, track="garp")
-    assert artifact["status"] == "blocked"
-    assert artifact["return_metric_coverage"]["selected_labels"]["roic"] == 1
-    assert artifact["return_metric_coverage"]["roic"]["companies"] == 0
-    assert artifact["return_metric_coverage"]["roic"][
-        "observations"
-    ] == expected_observations
+    assert artifact["status"] == "ready"
+    assert artifact["approval_ready"] is True
+    assert artifact["candidate_counts"]["base"]["drop"] == 1
+    assert artifact["return_metric_coverage"]["selected_labels"]["roic"] == {
+        "count": 1,
+        "total": 1,
+        "ratio": "1",
+    }
+    assert artifact["return_metric_coverage"]["roic"]["companies"] == 1
+    assert artifact["return_metric_coverage"]["roic"]["observations"] == 5
     assert artifact["return_metric_coverage"]["roe_fallback"][
         "observations"
     ] == 0
+    assert "return_metric_label" not in artifact["field_coverage"]
 
 
 def test_calibrator_reports_exact_supported_and_unsupported_branches() -> None:

@@ -1054,3 +1054,33 @@ def test_calibrator_deep_value_blocks_missing_trusted_proxy_source(
     assert artifact["distributions"]["missing_reasons"][
         "missing_trusted_other_income"
     ] == 1
+    assert artifact["distributions"]["missing_reasons"][
+        "missing_supported_branch_financial"
+    ] == 1
+
+
+def test_calibrator_rejects_duplicate_canonical_annual_year_before_overwrite() -> None:
+    from scripts.calibrate_discovery import _annual_rows
+
+    first = _deep_annual(2025)
+    duplicate = dict(_deep_annual(2025))
+    duplicate["period"] = "2025-12-31"
+    company = _company(annual=(first, duplicate))
+    with pytest.raises(ValueError, match="duplicate canonical annual year"):
+        _annual_rows(company)
+
+
+def test_calibrator_requires_exact_field_dictionary_source_metadata() -> None:
+    from scripts.calibrate_discovery import _trusted_decimal
+
+    row = _deep_annual(2025)
+    sources = dict(row["field_sources"])
+    sources["other_income"] = {
+        **sources["other_income"],
+        "report": "UNKNOWN_REPORT",
+    }
+    row["field_sources"] = sources
+    assert _trusted_decimal(row, "other_income", "deep_value") == (
+        True,
+        None,
+    )

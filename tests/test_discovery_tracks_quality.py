@@ -20,6 +20,7 @@ from types import MappingProxyType
 import pytest
 
 from discovery.builds import BUILD_VERSION
+from discovery.field_dictionary import FIELD_DICTIONARY
 from discovery.snapshot import FrozenCompanyInput, canonical_json
 from market.types import FinancialRow
 
@@ -222,15 +223,16 @@ def quality_payload(**threshold_overrides: str) -> dict[str, object]:
 
 
 def _metadata(field: str) -> dict[str, object]:
+    spec = FIELD_DICTIONARY[field]
     return {
         "source": "discovery",
-        "report": "test",
-        "field": field,
-        "unit": "test",
-        "consolidated_basis": "consolidated",
-        "period_type": "annual",
-        "financial_sector_substitute": None,
-        "source_as_of": "NOTICE_DATE/UPDATE_DATE",
+        "report": spec.report,
+        "field": spec.field,
+        "unit": spec.unit,
+        "consolidated_basis": spec.consolidated_basis,
+        "period_type": spec.period_type,
+        "financial_sector_substitute": spec.financial_sector_substitute,
+        "source_as_of": spec.source_as_of,
         "trusted": True,
     }
 
@@ -347,7 +349,7 @@ def frozen_company(
                 "last_trade_date": "2026-09-17",
                 "industry_version": "test-industry-v1",
                 "industry_as_of": "2026-09-17",
-                "security_source": "exchange",
+                "security_source": "eastmoney:push2delay",
                 "market_status_code": 1,
                 "snapshot_at": "2026-09-17T03:00:00Z",
             }
@@ -365,7 +367,7 @@ def frozen_company(
         sources=MappingProxyType(
             {
                 "price": "eastmoney:RPT_VALUEANALYSIS_DET",
-                "security": "exchange",
+                "security": "eastmoney:push2delay",
                 "financial_history": "checkpoint_payload:field_sources",
                 "valuation_history": ("eastmoney:RPT_VALUEANALYSIS_DET",),
             }
@@ -1850,6 +1852,64 @@ def test_calibrator_uses_exact_linear_quartiles() -> None:
         "p75": "1.75",
         "max": "2",
     }
+
+
+def test_calibrator_rejects_unknown_valuation_and_security_sources() -> None:
+    from scripts.calibrate_discovery import (
+        _source_coverage,
+        _valuation_result,
+    )
+
+    company = frozen_company()
+    fields = dict(company.fields)
+    fields["valuation_history"] = tuple(
+        dict(row, source="unknown") for row in fields["valuation_history"]
+    )
+    unknown_valuation = replace(
+        company,
+        fields=MappingProxyType(fields),
+    )
+    assert _valuation_result(
+        unknown_valuation,
+        "pe",
+        60,
+        "PE_TTM/PB_MRQ",
+    ) == (True, False)
+
+    security = dict(company.security_status)
+    security["security_source"] = "unknown"
+    unknown_security = replace(
+        company,
+        security_status=MappingProxyType(security),
+    )
+    assert _source_coverage((unknown_security,))["security"] == {
+        "present": 0,
+        "total": 1,
+        "ratio": "0",
+    }
+
+
+def test_calibrator_declares_every_required_supported_branch() -> None:
+    from scripts.calibrate_discovery import _required_supported_branches
+
+    assert _required_supported_branches("quality_discount") == {
+        "nonfinancial",
+        "cyclical",
+        "bank",
+    }
+    assert _required_supported_branches("deep_value") == {
+        "nonfinancial",
+        "financial",
+    }
+    assert _required_supported_branches("garp") == {"nonfinancial"}
+
+
+def test_calibrator_domain_validity_is_an_approval_gate_with_diagnostics() -> None:
+    from scripts.calibrate_discovery import _domain_readiness
+
+    assert _domain_readiness(4, 5, Decimal("0.8")) == (True, 1)
+    assert _domain_readiness(3, 5, Decimal("0.8")) == (False, 2)
+    assert _domain_readiness(0, 0, Decimal("0.8")) == (False, 0)
 
 
 @pytest.mark.parametrize("alias_kind", ["same", "hardlink", "symlink"])
