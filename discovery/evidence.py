@@ -8,7 +8,7 @@ from decimal import Decimal, InvalidOperation
 from types import MappingProxyType
 
 
-EVIDENCE_RULE_VERSION = "deterministic-evidence-v1"
+EVIDENCE_RULE_VERSION = "deterministic-evidence-v2"
 ALLOWED_RISK_CATEGORIES = frozenset(
     {
         "metric_near_threshold",
@@ -30,7 +30,36 @@ _OBSERVATION_REQUIREMENTS = MappingProxyType(
             "cash_conversion",
             "cash_conversion_observations",
         ),
+        "bank_capital_adequacy": (
+            "bank_capital",
+            "bank_capital_available_count",
+        ),
+        "bank_core_tier1_capital_adequacy": (
+            "bank_capital",
+            "bank_capital_available_count",
+        ),
+        "bank_npl": ("bank_npl", "bank_npl_available_count"),
     }
+)
+_QUALITY_BANK_FACTS = (
+    ("pb_percentile", ("pb_percentile",)),
+    ("roe_mean", ("roe_mean",)),
+    (
+        "bank_capital",
+        (
+            "bank_capital_adequacy",
+            "bank_core_tier1_capital_adequacy",
+        ),
+    ),
+    ("bank_npl", ("bank_npl",)),
+)
+_BANK_GATE_ORDER = (
+    "listing_age",
+    "positive_equity",
+    "bank_roe",
+    "bank_capital",
+    "bank_npl",
+    "bank_valuation",
 )
 
 
@@ -129,10 +158,35 @@ def _field_order(ruler: Mapping[str, object]) -> tuple[str, ...]:
     return tuple(result)
 
 
+def _fact_specs(
+    track: str,
+    metrics: Mapping[str, object],
+    ruler: Mapping[str, object],
+) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    if track != "quality_discount" or metrics.get("quality_branch") != "bank":
+        return tuple((field, (field,)) for field in _field_order(ruler))
+
+    branches = ruler.get("sector_branches")
+    if not isinstance(branches, Mapping):
+        raise ValueError("bank evidence branch policy is invalid")
+    bank = branches.get("bank")
+    policies = branches.get("branch_policies")
+    if (
+        not isinstance(bank, Mapping)
+        or not isinstance(policies, Mapping)
+        or tuple(bank.get("gate_order", ())) != _BANK_GATE_ORDER
+        or bank.get("valuation_policy") != "pb"
+        or policies.get("bank") != "bank"
+    ):
+        raise ValueError("bank evidence branch policy is invalid")
+    return _QUALITY_BANK_FACTS
+
+
 def _reliable_inputs(
     field: str,
     metrics: Mapping[str, object],
     ruler: Mapping[str, object],
+    branch: object,
 ) -> Mapping[str, object] | None:
     policies = ruler.get("missing_policy")
     minimums = ruler.get("min_observations")
@@ -147,6 +201,8 @@ def _reliable_inputs(
     if requirement is None:
         return None
     minimum_name, count_name = requirement
+    if field == "roe_mean" and branch == "bank":
+        minimum_name = "bank_roe"
     minimum = minimums.get(minimum_name)
     count = _decimal(metrics.get(count_name))
     if (
@@ -175,23 +231,39 @@ def _fact_items(
     formulas = ruler["formulas"]
     assert isinstance(formulas, Mapping)
     result = []
-    for field in _field_order(ruler):
-        inputs = _reliable_inputs(field, metrics, ruler)
-        if inputs is None:
+    branch = metrics.get("quality_branch")
+    for rule_name, fields in _fact_specs(track, metrics, ruler):
+        reliable = [
+            _reliable_inputs(field, metrics, ruler, branch)
+            for field in fields
+        ]
+        if any(inputs is None for inputs in reliable):
             continue
-        value = metrics[field]
+        inputs = {
+            key: value
+            for reliable_inputs in reliable
+            if reliable_inputs is not None
+            for key, value in reliable_inputs.items()
+        }
+        inputs.update(
+            {
+                f"formula.{field}": formulas[field]
+                for field in fields
+                if field in formulas
+            }
+        )
         result.append(
             _item(
                 kind="fact",
                 category=None,
-                rule_id=f"{track}.fact.{field}",
-                inputs={**inputs, "formula": formulas[field]},
-                text=f"{field}={value}",
-                as_of=source_as_of[_source(field)],
+                rule_id=f"{track}.fact.{rule_name}",
+                inputs=inputs,
+                text=",".join(f"{field}={metrics[field]}" for field in fields),
+                as_of=min(source_as_of[_source(field)] for field in fields),
                 completeness="complete",
             )
         )
-        if len(result) == 3:
+        if len(result) == 4:
             break
     return tuple(result)
 
@@ -205,13 +277,39 @@ def _threshold_risk(
     thresholds = ruler.get("thresholds")
     if not isinstance(thresholds, Mapping):
         raise ValueError("evidence ruler thresholds are invalid")
-    for field in _field_order(ruler):
-        if _reliable_inputs(field, metrics, ruler) is None:
+    branch = metrics.get("quality_branch")
+    fields = (
+        field
+        for _, fact_fields in _fact_specs(track, metrics, ruler)
+        for field in fact_fields
+    )
+    threshold_names = {
+        "bank_capital_adequacy": (
+            "bank_capital_adequacy_min",
+            "min",
+        ),
+        "bank_core_tier1_capital_adequacy": (
+            "bank_core_tier1_min",
+            "min",
+        ),
+        "bank_npl": ("bank_npl_max", "max"),
+    }
+    if branch == "bank":
+        threshold_names["roe_mean"] = ("bank_roe_min", "min")
+    for field in fields:
+        if _reliable_inputs(field, metrics, ruler, branch) is None:
             continue
         value = _decimal(metrics.get(field))
         assert value is not None
-        for suffix, direction in (("_max", "max"), ("_min", "min")):
-            name = f"{field}{suffix}"
+        names = (
+            (threshold_names[field],)
+            if field in threshold_names
+            else (
+                ((f"{field}_max", "max")),
+                ((f"{field}_min", "min")),
+            )
+        )
+        for name, direction in names:
             threshold = _decimal(thresholds.get(name))
             if threshold is None:
                 continue
