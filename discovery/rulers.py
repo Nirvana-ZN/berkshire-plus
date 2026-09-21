@@ -112,6 +112,11 @@ QUALITY_DISCOUNT_FORMULAS = MappingProxyType(
         "normalized_pe": (
             "current.price*latest(annual.shares)/normalized_earnings"
         ),
+        "bank_capital_adequacy": "latest(annual.capital_adequacy)",
+        "bank_core_tier1_capital_adequacy": (
+            "latest(annual.core_tier1_capital_adequacy)"
+        ),
+        "bank_npl": "latest(annual.npl)",
     }
 )
 QUALITY_DISCOUNT_THRESHOLDS = frozenset(
