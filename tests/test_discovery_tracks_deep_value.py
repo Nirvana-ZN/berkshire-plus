@@ -331,6 +331,51 @@ def test_missing_required_nonfinancial_field_is_insufficient() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("missing", "reason", "metric"),
+    [
+        ("shares", "normalized_pe_insufficient", "normalized_pe"),
+        ("revenue", "revenue_insufficient", "revenue_decline"),
+        (
+            "interest_debt",
+            "net_debt_insufficient",
+            "net_debt_to_normalized_fcf",
+        ),
+        (
+            "interest",
+            "interest_coverage_insufficient",
+            "interest_coverage",
+        ),
+        (
+            "net_income",
+            "one_time_profit_insufficient",
+            "one_time_profit_share",
+        ),
+        ("impairment_loss", "impairment_insufficient", "impairment_share"),
+        (
+            "asset_disposal_gain",
+            "subsidy_disposal_insufficient",
+            "subsidy_disposal_share",
+        ),
+    ],
+)
+def test_nonfinancial_current_gates_require_latest_fiscal_endpoint(
+    missing: str,
+    reason: str,
+    metric: str,
+) -> None:
+    annual = tuple(
+        _deep_annual(year, **({missing: None} if year == 2025 else {}))
+        for year in range(2021, 2026)
+    )
+    verdict = _classify(_company(annual=annual))
+    assert (verdict.verdict, verdict.primary_reason) == (
+        "insufficient",
+        reason,
+    )
+    assert verdict.metrics[metric] is None
+
+
 def test_financial_branch_uses_pb_roe_npl_and_verified_capital_only() -> None:
     annual = tuple(
         _deep_annual(
@@ -359,6 +404,33 @@ def test_financial_branch_uses_pb_roe_npl_and_verified_capital_only() -> None:
     assert verdict.metrics["roe_mean"] == "15"
     assert verdict.metrics["npl_change"] == "-0.4"
     assert verdict.metrics["bank_capital_adequacy"] == "14"
+
+
+def test_branch_selection_precedes_branch_specific_domain_validation() -> None:
+    bank = tuple(
+        _deep_annual(
+            year,
+            capex="-1",
+            shares="-1",
+            cash="-1",
+            interest_debt="-1",
+            revenue="-1",
+        )
+        for year in range(2021, 2026)
+    )
+    assert _classify(_company(industry="银行", annual=bank)).verdict == "pass"
+
+    industrial = tuple(
+        _deep_annual(
+            year,
+            npl="-1",
+        )
+        for year in range(2021, 2026)
+    )
+    assert _classify(_company(annual=industrial)).verdict == "pass"
+
+    unsupported = _classify(_company(industry="保险", annual=bank))
+    assert unsupported.primary_reason == "industry_branch_insurance_unsupported"
 
 
 def test_financial_missing_capital_is_insufficient() -> None:
@@ -731,6 +803,75 @@ def test_passing_bank_npl_worsening_emits_frozen_threshold_trend_risk() -> None:
         "0.1",
         "0.2",
     )
+
+
+def test_bank_roe_fact_and_near_threshold_use_bank_observations() -> None:
+    from discovery.evidence import build_evidence_card
+
+    annual = tuple(
+        _deep_annual(year, roe="8.5")
+        for year in range(2021, 2026)
+    )
+    company = _company(industry="银行", annual=annual)
+    verdict = _classify(company)
+    assert verdict.verdict == "pass"
+    card = build_evidence_card(
+        company.code,
+        verdict.metrics,
+        deep_value_payload(),
+        source_as_of={
+            key: company.as_of[key]
+            for key in ("security", "financial", "valuation")
+        },
+    )
+    roe_fact = next(
+        item
+        for item in card.items
+        if item.rule_id == "deep_value.fact.roe_mean"
+    )
+    risk = next(item for item in card.items if item.kind == "risk")
+    assert roe_fact.input_fields["bank_roe_observations"] == "5"
+    assert roe_fact.input_fields["min_observations.bank_roe"] == 5
+    assert (
+        risk.rule_id,
+        risk.category,
+        risk.input_fields["bank_roe_min"],
+    ) == (
+        "deep_value.risk.metric_near_threshold.roe_mean",
+        "metric_near_threshold",
+        "8",
+    )
+
+
+def test_evidence_threshold_arithmetic_is_bounded_and_context_isolated() -> None:
+    from discovery.evidence import FALLBACK_RISK_TEXT, build_evidence_card
+
+    payload = deep_value_payload(normalized_pe_max="1" + "0" * 3000)
+    company = _company()
+    verdict = _classify(company, payload)
+    assert verdict.verdict == "pass"
+    saved = getcontext().copy()
+    hostile = saved.copy()
+    hostile.prec = 2
+    hostile.Emax = 9
+    hostile.Emin = -9
+    hostile.clear_flags()
+    expected_flags = hostile.flags.copy()
+    try:
+        setcontext(hostile)
+        card = build_evidence_card(
+            company.code,
+            verdict.metrics,
+            payload,
+            source_as_of={
+                key: company.as_of[key]
+                for key in ("security", "financial", "valuation")
+            },
+        )
+        assert getcontext().flags == expected_flags
+        assert card.items[-1].display_text == FALLBACK_RISK_TEXT
+    finally:
+        setcontext(saved)
 
 
 def test_calibrator_deep_value_is_deterministic_blocked_and_read_only(

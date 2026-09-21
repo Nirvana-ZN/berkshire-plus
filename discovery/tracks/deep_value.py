@@ -63,6 +63,15 @@ _FIELDS = (
     "capital_adequacy",
     "core_tier1_capital_adequacy",
 )
+_NONFINANCIAL_FIELDS = frozenset(_FIELDS[:-4])
+_FINANCIAL_FIELDS = frozenset(
+    {
+        "roe",
+        "npl",
+        "capital_adequacy",
+        "core_tier1_capital_adequacy",
+    }
+)
 _DOMAINS = MappingProxyType(
     {
         "deducted_net_income": "signed",
@@ -257,6 +266,7 @@ def _trusted(row: Mapping[str, object], field: str) -> Decimal | None:
 def _financial_history(
     company: FrozenCompanyInput,
     financial_as_of: date,
+    applicable_fields: frozenset[str],
 ) -> tuple[_Annual, ...]:
     rows = _sequence(
         company.fields["financial_history"],
@@ -279,7 +289,16 @@ def _financial_history(
             year,
             period_end,
             source_as_of,
-            MappingProxyType({field: _trusted(raw, field) for field in _FIELDS}),
+            MappingProxyType(
+                {
+                    field: (
+                        _trusted(raw, field)
+                        if field in applicable_fields
+                        else None
+                    )
+                    for field in _FIELDS
+                }
+            ),
         )
     return tuple(result[year] for year in sorted(result))
 
@@ -341,6 +360,21 @@ def _available(window: _Window | None, *fields: str) -> tuple[_Annual, ...]:
     )
 
 
+def _latest(window: _Window | None, *fields: str) -> _Annual | None:
+    if window is None:
+        return None
+    row = next(
+        (row for row in window.rows if row.year == window.end_year),
+        None,
+    )
+    return (
+        row
+        if row is not None
+        and all(row.values[field] is not None for field in fields)
+        else None
+    )
+
+
 def _sum(values: Sequence[Decimal]) -> Decimal | None:
     total = Decimal(0)
     for value in values:
@@ -380,24 +414,35 @@ def _nonfinancial_metrics(
         metrics["normalized_fcf"] = median(usable_fcf)
 
     share_rows = _available(windows.get("dilution"), "shares")
+    latest_share_row = _latest(windows.get("dilution"), "shares")
     counts["dilution"] = len(share_rows)
-    if len(share_rows) >= ruler.min_observations["dilution"]:
-        ratio = _divide(share_rows[-1].values["shares"], share_rows[0].values["shares"])
+    if (
+        len(share_rows) >= ruler.min_observations["dilution"]
+        and latest_share_row is not None
+    ):
+        ratio = _divide(
+            latest_share_row.values["shares"],
+            share_rows[0].values["shares"],
+        )
         metrics["dilution_rate"] = _subtract(ratio, Decimal(1))
 
     net_debt_rows = _available(
         windows.get("net_debt"), "interest_debt", "cash"
     )
+    latest_net_debt_row = _latest(
+        windows.get("net_debt"), "interest_debt", "cash"
+    )
     counts["net_debt"] = len(net_debt_rows)
     if (
         len(net_debt_rows) >= ruler.min_observations["net_debt"]
+        and latest_net_debt_row is not None
         and metrics["normalized_fcf"] is not None
         and metrics["normalized_fcf"]
         > Decimal(ruler.thresholds["normalized_fcf_min"])
     ):
         net_debt = _subtract(
-            net_debt_rows[-1].values["interest_debt"],
-            net_debt_rows[-1].values["cash"],
+            latest_net_debt_row.values["interest_debt"],
+            latest_net_debt_row.values["cash"],
         )
         metrics["net_debt_to_normalized_fcf"] = _divide(
             net_debt, metrics["normalized_fcf"]
@@ -406,24 +451,29 @@ def _nonfinancial_metrics(
     interest_rows = _available(
         windows.get("interest_coverage"), "ebit", "interest"
     )
+    latest_interest_row = _latest(
+        windows.get("interest_coverage"), "ebit", "interest"
+    )
     counts["interest_coverage"] = len(interest_rows)
-    if interest_rows:
+    if latest_interest_row is not None:
         metrics["interest_coverage"] = _divide(
-            interest_rows[-1].values["ebit"],
-            interest_rows[-1].values["interest"].copy_abs(),  # type: ignore[union-attr]
+            latest_interest_row.values["ebit"],
+            latest_interest_row.values["interest"].copy_abs(),  # type: ignore[union-attr]
         )
 
     revenue_rows = _available(windows.get("revenue"), "revenue")
+    latest_revenue_row = _latest(windows.get("revenue"), "revenue")
     counts["revenue"] = len(revenue_rows)
     if (
         len(revenue_rows) >= ruler.min_observations["revenue"]
+        and latest_revenue_row is not None
         and revenue_rows[0].values["revenue"] is not None
         and revenue_rows[0].values["revenue"] > 0
     ):
         decline = _divide(
             _subtract(
                 revenue_rows[0].values["revenue"],
-                revenue_rows[-1].values["revenue"],
+                latest_revenue_row.values["revenue"],
             ),
             revenue_rows[0].values["revenue"],
         )
@@ -440,11 +490,16 @@ def _nonfinancial_metrics(
     one_time_rows = _available(
         windows.get("one_time_profit"), "net_income", "deducted_net_income"
     )
+    latest_one_time_row = _latest(
+        windows.get("one_time_profit"),
+        "net_income",
+        "deducted_net_income",
+    )
     counts["one_time_profit"] = len(one_time_rows)
-    if one_time_rows and denominator is not None:
+    if latest_one_time_row is not None and denominator is not None:
         excess = _subtract(
-            one_time_rows[-1].values["net_income"],
-            one_time_rows[-1].values["deducted_net_income"],
+            latest_one_time_row.values["net_income"],
+            latest_one_time_row.values["deducted_net_income"],
         )
         metrics["one_time_profit_share"] = _divide(
             None if excess is None else max(Decimal(0), excess),
@@ -454,10 +509,13 @@ def _nonfinancial_metrics(
     impairment_rows = _available(
         windows.get("impairment"), "impairment_loss"
     )
+    latest_impairment_row = _latest(
+        windows.get("impairment"), "impairment_loss"
+    )
     counts["impairment"] = len(impairment_rows)
-    if impairment_rows and denominator is not None:
+    if latest_impairment_row is not None and denominator is not None:
         metrics["impairment_share"] = _divide(
-            impairment_rows[-1].values["impairment_loss"].copy_abs(),  # type: ignore[union-attr]
+            latest_impairment_row.values["impairment_loss"].copy_abs(),  # type: ignore[union-attr]
             denominator,
         )
 
@@ -466,9 +524,14 @@ def _nonfinancial_metrics(
         "government_grants",
         "asset_disposal_gain",
     )
+    latest_subsidy_row = _latest(
+        windows.get("subsidy_disposal"),
+        "government_grants",
+        "asset_disposal_gain",
+    )
     counts["subsidy_disposal"] = len(subsidy_rows)
-    if subsidy_rows and denominator is not None:
-        latest = subsidy_rows[-1].values
+    if latest_subsidy_row is not None and denominator is not None:
+        latest = latest_subsidy_row.values
         total = _sum(
             (
                 latest["government_grants"].copy_abs(),  # type: ignore[union-attr]
@@ -477,7 +540,11 @@ def _nonfinancial_metrics(
         )
         metrics["subsidy_disposal_share"] = _divide(total, denominator)
 
-    latest_shares = share_rows[-1].values["shares"] if share_rows else None
+    latest_shares = (
+        latest_share_row.values["shares"]
+        if latest_share_row is not None
+        else None
+    )
     price = _decimal(company.fields["price"], "current price")
     market_value = _multiply(price, latest_shares)
     if (
@@ -673,7 +740,12 @@ def _gate_failures(
         ):
             return [("drop", "normalized_fcf_not_positive")]
         if counts.get(minimum, 0) < ruler.min_observations[minimum] or value is None:
-            return [_missing(metric, f"{minimum}_insufficient", ruler)]
+            reason = (
+                "normalized_pe_insufficient"
+                if gate == "normalized_valuation"
+                else f"{minimum}_insufficient"
+            )
+            return [_missing(metric, reason, ruler)]
         limit = Decimal(thresholds[threshold])
         failed = (
             value > limit
@@ -826,7 +898,13 @@ def classify(company: FrozenCompanyInput, ruler: TrackRuler) -> TrackVerdict:
         ):
             raise _SnapshotInvalid("snapshot look-ahead")
 
-        history = _financial_history(company, financial_as_of)
+        history = _financial_history(
+            company,
+            financial_as_of,
+            _FINANCIAL_FIELDS
+            if branch == "financial"
+            else _NONFINANCIAL_FIELDS,
+        )
         windows, audit, stale = _windows(
             history, ruler, company.snapshot_at.date()
         )

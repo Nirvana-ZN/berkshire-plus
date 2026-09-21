@@ -7,6 +7,12 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from types import MappingProxyType
 
+from discovery.tracks.quality_discount import (
+    MAX_ARITHMETIC_PRECISION,
+    _divide as _bounded_divide,
+    _subtract as _bounded_subtract,
+)
+
 
 EVIDENCE_RULE_VERSION = "deterministic-evidence-v2"
 ALLOWED_RISK_CATEGORIES = frozenset(
@@ -114,11 +120,28 @@ class EvidenceCard:
 def _decimal(value: object) -> Decimal | None:
     if type(value) not in {str, int}:
         return None
+    if (
+        type(value) is str
+        and len(value) > MAX_ARITHMETIC_PRECISION
+    ) or (
+        type(value) is int
+        and value.bit_length() > MAX_ARITHMETIC_PRECISION * 4
+    ):
+        return None
     try:
         result = Decimal(value)
-    except InvalidOperation:
+    except (InvalidOperation, ValueError):
         return None
-    return result if result.is_finite() else None
+    exponent = result.as_tuple().exponent
+    return (
+        result
+        if result.is_finite()
+        and isinstance(exponent, int)
+        and len(result.as_tuple().digits) <= MAX_ARITHMETIC_PRECISION
+        and abs(exponent) <= MAX_ARITHMETIC_PRECISION
+        and abs(result.adjusted()) <= MAX_ARITHMETIC_PRECISION
+        else None
+    )
 
 
 def _sources(field: str) -> tuple[str, ...]:
@@ -329,7 +352,10 @@ def _reliable_inputs(
     if requirement is None:
         return None
     minimum_name, count_name = requirement
-    if field == "roe_mean" and branch in {"bank", "financial"}:
+    if field == "roe_mean" and branch == "financial":
+        minimum_name = "bank_roe"
+        count_name = "bank_roe_observations"
+    elif field == "roe_mean" and branch == "bank":
         minimum_name = "bank_roe"
     minimum = minimums.get(minimum_name)
     count = _decimal(metrics.get(count_name))
@@ -451,11 +477,18 @@ def _threshold_risk(
             threshold = _decimal(thresholds.get(name))
             if threshold is None:
                 continue
-            distance = abs(threshold) / Decimal(10)
+            distance = _bounded_divide(threshold.copy_abs(), Decimal(10))
+            lower = _bounded_subtract(threshold, distance)
+            upper = _bounded_subtract(
+                threshold,
+                None if distance is None else distance.copy_negate(),
+            )
+            if lower is None or upper is None:
+                continue
             near = (
-                threshold - distance <= value <= threshold
+                lower <= value <= threshold
                 if direction == "max"
-                else threshold <= value <= threshold + distance
+                else threshold <= value <= upper
             )
             if near:
                 provenance, as_of = _provenance((field,), source_as_of)
