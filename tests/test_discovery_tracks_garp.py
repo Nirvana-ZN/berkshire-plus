@@ -340,6 +340,24 @@ def test_exact_annual_observations_and_cagr_periods_are_audited() -> None:
     assert short.metrics["revenue_growth_observations"] == "4"
 
 
+@pytest.mark.parametrize(
+    "minimum",
+    ["sustained_revenue_growth", "sustained_profit_growth"],
+)
+def test_sustained_growth_minimum_requires_at_least_two_periods(
+    minimum: str,
+) -> None:
+    from discovery.rulers import garp_ruler
+
+    payload = garp_payload()
+    payload["min_observations"][minimum] = 1
+    with pytest.raises(
+        ValueError,
+        match="GARP exact observation policy is invalid",
+    ):
+        garp_ruler(payload)
+
+
 def test_one_year_low_base_spike_does_not_satisfy_sustained_growth() -> None:
     revenue = {
         2021: "100",
@@ -365,7 +383,10 @@ def test_one_year_low_base_spike_does_not_satisfy_sustained_growth() -> None:
         )
         for year in range(2021, 2026)
     )
-    verdict = _classify(_company(annual=annual))
+    payload = garp_payload()
+    payload["min_observations"]["sustained_revenue_growth"] = 2
+    payload["min_observations"]["sustained_profit_growth"] = 2
+    verdict = _classify(_company(annual=annual), payload)
     assert (verdict.verdict, verdict.primary_reason) == (
         "drop",
         "revenue_growth_not_sustained",

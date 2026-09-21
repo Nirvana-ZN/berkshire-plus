@@ -1477,10 +1477,16 @@ def validate_garp_ruler(ruler: TrackRuler) -> TrackRuler:
         or ruler.min_observations["latest_growth"] != 2
         or ruler.min_observations["growth_drivers"]
         != windows["growth_drivers"]
-        or ruler.min_observations["sustained_revenue_growth"]
-        > cagr_periods["revenue"]
-        or ruler.min_observations["sustained_profit_growth"]
-        > cagr_periods["deducted_profit"]
+        or not (
+            2
+            <= ruler.min_observations["sustained_revenue_growth"]
+            <= cagr_periods["revenue"]
+        )
+        or not (
+            2
+            <= ruler.min_observations["sustained_profit_growth"]
+            <= cagr_periods["deducted_profit"]
+        )
         or ruler.min_observations["valuation_pe"] > 240
     ):
         raise ValueError("GARP exact observation policy is invalid")
