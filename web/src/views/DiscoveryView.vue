@@ -28,6 +28,7 @@ import {
   type ParsedDiscoveryDecision,
   type ParsedDiscoveryEvidence,
   type StageReviewIdentity,
+  validateCandidateEvidence,
 } from './discoveryViewModel'
 
 const DISCOVERY_RUN_STATUSES = [
@@ -190,6 +191,11 @@ interface AdjudicationCase {
   change: ParsedDiscoveryChange | null
 }
 
+type CandidatePayloadState =
+  | { kind: 'loading' }
+  | { kind: 'ready' }
+  | { kind: 'error'; message: string }
+
 interface StageView {
   key: StageKey
   title: string
@@ -255,8 +261,9 @@ const CURRENT_REFRESH_MS = 60_000
 const CURRENT_RETRY_MS = 5_000
 const MUTATION_FETCH_TIMEOUT_MS = 10_000
 const CHANGE_ZH: Record<string, string> = {
-  entered: '本周新入围',
-  exited: '本周未入围',
+  new: '本周新入围',
+  dropped: '本周退出',
+  reentered: '本周重新入围',
   continuous: '连续入围',
   reason_changed: '入围原因变化',
   data_changed: '数据变化',
@@ -290,6 +297,7 @@ const stageFingerprintCache = ref<Record<string, string>>({})
 const stageReviewableCache = ref<Record<string, boolean>>({})
 const reviewedStages = ref<Record<string, StageReviewIdentity>>({})
 const adjudicationPayloads = ref<Partial<Record<Track, StageResponse>>>({})
+const candidatePayloadStates = ref<Partial<Record<Track, CandidatePayloadState>>>({})
 const exclusionReasons = ref<Record<string, string>>({})
 const researchingCode = ref('')
 const overrideCode = ref('')
@@ -824,9 +832,19 @@ async function loadStage(
 
 async function loadAdjudicationPayload(track: Track, runId: number) {
   adjudicationControllers.get(track)?.abort()
+  const nextPayloads = { ...adjudicationPayloads.value }
+  delete nextPayloads[track]
+  adjudicationPayloads.value = nextPayloads
+  candidatePayloadStates.value = {
+    ...candidatePayloadStates.value,
+    [track]: { kind: 'loading' },
+  }
   const requestSequence = adjudicationRequestSequence
   const controller = new AbortController()
-  const cancelTimeout = armStageFetchTimeout(controller)
+  let timedOut = false
+  const cancelTimeout = armStageFetchTimeout(controller, () => {
+    timedOut = true
+  })
   adjudicationControllers.set(track, controller)
   try {
     const response = await fetch(
@@ -838,26 +856,71 @@ async function loadAdjudicationPayload(track: Track, runId: number) {
       !mounted
       || activeRunId.value !== runId
       || requestSequence !== adjudicationRequestSequence
-      || !response.ok
+      || adjudicationControllers.get(track) !== controller
     ) return
+    if (!response.ok) {
+      candidatePayloadStates.value = {
+        ...candidatePayloadStates.value,
+        [track]: {
+          kind: 'error',
+          message: `${errorMessage(body, '无法读取候选案例')}，请重试`,
+        },
+      }
+      return
+    }
     const payload = parseStageResponse(body)
     if (!payload) {
-      actionError.value = '服务返回的候选案例数据无效'
+      candidatePayloadStates.value = {
+        ...candidatePayloadStates.value,
+        [track]: { kind: 'error', message: '服务返回的候选案例数据无效，请重试' },
+      }
+      return
+    }
+    const validation = validateCandidateEvidence(payload)
+    if (!validation.valid) {
+      candidatePayloadStates.value = {
+        ...candidatePayloadStates.value,
+        [track]: {
+          kind: 'error',
+          message: `候选案例不可用于裁决：${validation.message}`,
+        },
+      }
       return
     }
     adjudicationPayloads.value = {
       ...adjudicationPayloads.value,
       [track]: payload,
     }
+    candidatePayloadStates.value = {
+      ...candidatePayloadStates.value,
+      [track]: { kind: 'ready' },
+    }
   } catch (error) {
-    if (!(error instanceof DOMException && error.name === 'AbortError')) {
-      actionError.value = '无法读取候选案例'
+    if (
+      !mounted
+      || activeRunId.value !== runId
+      || requestSequence !== adjudicationRequestSequence
+      || adjudicationControllers.get(track) !== controller
+    ) return
+    candidatePayloadStates.value = {
+      ...candidatePayloadStates.value,
+      [track]: {
+        kind: 'error',
+        message: timedOut ? '候选案例读取超时，请重试' : '无法读取候选案例，请重试',
+      },
     }
   } finally {
     cancelTimeout()
     if (adjudicationControllers.get(track) === controller) {
       adjudicationControllers.delete(track)
     }
+  }
+}
+
+function retryAdjudicationPayload(view: StageView) {
+  const current = state.value
+  if (view.track !== null && current.kind === 'ready') {
+    void loadAdjudicationPayload(view.track, current.run.id)
   }
 }
 
@@ -883,6 +946,7 @@ async function applyRun(
     abortAdjudicationRequests()
     clearStageCache()
     adjudicationPayloads.value = {}
+    candidatePayloadStates.value = {}
     for (const track of TRACKS) {
       const latest = run.tracks?.[track]?.stage
       selectedTrackStages.value[track] = isTrackStage(latest) ? latest : 'track_gate'
@@ -926,6 +990,7 @@ async function readCurrent(source: 'loaded' | 'created' = 'loaded'): Promise<boo
       abortAdjudicationRequests()
       clearStageCache()
       adjudicationPayloads.value = {}
+      candidatePayloadStates.value = {}
       activeRunId.value = null
       stageViews.value = []
       transitionAnnouncement.value = ''
@@ -1247,7 +1312,20 @@ function allCasesDecided(view: StageView): boolean {
 }
 
 function casesLoaded(view: StageView): boolean {
-  return view.track !== null && adjudicationPayloads.value[view.track] !== undefined
+  return view.track !== null
+    && candidatePayloadStates.value[view.track]?.kind === 'ready'
+    && adjudicationPayloads.value[view.track] !== undefined
+}
+
+function candidatePayloadError(view: StageView): string {
+  if (view.track === null) return ''
+  const candidateState = candidatePayloadStates.value[view.track]
+  return candidateState?.kind === 'error' ? candidateState.message : ''
+}
+
+function casesLoading(view: StageView): boolean {
+  return view.track !== null
+    && candidatePayloadStates.value[view.track]?.kind === 'loading'
 }
 
 function researchVerdict(item: AdjudicationCase): '值得深研' | '观察' | '排除' {
@@ -1256,8 +1334,16 @@ function researchVerdict(item: AdjudicationCase): '值得深研' | '观察' | '�
   return '观察'
 }
 
-function exclusionReason(code: string): string {
-  return exclusionReasons.value[code] ?? ''
+function draftKey(item: AdjudicationCase): string {
+  return `${item.track}:${item.code}`
+}
+
+function exclusionReason(item: AdjudicationCase): string {
+  return exclusionReasons.value[draftKey(item)] ?? ''
+}
+
+function factEvidence(item: AdjudicationCase): ParsedDiscoveryEvidence[] {
+  return item.evidence.filter((evidence) => evidence.kind === 'fact')
 }
 
 function riskText(item: AdjudicationCase): string {
@@ -1273,10 +1359,17 @@ function freshnessText(item: AdjudicationCase): string {
   return `${gaps}；截至 ${dates.length ? dates.join('、') : '日期不可用'}`
 }
 
-function weeklyChangeText(item: AdjudicationCase): string {
-  const change = item.change
+function weeklyChangeText(view: StageView, item: AdjudicationCase): string {
+  const terminal = view.status === 'confirmed' || view.status === 'insufficient_candidates'
+  const change = (
+    terminal
+      ? view.payload?.changes.find((candidate) => candidate.code === item.code)
+      : item.change
+  ) ?? null
   return change
-    ? CHANGE_ZH[change.classification] || change.classification
+    ? change.classifications
+      .map((classification) => CHANGE_ZH[classification] || classification)
+      .join('；')
     : '本周首次形成可裁决候选'
 }
 
@@ -1291,7 +1384,7 @@ async function saveDecision(
     actionError.value = '当前裁决阶段尚未成功加载并复核'
     return
   }
-  const reason = exclusionReason(item.code).trim()
+  const reason = exclusionReason(item).trim()
   if (decision === 'exclude' && !reason) {
     actionError.value = '排除必须填写理由'
     return
@@ -1320,7 +1413,10 @@ async function saveDecision(
       return
     }
     if (decision === 'exclude') {
-      exclusionReasons.value = { ...exclusionReasons.value, [item.code]: '' }
+      exclusionReasons.value = {
+        ...exclusionReasons.value,
+        [draftKey(item)]: '',
+      }
     }
     await refreshRun()
   } catch {
@@ -1503,7 +1599,7 @@ onBeforeUnmount(() => {
         class="panel stage-panel"
         :aria-busy="mutating
           || !!researchingCode
-          || (view.stage === 'adjudication' && !casesLoaded(view))
+          || (view.stage === 'adjudication' && casesLoading(view))
           || (view.created && (view.status === 'queued' || view.status === 'running'))"
         :aria-labelledby="`discovery-stage-${view.key.replace(':', '-')}`"
       >
@@ -1577,7 +1673,7 @@ onBeforeUnmount(() => {
                 <dt>关键证据</dt>
                 <dd>
                   <ul>
-                    <li v-for="evidence in caseItem.evidence" :key="evidence.id">
+                    <li v-for="evidence in factEvidence(caseItem)" :key="evidence.id">
                       {{ evidence.display_text }}
                     </li>
                   </ul>
@@ -1585,7 +1681,7 @@ onBeforeUnmount(() => {
               </div>
               <div><dt>风险与反方证据</dt><dd>{{ riskText(caseItem) }}</dd></div>
               <div><dt>数据缺口与新鲜度</dt><dd>{{ freshnessText(caseItem) }}</dd></div>
-              <div><dt>本周变化</dt><dd>{{ weeklyChangeText(caseItem) }}</dd></div>
+              <div><dt>本周变化</dt><dd>{{ weeklyChangeText(view, caseItem) }}</dd></div>
             </dl>
             <div v-if="view.status === 'waiting_confirmation'" class="case-actions">
               <button
@@ -1599,7 +1695,7 @@ onBeforeUnmount(() => {
               <label>
                 排除理由
                 <input
-                  v-model="exclusionReasons[caseItem.code]"
+                  v-model="exclusionReasons[draftKey(caseItem)]"
                   type="text"
                   name="exclusion_reason"
                   :required="caseItem.decision?.decision === 'exclude'"
@@ -1607,7 +1703,7 @@ onBeforeUnmount(() => {
               </label>
               <button
                 type="button"
-                :disabled="mutating || !exclusionReason(caseItem.code).trim()"
+                :disabled="mutating || !exclusionReason(caseItem).trim()"
                 :aria-label="`排除 ${caseItem.name}`"
                 @click="saveDecision(view, caseItem, 'exclude')"
               >
@@ -1625,10 +1721,16 @@ onBeforeUnmount(() => {
             </button>
           </article>
 
-          <p v-if="!casesLoaded(view)" class="muted">
+          <p v-if="casesLoading(view)" class="muted">
             正在读取候选案例…
           </p>
-          <p v-else-if="!adjudicationCases(view).length" class="muted">
+          <div v-if="candidatePayloadError(view)" role="alert">
+            <p>{{ candidatePayloadError(view) }}</p>
+            <button type="button" @click="retryAdjudicationPayload(view)">
+              重试候选案例
+            </button>
+          </div>
+          <p v-else-if="casesLoaded(view) && !adjudicationCases(view).length" class="muted">
             本轨道没有可保留候选，可明确以候选不足完成。
           </p>
           <button

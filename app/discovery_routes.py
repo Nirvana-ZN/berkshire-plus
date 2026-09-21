@@ -5,7 +5,7 @@ import json
 import logging
 import threading
 from collections.abc import Callable, Mapping
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from math import isfinite
 from uuid import uuid4
 
@@ -37,6 +37,11 @@ from discovery.constants import (
     china_week_key,
 )
 from discovery.diff import CorruptDiscoveryHistory, load_weekly_changes
+from discovery.evidence import (
+    ALLOWED_RISK_CATEGORIES,
+    EVIDENCE_RULE_VERSION,
+    FALLBACK_RISK_TEXT,
+)
 from discovery.overrides import OVERRIDE_ACTIONS
 from discovery.summaries import DiscoverySummaryError, build_stage_summary
 from discovery.snapshot import (
@@ -1332,17 +1337,12 @@ def _discovery_research_name(
             DiscoveryDecision.decision == "keep",
         )
     )
-    evidence = session.scalar(
-        select(DiscoveryEvidence.id)
-        .where(
-            DiscoveryEvidence.run_id == run.id,
-            DiscoveryEvidence.track == track,
-            DiscoveryEvidence.competition_attempt == competition.attempt,
-            DiscoveryEvidence.competition_stage_id == competition.id,
-            DiscoveryEvidence.code == code,
+    eligible_codes = {
+        row.code
+        for row in _researchable_competition_entrants(
+            session, competition
         )
-        .limit(1)
-    )
+    }
     frozen = session.scalar(
         select(DiscoveryInputSnapshot).where(
             DiscoveryInputSnapshot.run_id == run.id,
@@ -1352,7 +1352,7 @@ def _discovery_research_name(
     if (
         final_result is None
         or decision is None
-        or evidence is None
+        or code not in eligible_codes
         or frozen is None
     ):
         return None
@@ -1608,6 +1608,163 @@ def _effective_competition_rows(
     return [(row, overrides.get(row.code)) for row in rows]
 
 
+def _researchable_competition_entrants(
+    session: Session, competition: DiscoveryStage
+) -> list[DiscoveryResult]:
+    """Return effective pass rows backed by an exact reliable evidence card."""
+
+    evidence_by_code: dict[str, list[DiscoveryEvidence]] = {}
+    for item in session.scalars(
+        select(DiscoveryEvidence)
+        .where(
+            DiscoveryEvidence.run_id == competition.run_id,
+            DiscoveryEvidence.track == competition.track,
+            DiscoveryEvidence.stage == "competition",
+            DiscoveryEvidence.competition_stage_id == competition.id,
+            DiscoveryEvidence.competition_attempt == competition.attempt,
+        )
+        .order_by(
+            DiscoveryEvidence.code,
+            DiscoveryEvidence.kind,
+            DiscoveryEvidence.rule_id,
+            DiscoveryEvidence.id,
+        )
+    ):
+        evidence_by_code.setdefault(item.code, []).append(item)
+    source_dates_by_code: dict[str, Mapping[str, object]] = {}
+    for snapshot in session.scalars(
+        select(DiscoveryInputSnapshot).where(
+            DiscoveryInputSnapshot.run_id == competition.run_id,
+            DiscoveryInputSnapshot.code.in_(evidence_by_code),
+        )
+    ):
+        try:
+            source_dates = _persisted_json(snapshot.as_of_json)
+        except CorruptDiscoveryResult:
+            continue
+        if type(source_dates) is dict:
+            source_dates_by_code[snapshot.code] = source_dates
+
+    valid_codes: set[str] = set()
+    for code, items in evidence_by_code.items():
+        source_dates = source_dates_by_code.get(code, {})
+        identities = {(item.kind, item.rule_id) for item in items}
+        facts = [item for item in items if item.kind == "fact"]
+        risks = [item for item in items if item.kind == "risk"]
+        fallback = [
+            item
+            for item in risks
+            if item.rule_id == f"{competition.track}.risk.none"
+        ]
+        valid = (
+            len(identities) == len(items)
+            and 3 <= len(facts) <= 5
+            and bool(risks)
+            and (not fallback or len(risks) == 1)
+        )
+        for item in items:
+            try:
+                input_fields = _persisted_json(item.input_fields_json)
+                date.fromisoformat(item.as_of)
+            except (CorruptDiscoveryResult, TypeError, ValueError):
+                valid = False
+                continue
+            prefix = f"{competition.track}.{item.kind}."
+            source = (
+                input_fields.get("source")
+                if type(input_fields) is dict
+                else None
+            )
+            source_names = (
+                input_fields.get("sources")
+                if type(input_fields) is dict
+                else None
+            )
+            source_bundle = (
+                input_fields.get("source_as_of")
+                if type(input_fields) is dict
+                else None
+            )
+            exact_source = (
+                type(source) is str
+                and source_dates.get(source) == item.as_of
+            )
+            exact_bundle = (
+                type(source_bundle) is dict
+                and bool(source_bundle)
+                and all(
+                    type(name) is str
+                    and type(value) is str
+                    and source_dates.get(name) == value
+                    for name, value in source_bundle.items()
+                )
+                and (
+                    item.rule_id == f"{competition.track}.risk.none"
+                    or (
+                        source is None
+                        and type(source_names) is list
+                        and source_names == list(source_bundle)
+                    )
+                )
+                and item.as_of == min(source_bundle.values())
+            )
+            valid = valid and (
+                item.ruler_version_id == competition.ruler_version_id
+                and item.rule_version == EVIDENCE_RULE_VERSION
+                and item.kind in {"fact", "risk"}
+                and item.rule_id.startswith(prefix)
+                and type(input_fields) is dict
+                and bool(input_fields)
+                and type(item.display_text) is str
+                and bool(item.display_text.strip())
+                and (exact_source or exact_bundle)
+                and item.data_completeness in {"complete", "partial"}
+                and (
+                    item.kind != "fact"
+                    or item.data_completeness == "complete"
+                )
+            )
+            if item.kind == "risk":
+                category = item.rule_id.removeprefix(prefix).split(".", 1)[0]
+                valid = valid and (
+                    category == "none"
+                    or category in ALLOWED_RISK_CATEGORIES
+                )
+                if category == "none":
+                    valid = (
+                        valid
+                        and item.rule_id
+                        == f"{competition.track}.risk.none"
+                        and item.display_text == FALLBACK_RISK_TEXT
+                    )
+        if valid:
+            valid_codes.add(code)
+
+    return [
+        row
+        for row, override in _effective_competition_rows(
+            session, competition
+        )
+        if (
+            row.verdict
+            if override is None
+            else ("pass" if override.action == "forced_pass" else "drop")
+        )
+        == "pass"
+        and row.reason != "evidence_facts_insufficient"
+        and row.code in valid_codes
+    ]
+
+
+def _evidence_insufficient_rejection() -> JSONResponse:
+    return _error(
+        409,
+        error="候选证据不足",
+        code="DISCOVERY_EVIDENCE_INSUFFICIENT",
+        detail="有效入围公司必须具有 3–5 条可靠事实及至少一条风险证据",
+    )
+
+
 def _confirm_common(
     app,
     session: Session,
@@ -1816,7 +1973,7 @@ def _confirm_track(
             session.rollback()
             return False, _lineage_rejection(current)
         assert isinstance(parent, DiscoveryStage)
-        entrants = [
+        effective_entrants = [
             row
             for row, override in _effective_competition_rows(session, parent)
             if (
@@ -1826,6 +1983,18 @@ def _confirm_track(
             )
             == "pass"
         ]
+        entrants = _researchable_competition_entrants(session, parent)
+        if {row.code for row in entrants} != {
+            row.code for row in effective_entrants
+        }:
+            release(
+                session,
+                run.id,
+                JOB_TYPE_DISCOVERY,
+                owner_token=owner_token,
+            )
+            session.commit()
+            return False, _evidence_insufficient_rejection()
         decisions = session.scalars(
             select(DiscoveryDecision)
             .where(
@@ -2003,6 +2172,38 @@ def _confirm_track(
     if stale is not None:
         session.rollback()
         return False, stale
+    if stage == "competition":
+        effective_codes = {
+            row.code
+            for row, override in _effective_competition_rows(
+                session, current
+            )
+            if (
+                row.verdict
+                if override is None
+                else (
+                    "pass"
+                    if override.action == "forced_pass"
+                    else "drop"
+                )
+            )
+            == "pass"
+        }
+        eligible_codes = {
+            row.code
+            for row in _researchable_competition_entrants(
+                session, current
+            )
+        }
+        if eligible_codes != effective_codes:
+            release(
+                session,
+                run.id,
+                JOB_TYPE_DISCOVERY,
+                owner_token=owner_token,
+            )
+            session.commit()
+            return False, _evidence_insufficient_rejection()
     expected_updated_at = current.updated_at
     result = session.execute(
         update(DiscoveryStage)
@@ -3831,19 +4032,9 @@ def create_discovery_router() -> APIRouter:
                 )
             entrants = {
                 row.code
-                for row, override in _effective_competition_rows(
+                for row in _researchable_competition_entrants(
                     session, parent
                 )
-                if (
-                    row.verdict
-                    if override is None
-                    else (
-                        "pass"
-                        if override.action == "forced_pass"
-                        else "drop"
-                    )
-                )
-                == "pass"
             }
             if code not in entrants:
                 session.rollback()

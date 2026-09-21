@@ -217,7 +217,7 @@ def test_discovery_view_renders_actionable_case_cards() -> None:
     assert "尚无结构化反方证据" in page
     assert 'v-for="caseItem in adjudicationCases(view)"' in page
     assert 'name="exclusion_reason"' in page
-    assert "exclusionReason(caseItem.code).trim()" in page
+    assert "exclusionReason(caseItem).trim()" in page
     assert "/decisions" in page
     assert "/research" in page
     assert "stageExpectation(validated.identity)" in page
@@ -226,3 +226,25 @@ def test_discovery_view_renders_actionable_case_cards() -> None:
     assert "router.push(`/research/${data.id}`)" in page
     assert "买入" not in page
     assert "卖出" not in page
+
+
+def test_candidate_cards_fail_closed_with_retry_and_scoped_drafts() -> None:
+    page = (ROOT / "web/src/views/DiscoveryView.vue").read_text(
+        encoding="utf-8"
+    )
+
+    loader = page[
+        page.index("async function loadAdjudicationPayload(") :
+        page.index("async function loadAdjudicationPayloads(")
+    ]
+    assert "delete nextPayloads[track]" in loader
+    assert "response.ok" in loader
+    assert "候选案例数据无效" in loader
+    assert "候选案例读取超时" in loader
+    assert "kind: 'error'" in loader
+    assert "@click=\"retryAdjudicationPayload(view)\"" in page
+    assert "候选案例不可用于裁决" in page
+    assert "draftKey(caseItem)" in page
+    assert "`${item.track}:${item.code}`" in page
+    assert "change.classifications" in page
+    assert "weeklyChangeText(view, caseItem)" in page

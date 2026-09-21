@@ -52,20 +52,36 @@ export interface ParsedDiscoveryEvidence {
   competition_stage_id: number
   competition_attempt: number
   code: string
-  kind: string
+  ruler_version_id: number
+  rule_version: 'deterministic-evidence-v2'
+  kind: 'fact' | 'risk'
   rule_id: string
+  input_fields: Record<string, unknown>
   display_text: string
   as_of: string
-  data_completeness: string
+  data_completeness: 'complete' | 'partial'
 }
 
 export interface ParsedDiscoveryChange {
   code: string
-  classification: string
-  membership: string
-  cause: string | null
+  classification: DiscoveryChangeClassification
+  classifications: DiscoveryChangeClassification[]
+  membership: DiscoveryMembership
+  cause: DiscoveryChangeCause
   reason_changed: boolean
 }
+
+type DiscoveryMembership = 'new' | 'dropped' | 'reentered' | 'continuous'
+type DiscoveryChangeCause =
+  | 'data_changed'
+  | 'rule_changed'
+  | 'both_changed'
+  | 'decision_changed'
+  | null
+type DiscoveryChangeClassification =
+  | DiscoveryMembership
+  | Exclude<DiscoveryChangeCause, null>
+  | 'reason_changed'
 
 interface ParsedDistribution {
   status: 'available' | 'unavailable'
@@ -81,6 +97,8 @@ interface ParsedDistribution {
 export interface ParsedStageResponse {
   current: {
     id: number
+    track: DiscoveryTrack | null
+    stage: DiscoveryStageName
     attempt: number
     status: DiscoveryStageStatus
     error: string | null
@@ -142,6 +160,26 @@ const TRACK_STAGES: readonly DiscoveryTrackStage[] = [
   'competition',
   'adjudication',
 ]
+const CHANGE_MEMBERSHIPS: readonly DiscoveryMembership[] = [
+  'new',
+  'dropped',
+  'reentered',
+  'continuous',
+]
+const CHANGE_CAUSES: readonly Exclude<DiscoveryChangeCause, null>[] = [
+  'data_changed',
+  'rule_changed',
+  'both_changed',
+  'decision_changed',
+]
+const EVIDENCE_RULE_VERSION = 'deterministic-evidence-v2'
+const FALLBACK_RISK_TEXT = '尚无结构化反方证据'
+const RISK_CATEGORIES = new Set([
+  'metric_near_threshold',
+  'worsening_trend',
+  'sector_specific_risk',
+  'missing_non_gating_evidence',
+])
 // Mirrors SUMMARY_* limits in discovery/summaries.py; 128 is the ruler's
 // documented observation ceiling (for example MAX_FINANCIAL_ROWS).
 export const RESULT_MAX_ROWS = 20_000
@@ -469,20 +507,44 @@ function parseDecision(value: unknown): ParsedDiscoveryDecision | null {
 }
 
 function parseEvidence(value: unknown): ParsedDiscoveryEvidence | null {
+  if (!isRecord(value)) return null
+  const riskPrefix = `${String(value.track)}.risk.`
+  const riskCategory = typeof value.rule_id === 'string' && value.rule_id.startsWith(riskPrefix)
+    ? value.rule_id.slice(riskPrefix.length).split('.', 1)[0] ?? ''
+    : ''
   if (
-    !isRecord(value)
-    || nonNegativeInteger(value.id) === null
+    nonNegativeInteger(value.id) === null
     || !isTrack(value.track)
     || nonNegativeInteger(value.competition_stage_id) === null
     || nonNegativeInteger(value.competition_attempt) === null
     || typeof value.code !== 'string'
     || !value.code
-    || typeof value.kind !== 'string'
-    || !value.kind
+    || nonNegativeInteger(value.ruler_version_id) === null
+    || value.rule_version !== EVIDENCE_RULE_VERSION
+    || (value.kind !== 'fact' && value.kind !== 'risk')
     || typeof value.rule_id !== 'string'
+    || !value.rule_id.startsWith(`${value.track}.${value.kind}.`)
+    || !isRecord(value.input_fields)
+    || !Object.keys(value.input_fields).length
     || typeof value.display_text !== 'string'
+    || !value.display_text.trim()
     || typeof value.as_of !== 'string'
-    || typeof value.data_completeness !== 'string'
+    || !isIsoDate(value.as_of)
+    || (value.data_completeness !== 'complete' && value.data_completeness !== 'partial')
+    || (value.kind === 'fact' && value.data_completeness !== 'complete')
+    || (
+      value.kind === 'risk'
+      && (
+        (riskCategory !== 'none' && !RISK_CATEGORIES.has(riskCategory))
+        || (
+          riskCategory === 'none'
+          && (
+            value.rule_id !== `${value.track}.risk.none`
+            || value.display_text !== FALLBACK_RISK_TEXT
+          )
+        )
+      )
+    )
   ) return null
   return value as unknown as ParsedDiscoveryEvidence
 }
@@ -493,17 +555,41 @@ function parseChange(value: unknown): ParsedDiscoveryChange | null {
     || typeof value.code !== 'string'
     || !value.code
     || typeof value.classification !== 'string'
-    || typeof value.membership !== 'string'
-    || (value.cause !== null && typeof value.cause !== 'string')
+    || !CHANGE_MEMBERSHIPS.includes(value.membership as DiscoveryMembership)
+    || (
+      value.cause !== null
+      && !CHANGE_CAUSES.includes(value.cause as Exclude<DiscoveryChangeCause, null>)
+    )
     || typeof value.reason_changed !== 'boolean'
+    || !Array.isArray(value.classifications)
+  ) return null
+  const expected: DiscoveryChangeClassification[] = [
+    value.membership as DiscoveryMembership,
+    ...(value.reason_changed ? ['reason_changed' as const] : []),
+    ...(value.cause === null ? [] : [value.cause as Exclude<DiscoveryChangeCause, null>]),
+  ]
+  if (
+    value.classifications.length !== expected.length
+    || value.classifications.some((item, index) => item !== expected[index])
+    || value.classification !== (
+      value.cause ?? (value.reason_changed ? 'reason_changed' : value.membership)
+    )
   ) return null
   return {
     code: value.code,
-    classification: value.classification,
-    membership: value.membership,
-    cause: value.cause,
+    classification: value.classification as DiscoveryChangeClassification,
+    classifications: expected,
+    membership: value.membership as DiscoveryMembership,
+    cause: value.cause as DiscoveryChangeCause,
     reason_changed: value.reason_changed,
   }
+}
+
+function isIsoDate(value: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false
+  const timestamp = Date.parse(`${value}T00:00:00Z`)
+  return Number.isFinite(timestamp)
+    && new Date(timestamp).toISOString().slice(0, 10) === value
 }
 
 function parseSummary(value: unknown): ParsedStageResponse['summary'] | null {
@@ -581,6 +667,22 @@ export function parseStageResponse(value: unknown): ParsedStageResponse | null {
   if (!isRecord(value) || !isRecord(value.current) || !isStageStatus(value.current.status)) {
     return null
   }
+  const stage = value.current.stage
+  const track = value.current.track
+  if (
+    (stage !== 'safety' && !isTrackStage(stage))
+    || (stage === 'safety' && track !== undefined && track !== null)
+    || (stage !== 'safety' && !isTrack(track))
+  ) return null
+  const requiresCardArrays = stage === 'competition' || stage === 'adjudication'
+  if (
+    requiresCardArrays
+    && (
+      !Array.isArray(value.decisions)
+      || !Array.isArray(value.evidence)
+      || !Array.isArray(value.changes)
+    )
+  ) return null
   if (
     nonNegativeInteger(value.current.id) === null
     || typeof value.current.input_fingerprint !== 'string'
@@ -613,6 +715,8 @@ export function parseStageResponse(value: unknown): ParsedStageResponse | null {
   return {
     current: {
       id: value.current.id as number,
+      track: stage === 'safety' ? null : track as DiscoveryTrack,
+      stage,
       attempt: nonNegativeInteger(value.current.attempt) ?? 0,
       status: value.current.status,
       error: textOrNull(value.current.error),
@@ -634,4 +738,37 @@ export function parseStageResponse(value: unknown): ParsedStageResponse | null {
     changes: changes as ParsedDiscoveryChange[],
     summary,
   }
+}
+
+export function validateCandidateEvidence(
+  payload: ParsedStageResponse,
+): { valid: boolean; message: string } {
+  if (payload.current.stage !== 'competition') {
+    return { valid: false, message: '候选案例必须来自候选竞争阶段' }
+  }
+  for (const row of payload.pass) {
+    const items = payload.evidence.filter(
+      (item) => item.code === row.code
+        && item.track === payload.current.track
+        && item.competition_stage_id === payload.current.id
+        && item.competition_attempt === payload.current.attempt
+        && item.ruler_version_id === payload.current.ruler_version_id,
+    )
+    const facts = items.filter((item) => item.kind === 'fact')
+    const risks = items.filter((item) => item.kind === 'risk')
+    const identities = new Set(items.map((item) => `${item.kind}:${item.rule_id}`))
+    if (
+      row.reason === 'evidence_facts_insufficient'
+      || facts.length < 3
+      || facts.length > 5
+      || risks.length < 1
+      || identities.size !== items.length
+    ) {
+      return {
+        valid: false,
+        message: `${row.name} 缺少 3–5 条可靠事实或有效风险证据`,
+      }
+    }
+  }
+  return { valid: true, message: '' }
 }

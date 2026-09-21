@@ -1,3 +1,7 @@
+import json
+import subprocess
+from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -227,6 +231,155 @@ def _stage_expectation(payload: dict[str, object]) -> dict[str, object]:
         "expected_stage_revision": current["stage_revision"],
         "expected_mutation_version": current["mutation_version"],
     }
+
+
+def test_competition_route_payload_matches_ui_parser(tmp_path) -> None:
+    from fastapi.testclient import TestClient
+
+    app = _workflow_app(tmp_path)
+    with TestClient(app) as client:
+        run_id = _advance_to_competition(client)
+        payload = client.get(
+            f"/api/discoveries/{run_id}/tracks/garp/stages/competition"
+        ).json()
+
+    parser = (
+        Path(__file__).resolve().parents[1]
+        / "web/src/views/__tests__/parseStagePayload.ts"
+    )
+    parsed = subprocess.run(
+        ["node", "--experimental-strip-types", str(parser)],
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert parsed.returncode == 0, parsed.stderr
+
+
+def test_forced_pass_cannot_promote_insufficient_evidence_to_adjudication(
+    tmp_path,
+) -> None:
+    from fastapi.testclient import TestClient
+
+    from jobs.discovery import TrackExecutionOutcome
+
+    app = _workflow_app(tmp_path)
+    with TestClient(app) as client:
+        original = app.state.discovery_track_executor
+
+        def adversarial(context):
+            outcome = original(context)
+            if context.track != "garp" or context.stage != "competition":
+                return outcome
+            code = context.candidate_codes[0]
+            results = tuple(
+                replace(
+                    row,
+                    verdict="insufficient",
+                    reason="evidence_facts_insufficient",
+                )
+                if row.code == code
+                else row
+                for row in outcome.results
+            )
+            evidence = tuple(
+                row
+                for row in outcome.evidence
+                if row.code != code
+                or row.kind == "risk"
+                or row.rule_id.endswith("fixture_1")
+            )
+            return TrackExecutionOutcome(
+                status=outcome.status,
+                results=results,
+                evidence=evidence,
+            )
+
+        app.state.discovery_track_executor = adversarial
+        run_id = _advance_to_competition(client)
+        path = (
+            f"/api/discoveries/{run_id}/tracks/garp/stages/competition"
+        )
+        reviewed = client.get(path).json()
+        code = reviewed["insufficient"][0]["code"]
+        override = client.post(
+            f"/api/discoveries/{run_id}/overrides",
+            json={
+                "track": "garp",
+                "stage": "competition",
+                "attempt": reviewed["current"]["attempt"],
+                **_stage_expectation(reviewed),
+                "code": code,
+                "action": "forced_pass",
+                "reason": "不得绕过证据门槛",
+            },
+        )
+        assert override.status_code == 200
+        refreshed = client.get(path).json()
+        rejected = client.post(
+            f"{path}/confirm",
+            json={"sync": True, **_stage_expectation(refreshed)},
+        )
+
+        assert rejected.status_code == 409
+        assert rejected.json()["code"] == "DISCOVERY_EVIDENCE_INSUFFICIENT"
+        assert client.get(
+            f"/api/discoveries/{run_id}/tracks/garp/stages/adjudication"
+        ).status_code == 404
+
+
+def test_adjudication_finalization_rechecks_exact_evidence_cards(
+    tmp_path,
+) -> None:
+    from fastapi.testclient import TestClient
+    from sqlalchemy import select
+
+    from app.discovery_models import DiscoveryEvidence
+
+    app = _workflow_app(tmp_path)
+    with TestClient(app) as client:
+        run_id = _advance_to_competition(client)
+        assert client.post(
+            f"/api/discoveries/{run_id}/tracks/garp"
+            "/stages/competition/confirm",
+            json={"sync": True},
+        ).status_code == 200
+        for index in range(6):
+            assert client.post(
+                f"/api/discoveries/{run_id}/decisions",
+                json={
+                    "track": "garp",
+                    "code": f"60000{index}.SH",
+                    "decision": "keep" if index < 3 else "exclude",
+                    "reason": "排除" if index >= 3 else None,
+                },
+            ).status_code == 200
+        with app.state.session_factory() as session:
+            fact = session.scalar(
+                select(DiscoveryEvidence)
+                .where(
+                    DiscoveryEvidence.run_id == run_id,
+                    DiscoveryEvidence.track == "garp",
+                    DiscoveryEvidence.code == "600000.SH",
+                    DiscoveryEvidence.kind == "fact",
+                )
+                .limit(1)
+            )
+            assert fact is not None
+            session.delete(fact)
+            session.commit()
+        adjudication = client.get(
+            f"/api/discoveries/{run_id}/tracks/garp"
+            "/stages/adjudication"
+        ).json()
+        rejected = client.post(
+            f"/api/discoveries/{run_id}/tracks/garp"
+            "/stages/adjudication/confirm",
+            json=_stage_expectation(adjudication),
+        )
+        assert rejected.status_code == 409
+        assert rejected.json()["code"] == "DISCOVERY_EVIDENCE_INSUFFICIENT"
 
 
 def test_override_between_review_and_confirm_rejects_stale_session(

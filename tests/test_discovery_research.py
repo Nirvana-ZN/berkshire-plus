@@ -34,6 +34,7 @@ from app.models import (
     Watchlist,
 )
 from discovery.constants import china_week_key
+from discovery.evidence import EVIDENCE_RULE_VERSION, FALLBACK_RISK_TEXT
 from jobs.lock import (
     JOB_TYPE_FUNNEL,
     JOB_TYPE_RESEARCH,
@@ -129,7 +130,11 @@ def _seed_finalists(
                         security_status="trading",
                         fields_json="{}",
                         sources_json="{}",
-                        as_of_json="{}",
+                        as_of_json=(
+                            '{"financial":"2026-09-17",'
+                            '"security":"2026-09-17",'
+                            '"valuation":"2026-09-17"}'
+                        ),
                         data_version=run.data_version,
                         financial_version=run.financial_version,
                         valuation_version=run.valuation_version,
@@ -256,7 +261,7 @@ def _seed_finalists(
                 ]
             )
             if evidence:
-                session.add(
+                session.add_all(
                     DiscoveryEvidence(
                         run_id=run.id,
                         track=track,
@@ -265,15 +270,24 @@ def _seed_finalists(
                         stage="competition",
                         code=code,
                         ruler_version_id=ruler_id,
-                        rule_version="rules-v1",
-                        kind="evidence",
-                        rule_id="final",
-                        input_fields_json="{}",
-                        display_text="persisted evidence",
+                        rule_version=EVIDENCE_RULE_VERSION,
+                        kind="risk" if index == 3 else "fact",
+                        rule_id=(
+                            f"{track}.risk.none"
+                            if index == 3
+                            else f"{track}.fact.fixture_{index}"
+                        ),
+                        input_fields_json='{"source":"financial"}',
+                        display_text=(
+                            FALLBACK_RISK_TEXT
+                            if index == 3
+                            else f"persisted evidence {index}"
+                        ),
                         as_of="2026-09-17",
                         data_completeness="complete",
                         created_at=NOW,
                     )
+                    for index in range(4)
                 )
     session.commit()
 
@@ -423,6 +437,37 @@ def test_created_job_has_provenance_and_does_not_add_watchlist(
                 job.code,
             ) == (run_id, "quality_discount", "600519.SH")
             assert session.scalar(select(func.count()).select_from(Watchlist)) == 0
+
+
+def test_research_rejects_finalist_with_incomplete_evidence_card(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        discovery_routes,
+        "_dispatch_discovery_research",
+        _finish_dispatch,
+    )
+    app = _app(tmp_path)
+    with TestClient(app) as client:
+        with app.state.session_factory() as session:
+            run = _run(session)
+            _seed_finalists(session, run, {"garp": ["600000.SH"]})
+            fact = session.scalar(
+                select(DiscoveryEvidence)
+                .where(
+                    DiscoveryEvidence.run_id == run.id,
+                    DiscoveryEvidence.kind == "fact",
+                )
+                .limit(1)
+            )
+            assert fact is not None
+            session.delete(fact)
+            session.commit()
+            run_id = run.id
+
+        rejected = _post(client, run_id, "garp", "600000.SH")
+        assert rejected.status_code == 409
+        assert rejected.json()["code"] == "DISCOVERY_CANDIDATE_NOT_RESEARCHABLE"
 
 
 def test_same_run_code_is_idempotent_across_tracks(

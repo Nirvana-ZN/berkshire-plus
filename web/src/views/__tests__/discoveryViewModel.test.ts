@@ -20,6 +20,7 @@ import {
   sameStageReview,
   STAGE_FETCH_TIMEOUT_MS,
   shouldPollStage,
+  validateCandidateEvidence,
 } from '../discoveryViewModel.ts'
 
 test('stage cache keys include run, track, and stage', () => {
@@ -144,6 +145,7 @@ function stagePayload(metrics: unknown) {
   return {
     current: {
       id: 42,
+      stage: 'safety',
       attempt: 1,
       status: 'waiting_confirmation',
       error: null,
@@ -173,6 +175,96 @@ function stagePayload(metrics: unknown) {
     },
   }
 }
+
+function competitionPayload() {
+  const payload = stagePayload({})
+  payload.current = {
+    ...payload.current,
+    stage: 'competition',
+    track: 'garp',
+    ruler_version_id: 5,
+  }
+  return {
+    ...payload,
+    decisions: [],
+    evidence: [
+      ...Array.from({ length: 3 }, (_, index) => ({
+        id: index + 1,
+        track: 'garp',
+        competition_stage_id: 42,
+        competition_attempt: 1,
+        code: '000001',
+        ruler_version_id: 5,
+        rule_version: 'deterministic-evidence-v2',
+        kind: 'fact',
+        rule_id: `garp.fact.fixture_${index}`,
+        input_fields: { source: 'financial' },
+        display_text: `fact ${index}`,
+        as_of: '2026-09-17',
+        data_completeness: 'complete',
+      })),
+      {
+        id: 4,
+        track: 'garp',
+        competition_stage_id: 42,
+        competition_attempt: 1,
+        code: '000001',
+        ruler_version_id: 5,
+        rule_version: 'deterministic-evidence-v2',
+        kind: 'risk',
+        rule_id: 'garp.risk.none',
+        input_fields: { source_as_of: { financial: '2026-09-17' } },
+        display_text: '尚无结构化反方证据',
+        as_of: '2026-09-17',
+        data_completeness: 'complete',
+      },
+    ],
+    changes: [] as unknown[],
+  }
+}
+
+test('competition schema requires exact card arrays and reliable evidence', () => {
+  const payload = competitionPayload()
+  payload.changes = [{
+    code: '000001',
+    classification: 'both_changed',
+    classifications: ['continuous', 'reason_changed', 'both_changed'],
+    membership: 'continuous',
+    cause: 'both_changed',
+    reason_changed: true,
+  }]
+  const valid = parseStageResponse(payload)
+  assert.ok(valid)
+  assert.equal(validateCandidateEvidence(valid).valid, true)
+  assert.deepEqual(valid.changes[0]!.classifications, [
+    'continuous',
+    'reason_changed',
+    'both_changed',
+  ])
+
+  for (const key of ['decisions', 'evidence', 'changes'] as const) {
+    const malformed = competitionPayload()
+    delete (malformed as Record<string, unknown>)[key]
+    assert.equal(parseStageResponse(malformed), null)
+  }
+
+  const tooFewFacts = competitionPayload()
+  tooFewFacts.evidence.splice(0, 1)
+  const parsed = parseStageResponse(tooFewFacts)
+  assert.ok(parsed)
+  assert.equal(validateCandidateEvidence(parsed).valid, false)
+
+  const unknownChange = competitionPayload()
+  unknownChange.changes = [{
+    code: '000001',
+    classification: 'entered',
+    classifications: ['entered'],
+    membership: 'entered',
+    cause: null,
+    reason_changed: false,
+  }]
+  assert.equal(parseStageResponse(unknownChange), null)
+})
 
 test('one invalid metric row stays visible with an explicit unavailable reason', () => {
   const parsed = parseStageResponse(stagePayload({
