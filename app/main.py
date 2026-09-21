@@ -541,6 +541,8 @@ def _artifact_payload(session, job: ResearchJob) -> dict[str, object]:
         "status": job.status,
         "error": job.error,
         "screen_id": job.screen_run_id,
+        "discovery_run_id": job.discovery_run_id,
+        "discovery_track": job.discovery_track,
         "structured": structured,
         "markdown": markdown,
         "report_path": report_path,

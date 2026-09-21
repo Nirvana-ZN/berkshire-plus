@@ -35,6 +35,38 @@ export interface ParsedDiscoveryRow {
   override: ParsedDiscoveryOverride | null
 }
 
+export interface ParsedDiscoveryDecision {
+  id: number
+  track: DiscoveryTrack
+  competition_stage_id: number
+  competition_attempt: number
+  code: string
+  decision: 'keep' | 'exclude'
+  exclusion_reason: string | null
+  keep_note: string | null
+}
+
+export interface ParsedDiscoveryEvidence {
+  id: number
+  track: DiscoveryTrack
+  competition_stage_id: number
+  competition_attempt: number
+  code: string
+  kind: string
+  rule_id: string
+  display_text: string
+  as_of: string
+  data_completeness: string
+}
+
+export interface ParsedDiscoveryChange {
+  code: string
+  classification: string
+  membership: string
+  cause: string | null
+  reason_changed: boolean
+}
+
 interface ParsedDistribution {
   status: 'available' | 'unavailable'
   reason?: string
@@ -62,6 +94,9 @@ export interface ParsedStageResponse {
   drop: ParsedDiscoveryRow[]
   insufficient: ParsedDiscoveryRow[]
   overrides: ParsedDiscoveryOverride[]
+  decisions: ParsedDiscoveryDecision[]
+  evidence: ParsedDiscoveryEvidence[]
+  changes: ParsedDiscoveryChange[]
   summary: {
     schema_version: string
     rules: { id: string; text: string }[]
@@ -417,6 +452,60 @@ function parseRows(value: unknown): ParsedDiscoveryRow[] | null {
   return rows.some((row) => row === null) ? null : rows as ParsedDiscoveryRow[]
 }
 
+function parseDecision(value: unknown): ParsedDiscoveryDecision | null {
+  if (
+    !isRecord(value)
+    || nonNegativeInteger(value.id) === null
+    || !isTrack(value.track)
+    || nonNegativeInteger(value.competition_stage_id) === null
+    || nonNegativeInteger(value.competition_attempt) === null
+    || typeof value.code !== 'string'
+    || !value.code
+    || (value.decision !== 'keep' && value.decision !== 'exclude')
+    || (value.exclusion_reason !== null && typeof value.exclusion_reason !== 'string')
+    || (value.keep_note !== null && typeof value.keep_note !== 'string')
+  ) return null
+  return value as unknown as ParsedDiscoveryDecision
+}
+
+function parseEvidence(value: unknown): ParsedDiscoveryEvidence | null {
+  if (
+    !isRecord(value)
+    || nonNegativeInteger(value.id) === null
+    || !isTrack(value.track)
+    || nonNegativeInteger(value.competition_stage_id) === null
+    || nonNegativeInteger(value.competition_attempt) === null
+    || typeof value.code !== 'string'
+    || !value.code
+    || typeof value.kind !== 'string'
+    || !value.kind
+    || typeof value.rule_id !== 'string'
+    || typeof value.display_text !== 'string'
+    || typeof value.as_of !== 'string'
+    || typeof value.data_completeness !== 'string'
+  ) return null
+  return value as unknown as ParsedDiscoveryEvidence
+}
+
+function parseChange(value: unknown): ParsedDiscoveryChange | null {
+  if (
+    !isRecord(value)
+    || typeof value.code !== 'string'
+    || !value.code
+    || typeof value.classification !== 'string'
+    || typeof value.membership !== 'string'
+    || (value.cause !== null && typeof value.cause !== 'string')
+    || typeof value.reason_changed !== 'boolean'
+  ) return null
+  return {
+    code: value.code,
+    classification: value.classification,
+    membership: value.membership,
+    cause: value.cause,
+    reason_changed: value.reason_changed,
+  }
+}
+
 function parseSummary(value: unknown): ParsedStageResponse['summary'] | null {
   if (!isRecord(value) || !Array.isArray(value.rules) || !isRecord(value.ruler)
     || !isRecord(value.counts) || !isRecord(value.distributions)
@@ -512,7 +601,15 @@ export function parseStageResponse(value: unknown): ParsedStageResponse | null {
   const summary = parseSummary(value.summary)
   if (passed === null || dropped === null || insufficient === null || summary === null) return null
   const overrides = Array.isArray(value.overrides) ? value.overrides.map(parseOverride) : []
-  if (overrides.some((item) => item === null)) return null
+  const decisions = Array.isArray(value.decisions) ? value.decisions.map(parseDecision) : []
+  const evidence = Array.isArray(value.evidence) ? value.evidence.map(parseEvidence) : []
+  const changes = Array.isArray(value.changes) ? value.changes.map(parseChange) : []
+  if (
+    overrides.some((item) => item === null)
+    || decisions.some((item) => item === null)
+    || evidence.some((item) => item === null)
+    || changes.some((item) => item === null)
+  ) return null
   return {
     current: {
       id: value.current.id as number,
@@ -532,6 +629,9 @@ export function parseStageResponse(value: unknown): ParsedStageResponse | null {
     drop: dropped,
     insufficient,
     overrides: overrides as ParsedDiscoveryOverride[],
+    decisions: decisions as ParsedDiscoveryDecision[],
+    evidence: evidence as ParsedDiscoveryEvidence[],
+    changes: changes as ParsedDiscoveryChange[],
     summary,
   }
 }

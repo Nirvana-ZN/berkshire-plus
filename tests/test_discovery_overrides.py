@@ -966,6 +966,75 @@ def test_adjudication_keeper_bounds(
             assert stage["pass"] == []
 
 
+def test_decision_exact_revision_is_idempotent_and_rejects_stale_update(
+    tmp_path,
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    from fastapi.testclient import TestClient
+
+    app = _workflow_app(tmp_path)
+    with TestClient(app) as client:
+        run_id = _advance_to_competition(client)
+        assert client.post(
+            f"/api/discoveries/{run_id}/tracks/garp"
+            "/stages/competition/confirm",
+            json={"sync": True},
+        ).status_code == 200
+        path = (
+            f"/api/discoveries/{run_id}/tracks/garp"
+            "/stages/adjudication"
+        )
+        reviewed = client.get(path).json()
+        payload = {
+            "track": "garp",
+            "code": "600000.SH",
+            "decision": "keep",
+            **_stage_expectation(reviewed),
+        }
+        first = client.post(
+            f"/api/discoveries/{run_id}/decisions", json=payload
+        )
+        repeated = client.post(
+            f"/api/discoveries/{run_id}/decisions", json=payload
+        )
+        stale = client.post(
+            f"/api/discoveries/{run_id}/decisions",
+            json=payload | {
+                "decision": "exclude",
+                "reason": "旧页面改判",
+            },
+        )
+
+        assert first.status_code == repeated.status_code == 200
+        assert first.json()["id"] == repeated.json()["id"]
+        assert stale.status_code == 409
+        assert stale.json()["code"] == "DISCOVERY_STAGE_VERSION_MISMATCH"
+        assert (
+            client.get(path).json()["current"]["stage_revision"]
+            > reviewed["current"]["stage_revision"]
+        )
+        reviewed = client.get(path).json()
+        concurrent_payload = {
+            "track": "garp",
+            "code": "600001.SH",
+            "decision": "keep",
+            **_stage_expectation(reviewed),
+        }
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            responses = list(
+                pool.map(
+                    lambda _: client.post(
+                        f"/api/discoveries/{run_id}/decisions",
+                        json=concurrent_payload,
+                    ),
+                    range(2),
+                )
+            )
+        assert [response.status_code for response in responses] == [200, 200]
+        assert len({response.json()["id"] for response in responses}) == 1
+
+
 @pytest.mark.parametrize(
     ("keep_count", "expected_status"),
     [

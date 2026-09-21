@@ -3794,17 +3794,35 @@ def create_discovery_router() -> APIRouter:
             parent = _exact_parent(session, adjudication)
             if not isinstance(parent, DiscoveryStage):
                 return _lineage_rejection(adjudication)
-            changed = session.execute(
-                update(DiscoveryStage)
-                .where(
-                    DiscoveryStage.id == adjudication.id,
-                    DiscoveryStage.status == "waiting_confirmation",
-                    DiscoveryStage.superseded_at.is_(None),
-                )
-                .values(updated_at=DiscoveryStage.updated_at)
+            normalized_reason = (
+                reason.strip() if decision == "exclude" else None
             )
-            if int(changed.rowcount or 0) != 1:
-                session.rollback()
+            normalized_note = note if decision == "keep" else None
+            row = session.scalar(
+                select(DiscoveryDecision).where(
+                    DiscoveryDecision.run_id == run.id,
+                    DiscoveryDecision.track == track,
+                    DiscoveryDecision.competition_stage_id == parent.id,
+                    DiscoveryDecision.competition_attempt == parent.attempt,
+                    DiscoveryDecision.code == code,
+                )
+            )
+            if (
+                row is not None
+                and row.decision == decision
+                and row.exclusion_reason == normalized_reason
+                and row.keep_note == normalized_note
+            ):
+                return _decision_json(row)
+            stale = _stage_precondition_rejection(
+                session, payload, adjudication
+            )
+            if stale is not None:
+                return stale
+            if (
+                adjudication.status != "waiting_confirmation"
+                or adjudication.superseded_at is not None
+            ):
                 return _error(
                     409,
                     error="裁决不可编辑",
@@ -3836,6 +3854,7 @@ def create_discovery_router() -> APIRouter:
                     detail="代码不是冻结覆盖后的竞争阶段入围公司",
                 )
             parent_id = parent.id
+            adjudication_id = adjudication.id
             run, commit_at, rejection = _fresh_mutation_checkpoint(
                 request.app,
                 session,
@@ -3844,14 +3863,20 @@ def create_discovery_router() -> APIRouter:
             if rejection is not None:
                 return rejection
             assert run is not None
+            adjudication = session.get(DiscoveryStage, adjudication_id)
             parent = session.get(DiscoveryStage, parent_id)
-            if parent is None:
+            if adjudication is None or parent is None:
                 return _error(
                     409,
                     error="阶段谱系不可用",
                     code="invalid_predecessor",
                     detail="阶段缺少可验证的精确上游身份",
                 )
+            stale = _stage_precondition_rejection(
+                session, payload, adjudication
+            )
+            if stale is not None:
+                return stale
             row = session.scalar(
                 select(DiscoveryDecision).where(
                     DiscoveryDecision.run_id == run.id,
@@ -3861,6 +3886,56 @@ def create_discovery_router() -> APIRouter:
                     DiscoveryDecision.code == code,
                 )
             )
+            if (
+                row is not None
+                and row.decision == decision
+                and row.exclusion_reason == normalized_reason
+                and row.keep_note == normalized_note
+            ):
+                return _decision_json(row)
+            expected_updated_at = adjudication.updated_at
+            changed = session.execute(
+                update(DiscoveryStage)
+                .where(
+                    DiscoveryStage.id == adjudication.id,
+                    DiscoveryStage.updated_at == expected_updated_at,
+                    DiscoveryStage.status == "waiting_confirmation",
+                    DiscoveryStage.superseded_at.is_(None),
+                )
+                .values(
+                    updated_at=_next_stage_updated_at(
+                        adjudication, commit_at
+                    )
+                )
+            )
+            if int(changed.rowcount or 0) != 1:
+                session.rollback()
+                session.expire_all()
+                adjudication = session.get(
+                    DiscoveryStage, adjudication_id
+                )
+                row = session.scalar(
+                    select(DiscoveryDecision).where(
+                        DiscoveryDecision.run_id == run_id,
+                        DiscoveryDecision.track == track,
+                        DiscoveryDecision.competition_stage_id == parent_id,
+                        DiscoveryDecision.code == code,
+                    )
+                )
+                if (
+                    row is not None
+                    and row.decision == decision
+                    and row.exclusion_reason == normalized_reason
+                    and row.keep_note == normalized_note
+                ):
+                    return _decision_json(row)
+                if adjudication is not None:
+                    stale = _stage_precondition_rejection(
+                        session, payload, adjudication
+                    )
+                    if stale is not None:
+                        return stale
+                return _stage_claim_conflict()
             if row is None:
                 row = DiscoveryDecision(
                     run_id=run.id,
@@ -3870,19 +3945,15 @@ def create_discovery_router() -> APIRouter:
                     stage="competition",
                     code=code,
                     decision=decision,
-                    exclusion_reason=(
-                        reason.strip() if decision == "exclude" else None
-                    ),
-                    keep_note=note if decision == "keep" else None,
+                    exclusion_reason=normalized_reason,
+                    keep_note=normalized_note,
                     created_at=commit_at,
                 )
                 session.add(row)
             else:
                 row.decision = decision
-                row.exclusion_reason = (
-                    reason.strip() if decision == "exclude" else None
-                )
-                row.keep_note = note if decision == "keep" else None
+                row.exclusion_reason = normalized_reason
+                row.keep_note = normalized_note
                 row.created_at = commit_at
             session.commit()
             session.refresh(row)

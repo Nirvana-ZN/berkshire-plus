@@ -138,7 +138,7 @@ def test_discovery_view_requires_override_reason_and_terminal_guidance() -> None
     assert "Number.isFinite" in page
 
 
-def test_discovery_view_review_guards_and_read_only_adjudication() -> None:
+def test_discovery_view_review_guards_and_adjudication() -> None:
     page = (ROOT / "web/src/views/DiscoveryView.vue").read_text(
         encoding="utf-8"
     )
@@ -153,7 +153,6 @@ def test_discovery_view_review_guards_and_read_only_adjudication() -> None:
     assert "current.run.tracks" in page
     assert "transitionAnnouncement" in page
     assert 'aria-labelledby="`discovery-stage-' in page
-    assert "人工裁决将在 Task 4" in page
     assert "通过结果" in page
     assert "淘汰结果" in page
     assert "数据不足结果" in page
@@ -192,3 +191,38 @@ def test_discovery_view_review_guards_and_read_only_adjudication() -> None:
     resume = page[page.index("function endMutation") : page.index("async function postMutation")]
     assert resume.count("schedulePoll()") == 1
     assert resume.count("scheduleCurrentRefresh(") == 1
+
+
+def test_discovery_view_renders_actionable_case_cards() -> None:
+    page = (ROOT / "web/src/views/DiscoveryView.vue").read_text(
+        encoding="utf-8"
+    )
+
+    for label in (
+        "候选案例",
+        "入围原因",
+        "关键证据",
+        "风险与反方证据",
+        "数据缺口与新鲜度",
+        "本周变化",
+        "值得深研",
+        "观察",
+        "排除",
+        "保留为候选",
+        "加入本周深研",
+        "已保留",
+        "候选不足",
+    ):
+        assert label in page
+    assert "尚无结构化反方证据" in page
+    assert 'v-for="caseItem in adjudicationCases(view)"' in page
+    assert 'name="exclusion_reason"' in page
+    assert "exclusionReason(caseItem.code).trim()" in page
+    assert "/decisions" in page
+    assert "/research" in page
+    assert "stageExpectation(validated.identity)" in page
+    assert "keeperCount(view)" in page
+    assert "keeperCount(view) >= 3" in page
+    assert "router.push(`/research/${data.id}`)" in page
+    assert "买入" not in page
+    assert "卖出" not in page

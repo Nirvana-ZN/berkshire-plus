@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import {
   armFetchTimeout,
   armStageFetchTimeout,
@@ -23,6 +24,9 @@ import {
   type DiscoveryTrack,
   type DiscoveryTrackStage,
   type MetricValue,
+  type ParsedDiscoveryChange,
+  type ParsedDiscoveryDecision,
+  type ParsedDiscoveryEvidence,
   type StageReviewIdentity,
 } from './discoveryViewModel'
 
@@ -170,7 +174,20 @@ interface StageResponse {
   drop: DiscoveryRow[]
   insufficient: DiscoveryRow[]
   overrides: DiscoveryOverride[]
+  decisions: ParsedDiscoveryDecision[]
+  evidence: ParsedDiscoveryEvidence[]
+  changes: ParsedDiscoveryChange[]
   summary: StageSummary
+}
+
+interface AdjudicationCase {
+  code: string
+  name: string
+  surfacedReason: string
+  track: Track
+  evidence: ParsedDiscoveryEvidence[]
+  decision: ParsedDiscoveryDecision | null
+  change: ParsedDiscoveryChange | null
 }
 
 interface StageView {
@@ -237,7 +254,18 @@ const RESULT_GROUPS = [
 const CURRENT_REFRESH_MS = 60_000
 const CURRENT_RETRY_MS = 5_000
 const MUTATION_FETCH_TIMEOUT_MS = 10_000
+const CHANGE_ZH: Record<string, string> = {
+  entered: '本周新入围',
+  exited: '本周未入围',
+  continuous: '连续入围',
+  reason_changed: '入围原因变化',
+  data_changed: '数据变化',
+  rule_changed: '尺子变化',
+  both_changed: '数据与尺子同时变化',
+  decision_changed: '人工裁决变化',
+}
 
+const router = useRouter()
 const state = ref<ViewState>({ kind: 'loading' })
 const starting = ref(false)
 const mutating = ref(false)
@@ -261,6 +289,9 @@ const stageMetricKeysCache = ref<Record<string, string[]>>({})
 const stageFingerprintCache = ref<Record<string, string>>({})
 const stageReviewableCache = ref<Record<string, boolean>>({})
 const reviewedStages = ref<Record<string, StageReviewIdentity>>({})
+const adjudicationPayloads = ref<Partial<Record<Track, StageResponse>>>({})
+const exclusionReasons = ref<Record<string, string>>({})
+const researchingCode = ref('')
 const overrideCode = ref('')
 const overrideAction = ref<'forced_pass' | 'forced_drop'>('forced_pass')
 const overrideReason = ref('')
@@ -272,6 +303,8 @@ let currentController: AbortController | null = null
 let mutationRequestSequence = 0
 let mutationController: AbortController | null = null
 const stageControllers = new Map<string, AbortController>()
+const adjudicationControllers = new Map<Track, AbortController>()
+let adjudicationRequestSequence = 0
 
 const announcement = computed(() => {
   if (starting.value) return '正在创建本周发现…'
@@ -596,6 +629,12 @@ function abortStageRequests() {
   stageControllers.clear()
 }
 
+function abortAdjudicationRequests() {
+  adjudicationRequestSequence += 1
+  for (const controller of adjudicationControllers.values()) controller.abort()
+  adjudicationControllers.clear()
+}
+
 function beginMutation(): boolean {
   if (mutating.value) return false
   mutating.value = true
@@ -605,6 +644,7 @@ function beginMutation(): boolean {
   currentController?.abort()
   currentController = null
   abortStageRequests()
+  abortAdjudicationRequests()
   mutationRequestSequence += 1
   mutationController?.abort()
   mutationController = null
@@ -623,6 +663,7 @@ function endMutation() {
     void Promise.allSettled(
       stageViews.value.map((view) => loadStage(view, current.run.id)),
     )
+    void loadAdjudicationPayloads(current.run)
   }
 }
 
@@ -781,6 +822,53 @@ async function loadStage(
   }
 }
 
+async function loadAdjudicationPayload(track: Track, runId: number) {
+  adjudicationControllers.get(track)?.abort()
+  const requestSequence = adjudicationRequestSequence
+  const controller = new AbortController()
+  const cancelTimeout = armStageFetchTimeout(controller)
+  adjudicationControllers.set(track, controller)
+  try {
+    const response = await fetch(
+      `/api/discoveries/${runId}/tracks/${track}/stages/competition`,
+      { signal: controller.signal },
+    )
+    const body: unknown = await response.json()
+    if (
+      !mounted
+      || activeRunId.value !== runId
+      || requestSequence !== adjudicationRequestSequence
+      || !response.ok
+    ) return
+    const payload = parseStageResponse(body)
+    if (!payload) {
+      actionError.value = '服务返回的候选案例数据无效'
+      return
+    }
+    adjudicationPayloads.value = {
+      ...adjudicationPayloads.value,
+      [track]: payload,
+    }
+  } catch (error) {
+    if (!(error instanceof DOMException && error.name === 'AbortError')) {
+      actionError.value = '无法读取候选案例'
+    }
+  } finally {
+    cancelTimeout()
+    if (adjudicationControllers.get(track) === controller) {
+      adjudicationControllers.delete(track)
+    }
+  }
+}
+
+async function loadAdjudicationPayloads(run: DiscoveryRun) {
+  await Promise.allSettled(
+    TRACKS
+      .filter((track) => run.tracks?.[track]?.stage === 'adjudication')
+      .map((track) => loadAdjudicationPayload(track, run.id)),
+  )
+}
+
 async function applyRun(
   run: DiscoveryRun,
   source: 'loaded' | 'created',
@@ -792,7 +880,9 @@ async function applyRun(
   const changedRun = activeRunId.value !== run.id
   if (changedRun) {
     abortStageRequests()
+    abortAdjudicationRequests()
     clearStageCache()
+    adjudicationPayloads.value = {}
     for (const track of TRACKS) {
       const latest = run.tracks?.[track]?.stage
       selectedTrackStages.value[track] = isTrackStage(latest) ? latest : 'track_gate'
@@ -814,6 +904,7 @@ async function applyRun(
   scheduleCurrentRefresh()
   if (!mutating.value) {
     void Promise.allSettled(stageViews.value.map((view) => loadStage(view, run.id)))
+    void loadAdjudicationPayloads(run)
   }
 }
 
@@ -832,7 +923,9 @@ async function readCurrent(source: 'loaded' | 'created' = 'loaded'): Promise<boo
     if (response.status === 404) {
       stopPoll()
       abortStageRequests()
+      abortAdjudicationRequests()
       clearStageCache()
+      adjudicationPayloads.value = {}
       activeRunId.value = null
       stageViews.value = []
       transitionAnnouncement.value = ''
@@ -844,10 +937,12 @@ async function readCurrent(source: 'loaded' | 'created' = 'loaded'): Promise<boo
     if (!mounted || requestSequence !== currentRequestSequence) return false
     if (!response.ok) {
       abortStageRequests()
+      abortAdjudicationRequests()
       clearStageCache()
       state.value = { kind: 'error', message: errorMessage(body, '无法读取本周发现') }
     } else if (!isDiscoveryRun(body)) {
       abortStageRequests()
+      abortAdjudicationRequests()
       clearStageCache()
       state.value = { kind: 'error', message: '服务返回的本周批次数据无效' }
     } else {
@@ -858,6 +953,7 @@ async function readCurrent(source: 'loaded' | 'created' = 'loaded'): Promise<boo
     if (!timedOut && error instanceof DOMException && error.name === 'AbortError') return false
     if (!mounted || requestSequence !== currentRequestSequence) return false
     abortStageRequests()
+    abortAdjudicationRequests()
     clearStageCache()
     state.value = {
       kind: 'error',
@@ -1117,6 +1213,184 @@ function resultRows(view: StageView, key: 'pass' | 'drop' | 'insufficient'): Dis
   return view.payload?.[key] ?? []
 }
 
+function adjudicationCases(view: StageView): AdjudicationCase[] {
+  if (view.track === null || view.stage !== 'adjudication') return []
+  const payload = adjudicationPayloads.value[view.track]
+  if (!payload) return []
+  return payload.pass.map((row) => ({
+    code: row.code,
+    name: row.name,
+    surfacedReason: row.reason || '通过候选竞争固定尺子',
+    track: view.track as Track,
+    evidence: payload.evidence.filter(
+      (item) => item.code === row.code
+        && item.competition_stage_id === payload.current.id
+        && item.competition_attempt === payload.current.attempt,
+    ).slice(0, 5),
+    decision: payload.decisions.find(
+      (item) => item.code === row.code
+        && item.competition_stage_id === payload.current.id
+        && item.competition_attempt === payload.current.attempt,
+    ) ?? null,
+    change: payload.changes.find((item) => item.code === row.code) ?? null,
+  }))
+}
+
+function keeperCount(view: StageView): number {
+  return adjudicationCases(view).filter((item) => item.decision?.decision === 'keep').length
+}
+
+function allCasesDecided(view: StageView): boolean {
+  return view.track !== null
+    && adjudicationPayloads.value[view.track] !== undefined
+    && adjudicationCases(view).every((item) => item.decision !== null)
+}
+
+function casesLoaded(view: StageView): boolean {
+  return view.track !== null && adjudicationPayloads.value[view.track] !== undefined
+}
+
+function researchVerdict(item: AdjudicationCase): '值得深研' | '观察' | '排除' {
+  if (item.decision?.decision === 'keep') return '值得深研'
+  if (item.decision?.decision === 'exclude') return '排除'
+  return '观察'
+}
+
+function exclusionReason(code: string): string {
+  return exclusionReasons.value[code] ?? ''
+}
+
+function riskText(item: AdjudicationCase): string {
+  return item.evidence.find((evidence) => evidence.kind === 'risk')?.display_text
+    || '尚无结构化反方证据'
+}
+
+function freshnessText(item: AdjudicationCase): string {
+  const dates = [...new Set(item.evidence.map((evidence) => evidence.as_of).filter(Boolean))]
+  const gaps = item.evidence.some((evidence) => evidence.data_completeness !== 'complete')
+    ? '存在部分数据缺口'
+    : '结构化证据完整'
+  return `${gaps}；截至 ${dates.length ? dates.join('、') : '日期不可用'}`
+}
+
+function weeklyChangeText(item: AdjudicationCase): string {
+  const change = item.change
+  return change
+    ? CHANGE_ZH[change.classification] || change.classification
+    : '本周首次形成可裁决候选'
+}
+
+async function saveDecision(
+  view: StageView,
+  item: AdjudicationCase,
+  decision: 'keep' | 'exclude',
+) {
+  if (mutating.value || view.track === null) return
+  const expected = reviewedIdentityFor(view)
+  if (!expected) {
+    actionError.value = '当前裁决阶段尚未成功加载并复核'
+    return
+  }
+  const reason = exclusionReason(item.code).trim()
+  if (decision === 'exclude' && !reason) {
+    actionError.value = '排除必须填写理由'
+    return
+  }
+  if (!beginMutation()) return
+  actionError.value = ''
+  try {
+    const validated = (await beforeMutation([expected]))?.[0]
+    if (!validated || validated.view.status !== 'waiting_confirmation') {
+      actionError.value = '当前裁决阶段不可编辑'
+      return
+    }
+    const result = await postMutation(
+      `/api/discoveries/${validated.identity.runId}/decisions`,
+      {
+        track: item.track,
+        code: item.code,
+        decision,
+        reason: decision === 'exclude' ? reason : null,
+        ...stageExpectation(validated.identity),
+      },
+    )
+    if (!result) return
+    if (!result.response.ok) {
+      actionError.value = errorMessage(result.body, '裁决保存失败')
+      return
+    }
+    if (decision === 'exclude') {
+      exclusionReasons.value = { ...exclusionReasons.value, [item.code]: '' }
+    }
+    await refreshRun()
+  } catch {
+    actionError.value = '裁决保存失败'
+  } finally {
+    endMutation()
+  }
+}
+
+async function completeAdjudication(view: StageView) {
+  if (mutating.value || view.track === null || !allCasesDecided(view)) return
+  const expected = reviewedIdentityFor(view)
+  if (!expected) {
+    actionError.value = '当前裁决阶段尚未成功加载并复核'
+    return
+  }
+  if (!beginMutation()) return
+  actionError.value = ''
+  try {
+    const validated = (await beforeMutation([expected]))?.[0]
+    if (!validated || validated.view.status !== 'waiting_confirmation') {
+      actionError.value = '当前裁决阶段不可完成'
+      return
+    }
+    const result = await postMutation(
+      `${endpoint(validated.view, validated.identity.runId)}/confirm`,
+      stageExpectation(validated.identity),
+    )
+    if (!result) return
+    if (!result.response.ok) actionError.value = errorMessage(result.body, '裁决完成失败')
+    else await refreshRun()
+  } catch {
+    actionError.value = '裁决完成失败'
+  } finally {
+    endMutation()
+  }
+}
+
+async function startResearch(item: AdjudicationCase) {
+  const current = state.value
+  if (
+    researchingCode.value
+    || current.kind !== 'ready'
+    || item.decision?.decision !== 'keep'
+  ) return
+  researchingCode.value = item.code
+  actionError.value = ''
+  try {
+    const response = await fetch(`/api/discoveries/${current.run.id}/research`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ track: item.track, code: item.code }),
+    })
+    const data: unknown = await response.json()
+    if (!response.ok) {
+      actionError.value = errorMessage(data, '无法加入本周深研')
+      return
+    }
+    if (!isRecord(data) || nonNegativeInteger(data.id) === null || data.id === 0) {
+      actionError.value = '服务返回的研究任务无效'
+      return
+    }
+    await router.push(`/research/${data.id}`)
+  } catch {
+    actionError.value = '无法加入本周深研'
+  } finally {
+    researchingCode.value = ''
+  }
+}
+
 function overrideResult(view: StageView, code: string): DiscoveryRow | undefined {
   return rows(view).find((row) => row.code === code)
 }
@@ -1175,6 +1449,7 @@ onBeforeUnmount(() => {
   mutationController?.abort()
   mutationController = null
   abortStageRequests()
+  abortAdjudicationRequests()
   activeRunId.value = null
   stopPoll()
   stopCurrentRefresh()
@@ -1226,7 +1501,10 @@ onBeforeUnmount(() => {
         v-for="view in stageViews"
         :key="view.key"
         class="panel stage-panel"
-        :aria-busy="view.created && (view.status === 'queued' || view.status === 'running')"
+        :aria-busy="mutating
+          || !!researchingCode
+          || (view.stage === 'adjudication' && !casesLoaded(view))
+          || (view.created && (view.status === 'queued' || view.status === 'running'))"
         :aria-labelledby="`discovery-stage-${view.key.replace(':', '-')}`"
       >
         <div class="toolbar">
@@ -1264,11 +1542,109 @@ onBeforeUnmount(() => {
         <p v-else-if="view.status === 'failed'" class="muted">
           仅瞬时失败可重试；永久失败请放弃后重新创建。
         </p>
-        <p v-if="view.stage === 'adjudication'" class="muted">
-          人工裁决将在 Task 4 接入逐项决策；当前只读，不提供确认或人工覆盖。
-        </p>
+        <section
+          v-if="view.stage === 'adjudication' && view.track"
+          class="adjudication"
+          :aria-label="`${view.title}候选案例`"
+        >
+          <div class="keeper-summary">
+            <h3>候选案例</h3>
+            <p>
+              已保留 {{ keeperCount(view) }} / 5
+              <span v-if="keeperCount(view) < 3" class="candidate-warning">
+                · 候选不足，不显示为成功
+              </span>
+              <span v-else>· 已达到 3 家最低候选数</span>
+            </p>
+          </div>
 
-        <template v-if="view.payload">
+          <article
+            v-for="caseItem in adjudicationCases(view)"
+            :key="`${caseItem.track}:${caseItem.code}`"
+            class="case-card"
+            :aria-labelledby="`case-${caseItem.track}-${caseItem.code}`"
+          >
+            <div class="toolbar">
+              <h3 :id="`case-${caseItem.track}-${caseItem.code}`">
+                {{ caseItem.name }}（{{ caseItem.code }}）
+              </h3>
+              <strong class="research-verdict">{{ researchVerdict(caseItem) }}</strong>
+            </div>
+            <dl>
+              <div><dt>轨道</dt><dd>{{ TRACK_ZH[caseItem.track] }}</dd></div>
+              <div><dt>入围原因</dt><dd>{{ caseItem.surfacedReason }}</dd></div>
+              <div>
+                <dt>关键证据</dt>
+                <dd>
+                  <ul>
+                    <li v-for="evidence in caseItem.evidence" :key="evidence.id">
+                      {{ evidence.display_text }}
+                    </li>
+                  </ul>
+                </dd>
+              </div>
+              <div><dt>风险与反方证据</dt><dd>{{ riskText(caseItem) }}</dd></div>
+              <div><dt>数据缺口与新鲜度</dt><dd>{{ freshnessText(caseItem) }}</dd></div>
+              <div><dt>本周变化</dt><dd>{{ weeklyChangeText(caseItem) }}</dd></div>
+            </dl>
+            <div v-if="view.status === 'waiting_confirmation'" class="case-actions">
+              <button
+                type="button"
+                :disabled="mutating"
+                :aria-label="`保留 ${caseItem.name} 为候选`"
+                @click="saveDecision(view, caseItem, 'keep')"
+              >
+                保留为候选
+              </button>
+              <label>
+                排除理由
+                <input
+                  v-model="exclusionReasons[caseItem.code]"
+                  type="text"
+                  name="exclusion_reason"
+                  :required="caseItem.decision?.decision === 'exclude'"
+                />
+              </label>
+              <button
+                type="button"
+                :disabled="mutating || !exclusionReason(caseItem.code).trim()"
+                :aria-label="`排除 ${caseItem.name}`"
+                @click="saveDecision(view, caseItem, 'exclude')"
+              >
+                排除
+              </button>
+            </div>
+            <button
+              v-if="caseItem.decision?.decision === 'keep'
+                && (view.status === 'confirmed' || view.status === 'insufficient_candidates')"
+              type="button"
+              :disabled="!!researchingCode"
+              @click="startResearch(caseItem)"
+            >
+              {{ researchingCode === caseItem.code ? '正在创建深研…' : '加入本周深研' }}
+            </button>
+          </article>
+
+          <p v-if="!casesLoaded(view)" class="muted">
+            正在读取候选案例…
+          </p>
+          <p v-else-if="!adjudicationCases(view).length" class="muted">
+            本轨道没有可保留候选，可明确以候选不足完成。
+          </p>
+          <button
+            v-if="view.status === 'waiting_confirmation'"
+            type="button"
+            :disabled="mutating || !allCasesDecided(view)"
+            @click="completeAdjudication(view)"
+          >
+            {{ keeperCount(view) >= 3 ? '完成本轨道裁决' : '以候选不足完成' }}
+          </button>
+          <p v-if="view.status === 'insufficient_candidates'" class="candidate-warning">
+            候选不足：本轨道已明确结束，但未达到 3 家，不视为成功。
+          </p>
+        </section>
+
+        <template v-if="view.payload && view.stage !== 'adjudication'">
           <section class="stage-summary" :aria-label="stageAriaLabel(view.title, '阶段摘要')">
             <div>
               <h3>本层固定规则</h3>
@@ -1565,6 +1941,49 @@ td {
   margin-top: 0.75rem;
 }
 
+.keeper-summary {
+  border-bottom: 1px solid #e4ddd0;
+  margin-bottom: 0.75rem;
+}
+
+.case-card {
+  border: 1px solid #e4ddd0;
+  padding: 0.85rem;
+  margin: 0.75rem 0;
+}
+
+.case-card dl,
+.case-card dd,
+.case-card ul {
+  margin: 0;
+}
+
+.case-card dl > div {
+  display: grid;
+  grid-template-columns: 10rem 1fr;
+  gap: 0.75rem;
+  padding: 0.4rem 0;
+  border-top: 1px solid #eee8dd;
+}
+
+.case-card dt,
+.research-verdict {
+  font-weight: 600;
+}
+
+.case-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 0.6rem;
+  margin-top: 0.75rem;
+}
+
+.candidate-warning {
+  color: #8a4b08;
+  font-weight: 600;
+}
+
 @media (max-width: 640px) {
   .stage-summary {
     grid-template-columns: 1fr;
@@ -1574,6 +1993,11 @@ td {
   .override-form input,
   .override-form select {
     width: 100%;
+  }
+
+  .case-card dl > div {
+    grid-template-columns: 1fr;
+    gap: 0.2rem;
   }
 }
 </style>

@@ -411,6 +411,9 @@ def test_created_job_has_provenance_and_does_not_add_watchlist(
             client, run_id, "quality_discount", "600519.SH"
         )
         assert response.status_code == 200
+        payload = client.get(f"/api/research/{response.json()['id']}").json()
+        assert payload["discovery_run_id"] == run_id
+        assert payload["discovery_track"] == "quality_discount"
         with app.state.session_factory() as session:
             job = session.get(ResearchJob, response.json()["id"])
             assert job is not None
@@ -947,8 +950,23 @@ def test_ordinary_research_keeps_discovery_provenance_null(
             },
         )
         assert response.status_code == 200
+        payload = client.get(f"/api/research/{response.json()['id']}").json()
+        assert payload["discovery_run_id"] is None
+        assert payload["discovery_track"] is None
         with app.state.session_factory() as session:
             job = session.get(ResearchJob, response.json()["id"])
             assert job is not None
             assert job.discovery_run_id is None
             assert job.discovery_track is None
+
+
+def test_research_view_renders_optional_discovery_source() -> None:
+    page = (
+        Path(__file__).resolve().parents[1]
+        / "web/src/views/ResearchView.vue"
+    ).read_text(encoding="utf-8")
+
+    assert "discovery_run_id" in page
+    assert "discovery_track" in page
+    assert "来源：每周发现" in page
+    assert "TRACK_ZH" in page

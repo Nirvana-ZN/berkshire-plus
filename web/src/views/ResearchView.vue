@@ -50,6 +50,11 @@ const VALUATION_ZH: Record<string, string> = {
   eps: '每股收益',
   period: '报告期',
 }
+const TRACK_ZH: Record<string, string> = {
+  quality_discount: '优质折价',
+  deep_value: '深度价值',
+  garp: '合理价成长',
+}
 
 const route = useRoute()
 const errorText = ref('')
@@ -74,6 +79,8 @@ const thesisMark = ref('')
 const watching = ref(false)
 const joined = ref(false)
 const watchMessage = ref('')
+const discoveryRunId = ref<number | null>(null)
+const discoveryTrack = ref('')
 let timer: number | undefined
 
 const title = computed(() => name.value || '评估')
@@ -107,6 +114,12 @@ function applyResearch(data: Record<string, unknown>) {
   markdown.value = typeof data.markdown === 'string' ? data.markdown : ''
   gates.value = Array.isArray(data.gates) ? (data.gates as Gate[]) : []
   mirror.value = Array.isArray(data.mirror_test) ? (data.mirror_test as string[]) : []
+  discoveryRunId.value = typeof data.discovery_run_id === 'number'
+    ? data.discovery_run_id
+    : null
+  discoveryTrack.value = typeof data.discovery_track === 'string'
+    ? data.discovery_track
+    : ''
   const bands = data.price_bands
   bandMode.value =
     bands && typeof bands === 'object' && 'mode' in bands
@@ -236,6 +249,9 @@ onBeforeUnmount(stopPoll)
       </template>
     </div>
     <p v-if="status">状态：{{ JOB_STATUS[status] || status }}</p>
+    <p v-if="discoveryRunId !== null && discoveryTrack" class="source-badge">
+      来源：每周发现 / {{ TRACK_ZH[discoveryTrack] || discoveryTrack }}
+    </p>
     <p v-if="thesisMark" :class="{ 'thesis-pass': verdict === 'pass', 'thesis-fail': verdict === 'fail' }">{{ thesisMark }}</p>
     <p v-if="errorText">{{ errorText }}</p>
     <p v-if="watchMessage">{{ watchMessage }}</p>
@@ -356,5 +372,12 @@ onBeforeUnmount(stopPoll)
   background: #fff;
   border: 1px solid #d8d2c4;
   padding: 1rem;
+}
+
+.source-badge {
+  display: inline-block;
+  border: 1px solid #d8d2c4;
+  border-radius: 999px;
+  padding: 0.2rem 0.6rem;
 }
 </style>
