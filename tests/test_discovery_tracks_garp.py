@@ -24,8 +24,8 @@ from tests.test_discovery_tracks_quality import (
 FIELDS = [
     "revenue_cagr",
     "deducted_profit_cagr",
-    "revenue_positive_growth_periods",
-    "deducted_profit_positive_growth_periods",
+    "revenue_consistent_growth_periods",
+    "deducted_profit_consistent_growth_periods",
     "latest_revenue_growth",
     "latest_deducted_profit_growth",
     "revenue_growth_slowdown",
@@ -36,7 +36,7 @@ FIELDS = [
     "dilution_rate",
     "interest_debt_increase_to_revenue",
     "goodwill_increase_to_revenue",
-    "acquisition_cash_increase_to_revenue",
+    "acquisition_cash_to_revenue",
     "gross_margin_change",
     "net_margin_change",
     "impairment_share",
@@ -52,11 +52,12 @@ FORMULAS = {
     "deducted_profit_cagr": (
         "cagr(exact_annual.deducted_net_income,deducted_profit_cagr_periods)"
     ),
-    "revenue_positive_growth_periods": (
-        "count(exact_annual.revenue_yoy>0)"
+    "revenue_consistent_growth_periods": (
+        "count(exact_annual.revenue_yoy>=revenue_period_growth_min)"
     ),
-    "deducted_profit_positive_growth_periods": (
-        "count(exact_annual.deducted_net_income_yoy>0)"
+    "deducted_profit_consistent_growth_periods": (
+        "count(exact_annual.deducted_net_income_yoy"
+        ">=deducted_profit_period_growth_min)"
     ),
     "latest_revenue_growth": "latest(annual.revenue_yoy)",
     "latest_deducted_profit_growth": (
@@ -80,9 +81,8 @@ FORMULAS = {
         "max(0,latest(annual.goodwill)-earliest(annual.goodwill))/"
         "latest(annual.revenue)"
     ),
-    "acquisition_cash_increase_to_revenue": (
-        "max(0,latest(annual.acquisition_cash_paid)-"
-        "earliest(annual.acquisition_cash_paid))/latest(annual.revenue)"
+    "acquisition_cash_to_revenue": (
+        "sum(annual.acquisition_cash_paid)/sum(annual.revenue)"
     ),
     "gross_margin_change": (
         "latest(annual.gross_margin)-earliest(annual.gross_margin)"
@@ -110,6 +110,8 @@ def garp_payload(**threshold_overrides: str) -> dict[str, object]:
     thresholds = {
         "revenue_cagr_min": "0.08",
         "deducted_profit_cagr_min": "0.1",
+        "revenue_period_growth_min": "0.05",
+        "deducted_profit_period_growth_min": "0.05",
         "revenue_growth_slowdown_max": "0.1",
         "deducted_profit_growth_slowdown_max": "0.1",
         "return_on_capital_min": "10",
@@ -117,7 +119,7 @@ def garp_payload(**threshold_overrides: str) -> dict[str, object]:
         "dilution_rate_max": "0.05",
         "interest_debt_increase_to_revenue_max": "0.2",
         "goodwill_increase_to_revenue_max": "0.1",
-        "acquisition_cash_increase_to_revenue_max": "0.1",
+        "acquisition_cash_to_revenue_max": "0.1",
         "gross_margin_deterioration_max": "2",
         "net_margin_deterioration_max": "2",
         "impairment_share_max": "0.2",
@@ -145,7 +147,7 @@ def garp_payload(**threshold_overrides: str) -> dict[str, object]:
             "roe_fallback": 3,
             "cash_conversion": 5,
             "dilution": 2,
-            "growth_drivers": 2,
+            "growth_drivers": 5,
             "margin": 2,
             "quality_adjustments": 1,
             "valuation_pe": 60,
@@ -206,9 +208,15 @@ def garp_payload(**threshold_overrides: str) -> dict[str, object]:
             },
         },
         "order": [
+            ["cash_conversion", "desc", "nulls_last"],
+            ["return_on_capital", "desc", "nulls_last"],
+            [
+                "deducted_profit_consistent_growth_periods",
+                "desc",
+                "nulls_last",
+            ],
             ["peg", "asc", "nulls_last"],
             ["pe_percentile", "asc", "nulls_last"],
-            ["cash_conversion", "desc", "nulls_last"],
             ["code", "asc", "nulls_last"],
         ],
         "industry_version": "test-industry-v1",
@@ -278,7 +286,13 @@ def test_garp_ruler_is_semantically_complete_and_strict() -> None:
     assert garp_ruler(garp_payload()).track == "garp"
     mutations = (
         lambda value: value["thresholds"].pop("peg_growth_cap"),
+        lambda value: value["thresholds"].__setitem__(
+            "revenue_period_growth_min", "0"
+        ),
         lambda value: value["min_observations"].pop("roic"),
+        lambda value: value["min_observations"].__setitem__(
+            "growth_drivers", 4
+        ),
         lambda value: value["missing_policy"].pop("goodwill_increase_to_revenue"),
         lambda value: value["formulas"].__setitem__("peg", "current.pe/growth"),
         lambda value: value["sector_branches"]["common"]["cagr_periods"].__setitem__(
@@ -291,6 +305,9 @@ def test_garp_ruler_is_semantically_complete_and_strict() -> None:
             "return_metric_policy", "hidden_fallback"
         ),
         lambda value: value["order"].pop(1),
+        lambda value: value["order"].__setitem__(
+            0, ["peg", "asc", "nulls_last"]
+        ),
     )
     for mutation in mutations:
         payload = json.loads(json.dumps(garp_payload()))
@@ -324,13 +341,27 @@ def test_exact_annual_observations_and_cagr_periods_are_audited() -> None:
 
 
 def test_one_year_low_base_spike_does_not_satisfy_sustained_growth() -> None:
+    revenue = {
+        2021: "100",
+        2022: "100.1",
+        2023: "100.2",
+        2024: "100.3",
+        2025: "200",
+    }
+    profit = {
+        2021: "10",
+        2022: "10.01",
+        2023: "10.02",
+        2024: "10.03",
+        2025: "30",
+    }
     annual = tuple(
         _garp_annual(
             year,
-            revenue="100" if year < 2025 else "200",
-            deducted_net_income="10" if year < 2025 else "30",
-            net_income="10" if year < 2025 else "30",
-            ocf="12" if year < 2025 else "36",
+            revenue=revenue[year],
+            deducted_net_income=profit[year],
+            net_income=profit[year],
+            ocf=profit[year],
         )
         for year in range(2021, 2026)
     )
@@ -339,8 +370,8 @@ def test_one_year_low_base_spike_does_not_satisfy_sustained_growth() -> None:
         "drop",
         "revenue_growth_not_sustained",
     )
-    assert verdict.metrics["revenue_positive_growth_periods"] == "1"
-    assert verdict.metrics["deducted_profit_positive_growth_periods"] == "1"
+    assert verdict.metrics["revenue_consistent_growth_periods"] == "1"
+    assert verdict.metrics["deducted_profit_consistent_growth_periods"] == "1"
 
 
 def test_latest_growth_slowdown_is_compared_with_multi_year_trend() -> None:
@@ -389,6 +420,8 @@ def test_latest_growth_slowdown_is_compared_with_multi_year_trend() -> None:
 
 
 def test_roic_is_primary_and_roe_fallback_is_explicitly_labeled() -> None:
+    from discovery.evidence import build_evidence_card
+
     primary = _classify()
     assert primary.metrics["return_metric_label"] == "roic"
     assert primary.metrics["return_on_capital"] == "15"
@@ -401,6 +434,25 @@ def test_roic_is_primary_and_roe_fallback_is_explicitly_labeled() -> None:
     assert fallback.verdict == "pass"
     assert fallback.metrics["return_metric_label"] == "roe_fallback"
     assert fallback.metrics["return_on_capital"] == "13"
+    card = build_evidence_card(
+        fallback.code,
+        fallback.metrics,
+        garp_payload(),
+        source_as_of={
+            key: _company(annual=annual).as_of[key]
+            for key in ("security", "financial", "valuation")
+        },
+    )
+    return_fact = next(
+        item
+        for item in card.items
+        if item.rule_id == "garp.fact.return_on_capital"
+    )
+    assert "ROE fallback" in return_fact.display_text
+    assert return_fact.input_fields["return_metric_label"] == "roe_fallback"
+    assert return_fact.input_fields["return_metric_source_field"] == "roe"
+    assert return_fact.input_fields["return_metric_policy"] == "roic_then_roe"
+    assert return_fact.input_fields["source"] == "financial"
 
     partial = tuple(
         _garp_annual(year, roic=None if year == 2025 else "15")
@@ -425,8 +477,8 @@ def test_roic_is_primary_and_roe_fallback_is_explicitly_labeled() -> None:
         ),
         ({"goodwill": "25"}, "goodwill_increase_to_revenue_above_max"),
         (
-            {"acquisition_cash_paid": "25"},
-            "acquisition_cash_increase_to_revenue_above_max",
+            {"acquisition_cash_paid": "100"},
+            "acquisition_cash_to_revenue_above_max",
         ),
         ({"gross_margin": "27"}, "gross_margin_deterioration"),
         ({"net_margin": "9"}, "net_margin_deterioration"),
@@ -447,6 +499,20 @@ def test_growth_quality_and_unit_economics_gates(
     )
     verdict = _classify(_company(annual=annual))
     assert (verdict.verdict, verdict.primary_reason) == ("drop", reason)
+
+
+def test_acquisition_cash_uses_multi_year_flow_intensity_not_endpoint_delta() -> None:
+    annual = tuple(
+        _garp_annual(year, acquisition_cash_paid="20")
+        for year in range(2021, 2026)
+    )
+    verdict = _classify(_company(annual=annual))
+    assert (verdict.verdict, verdict.primary_reason) == (
+        "drop",
+        "acquisition_cash_to_revenue_above_max",
+    )
+    intensity = Decimal(str(verdict.metrics["acquisition_cash_to_revenue"]))
+    assert Decimal("0.15") < intensity < Decimal("0.16")
 
 
 @pytest.mark.parametrize(
@@ -624,7 +690,12 @@ def test_builtin_dispatches_garp_and_generic_evidence_in_order() -> None:
         builtin_track_executor,
     )
 
-    company = _company()
+    company = _company(
+        annual=tuple(
+            _garp_annual(year, roic=None, roe="13")
+            for year in range(2021, 2026)
+        )
+    )
     frozen = FrozenRunInputs(
         run_id=1,
         input_fingerprint="run",
@@ -687,7 +758,63 @@ def test_builtin_dispatches_garp_and_generic_evidence_in_order() -> None:
         "garp.fact.return_on_capital",
         "garp.fact.peg",
     ]
+    fallback = next(
+        row
+        for row in facts
+        if row.rule_id == "garp.fact.return_on_capital"
+    )
+    assert "ROE fallback" in fallback.display_text
+    assert json.loads(fallback.input_fields_json)["return_metric_label"] == (
+        "roe_fallback"
+    )
     assert all(row.rule_id.startswith("garp.") for row in ranked.evidence)
+
+
+def test_garp_competition_order_is_quality_first_before_valuation() -> None:
+    from discovery.competition import CompetitionCandidate, rank_competition
+    from discovery.rulers import garp_ruler
+
+    ruler = garp_ruler(garp_payload())
+    ranked = rank_competition(
+        (
+            CompetitionCandidate(
+                "600001.SH",
+                "制造业",
+                {
+                    "cash_conversion": "1.5",
+                    "return_on_capital": "16",
+                    "deducted_profit_consistent_growth_periods": "4",
+                    "peg": "1.4",
+                    "pe_percentile": "60",
+                },
+            ),
+            CompetitionCandidate(
+                "600002.SH",
+                "制造业",
+                {
+                    "cash_conversion": "1",
+                    "return_on_capital": "10",
+                    "deducted_profit_consistent_growth_periods": "3",
+                    "peg": "0.5",
+                    "pe_percentile": "10",
+                },
+            ),
+        ),
+        ruler.order,
+    )
+    assert [row.code for row in ranked] == ["600001.SH", "600002.SH"]
+    assert ruler.order == (
+        ("cash_conversion", "desc", "nulls_last"),
+        ("return_on_capital", "desc", "nulls_last"),
+        (
+            "deducted_profit_consistent_growth_periods",
+            "desc",
+            "nulls_last",
+        ),
+        ("peg", "asc", "nulls_last"),
+        ("pe_percentile", "asc", "nulls_last"),
+        ("code", "asc", "nulls_last"),
+    )
 
 
 def test_growth_driver_trend_emits_generic_deterministic_risk() -> None:

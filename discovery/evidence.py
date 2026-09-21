@@ -225,8 +225,8 @@ def _risk_specs(
                 "max",
             ),
             (
-                "acquisition_cash_increase_to_revenue",
-                "acquisition_cash_increase_to_revenue_max",
+                "acquisition_cash_to_revenue",
+                "acquisition_cash_to_revenue_max",
                 "max",
             ),
         )
@@ -403,6 +403,7 @@ def _reliable_inputs(
     if requirement is None:
         return None
     minimum_name, count_name = requirement
+    return_lineage: dict[str, object] = {}
     if field == "roe_mean" and branch == "financial":
         minimum_name = "bank_roe"
         count_name = "bank_roe_observations"
@@ -413,6 +414,23 @@ def _reliable_inputs(
     ) == "roe_fallback":
         minimum_name = "roe_fallback"
         count_name = "roe_fallback_observations"
+        branches = ruler.get("sector_branches")
+        config = (
+            branches.get(branch)
+            if isinstance(branches, Mapping) and type(branch) is str
+            else None
+        )
+        if (
+            not isinstance(config, Mapping)
+            or config.get("return_metric_policy") != "roic_then_roe"
+        ):
+            raise ValueError("ROE fallback evidence policy is invalid")
+        return_lineage = {
+            "return_metric_label": "roe_fallback",
+            "return_metric_source_field": "roe",
+            "return_metric_primary_field": "roic",
+            "return_metric_policy": "roic_then_roe",
+        }
     minimum = minimums.get(minimum_name)
     count = _decimal(metrics.get(count_name))
     if (
@@ -428,6 +446,7 @@ def _reliable_inputs(
             field: value,
             count_name: metrics[count_name],
             f"min_observations.{minimum_name}": minimum,
+            **return_lineage,
         }
     )
 
@@ -464,13 +483,19 @@ def _fact_items(
         )
         provenance, as_of = _provenance(fields, source_as_of)
         inputs.update(provenance)
+        text = ",".join(f"{field}={metrics[field]}" for field in fields)
+        if (
+            fields == ("return_on_capital",)
+            and metrics.get("return_metric_label") == "roe_fallback"
+        ):
+            text += " (ROE fallback)"
         result.append(
             _item(
                 kind="fact",
                 category=None,
                 rule_id=f"{track}.fact.{rule_name}",
                 inputs=inputs,
-                text=",".join(f"{field}={metrics[field]}" for field in fields),
+                text=text,
                 as_of=as_of,
                 completeness="complete",
             )

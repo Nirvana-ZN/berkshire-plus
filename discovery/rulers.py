@@ -445,8 +445,8 @@ _DEEP_GATE_SETS = MappingProxyType(
 GARP_FIELDS = (
     "revenue_cagr",
     "deducted_profit_cagr",
-    "revenue_positive_growth_periods",
-    "deducted_profit_positive_growth_periods",
+    "revenue_consistent_growth_periods",
+    "deducted_profit_consistent_growth_periods",
     "latest_revenue_growth",
     "latest_deducted_profit_growth",
     "revenue_growth_slowdown",
@@ -457,7 +457,7 @@ GARP_FIELDS = (
     "dilution_rate",
     "interest_debt_increase_to_revenue",
     "goodwill_increase_to_revenue",
-    "acquisition_cash_increase_to_revenue",
+    "acquisition_cash_to_revenue",
     "gross_margin_change",
     "net_margin_change",
     "impairment_share",
@@ -475,11 +475,12 @@ GARP_FORMULAS = MappingProxyType(
             "cagr(exact_annual.deducted_net_income,"
             "deducted_profit_cagr_periods)"
         ),
-        "revenue_positive_growth_periods": (
-            "count(exact_annual.revenue_yoy>0)"
+        "revenue_consistent_growth_periods": (
+            "count(exact_annual.revenue_yoy>=revenue_period_growth_min)"
         ),
-        "deducted_profit_positive_growth_periods": (
-            "count(exact_annual.deducted_net_income_yoy>0)"
+        "deducted_profit_consistent_growth_periods": (
+            "count(exact_annual.deducted_net_income_yoy"
+            ">=deducted_profit_period_growth_min)"
         ),
         "latest_revenue_growth": "latest(annual.revenue_yoy)",
         "latest_deducted_profit_growth": (
@@ -511,9 +512,8 @@ GARP_FORMULAS = MappingProxyType(
             "max(0,latest(annual.goodwill)-earliest(annual.goodwill))/"
             "latest(annual.revenue)"
         ),
-        "acquisition_cash_increase_to_revenue": (
-            "max(0,latest(annual.acquisition_cash_paid)-"
-            "earliest(annual.acquisition_cash_paid))/latest(annual.revenue)"
+        "acquisition_cash_to_revenue": (
+            "sum(annual.acquisition_cash_paid)/sum(annual.revenue)"
         ),
         "gross_margin_change": (
             "latest(annual.gross_margin)-earliest(annual.gross_margin)"
@@ -537,15 +537,19 @@ GARP_FORMULAS = MappingProxyType(
     }
 )
 GARP_ORDER = (
+    ("cash_conversion", "desc", "nulls_last"),
+    ("return_on_capital", "desc", "nulls_last"),
+    ("deducted_profit_consistent_growth_periods", "desc", "nulls_last"),
     ("peg", "asc", "nulls_last"),
     ("pe_percentile", "asc", "nulls_last"),
-    ("cash_conversion", "desc", "nulls_last"),
     ("code", "asc", "nulls_last"),
 )
 GARP_THRESHOLDS = frozenset(
     {
         "revenue_cagr_min",
         "deducted_profit_cagr_min",
+        "revenue_period_growth_min",
+        "deducted_profit_period_growth_min",
         "revenue_growth_slowdown_max",
         "deducted_profit_growth_slowdown_max",
         "return_on_capital_min",
@@ -553,7 +557,7 @@ GARP_THRESHOLDS = frozenset(
         "dilution_rate_max",
         "interest_debt_increase_to_revenue_max",
         "goodwill_increase_to_revenue_max",
-        "acquisition_cash_increase_to_revenue_max",
+        "acquisition_cash_to_revenue_max",
         "gross_margin_deterioration_max",
         "net_margin_deterioration_max",
         "impairment_share_max",
@@ -1439,6 +1443,16 @@ def validate_garp_ruler(ruler: TrackRuler) -> TrackRuler:
         raise ValueError("GARP percentile threshold exceeds 100")
     if thresholds["peg_growth_cap"] <= 0:
         raise ValueError("GARP PEG growth cap must be positive")
+    if any(
+        thresholds[key] <= 0 or thresholds[key] > 1
+        for key in (
+            "revenue_period_growth_min",
+            "deducted_profit_period_growth_min",
+        )
+    ):
+        raise ValueError(
+            "GARP sustained-growth period minima must be within (0, 1]"
+        )
     observation_windows = {
         "revenue_growth": "growth",
         "deducted_profit_growth": "growth",
@@ -1461,6 +1475,8 @@ def validate_garp_ruler(ruler: TrackRuler) -> TrackRuler:
         or ruler.min_observations["deducted_profit_growth"]
         != windows["growth"]
         or ruler.min_observations["latest_growth"] != 2
+        or ruler.min_observations["growth_drivers"]
+        != windows["growth_drivers"]
         or ruler.min_observations["sustained_revenue_growth"]
         > cagr_periods["revenue"]
         or ruler.min_observations["sustained_profit_growth"]

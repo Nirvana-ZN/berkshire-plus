@@ -77,8 +77,8 @@ _DOMAINS = MappingProxyType(
 _NUMERIC_METRICS = (
     "revenue_cagr",
     "deducted_profit_cagr",
-    "revenue_positive_growth_periods",
-    "deducted_profit_positive_growth_periods",
+    "revenue_consistent_growth_periods",
+    "deducted_profit_consistent_growth_periods",
     "latest_revenue_growth",
     "latest_deducted_profit_growth",
     "revenue_growth_slowdown",
@@ -88,7 +88,7 @@ _NUMERIC_METRICS = (
     "dilution_rate",
     "interest_debt_increase_to_revenue",
     "goodwill_increase_to_revenue",
-    "acquisition_cash_increase_to_revenue",
+    "acquisition_cash_to_revenue",
     "gross_margin_change",
     "net_margin_change",
     "impairment_share",
@@ -369,15 +369,18 @@ def _exact_endpoints(
     )
 
 
-def _growth(values: Sequence[Decimal]) -> tuple[int, Decimal | None]:
-    positive = 0
+def _growth(
+    values: Sequence[Decimal],
+    minimum: Decimal,
+) -> tuple[int, Decimal | None]:
+    consistent = 0
     latest = None
     for left, right in zip(values, values[1:], strict=False):
         change = _subtract(_divide(right, left), Decimal(1)) if left > 0 else None
-        if change is not None and change > 0:
-            positive += 1
+        if change is not None and change >= minimum:
+            consistent += 1
         latest = change
-    return positive, latest
+    return consistent, latest
 
 
 def _increase_share(
@@ -395,6 +398,17 @@ def _sum_abs(left: Decimal | None, right: Decimal | None) -> Decimal | None:
     if left is None or right is None:
         return None
     return _subtract(left.copy_abs(), right.copy_abs().copy_negate())
+
+
+def _sum(values: Sequence[Decimal | None]) -> Decimal | None:
+    total = Decimal(0)
+    for value in values:
+        if value is None:
+            return None
+        total = _subtract(total, value.copy_negate())
+        if total is None:
+            return None
+    return total
 
 
 def _metric_values(
@@ -431,8 +445,11 @@ def _metric_values(
     ):
         revenue = tuple(row.values["revenue"] for row in revenue_rows)
         metrics["revenue_cagr"] = cagr(revenue, int(periods["revenue"]))
-        positive, latest = _growth(revenue)  # type: ignore[arg-type]
-        metrics["revenue_positive_growth_periods"] = Decimal(positive)
+        consistent, latest = _growth(
+            revenue,  # type: ignore[arg-type]
+            Decimal(ruler.thresholds["revenue_period_growth_min"]),
+        )
+        metrics["revenue_consistent_growth_periods"] = Decimal(consistent)
         metrics["latest_revenue_growth"] = latest
     if _exact(
         growth_window,
@@ -445,8 +462,13 @@ def _metric_values(
         metrics["deducted_profit_cagr"] = cagr(
             profits, int(periods["deducted_profit"])
         )
-        positive, latest = _growth(profits)  # type: ignore[arg-type]
-        metrics["deducted_profit_positive_growth_periods"] = Decimal(positive)
+        consistent, latest = _growth(
+            profits,  # type: ignore[arg-type]
+            Decimal(ruler.thresholds["deducted_profit_period_growth_min"]),
+        )
+        metrics["deducted_profit_consistent_growth_periods"] = Decimal(
+            consistent
+        )
         metrics["latest_deducted_profit_growth"] = latest
     for prefix in ("revenue", "deducted_profit"):
         trend = metrics[f"{prefix}_cagr"]
@@ -528,14 +550,19 @@ def _metric_values(
         for metric, field in (
             ("interest_debt_increase_to_revenue", "interest_debt"),
             ("goodwill_increase_to_revenue", "goodwill"),
-            (
-                "acquisition_cash_increase_to_revenue",
-                "acquisition_cash_paid",
-            ),
         ):
             metrics[metric] = _increase_share(
                 first[field], last[field], last["revenue"]
             )
+        metrics["acquisition_cash_to_revenue"] = _divide(
+            _sum(
+                tuple(
+                    row.values["acquisition_cash_paid"]
+                    for row in driver_rows
+                )
+            ),
+            _sum(tuple(row.values["revenue"] for row in driver_rows)),
+        )
 
     margin_window = windows.get("margin")
     margin_rows = _available(margin_window, "gross_margin", "net_margin")
@@ -663,12 +690,12 @@ def _gate_failures(
         failures = []
         for metric, minimum, reason in (
             (
-                "revenue_positive_growth_periods",
+                "revenue_consistent_growth_periods",
                 "sustained_revenue_growth",
                 "revenue_growth_not_sustained",
             ),
             (
-                "deducted_profit_positive_growth_periods",
+                "deducted_profit_consistent_growth_periods",
                 "sustained_profit_growth",
                 "deducted_profit_growth_not_sustained",
             ),
@@ -737,9 +764,9 @@ def _gate_failures(
             None,
         ),
         "acquisition_cash_trend": (
-            "acquisition_cash_increase_to_revenue",
+            "acquisition_cash_to_revenue",
             "growth_drivers",
-            "acquisition_cash_increase_to_revenue_max",
+            "acquisition_cash_to_revenue_max",
             "above",
             None,
         ),
@@ -972,7 +999,7 @@ def classify(company: FrozenCompanyInput, ruler: TrackRuler) -> TrackVerdict:
         "deducted_profit_growth_slowdown",
         "interest_debt_increase_to_revenue",
         "goodwill_increase_to_revenue",
-        "acquisition_cash_increase_to_revenue",
+        "acquisition_cash_to_revenue",
     ):
         value = calculated[metric]
         if value is not None and value > 0:
