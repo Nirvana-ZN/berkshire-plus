@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 import json
 from math import isfinite
@@ -43,7 +43,12 @@ from discovery.constants import (
     china_week_key,
     utc_now,
 )
-from discovery.evidence import build_evidence_card
+from discovery.evidence import (
+    ALLOWED_RISK_CATEGORIES,
+    EVIDENCE_RULE_VERSION,
+    FALLBACK_RISK_TEXT,
+    build_evidence_card,
+)
 from discovery.snapshot import (
     FrozenRunInputs,
     FrozenValue,
@@ -147,6 +152,7 @@ class TrackExecutionResult:
 @dataclass(frozen=True)
 class TrackExecutionEvidence:
     code: str
+    ruler_version_id: int
     rule_version: str
     kind: str
     rule_id: str
@@ -254,6 +260,7 @@ def builtin_track_executor(
             evidence=tuple(
                 TrackExecutionEvidence(
                     code=row.code,
+                    ruler_version_id=context.ruler_version_id,
                     rule_version=item.rule_version,
                     kind=item.kind,
                     rule_id=item.rule_id,
@@ -910,6 +917,20 @@ def _validate_track_outcome(
         )
 
     evidence_keys = []
+    evidence_by_code: dict[str, list[TrackExecutionEvidence]] = {}
+    company_dates: dict[str, frozenset[str]] = {}
+    for company in context.frozen_inputs.companies:
+        dates = set()
+        for value in company.as_of.values():
+            if type(value) is not str:
+                continue
+            try:
+                parsed = date.fromisoformat(value)
+            except ValueError:
+                continue
+            if parsed.isoformat() == value:
+                dates.add(value)
+        company_dates[company.code] = frozenset(dates)
     for row in outcome.evidence:
         if (
             type(row) is not TrackExecutionEvidence
@@ -918,6 +939,26 @@ def _validate_track_outcome(
         ):
             raise TrackExecutorContractError(
                 "invalid competition evidence DTO"
+            )
+        if row.ruler_version_id != context.ruler_version_id:
+            raise TrackExecutorContractError(
+                "competition evidence ruler lineage is invalid"
+            )
+        if row.rule_version != EVIDENCE_RULE_VERSION:
+            raise TrackExecutorContractError(
+                "competition evidence rule version is invalid"
+            )
+        if row.kind not in {"fact", "risk"}:
+            raise TrackExecutorContractError(
+                "competition evidence kind is invalid"
+            )
+        if (
+            row.data_completeness not in {"complete", "partial"}
+            or row.kind == "fact"
+            and row.data_completeness != "complete"
+        ):
+            raise TrackExecutorContractError(
+                "competition evidence completeness is invalid"
             )
         for value in (
             row.code,
@@ -933,16 +974,77 @@ def _validate_track_outcome(
                     "competition evidence text is required"
                 )
         try:
-            _plain_metrics(row.input_fields_json)
+            input_fields = _plain_metrics(row.input_fields_json)
         except (TypeError, ValueError, json.JSONDecodeError) as error:
             raise TrackExecutorContractError(
                 f"competition evidence input is invalid: {error}"
             ) from error
+        if not input_fields:
+            raise TrackExecutorContractError(
+                "competition evidence input cannot be empty"
+            )
+        if row.as_of not in company_dates.get(row.code, frozenset()):
+            raise TrackExecutorContractError(
+                "competition evidence as-of is not source-bounded"
+            )
+        expected_prefix = f"{context.track}.{row.kind}."
+        if not row.rule_id.startswith(expected_prefix):
+            raise TrackExecutorContractError(
+                "competition evidence rule id is invalid"
+            )
+        if row.kind == "risk":
+            category = row.rule_id.removeprefix(expected_prefix).split(".", 1)[0]
+            if category != "none" and category not in ALLOWED_RISK_CATEGORIES:
+                raise TrackExecutorContractError(
+                    "competition evidence risk category is invalid"
+                )
+            if (
+                category == "none"
+                and row.display_text != FALLBACK_RISK_TEXT
+            ):
+                raise TrackExecutorContractError(
+                    "competition evidence fallback risk is invalid"
+                )
+        evidence_by_code.setdefault(row.code, []).append(row)
         evidence_keys.append((row.code, row.kind, row.rule_id))
     if len(evidence_keys) != len(set(evidence_keys)):
         raise TrackExecutorContractError(
             "competition evidence identities must be unique"
         )
+    if (
+        context.stage == "competition"
+        and outcome.status == "waiting_confirmation"
+        and set(evidence_by_code) != allowed_codes
+    ):
+        raise TrackExecutorContractError(
+            "competition evidence cards must match the exact candidate set"
+        )
+    results_by_code = {row.code: row for row in outcome.results}
+    for code, items in evidence_by_code.items():
+        facts = [item for item in items if item.kind == "fact"]
+        risks = [item for item in items if item.kind == "risk"]
+        evidence_insufficient = (
+            results_by_code[code].verdict == "insufficient"
+            and results_by_code[code].reason == "evidence_facts_insufficient"
+        )
+        fallback = [
+            item
+            for item in risks
+            if item.rule_id == f"{context.track}.risk.none"
+        ]
+        if (
+            not 1 <= len(items) <= 5
+            or not risks
+            or fallback
+            and len(risks) != 1
+            or evidence_insufficient
+            and len(facts) >= 3
+            or not evidence_insufficient
+            and (len(items) < 3 or len(facts) < 3)
+        ):
+            raise TrackExecutorContractError(
+                "competition evidence card is incomplete or inconsistent"
+            )
     return outcome
 
 
