@@ -173,6 +173,66 @@ FIELD_DICTIONARY: Mapping[str, FieldSpec] = MappingProxyType(
             ),
             **_CNY,
         ),
+        "roe": FieldSpec(
+            "RPT_F10_FINANCE_MAINFINADATA",
+            "ROEJQ",
+            unit="percent",
+            derivation_formula=None,
+            financial_sector_substitute=None,
+            missing_policy=(
+                "None when the exact weighted diluted ROE field is absent; "
+                "ROE and WEIGHTAVGROE are not aliases."
+            ),
+            **_MAIN,
+        ),
+        "shares": FieldSpec(
+            "RPT_F10_FINANCE_MAINFINADATA",
+            "TOTAL_SHARE",
+            unit="shares",
+            derivation_formula=None,
+            financial_sector_substitute=None,
+            missing_policy=(
+                "None unless the exact field is finite and positive; no total-share "
+                "alias is accepted."
+            ),
+            **_MAIN,
+        ),
+        "gross_margin": FieldSpec(
+            "RPT_F10_FINANCE_MAINFINADATA",
+            "XSMLL",
+            unit="percent",
+            derivation_formula=None,
+            financial_sector_substitute=None,
+            missing_policy=(
+                "None when the exact reported gross-margin percentage is absent; "
+                "not applicable to banks."
+            ),
+            **_MAIN,
+        ),
+        "net_margin": FieldSpec(
+            "RPT_F10_FINANCE_MAINFINADATA",
+            "XSJLL",
+            unit="percent",
+            derivation_formula=None,
+            financial_sector_substitute=None,
+            missing_policy=(
+                "None when the exact reported net-margin percentage is absent."
+            ),
+            **_MAIN,
+        ),
+        "interest_coverage": FieldSpec(
+            "RPT_F10_FINANCE_MAINFINADATA",
+            "INTSTCOVRATE",
+            unit="rate",
+            derivation_formula=None,
+            financial_sector_substitute=None,
+            missing_policy=(
+                "None when the direct reported interest-coverage rate is absent; "
+                "not reconstructed from EBIT and interest expense and not "
+                "applicable to banks."
+            ),
+            **_MAIN,
+        ),
         "ebit": FieldSpec(
             "RPT_F10_FINANCE_MAINFINADATA",
             ("PER_EBIT", "TOTAL_SHARE"),
@@ -291,6 +351,18 @@ FIELD_DICTIONARY: Mapping[str, FieldSpec] = MappingProxyType(
                 "and is not a reliable substitute."
             ),
             trusted=False,
+            **_CNY,
+        ),
+        "other_income": FieldSpec(
+            "RPT_F10_FINANCE_GINCOME",
+            "OTHER_INCOME",
+            derivation_formula=None,
+            financial_sector_substitute=None,
+            missing_policy=(
+                "None when the exact other-income line is absent. This line is a "
+                "conservative non-core-income proxy and must not be labeled as "
+                "government grants."
+            ),
             **_CNY,
         ),
         "asset_disposal_gain": FieldSpec(

@@ -25,10 +25,12 @@ from app.models import (
 )
 from discovery.company_payload import (
     company_payload_digest,
+    parse_company_payload,
     serialize_company_payload,
     verify_company_payload_digest,
 )
 from discovery.constants import CHINA_MARKET_TIMEZONE, china_market_date
+from discovery.field_dictionary import FIELD_DICTIONARY
 from jobs.lock import JOB_TYPE_DISCOVERY_DATA, lock_status, release, try_acquire
 from market.types import (
     DiscoveryCompanyData,
@@ -222,14 +224,24 @@ def _snapshot_parts(
         )
     ).all()
     checkpoints = {row.code for row in checkpoint_rows}
-    payloads_complete = all(
-        row.status != "done"
-        or verify_company_payload_digest(
+    def valid_payload(row: DiscoveryDataCheckpoint) -> bool:
+        if row.status != "done":
+            return True
+        if not verify_company_payload_digest(
             row.payload_json,
             row.payload_digest,
-        )
-        for row in checkpoint_rows
-    )
+        ):
+            return False
+        try:
+            parse_company_payload(
+                row.payload_json,
+                expected_code=row.code,
+            )
+        except (TypeError, ValueError):
+            return False
+        return True
+
+    payloads_complete = all(valid_payload(row) for row in checkpoint_rows)
     snapshots = set(
         session.scalars(
             select(DiscoveryUniverseSecurity.code).where(
@@ -986,9 +998,13 @@ def discovery_data_status(
     }
 
 _DISCOVERY_SHARED_FINANCIAL_FIELDS = (
+    "roe",
     "net_income",
     "ocf",
     "capex",
+    "interest_coverage",
+    "gross_margin",
+    "net_margin",
     "shares",
     "npl",
 )
@@ -1013,6 +1029,7 @@ _DISCOVERY_ONLY_FINANCIAL_FIELDS = (
     "nonperforming_loan_balance",
     "impairment_loss",
     "government_grants",
+    "other_income",
     "asset_disposal_gain",
     "goodwill",
     "acquisition_cash_paid",
@@ -1034,6 +1051,18 @@ def persist_discovery_financials(
 ) -> None:
     codes: set[str] = set()
     for row in rows:
+        untrusted = tuple(
+            field
+            for field, spec in FIELD_DICTIONARY.items()
+            if not spec.trusted and getattr(row, field) is not None
+        )
+        if row.interest is not None:
+            untrusted += ("interest",)
+        if untrusted:
+            raise ValueError(
+                "discovery financial row contains untrusted fields: "
+                + ", ".join(untrusted)
+            )
         codes.add(row.code)
         key = {
             "code": row.code,
@@ -1067,17 +1096,31 @@ def persist_discovery_financials(
                 ),
             )
         )
-        session.add_all(
-            [
+        provenance: list[FinancialFieldProvenance] = []
+        for field in _DISCOVERY_FINANCIAL_FIELDS:
+            if getattr(row, field) is None:
+                continue
+            spec = FIELD_DICTIONARY.get(field)
+            provenance.append(
                 FinancialFieldProvenance(
                     **key,
                     field=field,
                     source=_DISCOVERY_FINANCIAL_SOURCE,
+                    source_report=(
+                        spec.report
+                        if spec is not None
+                        and isinstance(spec.report, str)
+                        else None
+                    ),
+                    source_field=(
+                        spec.field
+                        if spec is not None
+                        and isinstance(spec.field, str)
+                        else None
+                    ),
                 )
-                for field in _DISCOVERY_FINANCIAL_FIELDS
-                if getattr(row, field) is not None
-            ]
-        )
+            )
+        session.add_all(provenance)
     stamp = datetime.now(timezone.utc)
     for code in codes:
         session.merge(

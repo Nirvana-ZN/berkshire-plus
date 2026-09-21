@@ -51,12 +51,11 @@ _FIELDS = (
     "shares",
     "cash",
     "interest_debt",
-    "ebit",
-    "interest",
+    "interest_coverage",
     "revenue",
     "net_income",
     "impairment_loss",
-    "government_grants",
+    "other_income",
     "asset_disposal_gain",
     "roe",
     "npl",
@@ -80,12 +79,11 @@ _DOMAINS = MappingProxyType(
         "shares": "positive",
         "cash": "nonnegative",
         "interest_debt": "nonnegative",
-        "ebit": "signed",
-        "interest": "signed",
+        "interest_coverage": "signed",
         "revenue": "nonnegative",
         "net_income": "signed",
         "impairment_loss": "signed",
-        "government_grants": "signed",
+        "other_income": "signed",
         "asset_disposal_gain": "signed",
         "roe": "signed",
         "npl": "nonnegative",
@@ -98,12 +96,12 @@ _WINDOW_FIELDS = MappingProxyType(
         "normalized_earnings": ("deducted_net_income",),
         "fcf": ("ocf", "capex"),
         "net_debt": ("interest_debt", "cash"),
-        "interest_coverage": ("ebit", "interest"),
+        "interest_coverage": ("interest_coverage",),
         "dilution": ("shares",),
         "revenue": ("revenue",),
         "one_time_profit": ("net_income", "deducted_net_income"),
         "impairment": ("impairment_loss",),
-        "subsidy_disposal": ("government_grants", "asset_disposal_gain"),
+        "non_core_income_proxy": ("other_income", "asset_disposal_gain"),
         "bank_roe": ("roe",),
         "bank_npl": ("npl",),
         "bank_capital": (
@@ -124,7 +122,7 @@ _NUMERIC_METRICS = (
     "revenue_decline",
     "one_time_profit_share",
     "impairment_share",
-    "subsidy_disposal_share",
+    "non_core_income_proxy_share",
     "pb_percentile",
     "pb_median_ratio",
     "roe_mean",
@@ -194,7 +192,7 @@ def _empty_metrics(code: str) -> dict[str, JsonMetric]:
             "revenue_observations": None,
             "one_time_profit_observations": None,
             "impairment_observations": None,
-            "subsidy_disposal_observations": None,
+            "non_core_income_proxy_observations": None,
             "valuation_pb_observations": None,
             "bank_roe_observations": None,
             "bank_npl_observations": None,
@@ -449,17 +447,16 @@ def _nonfinancial_metrics(
         )
 
     interest_rows = _available(
-        windows.get("interest_coverage"), "ebit", "interest"
+        windows.get("interest_coverage"), "interest_coverage"
     )
     latest_interest_row = _latest(
-        windows.get("interest_coverage"), "ebit", "interest"
+        windows.get("interest_coverage"), "interest_coverage"
     )
     counts["interest_coverage"] = len(interest_rows)
     if latest_interest_row is not None:
-        metrics["interest_coverage"] = _divide(
-            latest_interest_row.values["ebit"],
-            latest_interest_row.values["interest"].copy_abs(),  # type: ignore[union-attr]
-        )
+        metrics["interest_coverage"] = latest_interest_row.values[
+            "interest_coverage"
+        ]
 
     revenue_rows = _available(windows.get("revenue"), "revenue")
     latest_revenue_row = _latest(windows.get("revenue"), "revenue")
@@ -519,26 +516,26 @@ def _nonfinancial_metrics(
             denominator,
         )
 
-    subsidy_rows = _available(
-        windows.get("subsidy_disposal"),
-        "government_grants",
+    non_core_rows = _available(
+        windows.get("non_core_income_proxy"),
+        "other_income",
         "asset_disposal_gain",
     )
-    latest_subsidy_row = _latest(
-        windows.get("subsidy_disposal"),
-        "government_grants",
+    latest_non_core_row = _latest(
+        windows.get("non_core_income_proxy"),
+        "other_income",
         "asset_disposal_gain",
     )
-    counts["subsidy_disposal"] = len(subsidy_rows)
-    if latest_subsidy_row is not None and denominator is not None:
-        latest = latest_subsidy_row.values
+    counts["non_core_income_proxy"] = len(non_core_rows)
+    if latest_non_core_row is not None and denominator is not None:
+        latest = latest_non_core_row.values
         total = _sum(
             (
-                latest["government_grants"].copy_abs(),  # type: ignore[union-attr]
+                latest["other_income"].copy_abs(),  # type: ignore[union-attr]
                 latest["asset_disposal_gain"].copy_abs(),  # type: ignore[union-attr]
             )
         )
-        metrics["subsidy_disposal_share"] = _divide(total, denominator)
+        metrics["non_core_income_proxy_share"] = _divide(total, denominator)
 
     latest_shares = (
         latest_share_row.values["shares"]
@@ -711,10 +708,10 @@ def _gate_failures(
             "impairment_share_max",
             "above",
         ),
-        "subsidy_disposal": (
-            "subsidy_disposal_share",
-            "subsidy_disposal",
-            "subsidy_disposal_share_max",
+        "non_core_income_proxy": (
+            "non_core_income_proxy_share",
+            "non_core_income_proxy",
+            "non_core_income_proxy_share_max",
             "above",
         ),
         "bank_roe": (

@@ -570,6 +570,7 @@ def test_discovery_income_source_mapping() -> None:
                         "REPORT_TYPE": "年报",
                         "ASSET_IMPAIRMENT_INCOME": "-7000000",
                         "CREDIT_IMPAIRMENT_INCOME": "-3000000",
+                        "OTHER_INCOME": "4000000",
                         "ASSET_DISPOSAL_INCOME": "2000000",
                     }
                 )
@@ -582,9 +583,66 @@ def test_discovery_income_source_mapping() -> None:
     assert row.pretax_income == Decimal("120000000")
     assert row.income_tax == Decimal("20000000")
     assert row.impairment_loss == Decimal("10000000")
+    assert row.other_income == Decimal("4000000")
     assert row.asset_disposal_gain == Decimal("2000000")
     assert row.government_grants is None
     assert row.source_as_of == "2026-03-31"
+
+
+def test_discovery_main_financial_data_maps_only_live_verified_exact_fields() -> None:
+    class Stub(EastMoneyClient):
+        def _get_json(self, url: str) -> dict:
+            if "MAINFINADATA" in url:
+                return _statement_payload(
+                    {
+                        "REPORT_DATE": "2025-12-31 00:00:00",
+                        "REPORT_TYPE": "年报",
+                        "ROEJQ": "32.53",
+                        "ROE": "99",
+                        "TOTAL_SHARE": "1250081601",
+                        "TOTALSHARE": "9",
+                        "XSMLL": "91.1795516835",
+                        "GROSSPROFITMARGIN": "88",
+                        "XSJLL": "50.5278865155",
+                        "NETPROFITMARGIN": "44",
+                        "INTSTCOVRATE": "3994.57814905189",
+                    }
+                )
+            return _statement_payload()
+
+    row = Stub()._discovery_financials_for("600519.SH")[0]
+    assert row.roe == Decimal("32.53")
+    assert row.shares == Decimal("1250081601")
+    assert row.gross_margin == Decimal("91.1795516835")
+    assert row.net_margin == Decimal("50.5278865155")
+    assert row.interest_coverage == Decimal("3994.57814905189")
+    assert row.ebit is None
+    assert row.interest is None
+
+
+def test_discovery_main_financial_data_rejects_unverified_aliases_and_domains() -> None:
+    class Stub(EastMoneyClient):
+        def _get_json(self, url: str) -> dict:
+            if "MAINFINADATA" in url:
+                return _statement_payload(
+                    {
+                        "REPORT_DATE": "2025-12-31 00:00:00",
+                        "REPORT_TYPE": "年报",
+                        "ROE": "20",
+                        "TOTALSHARE": "100",
+                        "GROSSPROFITMARGIN": "30",
+                        "NETPROFITMARGIN": "10",
+                        "INTSTCOVRATE": "NaN",
+                    }
+                )
+            return _statement_payload()
+
+    row = Stub()._discovery_financials_for("601899.SH")[0]
+    assert row.roe is None
+    assert row.shares is None
+    assert row.gross_margin is None
+    assert row.net_margin is None
+    assert row.interest_coverage is None
 
 
 def test_discovery_balance_source_mapping_and_visible_debt_sum() -> None:

@@ -753,6 +753,8 @@ def calibrate(
 
     if track not in {"quality_discount", "deep_value", "garp"}:
         raise ValueError("unsupported discovery calibration track")
+    if track != "quality_discount":
+        return _blocked("track_calibration_not_implemented", track=track)
     path = Path(db_path)
     if not path.is_file():
         return _blocked("database_missing", track=track)
@@ -761,16 +763,6 @@ def calibrate(
             tables = _tables(connection)
             if not REQUIRED_TABLES <= tables:
                 return _blocked("missing_schema", track=track)
-            if track == "deep_value":
-                return _blocked(
-                    "trusted_government_grants_unavailable",
-                    track=track,
-                )
-            if track == "garp":
-                return _blocked(
-                    "trusted_roic_goodwill_acquisition_cash_unavailable",
-                    track=track,
-                )
             preflight = _preflight_latest_fill(connection)
             if preflight is None:
                 return _blocked("no_completed_fill")

@@ -54,6 +54,7 @@ from market.types import (
 )
 
 NEW_FINANCIAL_VALUES = {
+    "interest_coverage": Decimal("21.533919468562"),
     "revenue": Decimal("1000.01"),
     "deducted_net_income": Decimal("90.02"),
     "total_assets": Decimal("2000.03"),
@@ -66,14 +67,11 @@ NEW_FINANCIAL_VALUES = {
     "interest_debt": Decimal("100.10"),
     "pretax_income": Decimal("120.11"),
     "income_tax": Decimal("20.12"),
-    "normalized_effective_tax_rate": Decimal("16.13"),
-    "invested_capital": Decimal("600.14"),
-    "roic": Decimal("18.15"),
     "capital_adequacy": Decimal("14.16"),
     "core_tier1_capital_adequacy": Decimal("12.17"),
     "nonperforming_loan_balance": Decimal("9.18"),
     "impairment_loss": Decimal("8.19"),
-    "government_grants": Decimal("7.20"),
+    "other_income": Decimal("6.20"),
     "asset_disposal_gain": Decimal("6.21"),
     "goodwill": Decimal("5.22"),
     "acquisition_cash_paid": Decimal("4.23"),
@@ -241,8 +239,26 @@ def test_financial_new_fields_round_trip_through_db_and_snapshot(tmp_path) -> No
         persist_discovery_financials(session, [row])
         session.commit()
         loaded = _rows_from_db(session, [row.code])[0]
+        coverage_source = session.get(
+            FinancialFieldProvenance,
+            (row.code, row.period, row.period_type, "interest_coverage", "discovery"),
+        )
+        other_income_source = session.get(
+            FinancialFieldProvenance,
+            (row.code, row.period, row.period_type, "other_income", "discovery"),
+        )
     for field, expected in NEW_FINANCIAL_VALUES.items():
         assert getattr(loaded, field) == expected
+    assert coverage_source is not None
+    assert (
+        coverage_source.source_report,
+        coverage_source.source_field,
+    ) == ("RPT_F10_FINANCE_MAINFINADATA", "INTSTCOVRATE")
+    assert other_income_source is not None
+    assert (
+        other_income_source.source_report,
+        other_income_source.source_field,
+    ) == ("RPT_F10_FINANCE_GINCOME", "OTHER_INCOME")
 
     frozen = dump_snapshot([], [loaded], {}, set())["financials"][0]
     replayed = _to_financial(frozen)
@@ -252,6 +268,35 @@ def test_financial_new_fields_round_trip_through_db_and_snapshot(tmp_path) -> No
         {"code": row.code, "period": row.period, "period_type": "annual"}
     )
     assert all(getattr(legacy, field) is None for field in NEW_FINANCIAL_VALUES)
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("ebit", Decimal("1")),
+        ("interest", Decimal("1")),
+        ("roic", Decimal("1")),
+        ("government_grants", Decimal("1")),
+    ],
+)
+def test_discovery_persistence_rejects_untrusted_financial_fields(
+    tmp_path,
+    field: str,
+    value: Decimal,
+) -> None:
+    from jobs.discovery_data import persist_discovery_financials
+
+    engine = init_db(tmp_path / f"untrusted-{field}.db")
+    row = FinancialRow(
+        code="000333.SZ",
+        period="2025",
+        period_type="annual",
+        **{field: value},
+    )
+    with Session(engine) as session:
+        with pytest.raises(ValueError, match=field):
+            persist_discovery_financials(session, [row])
     engine.dispose()
 
 
@@ -275,7 +320,7 @@ def test_legacy_then_discovery_updates_only_owned_financial_fields(tmp_path) -> 
         roe=None,
         net_income=Decimal("101"),
         revenue=Decimal("1000.01"),
-        government_grants=Decimal("5"),
+        other_income=Decimal("5"),
     )
     with Session(engine) as session:
         persist_financials(session, [legacy])
@@ -292,7 +337,7 @@ def test_legacy_then_discovery_updates_only_owned_financial_fields(tmp_path) -> 
         assert stored.roe == Decimal("15")
         assert stored.net_income == Decimal("101")
         assert stored.revenue == Decimal("1000.01")
-        assert stored.government_grants == Decimal("5")
+        assert stored.other_income == Decimal("5")
 
         persist_discovery_financials(
             session,
@@ -300,14 +345,14 @@ def test_legacy_then_discovery_updates_only_owned_financial_fields(tmp_path) -> 
                 replace(
                     discovery,
                     net_income=None,
-                    government_grants=None,
+                    other_income=None,
                 )
             ],
         )
         session.commit()
         session.refresh(stored)
         assert stored.net_income == Decimal("101")
-        assert stored.government_grants is None
+        assert stored.other_income is None
         assert {
             row.mode
             for row in session.scalars(
@@ -332,7 +377,7 @@ def test_discovery_then_legacy_preserves_discovery_financial_fields(tmp_path) ->
         net_income=Decimal("100"),
         capex=Decimal("7"),
         revenue=Decimal("337532000000.12"),
-        government_grants=Decimal("5"),
+        other_income=Decimal("5"),
     )
     legacy = FinancialRow(
         code=discovery.code,
@@ -352,11 +397,11 @@ def test_discovery_then_legacy_preserves_discovery_financial_fields(tmp_path) ->
             Financial, (legacy.code, legacy.period, legacy.period_type)
         )
         assert stored is not None
-        assert stored.roe == Decimal("18")
+        assert stored.roe == Decimal("99")
         assert stored.net_income == Decimal("100")
         assert stored.capex == Decimal("7")
         assert stored.revenue == Decimal("337532000000.12")
-        assert stored.government_grants == Decimal("5")
+        assert stored.other_income == Decimal("5")
         assert session.get(
             FinancialFieldProvenance,
             (
@@ -570,7 +615,7 @@ def test_existing_financial_rows_infer_only_safe_legacy_completeness(tmp_path) -
         conn.execute(
             text(
                 "INSERT INTO settings (key, value) "
-                "VALUES ('fin_fetch_version', '3')"
+                "VALUES ('fin_fetch_version', '4')"
             )
         )
     old_engine.dispose()
@@ -676,7 +721,7 @@ def test_init_db_converts_interim_discovery_money_columns_to_text(tmp_path) -> N
         conn.execute(
             text(
                 "INSERT INTO settings (key, value) "
-                "VALUES ('fin_fetch_version', '3')"
+                "VALUES ('fin_fetch_version', '4')"
             )
         )
     old_engine.dispose()
@@ -1706,6 +1751,17 @@ def test_field_dictionary_is_immutable_and_marks_unavailable_sources() -> None:
     assert grants.field is None
     assert grants.trusted is False
     assert "OTHER_INCOME" in grants.missing_policy
+    assert FIELD_DICTIONARY["roe"].field == "ROEJQ"
+    assert FIELD_DICTIONARY["shares"].field == "TOTAL_SHARE"
+    assert FIELD_DICTIONARY["gross_margin"].field == "XSMLL"
+    assert FIELD_DICTIONARY["net_margin"].field == "XSJLL"
+    coverage = FIELD_DICTIONARY["interest_coverage"]
+    assert coverage.field == "INTSTCOVRATE"
+    assert coverage.unit == "rate"
+    other_income = FIELD_DICTIONARY["other_income"]
+    assert other_income.report == "RPT_F10_FINANCE_GINCOME"
+    assert other_income.field == "OTHER_INCOME"
+    assert "government grants" in other_income.missing_policy
     assert FIELD_DICTIONARY["ebit"].trusted is False
     assert FIELD_DICTIONARY["invested_capital"].field is None
     assert FIELD_DICTIONARY["roic"].trusted is False
@@ -3640,7 +3696,7 @@ def test_discovery_company_payload_round_trips_exact_strict_bundle() -> None:
     from discovery.company_payload import company_payload_digest
 
     assert company_payload_digest(encoded) == (
-        "16a5a6940ab6aa8c1c43d2d75f31e15fe62cb1ff1c7120bf593e1fd777f4607b"
+        "574ae1f6544473bb8db816782bdd11841e06908356e5e5201a1945af5b1bf720"
     )
     row = parsed["financial_rows"][0]
     assert row["values"]["revenue"] == "337532000000.123456789012345678"
@@ -3664,6 +3720,22 @@ def test_discovery_company_payload_round_trips_exact_strict_bundle() -> None:
     del missing["financial_rows"][0]["values"]["net_income"]
     with pytest.raises(ValueError, match="financial values"):
         parse_company_payload(json.dumps(missing, separators=(",", ":"), sort_keys=True))
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["ebit", "interest", "roic", "government_grants"],
+)
+def test_discovery_company_payload_rejects_untrusted_fields(field: str) -> None:
+    from discovery.company_payload import serialize_company_payload
+
+    bundle = _bundle("600519.SH")
+    row = replace(bundle.financial_rows[0], **{field: Decimal("1")})
+    with pytest.raises(ValueError, match=field):
+        serialize_company_payload(
+            replace(bundle, financial_rows=(row,)),
+            captured_at=datetime(2026, 9, 16, tzinfo=timezone.utc),
+        )
 
 
 @pytest.mark.parametrize(
@@ -6659,7 +6731,7 @@ def test_readiness_fields_are_track_and_financial_branch_specific(tmp_path) -> N
             complete,
             capex=Decimal("1"),
             revenue=Decimal("100"),
-            roic=Decimal("12"),
+            roe=Decimal("12"),
             government_grants=None,
         )
         _store_readiness_financial(
@@ -6691,7 +6763,7 @@ def test_readiness_fields_are_track_and_financial_branch_specific(tmp_path) -> N
             unknown,
             capex=Decimal("1"),
             revenue=Decimal("100"),
-            roic=Decimal("12"),
+            roe=Decimal("12"),
         )
         for code in (
             complete,
@@ -6730,19 +6802,19 @@ def test_readiness_fields_are_track_and_financial_branch_specific(tmp_path) -> N
     }
     assert "government_grants" not in deep_value.missing_fields
     assert garp.missing_fields == (
-        "financial_roic_policy",
+        "financial_return_metric_policy",
         "revenue",
-        "roic",
+        "roe",
     )
     assert report.missing_counts["garp"] == {
-        "financial_roic_policy": 2,
+        "financial_return_metric_policy": 2,
         "revenue": 1,
-        "roic": 1,
+        "roe": 1,
     }
     assert "capex" not in garp.missing_fields
     assert garp.eligible == 4
     assert report.company_insufficient["garp"] == {
-        "financial_roic_policy_unapproved": 2
+        "financial_return_metric_policy_unapproved": 2
     }
     assert all(track.ready is False for track in report.tracks.values())
     assert all(
@@ -6876,14 +6948,14 @@ def test_discovery_status_serializes_decimal_readiness_without_dispatch(
                 first,
                 capex=Decimal("1"),
                 revenue=Decimal("1"),
-                roic=Decimal("1"),
+                roe=Decimal("1"),
             )
             _store_readiness_financial(
                 session,
                 second,
                 capex=Decimal("1"),
                 revenue=Decimal("1"),
-                roic=Decimal("1"),
+                roe=Decimal("1"),
             )
             session.commit()
         before = list(market.calls)
@@ -6952,7 +7024,7 @@ def test_readiness_as_of_excludes_future_records_and_future_listing_is_invalid(
             past,
             capex=Decimal("1"),
             revenue=Decimal("1"),
-            roic=Decimal("1"),
+            roe=Decimal("1"),
             source_as_of="2026-03-31",
         )
         _store_readiness_financial(
@@ -6961,7 +7033,7 @@ def test_readiness_as_of_excludes_future_records_and_future_listing_is_invalid(
             period="2027",
             capex=Decimal("1"),
             revenue=Decimal("1"),
-            roic=Decimal("1"),
+            roe=Decimal("1"),
             source_as_of="2027-03-31",
         )
         _store_readiness_valuations(session, past)
@@ -7041,13 +7113,13 @@ def test_readiness_counts_aligned_financial_history_without_row_stitching(
                 aligned,
                 period=period,
                 revenue=Decimal("1"),
-                roic=Decimal("1"),
+                roe=Decimal("1"),
             )
         _store_readiness_financial(
             session,
             single,
             revenue=Decimal("1"),
-            roic=Decimal("1"),
+            roe=Decimal("1"),
         )
         for period in ("2022", "2023"):
             _store_readiness_financial(
@@ -7055,7 +7127,7 @@ def test_readiness_counts_aligned_financial_history_without_row_stitching(
             )
         for period in ("2024", "2025"):
             _store_readiness_financial(
-                session, split, period=period, roic=Decimal("1")
+                session, split, period=period, roe=Decimal("1")
             )
         session.commit()
 
@@ -7063,13 +7135,13 @@ def test_readiness_counts_aligned_financial_history_without_row_stitching(
             session,
             as_of=date(2026, 9, 16),
             approved_thresholds={"garp": Decimal("0.2")},
-            minimum_observations={"garp": {"revenue": 2, "roic": 2}},
+            minimum_observations={"garp": {"revenue": 2, "roe": 2}},
         )
 
     assert report.observations[aligned].financial["revenue"] == 2
     assert report.observations[single].financial["revenue"] == 1
     assert report.observations[split].financial["revenue"] == 2
-    assert report.observations[split].financial["roic"] == 2
+    assert report.observations[split].financial["roe"] == 2
     assert report.observations[split].aligned["garp"] == 0
     assert report.observations[missing].financial["revenue"] == 0
     assert report.tracks["garp"].complete == 1
@@ -7129,7 +7201,7 @@ def test_readiness_uses_explicit_bank_insurance_and_financial_branches(
             nonfinancial,
             capex=Decimal("1"),
             revenue=Decimal("1"),
-            roic=Decimal("1"),
+            roe=Decimal("1"),
         )
         session.commit()
 
@@ -7165,7 +7237,7 @@ def test_readiness_uses_explicit_bank_insurance_and_financial_branches(
         "unsupported_financial_branch": 1
     }
     assert report.company_insufficient["garp"] == {
-        "financial_roic_policy_unapproved": 5
+        "financial_return_metric_policy_unapproved": 5
     }
     engine.dispose()
 
@@ -7265,7 +7337,7 @@ def test_readiness_activation_is_per_track_and_configuration_is_strict(
             code,
             capex=Decimal("1"),
             revenue=Decimal("1"),
-            roic=Decimal("1"),
+            roe=Decimal("1"),
         )
         session.commit()
         partial = discovery_data_readiness(
@@ -7351,7 +7423,7 @@ def test_partial_observation_minimums_merge_over_measurement_defaults(
                 period=period,
                 capex=Decimal("1"),
                 revenue=Decimal("1"),
-                roic=Decimal("1"),
+                    roe=Decimal("1"),
             )
         _store_readiness_financial(
             session,
@@ -7382,7 +7454,7 @@ def test_partial_observation_minimums_merge_over_measurement_defaults(
     }
     assert report.minimum_observations["garp"] == {
         "revenue": 2,
-        "roic": 1,
+        "roe": 1,
     }
     assert report.tracks["deep_value"].activated is True
     assert report.tracks["deep_value"].complete == 2
@@ -7410,7 +7482,7 @@ def test_garp_financials_require_explicit_sector_policy(tmp_path) -> None:
             session,
             industrial,
             revenue=Decimal("1"),
-            roic=Decimal("1"),
+            roe=Decimal("1"),
         )
         _store_readiness_financial(
             session,
@@ -7446,9 +7518,9 @@ def test_garp_financials_require_explicit_sector_policy(tmp_path) -> None:
     assert garp.eligible == 2
     assert garp.complete == 1
     assert garp.activated is False
-    assert "financial_roic_policy" in garp.missing_fields
+    assert "financial_return_metric_policy" in garp.missing_fields
     assert unapproved.company_insufficient["garp"] == {
-        "financial_roic_policy_unapproved": 1
+        "financial_return_metric_policy_unapproved": 1
     }
     assert excluded.tracks["garp"].eligible == 1
     assert excluded.tracks["garp"].complete == 1

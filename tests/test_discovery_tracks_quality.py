@@ -61,9 +61,7 @@ FORMULAS = {
     "cash_conversion": "cash_conversion(annual.ocf,annual.net_income>0)",
     "dilution_rate": "latest(annual.shares)/earliest(annual.shares)-1",
     "debt_to_equity": "latest(annual.interest_debt)/latest(annual.net_assets)",
-    "interest_coverage": (
-        "latest(annual.ebit)/copy_abs(latest(annual.interest))"
-    ),
+    "interest_coverage": "latest(annual.interest_coverage)",
     "margin_change": "latest(annual.gross_margin)-earliest(annual.gross_margin)",
     "pe_percentile": "percentile_rank(current.pe,monthly.pe)",
     "pe_median_ratio": "current.pe/median(monthly.pe)",
@@ -250,8 +248,7 @@ def _annual(
     noncurrent_liab_1year: str | None = None,
     interest_debt: str = "40",
     net_assets: str = "100",
-    ebit: str = "40",
-    interest: str = "5",
+    interest_coverage: str = "8",
     gross_margin: str = "30",
     deducted_net_income: str = "100",
     capital_adequacy: str = "14",
@@ -271,8 +268,7 @@ def _annual(
         "noncurrent_liab_1year": noncurrent_liab_1year,
         "interest_debt": interest_debt,
         "net_assets": net_assets,
-        "ebit": ebit,
-        "interest": interest,
+        "interest_coverage": interest_coverage,
         "gross_margin": gross_margin,
         "deducted_net_income": deducted_net_income,
         "capital_adequacy": capital_adequacy,
@@ -699,8 +695,7 @@ def test_signed_economic_fields_remain_valid_domains() -> None:
         _annual(
             year,
             ocf="-120",
-            ebit="-10",
-            interest="-5",
+            interest_coverage="-2",
             gross_margin="-30",
         )
         for year in range(2021, 2026)
@@ -862,8 +857,7 @@ def test_bank_bypasses_industrial_gates_and_uses_declared_policy() -> None:
         _annual(
             year,
             interest_debt="999999",
-            ebit="1",
-            interest="100",
+            interest_coverage="0.01",
             capital_adequacy="14",
             core_tier1_capital_adequacy="10",
             npl="1",
@@ -882,7 +876,7 @@ def test_bank_bypasses_industrial_gates_and_uses_declared_policy() -> None:
     [
         ({"shares": "120"}, "dilution_rate_above_max"),
         ({"interest_debt": "200"}, "debt_to_equity_above_max"),
-        ({"ebit": "10", "interest": "5"}, "interest_coverage_below_min"),
+        ({"interest_coverage": "2"}, "interest_coverage_below_min"),
     ],
 )
 def test_dilution_leverage_and_interest_follow_ruler_policies(
@@ -1413,8 +1407,7 @@ def test_interest_coverage_sign_is_context_and_flag_invariant() -> None:
     annual = tuple(
         _annual(
             year,
-            ebit="10",
-            interest="3.34",
+            interest_coverage="2.994011976047904191616766467",
         )
         for year in range(2021, 2026)
     )

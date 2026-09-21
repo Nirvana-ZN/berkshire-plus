@@ -96,9 +96,7 @@ QUALITY_DISCOUNT_FORMULAS = MappingProxyType(
         "debt_to_equity": (
             "latest(annual.interest_debt)/latest(annual.net_assets)"
         ),
-        "interest_coverage": (
-            "latest(annual.ebit)/copy_abs(latest(annual.interest))"
-        ),
+        "interest_coverage": "latest(annual.interest_coverage)",
         "margin_change": (
             "latest(annual.gross_margin)-earliest(annual.gross_margin)"
         ),
@@ -259,7 +257,7 @@ DEEP_VALUE_FIELDS = (
     "revenue_decline",
     "one_time_profit_share",
     "impairment_share",
-    "subsidy_disposal_share",
+    "non_core_income_proxy_share",
     "pb_percentile",
     "pb_median_ratio",
     "roe_mean",
@@ -280,9 +278,7 @@ DEEP_VALUE_FORMULAS = MappingProxyType(
             "(latest(annual.interest_debt)-latest(annual.cash))/"
             "normalized_fcf"
         ),
-        "interest_coverage": (
-            "latest(annual.ebit)/copy_abs(latest(annual.interest))"
-        ),
+        "interest_coverage": "latest(annual.interest_coverage)",
         "dilution_rate": (
             "latest(annual.shares)/earliest(annual.shares)-1"
         ),
@@ -299,8 +295,8 @@ DEEP_VALUE_FORMULAS = MappingProxyType(
             "copy_abs(latest(annual.impairment_loss))/"
             "copy_abs(normalized_earnings)"
         ),
-        "subsidy_disposal_share": (
-            "(copy_abs(latest(annual.government_grants))+"
+        "non_core_income_proxy_share": (
+            "(copy_abs(latest(annual.other_income))+"
             "copy_abs(latest(annual.asset_disposal_gain)))/"
             "copy_abs(normalized_earnings)"
         ),
@@ -333,7 +329,7 @@ DEEP_VALUE_THRESHOLDS = frozenset(
         "revenue_decline_max",
         "one_time_profit_share_max",
         "impairment_share_max",
-        "subsidy_disposal_share_max",
+        "non_core_income_proxy_share_max",
         "pb_percentile_max",
         "pb_median_ratio_max",
         "bank_roe_min",
@@ -353,7 +349,7 @@ DEEP_VALUE_MINIMUMS = frozenset(
         "revenue",
         "one_time_profit",
         "impairment",
-        "subsidy_disposal",
+        "non_core_income_proxy",
         "valuation_pb",
         "bank_roe",
         "bank_npl",
@@ -379,7 +375,7 @@ _DEEP_LOOKBACK_KEYS = frozenset(
         "revenue",
         "one_time_profit",
         "impairment",
-        "subsidy_disposal",
+        "non_core_income_proxy",
         "bank_roe",
         "bank_npl",
         "bank_capital",
@@ -428,7 +424,7 @@ _DEEP_GATE_SETS = MappingProxyType(
                 "revenue_decline",
                 "one_time_profit",
                 "impairment",
-                "subsidy_disposal",
+                "non_core_income_proxy",
             }
         ),
         "financial": frozenset(
@@ -461,7 +457,7 @@ GARP_FIELDS = (
     "gross_margin_change",
     "net_margin_change",
     "impairment_share",
-    "subsidy_disposal_share",
+    "non_core_income_proxy_share",
     "capped_growth",
     "peg",
     "pe_percentile",
@@ -525,8 +521,8 @@ GARP_FORMULAS = MappingProxyType(
             "copy_abs(latest(annual.impairment_loss))/"
             "copy_abs(latest(annual.deducted_net_income))"
         ),
-        "subsidy_disposal_share": (
-            "(copy_abs(latest(annual.government_grants))+"
+        "non_core_income_proxy_share": (
+            "(copy_abs(latest(annual.other_income))+"
             "copy_abs(latest(annual.asset_disposal_gain)))/"
             "copy_abs(latest(annual.deducted_net_income))"
         ),
@@ -561,7 +557,7 @@ GARP_THRESHOLDS = frozenset(
         "gross_margin_deterioration_max",
         "net_margin_deterioration_max",
         "impairment_share_max",
-        "subsidy_disposal_share_max",
+        "non_core_income_proxy_share_max",
         "peg_growth_cap",
         "peg_max",
         "pe_percentile_max",
@@ -631,7 +627,7 @@ _GARP_GATE_SET = frozenset(
         "gross_margin",
         "net_margin",
         "impairment",
-        "subsidy_disposal",
+        "non_core_income_proxy",
         "peg",
         "valuation",
     }
@@ -1320,7 +1316,7 @@ def validate_deep_value_ruler(ruler: TrackRuler) -> TrackRuler:
         "revenue": "revenue",
         "one_time_profit": "one_time_profit",
         "impairment": "impairment",
-        "subsidy_disposal": "subsidy_disposal",
+        "non_core_income_proxy": "non_core_income_proxy",
         "bank_roe": "bank_roe",
         "bank_npl": "bank_npl",
         "bank_capital": "bank_capital",

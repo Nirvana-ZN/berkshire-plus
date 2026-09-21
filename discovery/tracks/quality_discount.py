@@ -139,8 +139,7 @@ _FINANCIAL_FIELD_DOMAINS = MappingProxyType(
         ),
         "interest_debt": ("nonnegative", "interest_debt_negative"),
         "net_assets": ("signed_economic", None),
-        "ebit": ("signed_economic", None),
-        "interest": ("signed_economic", None),
+        "interest_coverage": ("signed_economic", None),
         "gross_margin": ("signed_economic", None),
         "deducted_net_income": ("signed_economic", None),
         # Regulatory ratios remain signed measurements. Negative reported
@@ -770,7 +769,7 @@ def _available_window_rows(
         "dilution": ("shares",),
         "positive_equity": ("net_assets",),
         "leverage": ("interest_debt", "net_assets"),
-        "interest_coverage": ("ebit", "interest"),
+        "interest_coverage": ("interest_coverage",),
         "margin": ("gross_margin",),
         "normalized_earnings": ("deducted_net_income",),
         "bank_capital": (
@@ -949,15 +948,14 @@ def _metric_values(
         interest_history = (
             () if interest_rows is None else interest_rows.rows
         )
-        ebit, interest = _latest_pair(
-            interest_history, "ebit", "interest"
+        direct_coverage = tuple(
+            row.values["interest_coverage"]
+            for row in interest_history
+            if row.values["interest_coverage"] is not None
         )
-        counts["interest_coverage"] = _count_pairs(
-            interest_history, "ebit", "interest"
-        )
-        values["interest_coverage"] = _divide(
-            ebit,
-            None if interest is None else interest.copy_abs(),
+        counts["interest_coverage"] = len(direct_coverage)
+        values["interest_coverage"] = (
+            direct_coverage[-1] if direct_coverage else None
         )
         margin_rows = windows.get("margin")
         margin_history = () if margin_rows is None else margin_rows.rows

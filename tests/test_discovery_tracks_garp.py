@@ -40,7 +40,7 @@ FIELDS = [
     "gross_margin_change",
     "net_margin_change",
     "impairment_share",
-    "subsidy_disposal_share",
+    "non_core_income_proxy_share",
     "capped_growth",
     "peg",
     "pe_percentile",
@@ -94,8 +94,8 @@ FORMULAS = {
         "copy_abs(latest(annual.impairment_loss))/"
         "copy_abs(latest(annual.deducted_net_income))"
     ),
-    "subsidy_disposal_share": (
-        "(copy_abs(latest(annual.government_grants))+"
+    "non_core_income_proxy_share": (
+        "(copy_abs(latest(annual.other_income))+"
         "copy_abs(latest(annual.asset_disposal_gain)))/"
         "copy_abs(latest(annual.deducted_net_income))"
     ),
@@ -123,7 +123,7 @@ def garp_payload(**threshold_overrides: str) -> dict[str, object]:
         "gross_margin_deterioration_max": "2",
         "net_margin_deterioration_max": "2",
         "impairment_share_max": "0.2",
-        "subsidy_disposal_share_max": "0.2",
+        "non_core_income_proxy_share_max": "0.2",
         "peg_growth_cap": "0.25",
         "peg_max": "1.5",
         "pe_percentile_max": "70",
@@ -194,7 +194,7 @@ def garp_payload(**threshold_overrides: str) -> dict[str, object]:
                     "gross_margin",
                     "net_margin",
                     "impairment",
-                    "subsidy_disposal",
+                    "non_core_income_proxy",
                     "peg",
                     "valuation",
                 ],
@@ -240,7 +240,7 @@ def _garp_annual(year: int, **changes: str | None) -> dict[str, object]:
         "gross_margin": "30",
         "net_margin": "12",
         "impairment_loss": "1",
-        "government_grants": "1",
+        "other_income": "1",
         "asset_disposal_gain": "1",
     }
     values.update(changes)
@@ -505,8 +505,8 @@ def test_roic_is_primary_and_roe_fallback_is_explicitly_labeled() -> None:
         ({"net_margin": "9"}, "net_margin_deterioration"),
         ({"impairment_loss": "8"}, "impairment_share_above_max"),
         (
-            {"government_grants": "4", "asset_disposal_gain": "4"},
-            "subsidy_disposal_share_above_max",
+            {"other_income": "4", "asset_disposal_gain": "4"},
+            "non_core_income_proxy_share_above_max",
         ),
     ],
 )
@@ -547,7 +547,7 @@ def test_acquisition_cash_uses_multi_year_flow_intensity_not_endpoint_delta() ->
         ("gross_margin", "margin_insufficient"),
         ("net_margin", "margin_insufficient"),
         ("impairment_loss", "quality_adjustments_insufficient"),
-        ("government_grants", "quality_adjustments_insufficient"),
+        ("other_income", "quality_adjustments_insufficient"),
         ("asset_disposal_gain", "quality_adjustments_insufficient"),
     ],
 )
@@ -874,7 +874,7 @@ def test_growth_driver_trend_emits_generic_deterministic_risk() -> None:
     )
 
 
-def test_calibrator_garp_is_deterministic_blocked_read_only_and_never_active(
+def test_calibrator_garp_has_no_false_direct_roic_blocker_and_is_read_only(
     tmp_path: Path,
 ) -> None:
     from scripts.calibrate_discovery import calibrate
@@ -889,7 +889,7 @@ def test_calibrator_garp_is_deterministic_blocked_read_only_and_never_active(
     assert first["status"] == "blocked"
     assert first["approval_ready"] is False
     assert first["blocked_reasons"] == [
-        "trusted_roic_goodwill_acquisition_cash_unavailable"
+        "track_calibration_not_implemented"
     ]
     assert first["proposal"] is None
     assert hashlib.sha256(db.read_bytes()).hexdigest() == before

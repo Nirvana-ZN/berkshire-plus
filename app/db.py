@@ -10,7 +10,7 @@ from sqlalchemy.pool import NullPool
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "app.db"
 FIN_FETCH_KEY = "fin_fetch_version"
-FIN_FETCH_VERSION = "3"
+FIN_FETCH_VERSION = "4"
 _DISCOVERY_CNY_COLUMNS = (
     "net_income",
     "ocf",
@@ -31,6 +31,7 @@ _DISCOVERY_CNY_COLUMNS = (
     "nonperforming_loan_balance",
     "impairment_loss",
     "government_grants",
+    "other_income",
     "asset_disposal_gain",
     "goodwill",
     "acquisition_cash_paid",
@@ -621,6 +622,7 @@ def _ensure_financial_columns(engine: Engine) -> None:
         "capex": "TEXT",
         "ebit": "NUMERIC(20, 8)",
         "interest": "NUMERIC(20, 8)",
+        "interest_coverage": "NUMERIC(30, 12)",
         "gross_margin": "NUMERIC(20, 8)",
         "net_margin": "NUMERIC(20, 8)",
         "shares": "NUMERIC(20, 8)",
@@ -648,6 +650,7 @@ def _ensure_financial_columns(engine: Engine) -> None:
         "nonperforming_loan_balance": "TEXT",
         "impairment_loss": "TEXT",
         "government_grants": "TEXT",
+        "other_income": "TEXT",
         "asset_disposal_gain": "TEXT",
         "goodwill": "TEXT",
         "acquisition_cash_paid": "TEXT",
@@ -662,6 +665,26 @@ def _ensure_financial_columns(engine: Engine) -> None:
             if column not in names:
                 conn.execute(
                     text(f"ALTER TABLE financials ADD COLUMN {column} {sql_type}")
+                )
+
+
+def _ensure_financial_provenance_columns(engine: Engine) -> None:
+    from sqlalchemy import text
+
+    with engine.begin() as conn:
+        names = {
+            row[1]
+            for row in conn.execute(
+                text("PRAGMA table_info(financial_field_provenance)")
+            ).fetchall()
+        }
+        for column in ("source_report", "source_field"):
+            if names and column not in names:
+                conn.execute(
+                    text(
+                        "ALTER TABLE financial_field_provenance "
+                        f"ADD COLUMN {column} VARCHAR"
+                    )
                 )
 
 
@@ -1034,6 +1057,7 @@ def init_db(db_path: Path | None = None) -> Engine:
     _ensure_research_columns(engine)
     _ensure_listed_year(engine)
     _ensure_financial_columns(engine)
+    _ensure_financial_provenance_columns(engine)
     _ensure_discovery_fill_columns(engine)
     _ensure_discovery_checkpoint_columns(engine)
     _ensure_discovery_universe_seals(engine)

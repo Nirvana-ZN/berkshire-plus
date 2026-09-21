@@ -33,6 +33,7 @@ _LEGACY_FINANCIAL_FIELDS = (
     "capex",
     "ebit",
     "interest",
+    "interest_coverage",
     "gross_margin",
     "net_margin",
     "shares",
@@ -42,7 +43,17 @@ _LEGACY_FINANCIAL_FIELDS = (
     "eps",
 )
 _STRICT_SHARED_FINANCIAL_FIELDS = frozenset(
-    {"net_income", "ocf", "capex", "shares", "npl"}
+    {
+        "roe",
+        "net_income",
+        "ocf",
+        "capex",
+        "interest_coverage",
+        "gross_margin",
+        "net_margin",
+        "shares",
+        "npl",
+    }
 )
 
 

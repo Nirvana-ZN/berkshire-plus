@@ -35,6 +35,12 @@ _READINESS_DISPLAY_PRECISION = 28
 
 _FINANCIAL_FIELDS = (
     "roe",
+    "shares",
+    "gross_margin",
+    "net_margin",
+    "interest_coverage",
+    "other_income",
+    "asset_disposal_gain",
     "capex",
     "revenue",
     "roic",
@@ -49,7 +55,7 @@ _ALLOWED_MINIMUMS = {
 _MEASUREMENT_MINIMUMS = {
     QUALITY_DISCOUNT: {"pe": MIN_VALUATION_MONTHS, "pb": MIN_VALUATION_MONTHS},
     DEEP_VALUE: {"capex": 1, "capital_adequacy": 1, "npl": 1},
-    GARP: {"revenue": 1, "roic": 1},
+    GARP: {"revenue": 1, "roe": 1},
 }
 _VALUATION_POLICIES = frozenset({"both", "either", "pe", "pb"})
 _SECTOR_POLICIES = frozenset({"exclude_financial", "roe_fallback"})
@@ -606,11 +612,7 @@ def _track_activated(
         policy = sector_policies.get(track)
         if has_financial_companies and policy is None:
             return False
-        required = (
-            {"revenue", "roe"}
-            if policy == "roe_fallback"
-            else {"revenue", "roic"}
-        )
+        required = {"revenue", "roe"}
         return required <= configured[track].keys()
     return _ALLOWED_MINIMUMS[track] <= configured[track].keys()
 
@@ -793,21 +795,14 @@ def discovery_data_readiness(
                 garp_missing = ("industry",)
                 aligned[GARP] = 0
             elif financial_branch and garp_sector_policy is None:
-                garp_missing = ("financial_roic_policy",)
+                garp_missing = ("financial_return_metric_policy",)
                 aligned[GARP] = 0
                 insufficient[GARP][
-                    "financial_roic_policy_unapproved"
+                    "financial_return_metric_policy_unapproved"
                 ] += 1
             else:
-                garp_fields = (
-                    ("revenue", "roe")
-                    if financial_branch
-                    and garp_sector_policy == "roe_fallback"
-                    else ("revenue", "roic")
-                )
+                garp_fields = ("revenue", "roe")
                 garp_minimums = _effective_minimums(configured_minimums, GARP)
-                if "roe" in garp_fields:
-                    garp_minimums.setdefault("roe", 1)
                 aligned[GARP] = _aligned_count(
                     financials[company.code], garp_fields
                 )

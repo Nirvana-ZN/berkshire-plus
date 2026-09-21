@@ -52,7 +52,7 @@ _FIELDS = (
     "gross_margin",
     "net_margin",
     "impairment_loss",
-    "government_grants",
+    "other_income",
     "asset_disposal_gain",
 )
 _DOMAINS = MappingProxyType(
@@ -70,7 +70,7 @@ _DOMAINS = MappingProxyType(
         "gross_margin": "signed",
         "net_margin": "signed",
         "impairment_loss": "signed",
-        "government_grants": "signed",
+        "other_income": "signed",
         "asset_disposal_gain": "signed",
     }
 )
@@ -92,7 +92,7 @@ _NUMERIC_METRICS = (
     "gross_margin_change",
     "net_margin_change",
     "impairment_share",
-    "subsidy_disposal_share",
+    "non_core_income_proxy_share",
     "capped_growth",
     "peg",
     "pe_percentile",
@@ -114,7 +114,7 @@ _WINDOW_FIELDS = MappingProxyType(
         "quality_adjustments": (
             "deducted_net_income",
             "impairment_loss",
-            "government_grants",
+            "other_income",
             "asset_disposal_gain",
         ),
     }
@@ -585,7 +585,7 @@ def _metric_values(
         quality_window,
         "deducted_net_income",
         "impairment_loss",
-        "government_grants",
+        "other_income",
         "asset_disposal_gain",
     )
     counts["quality_adjustments"] = len(quality_rows)
@@ -604,8 +604,8 @@ def _metric_values(
             latest["impairment_loss"].copy_abs(),  # type: ignore[union-attr]
             denominator,
         )
-        metrics["subsidy_disposal_share"] = _divide(
-            _sum_abs(latest["government_grants"], latest["asset_disposal_gain"]),
+        metrics["non_core_income_proxy_share"] = _divide(
+            _sum_abs(latest["other_income"], latest["asset_disposal_gain"]),
             denominator,
         )
 
@@ -791,10 +791,10 @@ def _gate_failures(
             "above",
             None,
         ),
-        "subsidy_disposal": (
-            "subsidy_disposal_share",
+        "non_core_income_proxy": (
+            "non_core_income_proxy_share",
             "quality_adjustments",
-            "subsidy_disposal_share_max",
+            "non_core_income_proxy_share_max",
             "above",
             None,
         ),

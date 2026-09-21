@@ -15,7 +15,7 @@ from typing import Any
 from discovery.field_dictionary import FIELD_DICTIONARY, FieldSpec
 from market.types import DiscoveryCompanyData, FinancialRow, SecurityState
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _FINANCIAL_FIELDS = tuple(
     field.name
@@ -122,6 +122,18 @@ def serialize_company_payload(
     financial_rows = []
     for row in bundle.financial_rows:
         values = {field: getattr(row, field) for field in _FINANCIAL_FIELDS}
+        untrusted = tuple(
+            field
+            for field, spec in FIELD_DICTIONARY.items()
+            if not spec.trusted and values.get(field) is not None
+        )
+        if values.get("interest") is not None:
+            untrusted += ("interest",)
+        if untrusted:
+            raise ValueError(
+                "discovery company payload contains untrusted fields: "
+                + ", ".join(untrusted)
+            )
         financial_rows.append(
             {
                 "period": row.period,
@@ -254,6 +266,15 @@ def parse_company_payload(
                     raise ValueError("invalid financial share_change_ma")
             else:
                 _decimal(field_value, f"financial {field}")
+        untrusted = tuple(
+            field
+            for field, spec in FIELD_DICTIONARY.items()
+            if not spec.trusted and values.get(field) is not None
+        )
+        if values.get("interest") is not None:
+            untrusted += ("interest",)
+        if untrusted:
+            raise ValueError("invalid untrusted financial values")
         expected_sources = {
             field: _source_metadata(FIELD_DICTIONARY[field])
             for field, field_value in values.items()

@@ -2067,7 +2067,7 @@ class EastMoneyClient:
                     main, "TOTAL_SHARE", "TOTALSHARE", "TOTAL_SHARES"
                 )
                 if not strict
-                else None
+                else _positive_decimal(main.get("TOTAL_SHARE"))
             )
             ebit = (
                 _mul(_as_decimal(main.get("PER_EBIT")), shares)
@@ -2121,7 +2121,7 @@ class EastMoneyClient:
                             main, "ROEJQ", "ROE", "WEIGHTAVGROE"
                         )
                         if not strict
-                        else None
+                        else metric("roe", main)
                     ),
                     net_income=net_income,
                     ocf=ocf,
@@ -2134,19 +2134,24 @@ class EastMoneyClient:
                         if not strict
                         else None
                     ),
+                    interest_coverage=(
+                        None
+                        if not strict
+                        else metric("interest_coverage", main)
+                    ),
                     gross_margin=(
                         _first_decimal(
                             main, "XSMLL", "GROSSPROFITMARGIN"
                         )
                         if not strict
-                        else None
+                        else metric("gross_margin", main)
                     ),
                     net_margin=(
                         _first_decimal(
                             main, "XSJLL", "NETPROFITMARGIN"
                         )
                         if not strict
-                        else None
+                        else metric("net_margin", main)
                     ),
                     shares=shares,
                     share_change_ma=None,
@@ -2192,6 +2197,9 @@ class EastMoneyClient:
                     ),
                     impairment_loss=_impairment_loss(income_detail),
                     government_grants=None,
+                    other_income=metric(
+                        "other_income", income_detail
+                    ),
                     asset_disposal_gain=metric(
                         "asset_disposal_gain", income_detail
                     ),

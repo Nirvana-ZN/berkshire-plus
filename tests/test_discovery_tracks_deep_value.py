@@ -31,7 +31,7 @@ FIELDS = [
     "revenue_decline",
     "one_time_profit_share",
     "impairment_share",
-    "subsidy_disposal_share",
+    "non_core_income_proxy_share",
     "pb_percentile",
     "pb_median_ratio",
     "roe_mean",
@@ -49,7 +49,7 @@ FORMULAS = {
     "net_debt_to_normalized_fcf": (
         "(latest(annual.interest_debt)-latest(annual.cash))/normalized_fcf"
     ),
-    "interest_coverage": "latest(annual.ebit)/copy_abs(latest(annual.interest))",
+    "interest_coverage": "latest(annual.interest_coverage)",
     "dilution_rate": "latest(annual.shares)/earliest(annual.shares)-1",
     "revenue_decline": (
         "max(0,(earliest(annual.revenue)-latest(annual.revenue))/"
@@ -62,8 +62,8 @@ FORMULAS = {
     "impairment_share": (
         "copy_abs(latest(annual.impairment_loss))/copy_abs(normalized_earnings)"
     ),
-    "subsidy_disposal_share": (
-        "(copy_abs(latest(annual.government_grants))+"
+    "non_core_income_proxy_share": (
+        "(copy_abs(latest(annual.other_income))+"
         "copy_abs(latest(annual.asset_disposal_gain)))/"
         "copy_abs(normalized_earnings)"
     ),
@@ -91,7 +91,7 @@ def deep_value_payload(**threshold_overrides: str) -> dict[str, object]:
         "revenue_decline_max": "0.2",
         "one_time_profit_share_max": "0.3",
         "impairment_share_max": "0.3",
-        "subsidy_disposal_share_max": "0.2",
+        "non_core_income_proxy_share_max": "0.2",
         "pb_percentile_max": "30",
         "pb_median_ratio_max": "0.8",
         "bank_roe_min": "8",
@@ -116,7 +116,7 @@ def deep_value_payload(**threshold_overrides: str) -> dict[str, object]:
             "revenue": 2,
             "one_time_profit": 1,
             "impairment": 1,
-            "subsidy_disposal": 1,
+            "non_core_income_proxy": 1,
             "valuation_pb": 60,
             "bank_roe": 5,
             "bank_npl": 2,
@@ -136,7 +136,7 @@ def deep_value_payload(**threshold_overrides: str) -> dict[str, object]:
                     "revenue": 5,
                     "one_time_profit": 1,
                     "impairment": 1,
-                    "subsidy_disposal": 1,
+                    "non_core_income_proxy": 1,
                     "bank_roe": 5,
                     "bank_npl": 5,
                     "bank_capital": 5,
@@ -162,7 +162,7 @@ def deep_value_payload(**threshold_overrides: str) -> dict[str, object]:
                     "revenue_decline",
                     "one_time_profit",
                     "impairment",
-                    "subsidy_disposal",
+                    "non_core_income_proxy",
                 ],
                 "evidence_fields": [
                     "normalized_pe",
@@ -207,7 +207,7 @@ def _deep_annual(
         "capex": "20",
         "revenue": "200",
         "impairment_loss": "5",
-        "government_grants": "5",
+        "other_income": "5",
         "asset_disposal_gain": "5",
     }
     values.update(changes)
@@ -296,14 +296,14 @@ def test_nonfinancial_normalizes_deducted_profit_and_requires_positive_fcf() -> 
     ("changes", "reason"),
     [
         ({"cash": "0", "interest_debt": "400"}, "net_debt_to_normalized_fcf_above_max"),
-        ({"ebit": "5", "interest": "5"}, "interest_coverage_below_min"),
+        ({"interest_coverage": "1"}, "interest_coverage_below_min"),
         ({"shares": "120"}, "dilution_rate_above_max"),
         ({"revenue": "100"}, "revenue_decline_above_max"),
         ({"net_income": "200", "deducted_net_income": "100"}, "one_time_profit_share_above_max"),
         ({"impairment_loss": "40"}, "impairment_share_above_max"),
         (
-            {"government_grants": "15", "asset_disposal_gain": "15"},
-            "subsidy_disposal_share_above_max",
+            {"other_income": "15", "asset_disposal_gain": "15"},
+            "non_core_income_proxy_share_above_max",
         ),
     ],
 )
@@ -321,13 +321,13 @@ def test_nonfinancial_deep_value_gates(
 
 def test_missing_required_nonfinancial_field_is_insufficient() -> None:
     annual = tuple(
-        _deep_annual(year, government_grants=None)
+        _deep_annual(year, other_income=None)
         for year in range(2021, 2026)
     )
     verdict = _classify(_company(annual=annual))
     assert (verdict.verdict, verdict.primary_reason) == (
         "insufficient",
-        "subsidy_disposal_insufficient",
+        "non_core_income_proxy_insufficient",
     )
 
 
@@ -342,7 +342,7 @@ def test_missing_required_nonfinancial_field_is_insufficient() -> None:
             "net_debt_to_normalized_fcf",
         ),
         (
-            "interest",
+            "interest_coverage",
             "interest_coverage_insufficient",
             "interest_coverage",
         ),
@@ -354,8 +354,8 @@ def test_missing_required_nonfinancial_field_is_insufficient() -> None:
         ("impairment_loss", "impairment_insufficient", "impairment_share"),
         (
             "asset_disposal_gain",
-            "subsidy_disposal_insufficient",
-            "subsidy_disposal_share",
+            "non_core_income_proxy_insufficient",
+            "non_core_income_proxy_share",
         ),
     ],
 )
@@ -384,8 +384,7 @@ def test_financial_branch_uses_pb_roe_npl_and_verified_capital_only() -> None:
             capex="999",
             cash="0",
             interest_debt="999999",
-            ebit="1",
-            interest="999",
+            interest_coverage="0.001",
             npl=(
                 format(
                     Decimal("1.4") - Decimal(year - 2021) / Decimal(10),
@@ -693,7 +692,7 @@ def test_builtin_dispatches_deep_value_gate_and_competition() -> None:
     assert _validate_track_outcome(competition, ranked) is ranked
     with pytest.raises(
         TrackExecutorContractError,
-        match="as-of is not source-bounded",
+        match="canonical|source-bounded",
     ):
         _validate_track_outcome(
             competition,
@@ -893,7 +892,7 @@ def test_calibrator_deep_value_is_deterministic_blocked_and_read_only(
     assert hashlib.sha256(db.read_bytes()).hexdigest() == before
 
 
-def test_calibrator_blocks_untrusted_production_grants_before_activation(
+def test_calibrator_no_longer_mislabels_other_income_as_untrusted_grants(
     tmp_path: Path,
 ) -> None:
     from scripts.calibrate_discovery import calibrate
@@ -904,7 +903,7 @@ def test_calibrator_blocks_untrusted_production_grants_before_activation(
     before = hashlib.sha256(db.read_bytes()).hexdigest()
     artifact = calibrate(db, track="deep_value")
     assert artifact["blocked_reasons"] == [
-        "trusted_government_grants_unavailable"
+        "track_calibration_not_implemented"
     ]
     assert artifact["approval_ready"] is False
     assert artifact["proposal"] is None

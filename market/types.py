@@ -71,6 +71,7 @@ class FinancialRow:
     capex: Decimal | None = None
     ebit: Decimal | None = None
     interest: Decimal | None = None
+    interest_coverage: Decimal | None = None
     gross_margin: Decimal | None = None
     net_margin: Decimal | None = None
     shares: Decimal | None = None
@@ -98,6 +99,7 @@ class FinancialRow:
     nonperforming_loan_balance: Decimal | None = None
     impairment_loss: Decimal | None = None
     government_grants: Decimal | None = None
+    other_income: Decimal | None = None
     asset_disposal_gain: Decimal | None = None
     goodwill: Decimal | None = None
     acquisition_cash_paid: Decimal | None = None

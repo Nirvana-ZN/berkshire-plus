@@ -217,6 +217,9 @@ class Financial(Base):
     )
     ebit: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
     interest: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
+    interest_coverage: Mapped[Decimal | None] = mapped_column(
+        Numeric(30, 12), nullable=True
+    )
     gross_margin: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
     net_margin: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
     shares: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
@@ -278,6 +281,9 @@ class Financial(Base):
     government_grants: Mapped[Decimal | None] = mapped_column(
         CanonicalDecimalText(), nullable=True
     )
+    other_income: Mapped[Decimal | None] = mapped_column(
+        CanonicalDecimalText(), nullable=True
+    )
     asset_disposal_gain: Mapped[Decimal | None] = mapped_column(
         CanonicalDecimalText(), nullable=True
     )
@@ -306,6 +312,8 @@ class FinancialFieldProvenance(Base):
     period_type: Mapped[str] = mapped_column(String, primary_key=True)
     field: Mapped[str] = mapped_column(String, primary_key=True)
     source: Mapped[str] = mapped_column(String, primary_key=True)
+    source_report: Mapped[str | None] = mapped_column(String, nullable=True)
+    source_field: Mapped[str | None] = mapped_column(String, nullable=True)
 
 
 class ValuationSeries(Base):

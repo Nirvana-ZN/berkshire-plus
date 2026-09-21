@@ -71,9 +71,9 @@ _OBSERVATION_REQUIREMENTS = MappingProxyType(
             "impairment",
             "impairment_observations",
         ),
-        "subsidy_disposal_share": (
-            "subsidy_disposal",
-            "subsidy_disposal_observations",
+        "non_core_income_proxy_share": (
+            "non_core_income_proxy",
+            "non_core_income_proxy_observations",
         ),
         "revenue_cagr": (
             "revenue_growth",
@@ -455,8 +455,8 @@ def _risk_specs(
             ),
             ("impairment_share", "impairment_share_max", "max"),
             (
-                "subsidy_disposal_share",
-                "subsidy_disposal_share_max",
+                "non_core_income_proxy_share",
+                "non_core_income_proxy_share_max",
                 "max",
             ),
         )
