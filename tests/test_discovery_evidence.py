@@ -148,6 +148,47 @@ def test_fewer_than_three_reliable_facts_is_insufficient_not_padded() -> None:
     assert all(item.input_fields != {"text": "generic"} for item in facts)
 
 
+def test_bank_card_uses_branch_specific_reliable_facts() -> None:
+    from tests.test_discovery_tracks_quality import (
+        _classify,
+        frozen_company,
+        quality_payload,
+    )
+
+    company = frozen_company(industry="银行")
+    verdict = _classify(company)
+    assert verdict.verdict == "pass"
+
+    card = build_evidence_card(
+        company.code,
+        verdict.metrics,
+        quality_payload(),
+        source_as_of={
+            key: company.as_of[key]
+            for key in ("security", "financial", "valuation")
+        },
+    )
+
+    facts = {item.rule_id: item for item in card.items if item.kind == "fact"}
+    assert card.verdict == "pass"
+    assert 3 <= len(card.items) <= 5
+    assert set(facts) == {
+        "quality_discount.fact.pb_percentile",
+        "quality_discount.fact.roe_mean",
+        "quality_discount.fact.bank_capital",
+        "quality_discount.fact.bank_npl",
+    }
+    assert {
+        "bank_capital_adequacy",
+        "bank_core_tier1_capital_adequacy",
+    } <= set(facts["quality_discount.fact.bank_capital"].input_fields)
+    assert not any(
+        field in item.rule_id
+        for item in facts.values()
+        for field in ("pe_percentile", "cash_conversion")
+    )
+
+
 def test_builtin_competition_emits_evidence_for_every_entrant() -> None:
     from discovery.snapshot import FrozenRunInputs, canonical_json
     from jobs.discovery import (
@@ -279,3 +320,53 @@ def test_builtin_competition_emits_evidence_for_every_entrant() -> None:
         evidence=outcome.evidence,
     )
     assert _validate_track_outcome(context, allowed) is allowed
+
+    first_evidence = outcome.evidence[0]
+    malformed = (
+        replace(
+            outcome,
+            evidence=tuple(
+                item
+                for item in outcome.evidence
+                if item.code != "600000.SH"
+            ),
+        ),
+        replace(
+            outcome,
+            evidence=(
+                replace(first_evidence, kind="narrative"),
+                *outcome.evidence[1:],
+            ),
+        ),
+        replace(
+            outcome,
+            evidence=(
+                replace(first_evidence, data_completeness="unknown"),
+                *outcome.evidence[1:],
+            ),
+        ),
+        replace(
+            outcome,
+            evidence=(
+                replace(first_evidence, as_of="2026-09-16"),
+                *outcome.evidence[1:],
+            ),
+        ),
+        replace(
+            outcome,
+            evidence=(
+                replace(first_evidence, rule_version="ruler-digest"),
+                *outcome.evidence[1:],
+            ),
+        ),
+        replace(
+            outcome,
+            evidence=(
+                replace(first_evidence, ruler_version_id=8),
+                *outcome.evidence[1:],
+            ),
+        ),
+    )
+    for invalid in malformed:
+        with pytest.raises(TrackExecutorContractError):
+            _validate_track_outcome(context, invalid)
