@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
 from types import MappingProxyType
 
 import pytest
@@ -9,7 +10,9 @@ from discovery.evidence import (
     ALLOWED_RISK_CATEGORIES,
     EVIDENCE_RULE_VERSION,
     FALLBACK_RISK_TEXT,
+    PersistedEvidenceItem,
     build_evidence_card,
+    verify_canonical_evidence_card,
 )
 
 SOURCE_AS_OF = {
@@ -104,6 +107,88 @@ def test_evidence_is_deterministic_and_carries_rule_inputs() -> None:
     assert facts["quality_discount.fact.cash_conversion"].as_of == "2026-04-01"
     assert first.items[-1].display_text == FALLBACK_RISK_TEXT
     assert first.items[-1].kind == "risk"
+
+
+def test_canonical_verifier_rejects_semantic_evidence_forgery() -> None:
+    from tests.test_discovery_tracks_quality import (
+        _classify,
+        frozen_company,
+        quality_payload,
+    )
+
+    company = frozen_company(industry="银行")
+    result = _classify(company)
+    ruler = quality_payload()
+    source_as_of = {
+        key: company.as_of[key]
+        for key in ("security", "financial", "valuation")
+    }
+    card = build_evidence_card(
+        company.code,
+        result.metrics,
+        ruler,
+        source_as_of=source_as_of,
+    )
+    items = tuple(
+        PersistedEvidenceItem(
+            code=company.code,
+            ruler_version_id=7,
+            rule_version=item.rule_version,
+            kind=item.kind,
+            rule_id=item.rule_id,
+            input_fields=item.input_fields,
+            display_text=item.display_text,
+            as_of=item.as_of,
+            data_completeness=item.data_completeness,
+        )
+        for item in card.items
+    )
+
+    def verify(
+        candidate_items: tuple[PersistedEvidenceItem, ...],
+        candidate_metrics=result.metrics,
+    ) -> bool:
+        return verify_canonical_evidence_card(
+            track="quality_discount",
+            ruler=ruler,
+            ruler_version_id=7,
+            code=company.code,
+            metrics=candidate_metrics,
+            verdict="pass",
+            rank=1,
+            reason=None,
+            company_code=company.code,
+            company_industry=company.industry,
+            source_as_of=source_as_of,
+            items=candidate_items,
+        )
+
+    assert verify(items)
+    assert not verify(
+        (
+            replace(
+                items[0],
+                input_fields={**items[0].input_fields, "value": "999"},
+            ),
+            *items[1:],
+        )
+    )
+    assert not verify(
+        (
+            replace(
+                items[0],
+                rule_id="quality_discount.fact.allowed_looking_forgery",
+            ),
+            *items[1:],
+        )
+    )
+    assert not verify(
+        (replace(items[0], code="600001.SH"), *items[1:])
+    )
+    assert not verify(items, {**result.metrics, "code": "600001.SH"})
+    assert not verify(
+        (replace(items[0], as_of="2020-01-01"), *items[1:])
+    )
 
 
 def test_risks_use_only_allowed_categories() -> None:
@@ -239,10 +324,13 @@ def test_builtin_competition_emits_evidence_for_every_entrant() -> None:
             reason=None,
             metrics_json=canonical_json(
                 {
+                        "code": code,
                     "pe_percentile": "20",
                     "roe_cv": "0.1",
                     "cash_conversion": "1.2",
                     "roe_mean": "15",
+                    "branch": "nonfinancial",
+                    "quality_branch": "nonfinancial",
                     "valuation_pe_observations": "60",
                     "roe_observations": "5",
                     "cash_conversion_observations": (
@@ -330,6 +418,8 @@ def test_builtin_competition_emits_evidence_for_every_entrant() -> None:
         for item in first_code_items
         if item.rule_id == "quality_discount.risk.none"
     )
+    fabricated_inputs = json.loads(first_evidence.input_fields_json)
+    fabricated_inputs["value"] = "999"
     malformed = (
         replace(
             outcome,
@@ -369,6 +459,23 @@ def test_builtin_competition_emits_evidence_for_every_entrant() -> None:
                         {"metric": "1", "source": "financial"}
                     ),
                 ),
+                *outcome.evidence[1:],
+            ),
+        ),
+        replace(
+            outcome,
+            evidence=(
+                replace(
+                    first_evidence,
+                    input_fields_json=canonical_json(fabricated_inputs),
+                ),
+                *outcome.evidence[1:],
+            ),
+        ),
+        replace(
+            outcome,
+            evidence=(
+                replace(first_evidence, code="600001.SH"),
                 *outcome.evidence[1:],
             ),
         ),

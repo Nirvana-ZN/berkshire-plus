@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import datetime
 from decimal import Decimal
 import json
 from math import isfinite
@@ -44,10 +44,9 @@ from discovery.constants import (
     utc_now,
 )
 from discovery.evidence import (
-    ALLOWED_RISK_CATEGORIES,
-    EVIDENCE_RULE_VERSION,
-    FALLBACK_RISK_TEXT,
+    PersistedEvidenceItem,
     build_evidence_card,
+    verify_canonical_evidence_card,
 )
 from discovery.snapshot import (
     FrozenRunInputs,
@@ -925,163 +924,74 @@ def _validate_track_outcome(
             "unique and contiguous"
         )
 
-    evidence_keys = []
-    evidence_by_code: dict[str, list[TrackExecutionEvidence]] = {}
-    company_source_dates: dict[str, dict[str, str]] = {}
-    fallback_id = f"{context.track}.risk.none"
-    for company in context.frozen_inputs.companies:
-        dates = {}
-        for source, value in company.as_of.items():
-            if type(value) is not str:
-                continue
-            try:
-                parsed = date.fromisoformat(value)
-            except ValueError:
-                continue
-            if parsed.isoformat() == value:
-                dates[source] = value
-        company_source_dates[company.code] = dates
+    if context.stage != "competition":
+        if outcome.evidence:
+            raise TrackExecutorContractError(
+                "only competition outcomes may carry evidence"
+            )
+        return outcome
+
+    evidence_by_code: dict[str, list[PersistedEvidenceItem]] = {}
     for row in outcome.evidence:
         if (
             type(row) is not TrackExecutionEvidence
-            or context.stage != "competition"
             or row.code not in allowed_codes
         ):
             raise TrackExecutorContractError(
                 "invalid competition evidence DTO"
             )
-        if row.ruler_version_id != context.ruler_version_id:
-            raise TrackExecutorContractError(
-                "competition evidence ruler lineage is invalid"
-            )
-        if row.rule_version != EVIDENCE_RULE_VERSION:
-            raise TrackExecutorContractError(
-                "competition evidence rule version is invalid"
-            )
-        if row.kind not in {"fact", "risk"}:
-            raise TrackExecutorContractError(
-                "competition evidence kind is invalid"
-            )
-        if (
-            row.data_completeness not in {"complete", "partial"}
-            or row.kind == "fact"
-            and row.data_completeness != "complete"
-        ):
-            raise TrackExecutorContractError(
-                "competition evidence completeness is invalid"
-            )
-        for value in (
-            row.code,
-            row.rule_version,
-            row.kind,
-            row.rule_id,
-            row.display_text,
-            row.as_of,
-            row.data_completeness,
-        ):
-            if type(value) is not str or not value.strip():
-                raise TrackExecutorContractError(
-                    "competition evidence text is required"
-                )
         try:
             input_fields = _plain_metrics(row.input_fields_json)
         except (TypeError, ValueError, json.JSONDecodeError) as error:
             raise TrackExecutorContractError(
                 f"competition evidence input is invalid: {error}"
             ) from error
-        if not input_fields:
-            raise TrackExecutorContractError(
-                "competition evidence input cannot be empty"
+        evidence_by_code.setdefault(row.code, []).append(
+            PersistedEvidenceItem(
+                code=row.code,
+                ruler_version_id=row.ruler_version_id,
+                rule_version=row.rule_version,
+                kind=row.kind,
+                rule_id=row.rule_id,
+                input_fields=input_fields,
+                display_text=row.display_text,
+                as_of=row.as_of,
+                data_completeness=row.data_completeness,
             )
-        sources = company_source_dates.get(row.code, {})
-        source = input_fields.get("source")
-        source_names = input_fields.get("sources")
-        source_bundle = input_fields.get("source_as_of")
-        exact_source = (
-            type(source) is str
-            and source in sources
-            and row.as_of == sources[source]
         )
-        exact_bundle = (
-            type(source_bundle) is dict
-            and bool(source_bundle)
-            and all(
-                type(name) is str
-                and type(value) is str
-                and sources.get(name) == value
-                for name, value in source_bundle.items()
-            )
-            and (
-                row.rule_id == fallback_id
-                or (
-                    source is None
-                    and type(source_names) is list
-                    and source_names == list(source_bundle)
-                )
-            )
-            and row.as_of == min(source_bundle.values())
-        )
-        if not exact_source and not exact_bundle:
-            raise TrackExecutorContractError(
-                "competition evidence as-of is not source-bounded"
-            )
-        expected_prefix = f"{context.track}.{row.kind}."
-        if not row.rule_id.startswith(expected_prefix):
-            raise TrackExecutorContractError(
-                "competition evidence rule id is invalid"
-            )
-        if row.kind == "risk":
-            category = row.rule_id.removeprefix(expected_prefix).split(".", 1)[0]
-            if category != "none" and category not in ALLOWED_RISK_CATEGORIES:
-                raise TrackExecutorContractError(
-                    "competition evidence risk category is invalid"
-                )
-            if (
-                category == "none"
-                and row.display_text != FALLBACK_RISK_TEXT
-            ):
-                raise TrackExecutorContractError(
-                    "competition evidence fallback risk is invalid"
-                )
-        evidence_by_code.setdefault(row.code, []).append(row)
-        evidence_keys.append((row.code, row.kind, row.rule_id))
-    if len(evidence_keys) != len(set(evidence_keys)):
-        raise TrackExecutorContractError(
-            "competition evidence identities must be unique"
-        )
-    if (
-        context.stage == "competition"
-        and outcome.status == "waiting_confirmation"
-        and set(evidence_by_code) != allowed_codes
-    ):
-        raise TrackExecutorContractError(
-            "competition evidence cards must match the exact candidate set"
-        )
-    results_by_code = {row.code: row for row in outcome.results}
-    for code, items in evidence_by_code.items():
-        facts = [item for item in items if item.kind == "fact"]
-        risks = [item for item in items if item.kind == "risk"]
-        evidence_insufficient = (
-            results_by_code[code].verdict == "insufficient"
-            and results_by_code[code].reason == "evidence_facts_insufficient"
-        )
-        fallback = [
-            item
-            for item in risks
-            if item.rule_id == fallback_id
-        ]
-        if (
-            not 1 <= len(items) <= 5
-            or not risks
-            or fallback
-            and len(risks) != 1
-            or evidence_insufficient
-            and len(facts) >= 3
-            or not evidence_insufficient
-            and (len(items) < 3 or len(facts) < 3)
+
+    companies = {
+        company.code: company for company in context.frozen_inputs.companies
+    }
+    for row in outcome.results:
+        company = companies.get(row.code)
+        try:
+            metrics = _plain_metrics(row.metrics_json)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            metrics = {}
+        if company is None or not verify_canonical_evidence_card(
+            track=context.track,
+            ruler=context.ruler_payload,
+            ruler_version_id=context.ruler_version_id,
+            code=row.code,
+            metrics=metrics,
+            verdict=row.verdict,
+            rank=row.rank,
+            reason=row.reason,
+            company_code=company.code if company is not None else "",
+            company_industry=company.industry if company is not None else None,
+            source_as_of=(
+                {
+                    key: company.as_of.get(key)
+                    for key in ("security", "financial", "valuation")
+                }
+                if company is not None
+                else {}
+            ),
+            items=evidence_by_code.get(row.code, []),
         ):
             raise TrackExecutorContractError(
-                "competition evidence card is incomplete or inconsistent"
+                "competition evidence card is not canonical"
             )
     return outcome
 

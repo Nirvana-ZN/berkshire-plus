@@ -4,6 +4,7 @@ import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from decimal import Decimal
+import json
 from pathlib import Path
 from threading import Event
 from time import monotonic, sleep
@@ -18,7 +19,6 @@ from app.discovery_models import (
     DiscoveryCommonStage,
     DiscoveryDecision,
     DiscoveryEvidence,
-    DiscoveryInputSnapshot,
     DiscoveryResult,
     DiscoveryRun,
     DiscoveryStage,
@@ -34,7 +34,16 @@ from app.models import (
     Watchlist,
 )
 from discovery.constants import china_week_key
-from discovery.evidence import EVIDENCE_RULE_VERSION, FALLBACK_RISK_TEXT
+from discovery.evidence import build_evidence_card
+from discovery.snapshot import (
+    CompanySnapshotInput,
+    SnapshotVersions,
+    canonical_json,
+    freeze_discovery_ruler_payloads,
+    freeze_inputs,
+    load_frozen_inputs,
+)
+from discovery.tracks import scope_for_track
 from jobs.lock import (
     JOB_TYPE_FUNNEL,
     JOB_TYPE_RESEARCH,
@@ -66,6 +75,29 @@ def _app(tmp_path: Path, *, market=None):
 
 
 def _run(session) -> DiscoveryRun:
+    rulers = {}
+    for row in session.scalars(
+        select(RulerVersion).where(
+            RulerVersion.scope.in_(scope_for_track(track) for track in TRACKS)
+        )
+    ):
+        rulers[json.loads(row.payload_json)["track"]] = row.id
+    if set(rulers) != set(TRACKS):
+        from tests.discovery_helpers import discovery_ruler_values
+
+        for track in TRACKS:
+            payload, digest = discovery_ruler_values(track)
+            row = RulerVersion(
+                user_id=1,
+                scope=scope_for_track(track),
+                digest=digest,
+                reason=f"test {track}",
+                payload_json=payload,
+                activated_at=NOW,
+            )
+            session.add(row)
+            session.flush()
+            rulers[track] = row.id
     run = DiscoveryRun(
         user_id=1,
         week_key=china_week_key(NOW),
@@ -77,8 +109,14 @@ def _run(session) -> DiscoveryRun:
         data_version="data-v1",
         financial_version="financial-v1",
         valuation_version="valuation-v1",
+        quality_discount_ruler_version_id=rulers["quality_discount"],
+        deep_value_ruler_version_id=rulers["deep_value"],
+        garp_ruler_version_id=rulers["garp"],
         algorithm_version="discovery-v1",
-        input_fingerprint="run-fingerprint",
+        ruler_payloads_json=freeze_discovery_ruler_payloads(
+            session, rulers, "discovery-v1"
+        ),
+        input_fingerprint=None,
     )
     session.add(run)
     session.flush()
@@ -94,8 +132,41 @@ def _seed_finalists(
     keep: bool = True,
     evidence: bool = True,
 ) -> None:
-    ruler_id = session.scalar(select(RulerVersion.id).order_by(RulerVersion.id))
-    assert ruler_id is not None
+    ruler_ids = {
+        track: getattr(run, f"{track}_ruler_version_id") for track in TRACKS
+    }
+    codes = sorted({code for codes in by_track.values() for code in codes})
+    freeze_inputs(
+        session,
+        run,
+        [
+            CompanySnapshotInput(
+                code=code,
+                name=f"公司-{code}",
+                industry="制造业",
+                security_status={},
+                fields={},
+                sources={},
+                as_of={
+                    "security": "2026-09-17",
+                    "financial": "2026-09-17",
+                    "valuation": "2026-09-17",
+                },
+            )
+            for code in codes
+        ],
+        SnapshotVersions(
+            data_version=run.data_version,
+            financial_version=run.financial_version,
+            valuation_version=run.valuation_version,
+            ruler_version_ids=ruler_ids,
+            algorithm_version=run.algorithm_version,
+        ),
+        {"SH": ["2026-09-17"]},
+        snapshot_at=NOW,
+    )
+    frozen = load_frozen_inputs(session, run.id)
+    companies = {company.code: company for company in frozen.companies}
     common = DiscoveryCommonStage(
         run_id=run.id,
         attempt=1,
@@ -115,35 +186,10 @@ def _seed_finalists(
     )
     session.add(common)
     session.flush()
-    seen: set[str] = set()
     for track, codes in by_track.items():
         assert track in TRACKS
-        for code in codes:
-            if code not in seen:
-                seen.add(code)
-                session.add(
-                    DiscoveryInputSnapshot(
-                        run_id=run.id,
-                        code=code,
-                        name=f"公司-{code}",
-                        industry="制造业",
-                        security_status="trading",
-                        fields_json="{}",
-                        sources_json="{}",
-                        as_of_json=(
-                            '{"financial":"2026-09-17",'
-                            '"security":"2026-09-17",'
-                            '"valuation":"2026-09-17"}'
-                        ),
-                        data_version=run.data_version,
-                        financial_version=run.financial_version,
-                        valuation_version=run.valuation_version,
-                        ruler_versions_json="{}",
-                        algorithm_version=run.algorithm_version,
-                        input_fingerprint=f"fingerprint-{code}",
-                        snapshot_at=NOW,
-                    )
-                )
+        ruler_id = ruler_ids[track]
+        assert ruler_id is not None
         gate = DiscoveryStage(
             run_id=run.id,
             track=track,
@@ -219,7 +265,40 @@ def _seed_finalists(
         )
         session.add(adjudication)
         session.flush()
+        ruler_entry = frozen.ruler_payloads[track]
+        assert ruler_entry is not None
+        ruler = ruler_entry["payload"]
+        if track == "quality_discount":
+            from tests.test_discovery_tracks_quality import (
+                _classify,
+                frozen_company,
+            )
+        elif track == "deep_value":
+            from tests.test_discovery_tracks_deep_value import (
+                _classify,
+                frozen_company,
+            )
+        else:
+            from tests.test_discovery_tracks_garp import _classify, frozen_company
+        track_metrics = dict(_classify(frozen_company()).metrics)
+        if track == "deep_value":
+            track_metrics.update(
+                cumulative_fcf="100",
+                fcf_observations="5",
+            )
+        elif track == "garp":
+            track_metrics.update(
+                revenue_cagr="10",
+                revenue_growth_observations="5",
+            )
         for rank, code in enumerate(codes, 1):
+            metrics = {**track_metrics, "code": code}
+            card = build_evidence_card(
+                code,
+                metrics,
+                ruler,
+                source_as_of=companies[code].as_of,
+            )
             session.add_all(
                 [
                     DiscoveryResult(
@@ -230,7 +309,7 @@ def _seed_finalists(
                         code=code,
                         verdict="pass",
                         reason="persisted competition result",
-                        metrics_json="{}",
+                        metrics_json=canonical_json(metrics),
                         rank=rank,
                         created_at=NOW,
                     ),
@@ -270,24 +349,16 @@ def _seed_finalists(
                         stage="competition",
                         code=code,
                         ruler_version_id=ruler_id,
-                        rule_version=EVIDENCE_RULE_VERSION,
-                        kind="risk" if index == 3 else "fact",
-                        rule_id=(
-                            f"{track}.risk.none"
-                            if index == 3
-                            else f"{track}.fact.fixture_{index}"
-                        ),
-                        input_fields_json='{"source":"financial"}',
-                        display_text=(
-                            FALLBACK_RISK_TEXT
-                            if index == 3
-                            else f"persisted evidence {index}"
-                        ),
-                        as_of="2026-09-17",
-                        data_completeness="complete",
+                        rule_version=item.rule_version,
+                        kind=item.kind,
+                        rule_id=item.rule_id,
+                        input_fields_json=canonical_json(item.input_fields),
+                        display_text=item.display_text,
+                        as_of=item.as_of,
+                        data_completeness=item.data_completeness,
                         created_at=NOW,
                     )
-                    for index in range(4)
+                    for item in card.items
                 )
     session.commit()
 
@@ -468,6 +539,61 @@ def test_research_rejects_finalist_with_incomplete_evidence_card(
         rejected = _post(client, run_id, "garp", "600000.SH")
         assert rejected.status_code == 409
         assert rejected.json()["code"] == "DISCOVERY_CANDIDATE_NOT_RESEARCHABLE"
+
+
+def test_research_rejects_semantically_forged_evidence(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        discovery_routes,
+        "_dispatch_discovery_research",
+        _finish_dispatch,
+    )
+    app = _app(tmp_path)
+    with TestClient(app) as client:
+        with app.state.session_factory() as session:
+            run = _run(session)
+            _seed_finalists(session, run, {"garp": ["600000.SH"]})
+            run_id = run.id
+            fact = session.scalar(
+                select(DiscoveryEvidence).where(
+                    DiscoveryEvidence.run_id == run.id,
+                    DiscoveryEvidence.kind == "fact",
+                )
+            )
+            assert fact is not None
+            original = {
+                "input_fields_json": fact.input_fields_json,
+                "rule_id": fact.rule_id,
+                "code": fact.code,
+                "as_of": fact.as_of,
+            }
+            mutations = (
+                (
+                    "input_fields_json",
+                    canonical_json(
+                        {
+                            **json.loads(fact.input_fields_json),
+                            "value": "999",
+                        }
+                    ),
+                ),
+                ("rule_id", "garp.fact.allowed_looking_forgery"),
+                ("code", "600001.SH"),
+                ("as_of", "2020-01-01"),
+            )
+            for field, value in mutations:
+                setattr(fact, field, value)
+                session.commit()
+                rejected = _post(client, run_id, "garp", "600000.SH")
+                assert rejected.status_code == 409
+                assert (
+                    rejected.json()["code"]
+                    == "DISCOVERY_CANDIDATE_NOT_RESEARCHABLE"
+                )
+                setattr(fact, field, original[field])
+                session.commit()
+        assert _post(client, run_id, "garp", "600000.SH").status_code == 200
 
 
 def test_same_run_code_is_idempotent_across_tracks(

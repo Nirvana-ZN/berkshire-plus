@@ -38,9 +38,8 @@ from discovery.constants import (
 )
 from discovery.diff import CorruptDiscoveryHistory, load_weekly_changes
 from discovery.evidence import (
-    ALLOWED_RISK_CATEGORIES,
-    EVIDENCE_RULE_VERSION,
-    FALLBACK_RISK_TEXT,
+    PersistedEvidenceItem,
+    verify_canonical_evidence_card,
 )
 from discovery.overrides import OVERRIDE_ACTIONS
 from discovery.summaries import DiscoverySummaryError, build_stage_summary
@@ -1611,7 +1610,7 @@ def _effective_competition_rows(
 def _researchable_competition_entrants(
     session: Session, competition: DiscoveryStage
 ) -> list[DiscoveryResult]:
-    """Return effective pass rows backed by an exact reliable evidence card."""
+    """Return effective pass rows backed by a canonical frozen-input card."""
 
     evidence_by_code: dict[str, list[DiscoveryEvidence]] = {}
     for item in session.scalars(
@@ -1631,120 +1630,72 @@ def _researchable_competition_entrants(
         )
     ):
         evidence_by_code.setdefault(item.code, []).append(item)
-    source_dates_by_code: dict[str, Mapping[str, object]] = {}
-    for snapshot in session.scalars(
-        select(DiscoveryInputSnapshot).where(
-            DiscoveryInputSnapshot.run_id == competition.run_id,
-            DiscoveryInputSnapshot.code.in_(evidence_by_code),
-        )
-    ):
-        try:
-            source_dates = _persisted_json(snapshot.as_of_json)
-        except CorruptDiscoveryResult:
-            continue
-        if type(source_dates) is dict:
-            source_dates_by_code[snapshot.code] = source_dates
-
+    try:
+        frozen = load_frozen_inputs(session, competition.run_id)
+        ruler_entry = frozen.ruler_payloads.get(competition.track)
+        if (
+            not isinstance(ruler_entry, Mapping)
+            or ruler_entry.get("id") != competition.ruler_version_id
+            or not isinstance(ruler_entry.get("payload"), Mapping)
+            or frozen.ruler_version_ids.get(competition.track)
+            != competition.ruler_version_id
+        ):
+            return []
+        ruler = ruler_entry["payload"]
+    except (KeyError, TypeError, ValueError):
+        return []
+    companies = {company.code: company for company in frozen.companies}
     valid_codes: set[str] = set()
-    for code, items in evidence_by_code.items():
-        source_dates = source_dates_by_code.get(code, {})
-        identities = {(item.kind, item.rule_id) for item in items}
-        facts = [item for item in items if item.kind == "fact"]
-        risks = [item for item in items if item.kind == "risk"]
-        fallback = [
-            item
-            for item in risks
-            if item.rule_id == f"{competition.track}.risk.none"
-        ]
-        valid = (
-            len(identities) == len(items)
-            and 3 <= len(facts) <= 5
-            and bool(risks)
-            and (not fallback or len(risks) == 1)
-        )
-        for item in items:
-            try:
-                input_fields = _persisted_json(item.input_fields_json)
-                date.fromisoformat(item.as_of)
-            except (CorruptDiscoveryResult, TypeError, ValueError):
-                valid = False
+    rows = _effective_competition_rows(session, competition)
+    for row, _override in rows:
+        company = companies.get(row.code)
+        if company is None:
+            continue
+        try:
+            metrics = _persisted_json(row.metrics_json)
+            if type(metrics) is not dict:
                 continue
-            prefix = f"{competition.track}.{item.kind}."
-            source = (
-                input_fields.get("source")
-                if type(input_fields) is dict
-                else None
-            )
-            source_names = (
-                input_fields.get("sources")
-                if type(input_fields) is dict
-                else None
-            )
-            source_bundle = (
-                input_fields.get("source_as_of")
-                if type(input_fields) is dict
-                else None
-            )
-            exact_source = (
-                type(source) is str
-                and source_dates.get(source) == item.as_of
-            )
-            exact_bundle = (
-                type(source_bundle) is dict
-                and bool(source_bundle)
-                and all(
-                    type(name) is str
-                    and type(value) is str
-                    and source_dates.get(name) == value
-                    for name, value in source_bundle.items()
+            items = [
+                PersistedEvidenceItem(
+                    code=item.code,
+                    ruler_version_id=item.ruler_version_id,
+                    rule_version=item.rule_version,
+                    kind=item.kind,
+                    rule_id=item.rule_id,
+                    input_fields=_persisted_json(item.input_fields_json),
+                    display_text=item.display_text,
+                    as_of=item.as_of,
+                    data_completeness=item.data_completeness,
                 )
-                and (
-                    item.rule_id == f"{competition.track}.risk.none"
-                    or (
-                        source is None
-                        and type(source_names) is list
-                        and source_names == list(source_bundle)
-                    )
-                )
-                and item.as_of == min(source_bundle.values())
+                for item in evidence_by_code.get(row.code, [])
+            ]
+        except (CorruptDiscoveryResult, TypeError, ValueError):
+            continue
+        if (
+            sum(item.kind == "fact" for item in items) >= 3
+            and verify_canonical_evidence_card(
+                track=competition.track,
+                ruler=ruler,
+                ruler_version_id=competition.ruler_version_id,
+                code=row.code,
+                metrics=metrics,
+                verdict=row.verdict,
+                rank=row.rank,
+                reason=row.reason,
+                company_code=company.code,
+                company_industry=company.industry,
+                source_as_of={
+                    key: company.as_of.get(key)
+                    for key in ("security", "financial", "valuation")
+                },
+                items=items,
             )
-            valid = valid and (
-                item.ruler_version_id == competition.ruler_version_id
-                and item.rule_version == EVIDENCE_RULE_VERSION
-                and item.kind in {"fact", "risk"}
-                and item.rule_id.startswith(prefix)
-                and type(input_fields) is dict
-                and bool(input_fields)
-                and type(item.display_text) is str
-                and bool(item.display_text.strip())
-                and (exact_source or exact_bundle)
-                and item.data_completeness in {"complete", "partial"}
-                and (
-                    item.kind != "fact"
-                    or item.data_completeness == "complete"
-                )
-            )
-            if item.kind == "risk":
-                category = item.rule_id.removeprefix(prefix).split(".", 1)[0]
-                valid = valid and (
-                    category == "none"
-                    or category in ALLOWED_RISK_CATEGORIES
-                )
-                if category == "none":
-                    valid = (
-                        valid
-                        and item.rule_id
-                        == f"{competition.track}.risk.none"
-                        and item.display_text == FALLBACK_RISK_TEXT
-                    )
-        if valid:
-            valid_codes.add(code)
+        ):
+            valid_codes.add(row.code)
 
     return [
         row
-        for row, override in _effective_competition_rows(
-            session, competition
-        )
+        for row, override in rows
         if (
             row.verdict
             if override is None

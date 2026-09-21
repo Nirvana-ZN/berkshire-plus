@@ -79,8 +79,42 @@ def test_effective_verdict_rejects_non_value_objects() -> None:
         )
 
 
-def _competition_execution_evidence(context):
-    from discovery.evidence import EVIDENCE_RULE_VERSION, FALLBACK_RISK_TEXT
+def _competition_metrics(track: str, code: str) -> dict[str, object]:
+    shared = {"code": code, "branch": "nonfinancial", "risk_flags": []}
+    if track == "quality_discount":
+        return {
+            **shared,
+            "quality_branch": "nonfinancial",
+            "pe_percentile": "20",
+            "roe_cv": "0.1",
+            "cash_conversion": "1.2",
+            "valuation_pe_observations": "60",
+            "roe_observations": "5",
+            "cash_conversion_observations": "5",
+        }
+    if track == "deep_value":
+        return {
+            **shared,
+            "normalized_pe": "8",
+            "cumulative_fcf": "100",
+            "interest_coverage": "5",
+            "normalized_earnings_observations": "5",
+            "fcf_observations": "5",
+            "interest_coverage_observations": "1",
+        }
+    return {
+        **shared,
+        "revenue_cagr": "10",
+        "deducted_profit_cagr": "12",
+        "return_on_capital": "15",
+        "revenue_growth_observations": "5",
+        "deducted_profit_growth_observations": "5",
+        "roic_observations": "5",
+    }
+
+
+def _competition_execution_evidence(context, metrics_by_code):
+    from discovery.evidence import build_evidence_card
     from discovery.snapshot import canonical_json
     from jobs.discovery import TrackExecutionEvidence
 
@@ -88,40 +122,30 @@ def _competition_execution_evidence(context):
         company.code: company for company in context.frozen_inputs.companies
     }
     evidence = []
-    for code in context.candidate_codes:
+    for code in metrics_by_code:
         company = companies[code]
-        source, as_of = next(
-            (key, value)
-            for key, value in company.as_of.items()
-            if isinstance(value, str)
+        card = build_evidence_card(
+            code,
+            metrics_by_code[code],
+            context.ruler_payload,
+            source_as_of={
+                key: company.as_of[key]
+                for key in ("security", "financial", "valuation")
+            },
         )
-        input_fields = canonical_json({"source": source, "value": "fixture"})
         evidence.extend(
             TrackExecutionEvidence(
                 code=code,
                 ruler_version_id=context.ruler_version_id,
-                rule_version=EVIDENCE_RULE_VERSION,
-                kind="fact",
-                rule_id=f"{context.track}.fact.fixture_{index}",
-                input_fields_json=input_fields,
-                display_text=f"fixture fact {index}",
-                as_of=as_of,
-                data_completeness="complete",
+                rule_version=item.rule_version,
+                kind=item.kind,
+                rule_id=item.rule_id,
+                input_fields_json=canonical_json(item.input_fields),
+                display_text=item.display_text,
+                as_of=item.as_of,
+                data_completeness=item.data_completeness,
             )
-            for index in range(1, 4)
-        )
-        evidence.append(
-            TrackExecutionEvidence(
-                code=code,
-                ruler_version_id=context.ruler_version_id,
-                rule_version=EVIDENCE_RULE_VERSION,
-                kind="risk",
-                rule_id=f"{context.track}.risk.none",
-                input_fields_json=input_fields,
-                display_text=FALLBACK_RISK_TEXT,
-                as_of=as_of,
-                data_completeness="complete",
-            )
+            for item in card.items
         )
     return tuple(evidence)
 
@@ -163,6 +187,12 @@ def _workflow_app(tmp_path, *, clock=None):
     engine.dispose()
 
     def execute(context):
+        from discovery.snapshot import canonical_json
+
+        metrics = {
+            code: _competition_metrics(context.track, code)
+            for code in context.candidate_codes
+        }
         return TrackExecutionOutcome(
             status="waiting_confirmation",
             results=tuple(
@@ -170,7 +200,7 @@ def _workflow_app(tmp_path, *, clock=None):
                 code=code,
                 verdict="pass",
                 reason=None,
-                metrics_json="{}",
+                metrics_json=canonical_json(metrics[code]),
                 rank=index,
                 )
                 for index, code in enumerate(
@@ -178,7 +208,7 @@ def _workflow_app(tmp_path, *, clock=None):
                 )
             ),
             evidence=(
-                _competition_execution_evidence(context)
+                _competition_execution_evidence(context, metrics)
                 if context.stage == "competition"
                 else ()
             ),
@@ -186,10 +216,23 @@ def _workflow_app(tmp_path, *, clock=None):
 
     def snapshot(session, **kwargs):
         frozen = build_production_snapshot(session, **kwargs)
+
+        def canonical_company(index):
+            value = company(f"60000{index}.SH")
+            return replace(
+                value,
+                as_of={
+                    **value.as_of,
+                    "security": "2026-09-17",
+                    "financial": "2026-09-17",
+                    "valuation": "2026-09-17",
+                },
+            )
+
         return replace(
             frozen,
             companies=tuple(
-                company(f"60000{index}.SH") for index in range(6)
+                canonical_company(index) for index in range(6)
             ),
         )
 
@@ -262,6 +305,7 @@ def test_forced_pass_cannot_promote_insufficient_evidence_to_adjudication(
 ) -> None:
     from fastapi.testclient import TestClient
 
+    from discovery.snapshot import canonical_json
     from jobs.discovery import TrackExecutionOutcome
 
     app = _workflow_app(tmp_path)
@@ -273,11 +317,18 @@ def test_forced_pass_cannot_promote_insufficient_evidence_to_adjudication(
             if context.track != "garp" or context.stage != "competition":
                 return outcome
             code = context.candidate_codes[0]
+            target_metrics = json.loads(outcome.results[0].metrics_json)
+            target_metrics.update(
+                revenue_growth_observations="0",
+                deducted_profit_growth_observations="0",
+                roic_observations="0",
+            )
             results = tuple(
                 replace(
                     row,
                     verdict="insufficient",
                     reason="evidence_facts_insufficient",
+                    metrics_json=canonical_json(target_metrics),
                 )
                 if row.code == code
                 else row
@@ -287,8 +338,8 @@ def test_forced_pass_cannot_promote_insufficient_evidence_to_adjudication(
                 row
                 for row in outcome.evidence
                 if row.code != code
-                or row.kind == "risk"
-                or row.rule_id.endswith("fixture_1")
+            ) + _competition_execution_evidence(
+                context, {code: target_metrics}
             )
             return TrackExecutionOutcome(
                 status=outcome.status,

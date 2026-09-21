@@ -5,8 +5,10 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+import json
 from types import MappingProxyType
 
+from discovery.industry import classify_industry_branch
 from discovery.tracks.quality_discount import (
     MAX_ARITHMETIC_PRECISION,
     _divide as _bounded_divide,
@@ -136,6 +138,201 @@ class EvidenceCard:
     verdict: str
     reason: str | None
     items: tuple[EvidenceItem, ...]
+
+
+@dataclass(frozen=True)
+class PersistedEvidenceItem:
+    code: str
+    ruler_version_id: int
+    rule_version: str
+    kind: str
+    rule_id: str
+    input_fields: Mapping[str, object]
+    display_text: str
+    as_of: str
+    data_completeness: str
+
+
+_MAX_CANONICAL_EVIDENCE_BYTES = 65_536
+
+
+def _canonical_evidence_value(value: object) -> str | None:
+    remaining = [512]
+
+    def plain(item: object, depth: int = 0) -> object:
+        remaining[0] -= 1
+        if remaining[0] < 0 or depth > 12:
+            raise ValueError("evidence value is too complex")
+        if item is None or type(item) in {bool, int, float, str}:
+            return item
+        if isinstance(item, Mapping):
+            if any(type(key) is not str for key in item):
+                raise TypeError("evidence object keys must be strings")
+            return {
+                key: plain(child, depth + 1)
+                for key, child in item.items()
+            }
+        if isinstance(item, Sequence) and type(item) is not str:
+            return [plain(child, depth + 1) for child in item]
+        raise TypeError("evidence value is not JSON-compatible")
+
+    try:
+        encoded = json.dumps(
+            plain(value),
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    except (TypeError, ValueError):
+        return None
+    return (
+        encoded
+        if len(encoded.encode("utf-8")) <= _MAX_CANONICAL_EVIDENCE_BYTES
+        else None
+    )
+
+
+def _branch_matches_frozen_company(
+    track: str,
+    metrics: Mapping[str, object],
+    ruler: Mapping[str, object],
+    industry: object,
+) -> bool:
+    try:
+        if industry is not None and type(industry) is not str:
+            return False
+        shared = classify_industry_branch(industry)
+        if track == "garp":
+            return metrics.get("branch") == shared
+        branches = ruler.get("sector_branches")
+        if not isinstance(branches, Mapping):
+            return metrics.get("branch") == shared
+        policies = branches.get("branch_policies")
+        if (
+            not isinstance(policies, Mapping)
+            or type(policies.get(shared)) is not str
+        ):
+            return False
+        policy = policies[shared]
+        if track == "deep_value":
+            expected = (
+                shared
+                if policy in {"unsupported", "insufficient"}
+                else policy
+            )
+            return metrics.get("branch") == expected
+        if track != "quality_discount" or metrics.get("branch") != shared:
+            return False
+        if policy in {"unsupported", "insufficient"}:
+            expected_quality = None
+        elif policy == "bank":
+            expected_quality = "bank"
+        else:
+            industry_map = branches.get("industry_map")
+            if not isinstance(industry_map, Mapping):
+                return False
+            matches = [
+                branch
+                for branch in ("nonfinancial", "cyclical")
+                if isinstance(industry_map.get(branch), Sequence)
+                and type(industry_map.get(branch)) is not str
+                and industry in industry_map[branch]
+            ]
+            expected_quality = matches[0] if len(matches) == 1 else None
+        return metrics.get("quality_branch") == expected_quality
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def verify_canonical_evidence_card(
+    *,
+    track: str,
+    ruler: Mapping[str, object],
+    ruler_version_id: int,
+    code: str,
+    metrics: Mapping[str, object],
+    verdict: str,
+    rank: int | None,
+    reason: str | None,
+    company_code: str,
+    company_industry: object,
+    source_as_of: Mapping[str, object],
+    items: Sequence[PersistedEvidenceItem],
+) -> bool:
+    """Regenerate and exactly compare one bounded persisted evidence card."""
+
+    if (
+        type(track) is not str
+        or not isinstance(ruler, Mapping)
+        or ruler.get("track") != track
+        or type(ruler_version_id) is not int
+        or ruler_version_id < 1
+        or type(code) is not str
+        or not code
+        or code != company_code
+        or not isinstance(metrics, Mapping)
+        or metrics.get("code") != code
+        or not isinstance(source_as_of, Mapping)
+        or type(items) not in {tuple, list}
+        or not 1 <= len(items) <= 5
+        or rank is not None
+        and (type(rank) is not int or rank < 1)
+        or not _branch_matches_frozen_company(
+            track, metrics, ruler, company_industry
+        )
+        or _canonical_evidence_value(metrics) is None
+        or _canonical_evidence_value(source_as_of) is None
+    ):
+        return False
+    try:
+        expected = build_evidence_card(
+            code, metrics, ruler, source_as_of=source_as_of
+        )
+    except (KeyError, TypeError, ValueError, InvalidOperation):
+        return False
+    if (
+        expected.verdict == "insufficient"
+        and rank is not None
+        and (verdict, reason)
+        != ("insufficient", "evidence_facts_insufficient")
+        or expected.verdict == "pass"
+        and reason == "evidence_facts_insufficient"
+    ):
+        return False
+
+    expected_by_identity = {
+        (item.kind, item.rule_id): item for item in expected.items
+    }
+    actual_by_identity: dict[
+        tuple[str, str], PersistedEvidenceItem
+    ] = {}
+    for item in items:
+        if (
+            type(item) is not PersistedEvidenceItem
+            or item.code != code
+            or item.ruler_version_id != ruler_version_id
+            or type(item.kind) is not str
+            or type(item.rule_id) is not str
+            or (item.kind, item.rule_id) in actual_by_identity
+        ):
+            return False
+        actual_by_identity[(item.kind, item.rule_id)] = item
+    if set(actual_by_identity) != set(expected_by_identity):
+        return False
+
+    for identity, expected_item in expected_by_identity.items():
+        actual = actual_by_identity[identity]
+        if (
+            actual.rule_version != expected_item.rule_version
+            or actual.display_text != expected_item.display_text
+            or actual.as_of != expected_item.as_of
+            or actual.data_completeness != expected_item.data_completeness
+            or _canonical_evidence_value(actual.input_fields)
+            != _canonical_evidence_value(dict(expected_item.input_fields))
+        ):
+            return False
+    return True
 
 
 def _decimal(value: object) -> Decimal | None:
