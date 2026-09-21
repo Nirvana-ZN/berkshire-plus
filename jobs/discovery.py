@@ -34,6 +34,7 @@ from app.discovery_models import (
 from app.models import JobLock
 from discovery.aggregate import aggregate_run_status
 from discovery.common import CommonVerdict, classify_common
+from discovery.competition import CompetitionCandidate, rank_competition
 from discovery.constants import (
     TRACKS,
     VERDICTS,
@@ -42,6 +43,7 @@ from discovery.constants import (
     china_week_key,
     utc_now,
 )
+from discovery.evidence import build_evidence_card
 from discovery.snapshot import (
     FrozenRunInputs,
     FrozenValue,
@@ -127,6 +129,7 @@ class TrackExecutionContext:
     frozen_inputs: FrozenRunInputs
     ruler_payload: Mapping[str, FrozenValue]
     candidates: tuple[TrackExecutionCandidate, ...]
+    ruler_digest: str | None = None
 
     @property
     def candidate_codes(self) -> tuple[str, ...]:
@@ -169,9 +172,12 @@ TrackExecutor = Callable[[TrackExecutionContext], TrackExecutionOutcome]
 def builtin_track_executor(
     context: TrackExecutionContext,
 ) -> TrackExecutionOutcome:
-    """Dispatch only production track gates implemented by this build."""
+    """Dispatch production stages implemented by this build."""
 
-    if context.track != "quality_discount" or context.stage != "track_gate":
+    if context.track != "quality_discount" or context.stage not in {
+        "track_gate",
+        "competition",
+    }:
         return TrackExecutionOutcome(
             status="ruler_not_ready",
             error="当前构建尚未实现该轨道阶段",
@@ -182,6 +188,85 @@ def builtin_track_executor(
         return TrackExecutionOutcome(
             status="ruler_not_ready",
             error="冻结的质量折价尺子不完整或不兼容",
+        )
+    if context.stage == "competition":
+        companies = {
+            company.code: company for company in context.frozen_inputs.companies
+        }
+        if (
+            len(companies) != len(context.frozen_inputs.companies)
+            or len(context.candidate_codes) != len(set(context.candidate_codes))
+            or not set(context.candidate_codes) <= set(companies)
+        ):
+            raise TrackExecutorContractError(
+                "competition candidates do not match frozen companies"
+            )
+        metrics = {
+            candidate.code: _plain_metrics(candidate.metrics_json)
+            for candidate in context.candidates
+        }
+        ranked = rank_competition(
+            tuple(
+                CompetitionCandidate(
+                    code=candidate.code,
+                    industry=companies[candidate.code].industry,
+                    metrics=metrics[candidate.code],
+                )
+                for candidate in context.candidates
+            ),
+            ruler.order,
+        )
+        rule_version = (
+            context.ruler_digest
+            or f"{context.track}:{context.algorithm_version}"
+        )
+        cards = {
+            row.code: build_evidence_card(
+                row.code,
+                metrics[row.code],
+                context.ruler_payload,
+                rule_version=rule_version,
+                as_of=companies[row.code].snapshot_at.date().isoformat(),
+            )
+            for row in ranked
+        }
+        candidates = {candidate.code: candidate for candidate in context.candidates}
+        return TrackExecutionOutcome(
+            status="waiting_confirmation",
+            results=tuple(
+                TrackExecutionResult(
+                    code=row.code,
+                    verdict=(
+                        "insufficient"
+                        if row.verdict == "pass"
+                        and cards[row.code].verdict == "insufficient"
+                        else row.verdict
+                    ),
+                    reason=(
+                        cards[row.code].reason
+                        if row.verdict == "pass"
+                        and cards[row.code].verdict == "insufficient"
+                        else row.reason
+                    ),
+                    metrics_json=candidates[row.code].metrics_json,
+                    rank=row.rank,
+                )
+                for row in ranked
+            ),
+            evidence=tuple(
+                TrackExecutionEvidence(
+                    code=row.code,
+                    rule_version=item.rule_version,
+                    kind=item.kind,
+                    rule_id=item.rule_id,
+                    input_fields_json=canonical_json(item.input_fields),
+                    display_text=item.display_text,
+                    as_of=item.as_of,
+                    data_completeness=item.data_completeness,
+                )
+                for row in ranked
+                for item in cards[row.code].items
+            ),
         )
     companies = {
         company.code: company for company in context.frozen_inputs.companies
@@ -802,10 +887,7 @@ def _validate_track_outcome(
             "waiting track results must match the exact candidate set"
         )
     ranks = [row.rank for row in outcome.results if row.rank is not None]
-    if ranks and (
-        len(ranks) != len(outcome.results)
-        or sorted(ranks) != list(range(1, len(ranks) + 1))
-    ):
+    if ranks and sorted(ranks) != list(range(1, len(ranks) + 1)):
         raise TrackExecutorContractError(
             "track result ranks must be unique and contiguous"
         )
@@ -1012,6 +1094,11 @@ def _execute_track_stage(
             frozen_inputs=frozen,
             ruler_payload=ruler_payload,
             candidates=_track_candidates(session, stage),
+            ruler_digest=(
+                str(frozen_ruler["sha256"])
+                if type(frozen_ruler.get("sha256")) is str
+                else None
+            ),
         )
         session.rollback()
         outcome = (
