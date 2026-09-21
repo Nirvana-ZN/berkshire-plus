@@ -918,10 +918,11 @@ def _validate_track_outcome(
 
     evidence_keys = []
     evidence_by_code: dict[str, list[TrackExecutionEvidence]] = {}
-    company_dates: dict[str, frozenset[str]] = {}
+    company_source_dates: dict[str, dict[str, str]] = {}
+    fallback_id = f"{context.track}.risk.none"
     for company in context.frozen_inputs.companies:
-        dates = set()
-        for value in company.as_of.values():
+        dates = {}
+        for source, value in company.as_of.items():
             if type(value) is not str:
                 continue
             try:
@@ -929,8 +930,8 @@ def _validate_track_outcome(
             except ValueError:
                 continue
             if parsed.isoformat() == value:
-                dates.add(value)
-        company_dates[company.code] = frozenset(dates)
+                dates[source] = value
+        company_source_dates[company.code] = dates
     for row in outcome.evidence:
         if (
             type(row) is not TrackExecutionEvidence
@@ -983,7 +984,27 @@ def _validate_track_outcome(
             raise TrackExecutorContractError(
                 "competition evidence input cannot be empty"
             )
-        if row.as_of not in company_dates.get(row.code, frozenset()):
+        sources = company_source_dates.get(row.code, {})
+        source = input_fields.get("source")
+        source_bundle = input_fields.get("source_as_of")
+        exact_source = (
+            type(source) is str
+            and source in sources
+            and row.as_of == sources[source]
+        )
+        exact_bundle = (
+            row.rule_id == fallback_id
+            and type(source_bundle) is dict
+            and bool(source_bundle)
+            and all(
+                type(name) is str
+                and type(value) is str
+                and sources.get(name) == value
+                for name, value in source_bundle.items()
+            )
+            and row.as_of == min(source_bundle.values())
+        )
+        if not exact_source and not exact_bundle:
             raise TrackExecutorContractError(
                 "competition evidence as-of is not source-bounded"
             )
@@ -1030,7 +1051,7 @@ def _validate_track_outcome(
         fallback = [
             item
             for item in risks
-            if item.rule_id == f"{context.track}.risk.none"
+            if item.rule_id == fallback_id
         ]
         if (
             not 1 <= len(items) <= 5
