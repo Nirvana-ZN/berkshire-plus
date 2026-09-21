@@ -394,6 +394,7 @@ def _payload(
         "order": [
             ["pe_percentile", "asc", "nulls_last"],
             ["roe_cv", "asc", "nulls_last"],
+            ["cash_conversion", "desc", "nulls_last"],
             ["code", "asc", "nulls_last"],
         ],
         "industry_version": industry_version,
