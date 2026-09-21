@@ -473,6 +473,51 @@ def test_adjudication_reason_comes_from_competition_not_notes(tmp_path) -> None:
     engine.dispose()
 
 
+@pytest.mark.parametrize(
+    ("ancestor", "field", "value"),
+    [
+        ("common", "input_fingerprint", "wrong-input"),
+        ("common", "algorithm_version", "wrong-build"),
+        ("track_gate", "input_fingerprint", "wrong-input"),
+        ("competition", "algorithm_version", "wrong-build"),
+    ],
+)
+def test_adjudication_validates_complete_ancestor_chain(
+    tmp_path, ancestor: str, field: str, value: object
+) -> None:
+    from app.discovery_models import DiscoveryCommonStage, DiscoveryStage
+
+    engine, factory, run_ids, stage_ids, *_ = _finalized_history(tmp_path)
+    with factory() as session:
+        adjudication = session.get(DiscoveryStage, stage_ids[-1])
+        assert adjudication is not None
+        competition = session.get(
+            DiscoveryStage, adjudication.predecessor_stage_id
+        )
+        assert competition is not None
+        gate = session.get(
+            DiscoveryStage, competition.predecessor_stage_id
+        )
+        assert gate is not None
+        common = session.get(DiscoveryCommonStage, gate.common_stage_id)
+        assert common is not None
+        row = {
+            "common": common,
+            "track_gate": gate,
+            "competition": competition,
+        }[ancestor]
+        setattr(row, field, value)
+        session.flush()
+        with pytest.raises(CorruptDiscoveryHistory):
+            load_weekly_changes(
+                session,
+                run_ids[-1],
+                track="quality_discount",
+                stage="adjudication",
+            )
+    engine.dispose()
+
+
 @pytest.mark.parametrize("corruption", ["algorithm", "historical_json"])
 def test_corrupt_lineage_fails_closed(
     tmp_path, corruption: str

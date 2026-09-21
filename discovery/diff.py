@@ -353,6 +353,53 @@ def _data_fingerprint(row: object) -> str:
     return hashlib.sha256(canonical_json(semantic).encode()).hexdigest()
 
 
+def _validate_track_lineage(
+    session: Session,
+    run: DiscoveryRun,
+    track: str,
+    stage: DiscoveryStage,
+    frozen,
+) -> DiscoveryCommonStage | DiscoveryStage:
+    if (
+        stage.run_id != run.id
+        or stage.track != track
+        or stage.superseded_at is not None
+        or stage.input_fingerprint != frozen.input_fingerprint
+        or stage.algorithm_version != frozen.algorithm_version
+        or type(stage.ruler_version_id) is not int
+        or stage.ruler_version_id < 1
+        or stage.ruler_version_id != frozen.ruler_version_ids.get(track)
+    ):
+        raise CorruptDiscoveryHistory("persisted stage lineage is corrupt")
+    if stage.stage == "track_gate":
+        parent = session.get(DiscoveryCommonStage, stage.common_stage_id)
+        if (
+            parent is None
+            or parent.run_id != run.id
+            or parent.status != "confirmed"
+            or parent.superseded_at is not None
+            or parent.input_fingerprint != frozen.input_fingerprint
+            or parent.algorithm_version != frozen.algorithm_version
+            or stage.predecessor_stage_id is not None
+            or stage.predecessor_stage is not None
+        ):
+            raise CorruptDiscoveryHistory("persisted common lineage is corrupt")
+        return parent
+    expected = "track_gate" if stage.stage == "competition" else "competition"
+    parent = session.get(DiscoveryStage, stage.predecessor_stage_id)
+    if (
+        stage.stage not in {"competition", "adjudication"}
+        or stage.common_stage_id is not None
+        or stage.predecessor_stage != expected
+        or parent is None
+        or parent.stage != expected
+        or parent.status != "confirmed"
+    ):
+        raise CorruptDiscoveryHistory("persisted predecessor lineage is corrupt")
+    _validate_track_lineage(session, run, track, parent, frozen)
+    return parent
+
+
 def _completed_track_rows(
     session: Session,
     run: DiscoveryRun,
@@ -379,40 +426,13 @@ def _completed_track_rows(
         )
         if stage is None or stage.status not in readable:
             return None
-        if stage_name == "track_gate":
-            parent = session.get(DiscoveryCommonStage, stage.common_stage_id)
-            valid_parent = (
-                parent is not None
-                and parent.run_id == run.id
-                and parent.status == "confirmed"
-                and parent.superseded_at is None
-                and stage.predecessor_stage_id is None
-            )
-        else:
-            parent = session.get(DiscoveryStage, stage.predecessor_stage_id)
-            expected = (
-                "track_gate" if stage_name == "competition" else "competition"
-            )
-            valid_parent = (
-                parent is not None
-                and parent.run_id == run.id
-                and parent.track == track
-                and parent.stage == expected
-                and stage.predecessor_stage == expected
-                and parent.status == "confirmed"
-                and parent.superseded_at is None
-                and stage.common_stage_id is None
-            )
         frozen = load_frozen_inputs(session, run.id)
+        parent = _validate_track_lineage(
+            session, run, track, stage, frozen
+        )
         companies = {row.code: row for row in frozen.companies}
         if (
-            not valid_parent
-            or stage.input_fingerprint != frozen.input_fingerprint
-            or stage.algorithm_version != frozen.algorithm_version
-            or type(stage.ruler_version_id) is not int
-            or stage.ruler_version_id < 1
-            or frozen.ruler_version_ids.get(track) != stage.ruler_version_id
-            or len(companies) != len(frozen.companies)
+            len(companies) != len(frozen.companies)
         ):
             raise CorruptDiscoveryHistory("persisted stage lineage is corrupt")
         results = session.scalars(
