@@ -129,7 +129,6 @@ class TrackExecutionContext:
     frozen_inputs: FrozenRunInputs
     ruler_payload: Mapping[str, FrozenValue]
     candidates: tuple[TrackExecutionCandidate, ...]
-    ruler_digest: str | None = None
 
     @property
     def candidate_codes(self) -> tuple[str, ...]:
@@ -167,6 +166,7 @@ class TrackExecutionOutcome:
 
 
 TrackExecutor = Callable[[TrackExecutionContext], TrackExecutionOutcome]
+_UNRANKED_COMPETITION_REASONS = frozenset({"industry_unknown"})
 
 
 def builtin_track_executor(
@@ -216,17 +216,15 @@ def builtin_track_executor(
             ),
             ruler.order,
         )
-        rule_version = (
-            context.ruler_digest
-            or f"{context.track}:{context.algorithm_version}"
-        )
         cards = {
             row.code: build_evidence_card(
                 row.code,
                 metrics[row.code],
                 context.ruler_payload,
-                rule_version=rule_version,
-                as_of=companies[row.code].snapshot_at.date().isoformat(),
+                source_as_of={
+                    key: companies[row.code].as_of[key]
+                    for key in ("security", "financial", "valuation")
+                },
             )
             for row in ranked
         }
@@ -238,13 +236,13 @@ def builtin_track_executor(
                     code=row.code,
                     verdict=(
                         "insufficient"
-                        if row.verdict == "pass"
+                        if row.rank is not None
                         and cards[row.code].verdict == "insufficient"
                         else row.verdict
                     ),
                     reason=(
                         cards[row.code].reason
-                        if row.verdict == "pass"
+                        if row.rank is not None
                         and cards[row.code].verdict == "insufficient"
                         else row.reason
                     ),
@@ -887,9 +885,28 @@ def _validate_track_outcome(
             "waiting track results must match the exact candidate set"
         )
     ranks = [row.rank for row in outcome.results if row.rank is not None]
-    if ranks and sorted(ranks) != list(range(1, len(ranks) + 1)):
+    unranked = [row for row in outcome.results if row.rank is None]
+    invalid_competition_rank = context.stage == "competition" and (
+        any(
+            row.verdict != "insufficient"
+            or row.reason not in _UNRANKED_COMPETITION_REASONS
+            for row in unranked
+        )
+        or sorted(ranks) != list(range(1, len(ranks) + 1))
+    )
+    invalid_other_rank = (
+        context.stage != "competition"
+        and bool(ranks)
+        and (
+            len(ranks) != len(outcome.results)
+            or sorted(ranks) != list(range(1, len(ranks) + 1))
+        )
+    )
+    if invalid_competition_rank or invalid_other_rank:
         raise TrackExecutorContractError(
-            "track result ranks must be unique and contiguous"
+            "unranked competition results require an allowed "
+            "pre-competition insufficiency; all other ranks must be "
+            "unique and contiguous"
         )
 
     evidence_keys = []
@@ -1094,11 +1111,6 @@ def _execute_track_stage(
             frozen_inputs=frozen,
             ruler_payload=ruler_payload,
             candidates=_track_candidates(session, stage),
-            ruler_digest=(
-                str(frozen_ruler["sha256"])
-                if type(frozen_ruler.get("sha256")) is str
-                else None
-            ),
         )
         session.rollback()
         outcome = (
