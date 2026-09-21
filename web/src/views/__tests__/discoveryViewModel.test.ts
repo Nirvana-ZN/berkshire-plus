@@ -2,18 +2,22 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  armFetchTimeout,
   armStageFetchTimeout,
   canAbandonRun,
   collectMetricKeys,
+  CURRENT_FETCH_TIMEOUT_MS,
   latestStagesNeedPolling,
   matchesStagePointer,
   parseMetricRecord,
   parseStageResponse,
   renderMetricValue,
+  reviewedStageActions,
   RESULT_METRIC_KEYS_MAX,
   RESULT_OBSERVATIONS_MAX,
   stageActions,
   stageCacheKey,
+  sameStageReview,
   STAGE_FETCH_TIMEOUT_MS,
   shouldPollStage,
 } from '../discoveryViewModel.ts'
@@ -45,6 +49,26 @@ test('only actionable stage states expose controls', () => {
   assert.equal(stageActions('competition', 'failed', 'transient').retry, true)
   assert.equal(stageActions('competition', 'failed', 'permanent').retry, false)
   assert.equal(stageActions('adjudication', 'failed', 'transient').retry, false)
+  assert.deepEqual(
+    reviewedStageActions(false, 'track_gate', 'waiting_confirmation', null),
+    { confirm: false, override: false, retry: false },
+  )
+})
+
+test('review identity mismatch fails closed before mutation', () => {
+  const reviewed = {
+    runId: 7,
+    track: 'garp' as const,
+    stage: 'competition' as const,
+    attempt: 2,
+    status: 'waiting_confirmation' as const,
+    fingerprint: 'payload-a',
+  }
+  assert.equal(sameStageReview(reviewed, { ...reviewed }), true)
+  assert.equal(sameStageReview(reviewed, { ...reviewed, runId: 8 }), false)
+  assert.equal(sameStageReview(reviewed, { ...reviewed, stage: 'adjudication' }), false)
+  assert.equal(sameStageReview(reviewed, { ...reviewed, attempt: 3 }), false)
+  assert.equal(sameStageReview(reviewed, { ...reviewed, fingerprint: 'payload-b' }), false)
 })
 
 test('polling and abandon follow backend mutability', () => {
@@ -188,4 +212,25 @@ test('stage fetch timeout is bounded, abortable, and cancellable', () => {
   assert.equal(controller.signal.aborted, true)
   cancel()
   assert.equal(cancelled, 'timer')
+})
+
+test('current fetch timeout aborts on the bounded recovery deadline', () => {
+  const controller = new AbortController()
+  let scheduled: (() => void) | undefined
+  let delay = 0
+  const cancel = armFetchTimeout(
+    controller,
+    CURRENT_FETCH_TIMEOUT_MS,
+    () => {},
+    (callback, milliseconds) => {
+      scheduled = callback
+      delay = milliseconds
+      return 1
+    },
+    () => {},
+  )
+  assert.equal(delay, CURRENT_FETCH_TIMEOUT_MS)
+  scheduled!()
+  assert.equal(controller.signal.aborted, true)
+  cancel()
 })

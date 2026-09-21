@@ -162,5 +162,14 @@ def test_discovery_view_review_guards_and_read_only_adjudication() -> None:
     assert "stage !== 'adjudication'" in helper
     apply_run = page[page.index("async function applyRun") : page.index("async function readCurrent")]
     assert apply_run.index("schedulePoll()") < apply_run.index("void Promise.allSettled")
-    assert "if (stageControllers.has(cacheKey)) return" in page
+    assert "if (stageControllers.has(cacheKey)) {" in page
     assert "armStageFetchTimeout" in page
+    assert "reviewedStageActions" in page
+    assert "stagePayloadFingerprint" in page
+    assert "sameStageReview" in page
+    preflight = page[page.index("async function beforeMutation") : page.index("async function stageMutation")]
+    assert "await readCurrent()" in preflight
+    assert "loadStage(view, expectedRunId, true)" in preflight
+    assert "pointer.attempt !== identity.attempt" in preflight
+    assert "CURRENT_FETCH_TIMEOUT_MS" in page
+    assert "scheduleCurrentRefresh(CURRENT_RETRY_MS)" in page

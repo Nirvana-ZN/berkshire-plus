@@ -1,16 +1,20 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import {
+  armFetchTimeout,
   armStageFetchTimeout,
   canAbandonRun,
   collectMetricKeys,
+  CURRENT_FETCH_TIMEOUT_MS,
   latestStagesNeedPolling,
   matchesStagePointer,
   parseStageResponse,
   renderMetricValue,
-  stageActions,
+  reviewedStageActions,
   stageAriaLabel,
   stageCacheKey,
+  stagePayloadFingerprint,
+  sameStageReview,
   shouldPollStage,
   STAGE_POLL_INTERVAL_MS,
   type DiscoveryFailureKind,
@@ -19,6 +23,7 @@ import {
   type DiscoveryTrack,
   type DiscoveryTrackStage,
   type MetricValue,
+  type StageReviewIdentity,
 } from './discoveryViewModel'
 
 const DISCOVERY_RUN_STATUSES = [
@@ -215,6 +220,7 @@ const RESULT_GROUPS = [
   { key: 'insufficient', title: '数据不足结果' },
 ] as const
 const CURRENT_REFRESH_MS = 60_000
+const CURRENT_RETRY_MS = 5_000
 
 const state = ref<ViewState>({ kind: 'loading' })
 const starting = ref(false)
@@ -236,6 +242,9 @@ const pinnedTrackStages = ref<Record<Track, boolean>>({
 })
 const stagePayloadCache = ref<Record<string, StageResponse>>({})
 const stageMetricKeysCache = ref<Record<string, string[]>>({})
+const stageFingerprintCache = ref<Record<string, string>>({})
+const stageReviewableCache = ref<Record<string, boolean>>({})
+const reviewedStages = ref<Record<string, StageReviewIdentity>>({})
 const overrideCode = ref('')
 const overrideAction = ref<'forced_pass' | 'forced_drop'>('forced_pass')
 const overrideReason = ref('')
@@ -417,18 +426,125 @@ function endpoint(view: StageView, runId: number): string {
     : `/api/discoveries/${runId}/tracks/${view.track}/stages/${view.stage}`
 }
 
+function clearReviewedStage(key?: string) {
+  if (key === undefined) {
+    reviewedStages.value = {}
+    return
+  }
+  const next = { ...reviewedStages.value }
+  delete next[key]
+  reviewedStages.value = next
+}
+
 function clearStageCache(key?: string) {
   if (key === undefined) {
     stagePayloadCache.value = {}
     stageMetricKeysCache.value = {}
+    stageFingerprintCache.value = {}
+    stageReviewableCache.value = {}
+    clearReviewedStage()
     return
   }
   const payloads = { ...stagePayloadCache.value }
   const metricKeys = { ...stageMetricKeysCache.value }
+  const fingerprints = { ...stageFingerprintCache.value }
+  const reviewable = { ...stageReviewableCache.value }
   delete payloads[key]
   delete metricKeys[key]
+  delete fingerprints[key]
+  delete reviewable[key]
   stagePayloadCache.value = payloads
   stageMetricKeysCache.value = metricKeys
+  stageFingerprintCache.value = fingerprints
+  stageReviewableCache.value = reviewable
+  clearReviewedStage(key)
+}
+
+function reviewIdentity(
+  runId: number,
+  view: StageView,
+  payload: StageResponse,
+  fingerprint: string,
+): StageReviewIdentity {
+  return {
+    runId,
+    track: view.track,
+    stage: view.stage,
+    attempt: payload.current.attempt,
+    status: payload.current.status,
+    fingerprint,
+  }
+}
+
+function pointerMatchesView(run: DiscoveryRun, view: StageView, payload: StageResponse): boolean {
+  const pointer = view.track === null ? run.safety : run.tracks?.[view.track]
+  return pointer?.created === true
+    && (view.track === null || pointer.stage === view.stage)
+    && matchesStagePointer(
+      pointer.attempt,
+      pointer.status,
+      payload.current.attempt,
+      payload.current.status,
+    )
+}
+
+function reviewedIdentityFor(view: StageView): StageReviewIdentity | null {
+  const current = state.value
+  if (
+    current.kind !== 'ready'
+    || activeRunId.value !== current.run.id
+    || !stageViews.value.includes(view)
+    || view.payload === null
+    || view.error !== ''
+  ) return null
+  const key = stageCacheKey(current.run.id, view.track, view.stage)
+  const fingerprint = stageFingerprintCache.value[key]
+  if (
+    !fingerprint
+    || stagePayloadCache.value[key] !== view.payload
+    || stageReviewableCache.value[key] !== true
+    || !pointerMatchesView(current.run, view, view.payload)
+  ) return null
+  const actual = reviewIdentity(current.run.id, view, view.payload, fingerprint)
+  return sameStageReview(reviewedStages.value[key], actual) ? actual : null
+}
+
+function currentStageViews(): StageView[] | null {
+  const current = state.value
+  if (current.kind !== 'ready') return null
+  const views: StageView[] = []
+  if (current.run.safety?.created) {
+    const safety = stageViews.value.find((view) => view.track === null && view.stage === 'safety')
+    if (!safety) return null
+    views.push(safety)
+  }
+  for (const track of TRACKS) {
+    const pointer = current.run.tracks?.[track]
+    if (!pointer?.created) continue
+    if (!isTrackStage(pointer.stage)) return null
+    const view = stageViews.value.find(
+      (candidate) => candidate.track === track && candidate.stage === pointer.stage,
+    )
+    if (!view) return null
+    views.push(view)
+  }
+  return views.length ? views : null
+}
+
+function abandonReviewIdentities(): StageReviewIdentity[] | null {
+  const views = currentStageViews()
+  if (!views) return null
+  const identities = views.map(reviewedIdentityFor)
+  return identities.some((identity) => identity === null)
+    ? null
+    : identities as StageReviewIdentity[]
+}
+
+function canAbandonReviewedRun(): boolean {
+  const current = state.value
+  return current.kind === 'ready'
+    && canAbandonRun(current.run.current, current.run.status)
+    && abandonReviewIdentities() !== null
 }
 
 function stageAvailable(track: Track, stage: TrackStage): boolean {
@@ -476,17 +592,25 @@ function schedulePoll() {
   }, STAGE_POLL_INTERVAL_MS)
 }
 
-function scheduleCurrentRefresh() {
+function scheduleCurrentRefresh(delay = CURRENT_REFRESH_MS) {
   stopCurrentRefresh()
   if (!mounted) return
   currentRefreshTimer = window.setTimeout(() => {
     if (mounted) void readCurrent()
-  }, CURRENT_REFRESH_MS)
+  }, delay)
 }
 
-async function loadStage(view: StageView, runId: number) {
+async function loadStage(
+  view: StageView,
+  runId: number,
+  force = false,
+): Promise<StageResponse | null> {
   const cacheKey = stageCacheKey(runId, view.track, view.stage)
-  if (stageControllers.has(cacheKey)) return
+  if (stageControllers.has(cacheKey)) {
+    if (!force) return null
+    stageControllers.get(cacheKey)?.abort()
+  }
+  if (force) clearReviewedStage(cacheKey)
   const requestNumber = (activeStageKey.value[cacheKey] ?? 0) + 1
   activeStageKey.value[cacheKey] = requestNumber
   const controller = new AbortController()
@@ -502,23 +626,23 @@ async function loadStage(view: StageView, runId: number) {
       !mounted
       || activeRunId.value !== runId
       || activeStageKey.value[cacheKey] !== requestNumber
-    ) return
+    ) return null
     const current = stageViews.value.find((item) => item.key === view.key)
-    if (!current) return
+    if (!current) return null
     if (response.status === 404) {
       clearStageCache(cacheKey)
       current.payload = null
       current.metricKeys = []
       current.created = false
       current.error = shouldPollStage(view.created, view.status) ? '' : '阶段尚未生成'
-      return
+      return null
     }
     if (!response.ok) {
       clearStageCache(cacheKey)
       current.payload = null
       current.metricKeys = []
       current.error = errorMessage(body, '无法读取阶段结果')
-      return
+      return null
     }
     const payload = parseStageResponse(body)
     if (!payload) {
@@ -526,30 +650,45 @@ async function loadStage(view: StageView, runId: number) {
       current.payload = null
       current.metricKeys = []
       current.error = '服务返回的阶段数据无效'
-      return
+      return null
     }
-    const metricKeys = collectMetricKeys([
+    const resultRows = [
       ...payload.pass,
       ...payload.drop,
       ...payload.insufficient,
-    ])
+    ]
+    const metricKeys = collectMetricKeys(resultRows)
     stagePayloadCache.value = { ...stagePayloadCache.value, [cacheKey]: payload }
     stageMetricKeysCache.value = {
       ...stageMetricKeysCache.value,
       [cacheKey]: metricKeys,
+    }
+    const fingerprint = stagePayloadFingerprint(payload)
+    stageFingerprintCache.value = {
+      ...stageFingerprintCache.value,
+      [cacheKey]: fingerprint,
+    }
+    stageReviewableCache.value = {
+      ...stageReviewableCache.value,
+      [cacheKey]: resultRows.every((row) => row.metrics_unavailable_reason === null),
+    }
+    reviewedStages.value = {
+      ...reviewedStages.value,
+      [cacheKey]: reviewIdentity(runId, current, payload, fingerprint),
     }
     current.payload = payload
     current.metricKeys = metricKeys
     current.created = true
     current.status = payload.current.status
     current.error = ''
+    return payload
   } catch (error) {
-    if (!timedOut && error instanceof DOMException && error.name === 'AbortError') return
+    if (!timedOut && error instanceof DOMException && error.name === 'AbortError') return null
     if (
       !mounted
       || activeRunId.value !== runId
       || activeStageKey.value[cacheKey] !== requestNumber
-    ) return
+    ) return null
     clearStageCache(cacheKey)
     const current = stageViews.value.find((item) => item.key === view.key)
     if (current) {
@@ -557,6 +696,7 @@ async function loadStage(view: StageView, runId: number) {
       current.metricKeys = []
       current.error = timedOut ? '阶段读取超时，将在下一轮重试' : '无法读取阶段结果'
     }
+    return null
   } finally {
     cancelTimeout()
     if (stageControllers.get(cacheKey) === controller) stageControllers.delete(cacheKey)
@@ -601,6 +741,10 @@ async function readCurrent(source: 'loaded' | 'created' = 'loaded'): Promise<boo
   const requestSequence = ++currentRequestSequence
   currentController?.abort()
   const controller = new AbortController()
+  let timedOut = false
+  const cancelTimeout = armFetchTimeout(controller, CURRENT_FETCH_TIMEOUT_MS, () => {
+    timedOut = true
+  })
   currentController = controller
   try {
     const response = await fetch('/api/discoveries/current', { signal: controller.signal })
@@ -631,16 +775,20 @@ async function readCurrent(source: 'loaded' | 'created' = 'loaded'): Promise<boo
       return true
     }
   } catch (error) {
-    if (error instanceof DOMException && error.name === 'AbortError') return false
+    if (!timedOut && error instanceof DOMException && error.name === 'AbortError') return false
     if (!mounted || requestSequence !== currentRequestSequence) return false
     abortStageRequests()
     clearStageCache()
-    state.value = { kind: 'error', message: '无法读取本周发现' }
+    state.value = {
+      kind: 'error',
+      message: timedOut ? '读取本周批次超时，将自动重试' : '无法读取本周发现',
+    }
   } finally {
+    cancelTimeout()
     if (currentController === controller) currentController = null
   }
   stopPoll()
-  scheduleCurrentRefresh()
+  scheduleCurrentRefresh(CURRENT_RETRY_MS)
   return false
 }
 
@@ -676,40 +824,98 @@ async function startDiscovery() {
   }
 }
 
-async function beforeMutation(expectedRunId: number): Promise<boolean> {
-  const refreshed = await readCurrent()
-  if (!refreshed || activeRunId.value !== expectedRunId) {
-    actionError.value = '周次或当前批次已变化，已重新加载，请复核后再操作'
-    return false
+async function beforeMutation(
+  expected: StageReviewIdentity[],
+  requireAllCurrentStages = false,
+): Promise<StageView[] | null> {
+  if (
+    !expected.length
+    || expected.some((identity) => !sameStageReview(
+      reviewedStages.value[stageCacheKey(identity.runId, identity.track, identity.stage)],
+      identity,
+    ))
+  ) {
+    actionError.value = '当前阶段尚未成功加载并复核'
+    return null
   }
-  return true
+  const expectedRunId = expected[0]!.runId
+  const refreshed = await readCurrent()
+  if (!refreshed || activeRunId.value !== expectedRunId || state.value.kind !== 'ready') {
+    actionError.value = '周次或当前批次已变化，已重新加载，请复核后再操作'
+    return null
+  }
+  const views: StageView[] = []
+  for (const identity of expected) {
+    const view = stageViews.value.find(
+      (candidate) => candidate.track === identity.track && candidate.stage === identity.stage,
+    )
+    if (!view) {
+      actionError.value = '阶段已变化，请重新选择并复核'
+      return null
+    }
+    const pointer = view.track === null
+      ? state.value.run.safety
+      : state.value.run.tracks?.[view.track]
+    if (
+      pointer?.created !== true
+      || (view.track !== null && pointer.stage !== view.stage)
+      || pointer.attempt !== identity.attempt
+      || pointer.status !== identity.status
+    ) {
+      actionError.value = '阶段身份或状态已变化，请复核最新结果'
+      return null
+    }
+    views.push(view)
+  }
+  if (requireAllCurrentStages) {
+    const allCurrent = currentStageViews()
+    const expectedKeys = new Set(expected.map(
+      (identity) => stageCacheKey(identity.runId, identity.track, identity.stage),
+    ))
+    if (
+      !allCurrent
+      || allCurrent.length !== expected.length
+      || allCurrent.some((view) => !expectedKeys.has(
+        stageCacheKey(expectedRunId, view.track, view.stage),
+      ))
+    ) {
+      actionError.value = '当前阶段集合已变化，请复核最新结果'
+      return null
+    }
+  }
+  const payloads = await Promise.all(
+    views.map((view) => loadStage(view, expectedRunId, true)),
+  )
+  const actual = views.map(reviewedIdentityFor)
+  if (
+    payloads.some((payload) => payload === null)
+    || expected.some((identity, index) => !sameStageReview(identity, actual[index]))
+  ) {
+    actionError.value = '阶段结果已变化或无法验证，请复核最新结果后重试'
+    return null
+  }
+  return views
 }
 
 async function stageMutation(view: StageView, action: 'confirm' | 'retry') {
   if (mutating.value || activeRunId.value === null) return
-  const runId = activeRunId.value
-  const track = view.track
-  const stage = view.stage
+  const expected = reviewedIdentityFor(view)
+  if (!expected) {
+    actionError.value = '当前阶段尚未成功加载并复核'
+    return
+  }
+  const runId = expected.runId
   actionError.value = ''
   mutating.value = true
   try {
-    if (!await beforeMutation(runId)) return
-    const currentView = stageViews.value.find(
-      (item) => item.track === track && item.stage === stage,
-    )
-    if (!currentView) {
-      actionError.value = '阶段已变化，请重新选择'
-      return
-    }
-    const allowed = stageActions(
-      currentView.stage,
-      currentView.status,
-      currentView.payload?.current.failure_kind ?? null,
-    )
+    const currentView = (await beforeMutation([expected]))?.[0]
+    if (!currentView) return
+    const allowed = actionsFor(currentView)
     if ((action === 'confirm' && !allowed.confirm) || (action === 'retry' && !allowed.retry)) {
       actionError.value = '当前阶段状态不允许此操作'
       return
     }
+    clearReviewedStage(stageCacheKey(runId, currentView.track, currentView.stage))
     const response = await fetch(`${endpoint(currentView, runId)}/${action}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -727,9 +933,14 @@ async function stageMutation(view: StageView, action: 'confirm' | 'retry') {
 
 async function saveOverride(view: StageView) {
   if (mutating.value || activeRunId.value === null || view.track === null || view.stage === 'safety') return
-  const runId = activeRunId.value
-  const track = view.track
-  const stage = view.stage
+  const expected = reviewedIdentityFor(view)
+  if (!expected || expected.track === null || expected.stage === 'safety') {
+    actionError.value = '当前阶段尚未成功加载并复核'
+    return
+  }
+  const runId = expected.runId
+  const track = expected.track
+  const stage = expected.stage
   const reason = overrideReason.value.trim()
   const code = overrideCode.value.trim()
   if (!code || !reason) {
@@ -739,21 +950,12 @@ async function saveOverride(view: StageView) {
   actionError.value = ''
   mutating.value = true
   try {
-    if (!await beforeMutation(runId)) return
-    const currentView = stageViews.value.find(
-      (item) => item.track === track && item.stage === stage,
-    )
-    if (
-      !currentView
-      || !stageActions(
-        currentView.stage,
-        currentView.status,
-        currentView.payload?.current.failure_kind ?? null,
-      ).override
-    ) {
+    const currentView = (await beforeMutation([expected]))?.[0]
+    if (!currentView || !actionsFor(currentView).override) {
       actionError.value = '当前阶段不可人工覆盖'
       return
     }
+    clearReviewedStage(stageCacheKey(runId, track, stage))
     const response = await fetch(`/api/discoveries/${runId}/overrides`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -783,11 +985,17 @@ async function saveOverride(view: StageView) {
 
 async function abandonRun() {
   if (mutating.value || activeRunId.value === null) return
-  const runId = activeRunId.value
+  const expected = abandonReviewIdentities()
+  if (!expected) {
+    actionError.value = '请先成功加载并复核所有当前阶段'
+    return
+  }
+  const runId = expected[0]!.runId
   actionError.value = ''
   mutating.value = true
   try {
-    if (!await beforeMutation(runId)) return
+    if (!await beforeMutation(expected, true)) return
+    clearReviewedStage()
     const response = await fetch(`/api/discoveries/${runId}/abandon`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -836,7 +1044,8 @@ function overrideVerdict(view: StageView, code: string, original: boolean): stri
 }
 
 function actionsFor(view: StageView) {
-  return stageActions(
+  return reviewedStageActions(
+    reviewedIdentityFor(view) !== null,
     view.stage,
     view.status,
     view.payload?.current.failure_kind ?? null,
@@ -1162,7 +1371,7 @@ onBeforeUnmount(() => {
       </article>
 
       <div
-        v-if="canAbandonRun(state.run.current, state.run.status)"
+        v-if="canAbandonReviewedRun()"
         class="panel"
       >
         <h2>无法继续？</h2>

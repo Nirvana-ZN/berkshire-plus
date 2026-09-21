@@ -112,7 +112,17 @@ export const RESULT_METRIC_MAX_DEPTH = 128
 export const RESULT_METRIC_MAX_NODES = RESULT_METRICS_MAX_UTF8_BYTES
 export const STAGE_POLL_INTERVAL_MS = 800
 export const STAGE_FETCH_TIMEOUT_MS = 5_000
+export const CURRENT_FETCH_TIMEOUT_MS = 5_000
 const INVALID_METRIC = Symbol('invalid-metric')
+
+export interface StageReviewIdentity {
+  runId: number
+  track: DiscoveryTrack | null
+  stage: DiscoveryStageName
+  attempt: number
+  status: DiscoveryStageStatus
+  fingerprint: string
+}
 
 export function stageCacheKey(
   runId: number,
@@ -147,8 +157,9 @@ export function collectMetricKeys(
   return [...keys].sort()
 }
 
-export function armStageFetchTimeout(
+export function armFetchTimeout(
   controller: AbortController,
+  timeoutMs: number,
   onTimeout: () => void = () => {},
   schedule: (callback: () => void, delay: number) => unknown =
     (callback, delay) => globalThis.setTimeout(callback, delay),
@@ -158,8 +169,49 @@ export function armStageFetchTimeout(
   const handle = schedule(() => {
     onTimeout()
     controller.abort()
-  }, STAGE_FETCH_TIMEOUT_MS)
+  }, timeoutMs)
   return () => cancel(handle)
+}
+
+export function armStageFetchTimeout(
+  controller: AbortController,
+  onTimeout: () => void = () => {},
+  schedule?: (callback: () => void, delay: number) => unknown,
+  cancel?: (handle: unknown) => void,
+): () => void {
+  return armFetchTimeout(
+    controller,
+    STAGE_FETCH_TIMEOUT_MS,
+    onTimeout,
+    schedule,
+    cancel,
+  )
+}
+
+export function stagePayloadFingerprint(value: unknown): string {
+  const serialized = JSON.stringify(value) ?? 'undefined'
+  let first = 0x811c9dc5
+  let second = 0x9e3779b9
+  for (let index = 0; index < serialized.length; index += 1) {
+    const code = serialized.charCodeAt(index)
+    first = Math.imul(first ^ code, 0x01000193)
+    second = Math.imul(second ^ code, 0x85ebca6b)
+  }
+  return `${serialized.length}:${(first >>> 0).toString(16)}:${(second >>> 0).toString(16)}`
+}
+
+export function sameStageReview(
+  expected: StageReviewIdentity | null | undefined,
+  actual: StageReviewIdentity | null | undefined,
+): boolean {
+  return expected != null
+    && actual != null
+    && expected.runId === actual.runId
+    && expected.track === actual.track
+    && expected.stage === actual.stage
+    && expected.attempt === actual.attempt
+    && expected.status === actual.status
+    && expected.fingerprint === actual.fingerprint
 }
 
 export function matchesStagePointer(
@@ -185,6 +237,17 @@ export function stageActions(
     override: waiting && stage !== 'safety',
     retry: stage !== 'adjudication' && status === 'failed' && failureKind === 'transient',
   }
+}
+
+export function reviewedStageActions(
+  reviewed: boolean,
+  stage: DiscoveryStageName,
+  status: DiscoveryStageStatus,
+  failureKind: DiscoveryFailureKind,
+): { confirm: boolean; override: boolean; retry: boolean } {
+  return reviewed
+    ? stageActions(stage, status, failureKind)
+    : { confirm: false, override: false, retry: false }
 }
 
 export function canAbandonRun(current: boolean, status: string): boolean {
