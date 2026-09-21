@@ -7,42 +7,54 @@ import pytest
 
 from discovery.evidence import (
     ALLOWED_RISK_CATEGORIES,
+    EVIDENCE_RULE_VERSION,
     FALLBACK_RISK_TEXT,
     build_evidence_card,
 )
+
+SOURCE_AS_OF = {
+    "security": "2026-09-17",
+    "financial": "2026-04-01",
+    "valuation": "2026-08-31",
+}
 
 
 def ruler_payload() -> dict[str, object]:
     return {
         "track": "quality_discount",
         "fields": [
-            "valuation_percentile",
-            "roe_stability",
+            "pe_percentile",
+            "roe_cv",
             "cash_conversion",
             "margin_change",
             "code",
         ],
         "formulas": {
-            "valuation_percentile": "percentile_rank(current.pe,monthly.pe)",
-            "roe_stability": "coefficient_of_variation(annual.roe)",
+            "pe_percentile": "percentile_rank(current.pe,monthly.pe)",
+            "roe_cv": "coefficient_of_variation(annual.roe)",
             "cash_conversion": "mean(annual.ocf/annual.net_income)",
             "margin_change": "latest(gross_margin)-earliest(gross_margin)",
         },
         "thresholds": {
-            "valuation_percentile_max": "30",
-            "roe_stability_max": "0.25",
+            "pe_percentile_max": "30",
+            "roe_cv_max": "0.25",
             "cash_conversion_min": "1",
         },
+        "min_observations": {
+            "valuation_pe": 60,
+            "roe": 5,
+            "cash_conversion": 5,
+        },
         "missing_policy": {
-            "valuation_percentile": "insufficient",
-            "roe_stability": "insufficient",
+            "pe_percentile": "insufficient",
+            "roe_cv": "insufficient",
             "cash_conversion": "insufficient",
             "margin_change": "skip",
             "code": "insufficient",
         },
         "order": [
-            ["valuation_percentile", "asc", "nulls_last"],
-            ["roe_stability", "asc", "nulls_last"],
+            ["pe_percentile", "asc", "nulls_last"],
+            ["roe_cv", "asc", "nulls_last"],
             ["cash_conversion", "desc", "nulls_last"],
             ["code", "asc", "nulls_last"],
         ],
@@ -52,10 +64,13 @@ def ruler_payload() -> dict[str, object]:
 
 def metrics(**changes: object) -> dict[str, object]:
     values = {
-        "valuation_percentile": "20",
-        "roe_stability": "0.1",
+        "pe_percentile": "20",
+        "roe_cv": "0.1",
         "cash_conversion": "1.2",
         "margin_change": "1",
+        "valuation_pe_observations": "60",
+        "roe_observations": "5",
+        "cash_conversion_observations": "5",
         "risk_flags": [],
     }
     values.update(changes)
@@ -67,15 +82,13 @@ def test_evidence_is_deterministic_and_carries_rule_inputs() -> None:
         "600000.SH",
         metrics(),
         ruler_payload(),
-        rule_version="quality-v7",
-        as_of="2026-09-17",
+        source_as_of=SOURCE_AS_OF,
     )
     second = build_evidence_card(
         "600000.SH",
         metrics(),
         ruler_payload(),
-        rule_version="quality-v7",
-        as_of="2026-09-17",
+        source_as_of=SOURCE_AS_OF,
     )
 
     assert first == second
@@ -95,7 +108,7 @@ def test_evidence_is_deterministic_and_carries_rule_inputs() -> None:
 
 def test_risks_use_only_allowed_categories() -> None:
     cases = (
-        metrics(valuation_percentile="29"),
+        metrics(pe_percentile="29"),
         metrics(risk_flags=["margin_deterioration"]),
         metrics(risk_flags=["bank_asset_quality"]),
         metrics(margin_change=None),
@@ -106,8 +119,7 @@ def test_risks_use_only_allowed_categories() -> None:
             "600000.SH",
             values,
             ruler_payload(),
-            rule_version="quality-v7",
-            as_of="2026-09-17",
+            source_as_of=SOURCE_AS_OF,
         )
         categories.update(
             item.category
@@ -122,10 +134,9 @@ def test_risks_use_only_allowed_categories() -> None:
 def test_fewer_than_three_reliable_facts_is_insufficient_not_padded() -> None:
     card = build_evidence_card(
         "600000.SH",
-        metrics(cash_conversion=None, margin_change=None),
+        metrics(cash_conversion_observations="4", margin_change="99"),
         ruler_payload(),
-        rule_version="quality-v7",
-        as_of="2026-09-17",
+        source_as_of=SOURCE_AS_OF,
     )
 
     facts = [item for item in card.items if item.kind == "fact"]
