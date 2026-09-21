@@ -31,6 +31,7 @@ export interface ParsedDiscoveryRow {
   reason: string | null
   rank: number | null
   metrics: Record<string, MetricValue>
+  metrics_unavailable_reason: string | null
   override: ParsedDiscoveryOverride | null
 }
 
@@ -101,12 +102,16 @@ const TRACK_STAGES: readonly DiscoveryTrackStage[] = [
   'competition',
   'adjudication',
 ]
-const METRIC_MAX_DEPTH = 3
-const METRIC_MAX_ARRAY_LENGTH = 64
-const METRIC_MAX_NODES = 256
-const METRIC_MAX_KEYS = 128
-const METRIC_MAX_STRING_LENGTH = 4096
-const METRIC_MAX_TOTAL_STRING_LENGTH = 65_536
+// Mirrors SUMMARY_* limits in discovery/summaries.py; 128 is the ruler's
+// documented observation ceiling (for example MAX_FINANCIAL_ROWS).
+export const RESULT_MAX_ROWS = 20_000
+export const RESULT_METRICS_MAX_UTF8_BYTES = 64 * 1024
+export const RESULT_METRIC_KEYS_MAX = 256
+export const RESULT_OBSERVATIONS_MAX = 128
+export const RESULT_METRIC_MAX_DEPTH = 128
+export const RESULT_METRIC_MAX_NODES = RESULT_METRICS_MAX_UTF8_BYTES
+export const STAGE_POLL_INTERVAL_MS = 800
+export const STAGE_FETCH_TIMEOUT_MS = 5_000
 const INVALID_METRIC = Symbol('invalid-metric')
 
 export function stageCacheKey(
@@ -119,6 +124,42 @@ export function stageCacheKey(
 
 export function shouldPollStage(created: boolean, status: DiscoveryStageStatus): boolean {
   return created && (status === 'queued' || status === 'running')
+}
+
+export function latestStagesNeedPolling(
+  pointers: readonly (
+    { created: boolean; status: DiscoveryStageStatus | null } | null | undefined
+  )[],
+): boolean {
+  return pointers.some(
+    (pointer) => pointer?.status != null
+      && shouldPollStage(pointer.created, pointer.status),
+  )
+}
+
+export function collectMetricKeys(
+  rows: readonly { metrics: Readonly<Record<string, MetricValue>> }[],
+): string[] {
+  const keys = new Set<string>()
+  for (const row of rows) {
+    for (const key of Object.keys(row.metrics)) keys.add(key)
+  }
+  return [...keys].sort()
+}
+
+export function armStageFetchTimeout(
+  controller: AbortController,
+  onTimeout: () => void = () => {},
+  schedule: (callback: () => void, delay: number) => unknown =
+    (callback, delay) => globalThis.setTimeout(callback, delay),
+  cancel: (handle: unknown) => void =
+    (handle) => globalThis.clearTimeout(handle as ReturnType<typeof setTimeout>),
+): () => void {
+  const handle = schedule(() => {
+    onTimeout()
+    controller.abort()
+  }, STAGE_FETCH_TIMEOUT_MS)
+  return () => cancel(handle)
 }
 
 export function matchesStagePointer(
@@ -186,24 +227,18 @@ function textOrNull(value: unknown): string | null {
 function parseMetricValue(
   value: unknown,
   depth: number,
-  budget: { nodes: number; characters: number },
+  budget: { nodes: number },
 ): MetricValue | typeof INVALID_METRIC {
   budget.nodes += 1
-  if (budget.nodes > METRIC_MAX_NODES) return INVALID_METRIC
+  if (budget.nodes > RESULT_METRIC_MAX_NODES) return INVALID_METRIC
   if (value === null) return null
-  if (typeof value === 'string') {
-    budget.characters += value.length
-    return value.length <= METRIC_MAX_STRING_LENGTH
-      && budget.characters <= METRIC_MAX_TOTAL_STRING_LENGTH
-      ? value
-      : INVALID_METRIC
-  }
+  if (typeof value === 'string') return value
   if (typeof value === 'number') {
     return Number.isFinite(value) ? value : INVALID_METRIC
   }
   if (typeof value === 'boolean') return value
-  if (!Array.isArray(value) || depth >= METRIC_MAX_DEPTH) return INVALID_METRIC
-  if (value.length > METRIC_MAX_ARRAY_LENGTH) return INVALID_METRIC
+  if (!Array.isArray(value) || depth >= RESULT_METRIC_MAX_DEPTH) return INVALID_METRIC
+  if (value.length > RESULT_OBSERVATIONS_MAX) return INVALID_METRIC
   const parsed: MetricValue[] = []
   for (const item of value) {
     const child = parseMetricValue(item, depth + 1, budget)
@@ -216,11 +251,18 @@ function parseMetricValue(
 export function parseMetricRecord(value: unknown): Record<string, MetricValue> | null {
   if (!isRecord(value)) return null
   const entries = Object.entries(value)
-  if (entries.length > METRIC_MAX_KEYS) return null
-  const budget = { nodes: 0, characters: 0 }
+  if (entries.length > RESULT_METRIC_KEYS_MAX) return null
+  try {
+    if (
+      new TextEncoder().encode(JSON.stringify(value)).byteLength
+      > RESULT_METRICS_MAX_UTF8_BYTES
+    ) return null
+  } catch {
+    return null
+  }
+  const budget = { nodes: 0 }
   const parsed: Record<string, MetricValue> = {}
   for (const [key, raw] of entries) {
-    if (!key || key.length > 256) return null
     const metric = parseMetricValue(raw, 0, budget)
     if (metric === INVALID_METRIC) return null
     parsed[key] = metric
@@ -274,7 +316,6 @@ function parseRow(value: unknown): ParsedDiscoveryRow | null {
     || (value.rank !== undefined && value.rank !== null && nonNegativeInteger(value.rank) === null)
   ) return null
   const metrics = parseMetricRecord(value.metrics)
-  if (metrics === null) return null
   const override = value.override == null ? null : parseOverride(value.override)
   if (value.override != null && override === null) return null
   return {
@@ -284,13 +325,16 @@ function parseRow(value: unknown): ParsedDiscoveryRow | null {
     original_verdict: value.original_verdict,
     reason: textOrNull(value.reason),
     rank: value.rank == null ? null : value.rank as number,
-    metrics,
+    metrics: metrics ?? {},
+    metrics_unavailable_reason: metrics === null
+      ? '指标值超出安全展示契约，已隐藏本行指标'
+      : null,
     override,
   }
 }
 
 function parseRows(value: unknown): ParsedDiscoveryRow[] | null {
-  if (!Array.isArray(value)) return null
+  if (!Array.isArray(value) || value.length > RESULT_MAX_ROWS) return null
   const rows = value.map(parseRow)
   return rows.some((row) => row === null) ? null : rows as ParsedDiscoveryRow[]
 }

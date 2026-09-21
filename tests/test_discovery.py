@@ -76,6 +76,9 @@ def test_discovery_view_guides_stages_with_typed_structured_results() -> None:
     page = (ROOT / "web/src/views/DiscoveryView.vue").read_text(
         encoding="utf-8"
     )
+    helper = (ROOT / "web/src/views/discoveryViewModel.ts").read_text(
+        encoding="utf-8"
+    )
 
     for label in (
         "共同排雷",
@@ -114,7 +117,8 @@ def test_discovery_view_guides_stages_with_typed_structured_results() -> None:
     assert "selectedTrackStages" in page
     assert "original_verdict" in page
     assert "snapshot_at" in page
-    assert "800" in page
+    assert "STAGE_POLL_INTERVAL_MS" in page
+    assert "STAGE_POLL_INTERVAL_MS = 800" in helper
     assert "onBeforeUnmount" in page
     assert "snapshot_json" not in page
     assert "买入" not in page
@@ -156,3 +160,7 @@ def test_discovery_view_review_guards_and_read_only_adjudication() -> None:
     assert "人工覆盖记录" in page
     assert "stageAriaLabel" in page
     assert "stage !== 'adjudication'" in helper
+    apply_run = page[page.index("async function applyRun") : page.index("async function readCurrent")]
+    assert apply_run.index("schedulePoll()") < apply_run.index("void Promise.allSettled")
+    assert "if (stageControllers.has(cacheKey)) return" in page
+    assert "armStageFetchTimeout" in page

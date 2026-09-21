@@ -1,7 +1,10 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import {
+  armStageFetchTimeout,
   canAbandonRun,
+  collectMetricKeys,
+  latestStagesNeedPolling,
   matchesStagePointer,
   parseStageResponse,
   renderMetricValue,
@@ -9,6 +12,7 @@ import {
   stageAriaLabel,
   stageCacheKey,
   shouldPollStage,
+  STAGE_POLL_INTERVAL_MS,
   type DiscoveryFailureKind,
   type DiscoveryStageName,
   type DiscoveryStageStatus,
@@ -86,6 +90,7 @@ interface DiscoveryRow {
   reason: string | null
   rank: number | null
   metrics: Record<string, MetricValue>
+  metrics_unavailable_reason: string | null
   override: DiscoveryOverride | null
 }
 
@@ -161,6 +166,7 @@ interface StageView {
   created: boolean
   status: StageStatus
   payload: StageResponse | null
+  metricKeys: string[]
   error: string
 }
 
@@ -229,6 +235,7 @@ const pinnedTrackStages = ref<Record<Track, boolean>>({
   garp: false,
 })
 const stagePayloadCache = ref<Record<string, StageResponse>>({})
+const stageMetricKeysCache = ref<Record<string, string[]>>({})
 const overrideCode = ref('')
 const overrideAction = ref<'forced_pass' | 'forced_drop'>('forced_pass')
 const overrideReason = ref('')
@@ -367,6 +374,7 @@ function viewsForRun(run: DiscoveryRun): StageView[] {
     created: run.safety?.created ?? true,
     status: safetyPayload?.current.status ?? safetyStatus,
     payload: safetyPayload,
+    metricKeys: stageMetricKeysCache.value[safetyKey] ?? [],
     error: '',
   }]
   for (const track of TRACKS) {
@@ -396,6 +404,7 @@ function viewsForRun(run: DiscoveryRun): StageView[] {
       created: payload !== null || (selectedIsLatest && (pointer?.created ?? false)),
       status: payload?.current.status ?? (selectedIsLatest ? pointer?.status ?? 'queued' : 'queued'),
       payload,
+      metricKeys: stageMetricKeysCache.value[cacheKey] ?? [],
       error: '',
     })
   }
@@ -411,11 +420,15 @@ function endpoint(view: StageView, runId: number): string {
 function clearStageCache(key?: string) {
   if (key === undefined) {
     stagePayloadCache.value = {}
+    stageMetricKeysCache.value = {}
     return
   }
-  const next = { ...stagePayloadCache.value }
-  delete next[key]
-  stagePayloadCache.value = next
+  const payloads = { ...stagePayloadCache.value }
+  const metricKeys = { ...stageMetricKeysCache.value }
+  delete payloads[key]
+  delete metricKeys[key]
+  stagePayloadCache.value = payloads
+  stageMetricKeysCache.value = metricKeys
 }
 
 function stageAvailable(track: Track, stage: TrackStage): boolean {
@@ -452,10 +465,7 @@ function needsPolling(): boolean {
     current.run.safety,
     ...TRACKS.map((track) => current.run.tracks?.[track]),
   ]
-  return pointers.some(
-    (pointer) => pointer?.status != null
-      && shouldPollStage(pointer.created, pointer.status),
-  )
+  return latestStagesNeedPolling(pointers)
 }
 
 function schedulePoll() {
@@ -463,7 +473,7 @@ function schedulePoll() {
   if (!mounted || !needsPolling()) return
   pollTimer = window.setTimeout(() => {
     if (mounted) void refreshRun()
-  }, 800)
+  }, STAGE_POLL_INTERVAL_MS)
 }
 
 function scheduleCurrentRefresh() {
@@ -476,10 +486,14 @@ function scheduleCurrentRefresh() {
 
 async function loadStage(view: StageView, runId: number) {
   const cacheKey = stageCacheKey(runId, view.track, view.stage)
+  if (stageControllers.has(cacheKey)) return
   const requestNumber = (activeStageKey.value[cacheKey] ?? 0) + 1
   activeStageKey.value[cacheKey] = requestNumber
-  stageControllers.get(cacheKey)?.abort()
   const controller = new AbortController()
+  let timedOut = false
+  const cancelTimeout = armStageFetchTimeout(controller, () => {
+    timedOut = true
+  })
   stageControllers.set(cacheKey, controller)
   try {
     const response = await fetch(endpoint(view, runId), { signal: controller.signal })
@@ -494,6 +508,7 @@ async function loadStage(view: StageView, runId: number) {
     if (response.status === 404) {
       clearStageCache(cacheKey)
       current.payload = null
+      current.metricKeys = []
       current.created = false
       current.error = shouldPollStage(view.created, view.status) ? '' : '阶段尚未生成'
       return
@@ -501,6 +516,7 @@ async function loadStage(view: StageView, runId: number) {
     if (!response.ok) {
       clearStageCache(cacheKey)
       current.payload = null
+      current.metricKeys = []
       current.error = errorMessage(body, '无法读取阶段结果')
       return
     }
@@ -508,16 +524,27 @@ async function loadStage(view: StageView, runId: number) {
     if (!payload) {
       clearStageCache(cacheKey)
       current.payload = null
+      current.metricKeys = []
       current.error = '服务返回的阶段数据无效'
       return
     }
+    const metricKeys = collectMetricKeys([
+      ...payload.pass,
+      ...payload.drop,
+      ...payload.insufficient,
+    ])
     stagePayloadCache.value = { ...stagePayloadCache.value, [cacheKey]: payload }
+    stageMetricKeysCache.value = {
+      ...stageMetricKeysCache.value,
+      [cacheKey]: metricKeys,
+    }
     current.payload = payload
+    current.metricKeys = metricKeys
     current.created = true
     current.status = payload.current.status
     current.error = ''
   } catch (error) {
-    if (error instanceof DOMException && error.name === 'AbortError') return
+    if (!timedOut && error instanceof DOMException && error.name === 'AbortError') return
     if (
       !mounted
       || activeRunId.value !== runId
@@ -527,9 +554,11 @@ async function loadStage(view: StageView, runId: number) {
     const current = stageViews.value.find((item) => item.key === view.key)
     if (current) {
       current.payload = null
-      current.error = '无法读取阶段结果'
+      current.metricKeys = []
+      current.error = timedOut ? '阶段读取超时，将在下一轮重试' : '无法读取阶段结果'
     }
   } finally {
+    cancelTimeout()
     if (stageControllers.get(cacheKey) === controller) stageControllers.delete(cacheKey)
   }
 }
@@ -562,10 +591,10 @@ async function applyRun(
   activeRunId.value = run.id
   state.value = { kind: 'ready', run, source }
   stageViews.value = viewsForRun(run)
-  await Promise.all(stageViews.value.map((view) => loadStage(view, run.id)))
   if (!mounted || requestSequence !== currentRequestSequence || activeRunId.value !== run.id) return
   schedulePoll()
   scheduleCurrentRefresh()
+  void Promise.allSettled(stageViews.value.map((view) => loadStage(view, run.id)))
 }
 
 async function readCurrent(source: 'loaded' | 'created' = 'loaded'): Promise<boolean> {
@@ -778,7 +807,6 @@ async function onStageSelection(track: Track) {
   const current = state.value
   if (current.kind !== 'ready') return
   pinnedTrackStages.value[track] = true
-  abortStageRequests()
   stageViews.value = viewsForRun(current.run)
   const view = stageViews.value.find((item) => item.track === track)
   if (view) await loadStage(view, current.run.id)
@@ -805,10 +833,6 @@ function overrideDirection(override: DiscoveryOverride): string {
 function overrideVerdict(view: StageView, code: string, original: boolean): string {
   const row = overrideResult(view, code)
   return row ? verdictLabel(original ? row.original_verdict : row.verdict) : '不可用'
-}
-
-function metricKeys(view: StageView): string[] {
-  return [...new Set(rows(view).flatMap((row) => Object.keys(row.metrics)))].sort()
 }
 
 function actionsFor(view: StageView) {
@@ -1033,7 +1057,8 @@ onBeforeUnmount(() => {
                   <th>有效判定</th>
                   <th>理由</th>
                   <th>排名</th>
-                  <th v-for="metric in metricKeys(view)" :key="metric">{{ metric }}</th>
+                  <th>指标状态</th>
+                  <th v-for="metric in view.metricKeys" :key="metric">{{ metric }}</th>
                 </tr>
               </thead>
               <tbody>
@@ -1044,12 +1069,13 @@ onBeforeUnmount(() => {
                   <td>{{ verdictLabel(row.verdict) }}</td>
                   <td>{{ row.reason || '—' }}</td>
                   <td>{{ row.rank ?? '—' }}</td>
-                  <td v-for="metric in metricKeys(view)" :key="metric">
+                  <td>{{ row.metrics_unavailable_reason || '可用' }}</td>
+                  <td v-for="metric in view.metricKeys" :key="metric">
                     {{ formatValue(row.metrics[metric]) }}
                   </td>
                 </tr>
                 <tr v-if="!resultRows(view, group.key).length">
-                  <td :colspan="6 + metricKeys(view).length">暂无{{ group.title }}</td>
+                  <td :colspan="7 + view.metricKeys.length">暂无{{ group.title }}</td>
                 </tr>
               </tbody>
             </table>
