@@ -70,3 +70,59 @@ def test_discovery_view_announces_async_states() -> None:
         "无法读取本周发现",
     ):
         assert message in page
+
+
+def test_discovery_view_guides_stages_with_typed_structured_results() -> None:
+    page = (ROOT / "web/src/views/DiscoveryView.vue").read_text(
+        encoding="utf-8"
+    )
+
+    for label in (
+        "共同排雷",
+        "优质折价",
+        "深度价值",
+        "合理价成长",
+        "轨道门槛",
+        "候选竞争",
+        "人工裁决",
+        "通过",
+        "淘汰",
+        "数据不足",
+        "人工覆盖",
+        "本层固定规则",
+        "尺子版本/改因",
+        "计数",
+        "指标分布",
+        "阈值位置",
+        "waiting_confirmation",
+        "failed",
+        "data_not_ready",
+        "ruler_not_ready",
+    ):
+        assert label in page
+
+    assert "interface DiscoveryRow" in page
+    assert "interface StageSummary" in page
+    assert "/stages/safety" in page
+    assert "/tracks/${view.track}/stages/${view.stage}" in page
+    assert "/overrides" in page
+    assert "activeRunId" in page
+    assert "activeStageKey" in page
+    assert "800" in page
+    assert "onBeforeUnmount" in page
+    assert "snapshot_json" not in page
+    assert "买入" not in page
+    assert "卖出" not in page
+
+
+def test_discovery_view_requires_override_reason_and_terminal_guidance() -> None:
+    page = (ROOT / "web/src/views/DiscoveryView.vue").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'overrideReason.value.trim()' in page
+    assert 'name="override_reason"' in page
+    assert "仅在等待确认时可确认" in page
+    assert "仅瞬时失败可重试" in page
+    assert "放弃本批次并重新创建" in page
+    assert "Number.isFinite" in page
