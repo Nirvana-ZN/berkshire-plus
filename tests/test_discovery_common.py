@@ -1086,10 +1086,7 @@ def test_drain_persists_validated_competition_evidence(tmp_path) -> None:
         def execute(context):
             assert context.candidate_codes == ("600000.SH",)
             company_as_of = context.frozen_inputs.companies[0].as_of
-            source_as_of = {
-                key: company_as_of[key]
-                for key in ("security", "financial", "valuation")
-            }
+            source_as_of = {"price": company_as_of["price"]}
             return TrackExecutionOutcome(
                 status="waiting_confirmation",
                 results=(
@@ -1109,11 +1106,11 @@ def test_drain_persists_validated_competition_evidence(tmp_path) -> None:
                             rule_version=EVIDENCE_RULE_VERSION,
                             kind="fact",
                             rule_id=f"quality_discount.fact.{field}",
-                            input_fields_json=(
-                                f'{{"{field}":"1","source":"security"}}'
+                            input_fields_json=canonical_json(
+                                {field: "1", "source": "price"}
                             ),
                             display_text=f"{field}=1",
-                            as_of=source_as_of["security"],
+                            as_of=source_as_of["price"],
                             data_completeness="complete",
                         )
                         for field in ("cash_conversion", "roe_cv", "valuation")
@@ -1142,7 +1139,9 @@ def test_drain_persists_validated_competition_evidence(tmp_path) -> None:
         )
         assert outcome.executed == 1
         evidence = session.scalar(select(DiscoveryEvidence))
-        assert evidence is not None
+        assert evidence is not None, session.get(
+            DiscoveryStage, competition.id
+        ).error
         assert (
             evidence.competition_stage_id,
             evidence.competition_attempt,
