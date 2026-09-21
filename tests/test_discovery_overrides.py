@@ -224,6 +224,7 @@ def _stage_expectation(payload: dict[str, object]) -> dict[str, object]:
         "expected_stage_status": current["status"],
         "expected_input_fingerprint": current["input_fingerprint"],
         "expected_ruler_version_id": current["ruler_version_id"],
+        "expected_stage_revision": current["stage_revision"],
         "expected_mutation_version": current["mutation_version"],
     }
 
@@ -264,6 +265,84 @@ def test_override_between_review_and_confirm_rejects_stale_session(
         assert reviewing.get(path).json()["current"]["status"] == (
             "waiting_confirmation"
         )
+
+
+def test_concurrent_same_revision_overrides_have_one_winner(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from fastapi.testclient import TestClient
+
+    from app import discovery_routes
+
+    app = _workflow_app(tmp_path)
+    with TestClient(app) as first, TestClient(app) as second:
+        run_id = _advance_to_competition(first)
+        stage_path = (
+            f"/api/discoveries/{run_id}/tracks/garp"
+            "/stages/competition"
+        )
+        reviewed = first.get(stage_path).json()
+        expectation = _stage_expectation(reviewed)
+        barrier = threading.Barrier(2)
+        original = discovery_routes._stage_precondition_rejection
+
+        def synchronize(session, payload, row):
+            rejection = original(session, payload, row)
+            if (
+                rejection is None
+                and payload.get("expected_mutation_version")
+                == expectation["expected_mutation_version"]
+            ):
+                barrier.wait(timeout=5)
+            return rejection
+
+        monkeypatch.setattr(
+            discovery_routes,
+            "_stage_precondition_rejection",
+            synchronize,
+        )
+
+        def save(client: TestClient, code: str):
+            return client.post(
+                f"/api/discoveries/{run_id}/overrides",
+                json={
+                    "track": "garp",
+                    "stage": "competition",
+                    "attempt": reviewed["current"]["attempt"],
+                    **expectation,
+                    "code": code,
+                    "action": "forced_drop",
+                    "reason": f"{code} concurrent update",
+                },
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            responses = [
+                pool.submit(save, first, "600004.SH"),
+                pool.submit(save, second, "600005.SH"),
+            ]
+            results = [future.result(timeout=10) for future in responses]
+
+        assert sorted(response.status_code for response in results) == [
+            200,
+            409,
+        ]
+        loser = next(response for response in results if response.status_code == 409)
+        assert loser.json()["code"] == "DISCOVERY_STAGE_VERSION_MISMATCH"
+        after = first.get(stage_path).json()
+        assert isinstance(after["current"]["stage_revision"], int)
+        assert (
+            after["current"]["stage_revision"]
+            > reviewed["current"]["stage_revision"]
+        )
+        persisted = after["overrides"]
+        assert len(persisted) == 1
+        winner = next(response for response in results if response.status_code == 200)
+        assert persisted[0]["code"] == winner.json()["code"]
 
 
 def test_abandon_rejects_stale_run_week_identity(tmp_path) -> None:

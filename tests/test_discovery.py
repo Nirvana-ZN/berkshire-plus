@@ -175,6 +175,7 @@ def test_discovery_view_review_guards_and_read_only_adjudication() -> None:
     assert "scheduleCurrentRefresh(CURRENT_RETRY_MS)" in page
     assert "expected_stage_id" in page
     assert "expected_input_fingerprint" in page
+    assert "expected_stage_revision" in page
     assert "expected_mutation_version" in page
     assert "stageExpectation(validated.identity)" in page
     assert "attempt: validated.identity.attempt" in page

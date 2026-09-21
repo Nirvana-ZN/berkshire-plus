@@ -5,7 +5,7 @@ import json
 import logging
 import threading
 from collections.abc import Callable, Mapping
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from math import isfinite
 from uuid import uuid4
 
@@ -391,6 +391,7 @@ def _stage_mutation_version(
             ),
             "algorithm_version": row.algorithm_version,
             "superseded_at": _iso(row.superseded_at),
+            "stage_revision": _stage_revision(row),
             "overrides": overrides,
         }
     )
@@ -407,8 +408,34 @@ def _stage_token_json(
             if isinstance(row, DiscoveryStage)
             else None
         ),
+        "stage_revision": _stage_revision(row),
         "mutation_version": _stage_mutation_version(session, row),
     }
+
+
+def _stage_revision(
+    row: DiscoveryCommonStage | DiscoveryStage,
+) -> int:
+    updated_at = row.updated_at.astimezone(timezone.utc)
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    delta = updated_at - epoch
+    return (
+        (delta.days * 86_400 + delta.seconds) * 1_000_000
+        + delta.microseconds
+    )
+
+
+def _next_stage_updated_at(
+    row: DiscoveryCommonStage | DiscoveryStage,
+    candidate: datetime,
+) -> datetime:
+    current = row.updated_at.astimezone(timezone.utc)
+    candidate = candidate.astimezone(timezone.utc)
+    return (
+        candidate
+        if candidate > current
+        else current + timedelta(microseconds=1)
+    )
 
 
 _STAGE_EXPECTATION_KEYS = (
@@ -417,8 +444,13 @@ _STAGE_EXPECTATION_KEYS = (
     "expected_stage_status",
     "expected_input_fingerprint",
     "expected_ruler_version_id",
+    "expected_stage_revision",
     "expected_mutation_version",
 )
+
+
+def _has_stage_expectation(payload: Mapping[str, object]) -> bool:
+    return any(key in payload for key in _STAGE_EXPECTATION_KEYS)
 
 
 def _stage_precondition_rejection(
@@ -441,6 +473,7 @@ def _stage_precondition_rejection(
             expected_ruler is not None
             and type(expected_ruler) is not int
         )
+        or type(payload.get("expected_stage_revision")) is not int
         or type(payload.get("expected_mutation_version")) is not str
         or not payload["expected_input_fingerprint"]
         or not payload["expected_mutation_version"]
@@ -468,6 +501,7 @@ def _stage_precondition_rejection(
         or payload["expected_stage_status"] != row.status
         or payload["expected_input_fingerprint"] != row.input_fingerprint
         or expected_ruler != ruler_version_id
+        or payload["expected_stage_revision"] != _stage_revision(row)
         or payload["expected_mutation_version"] != actual_version
     ):
         return _error(
@@ -478,6 +512,7 @@ def _stage_precondition_rejection(
             current_stage_id=row.id,
             current_stage_attempt=row.attempt,
             current_stage_status=row.status,
+            current_stage_revision=_stage_revision(row),
             current_mutation_version=actual_version,
         )
     return None
@@ -519,6 +554,15 @@ def _run_precondition_rejection(
             current_week_key=run.week_key,
         )
     return None
+
+
+def _stage_claim_conflict() -> JSONResponse:
+    return _error(
+        409,
+        error="阶段已变化",
+        code="DISCOVERY_STAGE_VERSION_MISMATCH",
+        detail="阶段版本已被其他会话更新",
+    )
 
 
 def _persisted_json(text: str) -> object:
@@ -1620,22 +1664,31 @@ def _confirm_common(
     if stale is not None:
         session.rollback()
         return False, stale
+    expected_updated_at = current.updated_at
     result = session.execute(
         update(DiscoveryCommonStage)
         .where(
             DiscoveryCommonStage.id == current.id,
+            DiscoveryCommonStage.attempt == current.attempt,
+            DiscoveryCommonStage.input_fingerprint
+            == current.input_fingerprint,
+            DiscoveryCommonStage.updated_at == expected_updated_at,
             DiscoveryCommonStage.status == "waiting_confirmation",
             DiscoveryCommonStage.superseded_at.is_(None),
         )
         .values(
             status="confirmed",
             confirmed_at=now,
-            updated_at=now,
+            updated_at=_next_stage_updated_at(current, now),
         )
     )
     if int(result.rowcount or 0) != 1:
         session.rollback()
-        return False, None
+        return (
+            (False, _stage_claim_conflict())
+            if _has_stage_expectation(expectation)
+            else (False, None)
+        )
     session.add_all(
         _new_track_stage(
             run,
@@ -1856,10 +1909,17 @@ def _confirm_track(
             for index, row in enumerate(keepers, start=1)
         }
         target = "confirmed" if len(keepers) >= 3 else "insufficient_candidates"
+        expected_updated_at = current.updated_at
         changed = session.execute(
             update(DiscoveryStage)
             .where(
                 DiscoveryStage.id == current.id,
+                DiscoveryStage.attempt == current.attempt,
+                DiscoveryStage.input_fingerprint
+                == current.input_fingerprint,
+                DiscoveryStage.ruler_version_id
+                == current.ruler_version_id,
+                DiscoveryStage.updated_at == expected_updated_at,
                 DiscoveryStage.status == "waiting_confirmation",
                 DiscoveryStage.superseded_at.is_(None),
             )
@@ -1870,24 +1930,20 @@ def _confirm_track(
                 drop_count=len(decisions) - len(keepers),
                 insufficient_count=0,
                 confirmed_at=now,
-                updated_at=now,
+                updated_at=_next_stage_updated_at(current, now),
             )
         )
         if int(changed.rowcount or 0) != 1:
             session.rollback()
-            session.expire_all()
-            refreshed = session.get(DiscoveryStage, exact_stage_id)
-            if refreshed is not None and refreshed.status in {
-                "confirmed",
-                "insufficient_candidates",
-            }:
-                return False, None
-            return False, _error(
-                409,
-                error="阶段不可确认",
-                code="DISCOVERY_STAGE_NOT_CONFIRMABLE",
-                detail="裁决阶段状态已改变",
-            )
+            if not _has_stage_expectation(expectation):
+                session.expire_all()
+                refreshed = session.get(DiscoveryStage, exact_stage_id)
+                if refreshed is not None and refreshed.status in {
+                    "confirmed",
+                    "insufficient_candidates",
+                }:
+                    return False, None
+            return False, _stage_claim_conflict()
         session.add_all(
             DiscoveryResult(
                 run_id=run.id,
@@ -1947,22 +2003,31 @@ def _confirm_track(
     if stale is not None:
         session.rollback()
         return False, stale
+    expected_updated_at = current.updated_at
     result = session.execute(
         update(DiscoveryStage)
         .where(
             DiscoveryStage.id == current.id,
+            DiscoveryStage.attempt == current.attempt,
+            DiscoveryStage.input_fingerprint == current.input_fingerprint,
+            DiscoveryStage.ruler_version_id == current.ruler_version_id,
+            DiscoveryStage.updated_at == expected_updated_at,
             DiscoveryStage.status == "waiting_confirmation",
             DiscoveryStage.superseded_at.is_(None),
         )
         .values(
             status="confirmed",
             confirmed_at=now,
-            updated_at=now,
+            updated_at=_next_stage_updated_at(current, now),
         )
     )
     if int(result.rowcount or 0) != 1:
         session.rollback()
-        return False, None
+        return (
+            (False, _stage_claim_conflict())
+            if _has_stage_expectation(expectation)
+            else (False, None)
+        )
     session.add(
         _new_track_stage(
             run,
@@ -2750,7 +2815,33 @@ def create_discovery_router() -> APIRouter:
                 if stale is not None:
                     session.rollback()
                     return stale
-                current.superseded_at = commit_at
+                expected_updated_at = current.updated_at
+                changed = session.execute(
+                    update(DiscoveryCommonStage)
+                    .where(
+                        DiscoveryCommonStage.id == current.id,
+                        DiscoveryCommonStage.attempt == current.attempt,
+                        DiscoveryCommonStage.input_fingerprint
+                        == current.input_fingerprint,
+                        DiscoveryCommonStage.updated_at
+                        == expected_updated_at,
+                        DiscoveryCommonStage.status == "failed",
+                        DiscoveryCommonStage.superseded_at.is_(None),
+                    )
+                    .values(
+                        superseded_at=commit_at,
+                        updated_at=_next_stage_updated_at(
+                            current, commit_at
+                        ),
+                    )
+                )
+                if int(changed.rowcount or 0) != 1:
+                    session.rollback()
+                    if _has_stage_expectation(payload):
+                        return _stage_claim_conflict()
+                    refreshed_run = _owned_run(session, run_id)
+                    assert refreshed_run is not None
+                    return _run_payload(session, refreshed_run)
                 session.add(
                     DiscoveryCommonStage(
                         run_id=run.id,
@@ -3072,7 +3163,34 @@ def create_discovery_router() -> APIRouter:
                 if stale is not None:
                     session.rollback()
                     return stale
-                current.superseded_at = commit_at
+                expected_updated_at = current.updated_at
+                changed = session.execute(
+                    update(DiscoveryStage)
+                    .where(
+                        DiscoveryStage.id == current.id,
+                        DiscoveryStage.attempt == current.attempt,
+                        DiscoveryStage.input_fingerprint
+                        == current.input_fingerprint,
+                        DiscoveryStage.ruler_version_id
+                        == current.ruler_version_id,
+                        DiscoveryStage.updated_at == expected_updated_at,
+                        DiscoveryStage.status == "failed",
+                        DiscoveryStage.superseded_at.is_(None),
+                    )
+                    .values(
+                        superseded_at=commit_at,
+                        updated_at=_next_stage_updated_at(
+                            current, commit_at
+                        ),
+                    )
+                )
+                if int(changed.rowcount or 0) != 1:
+                    session.rollback()
+                    if _has_stage_expectation(payload):
+                        return _stage_claim_conflict()
+                    refreshed_run = _owned_run(session, run_id)
+                    assert refreshed_run is not None
+                    return _run_payload(session, refreshed_run)
                 session.add(
                     DiscoveryStage(
                         run_id=run.id,
@@ -3446,22 +3564,43 @@ def create_discovery_router() -> APIRouter:
             if stale is not None:
                 session.rollback()
                 return stale
-            changed = session.execute(
-                update(DiscoveryStage)
-                .where(
-                    DiscoveryStage.id == stage_row.id,
-                    DiscoveryStage.status == "waiting_confirmation",
-                    DiscoveryStage.superseded_at.is_(None),
+            expected_updated_at = stage_row.updated_at
+            try:
+                changed = session.execute(
+                    update(DiscoveryStage)
+                    .where(
+                        DiscoveryStage.id == stage_row.id,
+                        DiscoveryStage.attempt == stage_row.attempt,
+                        DiscoveryStage.input_fingerprint
+                        == stage_row.input_fingerprint,
+                        DiscoveryStage.ruler_version_id
+                        == stage_row.ruler_version_id,
+                        DiscoveryStage.updated_at
+                        == expected_updated_at,
+                        DiscoveryStage.status
+                        == "waiting_confirmation",
+                        DiscoveryStage.superseded_at.is_(None),
+                    )
+                    .values(
+                        updated_at=_next_stage_updated_at(
+                            stage_row, commit_at
+                        )
+                    )
                 )
-                .values(updated_at=DiscoveryStage.updated_at)
-            )
+            except OperationalError:
+                session.rollback()
+                return _stage_claim_conflict()
             if int(changed.rowcount or 0) != 1:
                 session.rollback()
-                return _error(
-                    409,
-                    error="覆盖不可编辑",
-                    code="DISCOVERY_OVERRIDE_NOT_EDITABLE",
-                    detail="覆盖仅可在待确认阶段编辑",
+                return (
+                    _stage_claim_conflict()
+                    if _has_stage_expectation(payload)
+                    else _error(
+                        409,
+                        error="覆盖不可编辑",
+                        code="DISCOVERY_OVERRIDE_NOT_EDITABLE",
+                        detail="覆盖仅可在待确认阶段编辑",
+                    )
                 )
             exists = session.scalar(
                 select(DiscoveryResult.id).where(
@@ -3505,7 +3644,11 @@ def create_discovery_router() -> APIRouter:
                 row.action = action
                 row.reason = reason.strip()
                 row.created_at = commit_at
-            session.commit()
+            try:
+                session.commit()
+            except OperationalError:
+                session.rollback()
+                return _stage_claim_conflict()
             session.refresh(row)
             return _override_json(row)
 
@@ -3546,7 +3689,7 @@ def create_discovery_router() -> APIRouter:
                     detail="覆盖不属于当前阶段",
                 )
             stage_id = stage_row.id
-            run, _commit_at, rejection = _fresh_mutation_checkpoint(
+            run, commit_at, rejection = _fresh_mutation_checkpoint(
                 request.app,
                 session,
                 run.id,
@@ -3567,10 +3710,20 @@ def create_discovery_router() -> APIRouter:
                 update(DiscoveryStage)
                 .where(
                     DiscoveryStage.id == stage_row.id,
+                    DiscoveryStage.attempt == stage_row.attempt,
+                    DiscoveryStage.input_fingerprint
+                    == stage_row.input_fingerprint,
+                    DiscoveryStage.ruler_version_id
+                    == stage_row.ruler_version_id,
+                    DiscoveryStage.updated_at == stage_row.updated_at,
                     DiscoveryStage.status == "waiting_confirmation",
                     DiscoveryStage.superseded_at.is_(None),
                 )
-                .values(updated_at=DiscoveryStage.updated_at)
+                .values(
+                    updated_at=_next_stage_updated_at(
+                        stage_row, commit_at
+                    )
+                )
             )
             if int(changed.rowcount or 0) != 1:
                 session.rollback()

@@ -64,6 +64,7 @@ interface RunStagePointer {
   attempt?: number
   input_fingerprint?: string
   ruler_version_id?: number | null
+  stage_revision?: number
   mutation_version?: string
 }
 
@@ -159,6 +160,7 @@ interface StageCurrent {
   failure_kind: DiscoveryFailureKind
   input_fingerprint: string
   ruler_version_id: number | null
+  stage_revision: number
   mutation_version: string
 }
 
@@ -314,6 +316,9 @@ function isRunStagePointer(value: unknown): value is RunStagePointer {
         )
         && typeof value.mutation_version === 'string'
         && !!value.mutation_version
+        && typeof value.stage_revision === 'number'
+        && Number.isSafeInteger(value.stage_revision)
+        && value.stage_revision >= 0
       )
     )
     && (value.attempt === undefined || nonNegativeInteger(value.attempt) !== null)
@@ -505,6 +510,7 @@ function reviewIdentity(
     status: payload.current.status,
     inputFingerprint: payload.current.input_fingerprint,
     rulerVersionId: payload.current.ruler_version_id,
+    stageRevision: payload.current.stage_revision,
     mutationVersion: payload.current.mutation_version,
     fingerprint,
   }
@@ -517,6 +523,7 @@ function stageExpectation(identity: StageReviewIdentity) {
     expected_stage_status: identity.status,
     expected_input_fingerprint: identity.inputFingerprint,
     expected_ruler_version_id: identity.rulerVersionId,
+    expected_stage_revision: identity.stageRevision,
     expected_mutation_version: identity.mutationVersion,
   }
 }
@@ -534,6 +541,7 @@ function pointerMatchesView(run: DiscoveryRun, view: StageView, payload: StageRe
     && pointer.id === payload.current.id
     && pointer.input_fingerprint === payload.current.input_fingerprint
     && pointer.ruler_version_id === payload.current.ruler_version_id
+    && pointer.stage_revision === payload.current.stage_revision
     && pointer.mutation_version === payload.current.mutation_version
 }
 
@@ -935,6 +943,7 @@ async function beforeMutation(
       || pointer.status !== identity.status
       || pointer.input_fingerprint !== identity.inputFingerprint
       || pointer.ruler_version_id !== identity.rulerVersionId
+      || pointer.stage_revision !== identity.stageRevision
       || pointer.mutation_version !== identity.mutationVersion
     ) {
       actionError.value = '阶段身份或状态已变化，请复核最新结果'

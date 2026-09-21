@@ -65,6 +65,7 @@ test('review identity mismatch fails closed before mutation', () => {
     status: 'waiting_confirmation' as const,
     inputFingerprint: 'inputs-a',
     rulerVersionId: 5,
+    stageRevision: 1_700_000_000_000_000,
     mutationVersion: 'mutation-a',
     fingerprint: 'payload-a',
   }
@@ -149,6 +150,7 @@ function stagePayload(metrics: unknown) {
       failure_kind: null,
       input_fingerprint: 'inputs-a',
       ruler_version_id: 5,
+      stage_revision: 1_700_000_000_000_000,
       mutation_version: 'mutation-a',
     },
     pass: [row],

@@ -55,6 +55,7 @@ export interface ParsedStageResponse {
     failure_kind: DiscoveryFailureKind
     input_fingerprint: string
     ruler_version_id: number | null
+    stage_revision: number
     mutation_version: string
   }
   pass: ParsedDiscoveryRow[]
@@ -128,6 +129,7 @@ export interface StageReviewIdentity {
   status: DiscoveryStageStatus
   inputFingerprint: string
   rulerVersionId: number | null
+  stageRevision: number
   mutationVersion: string
   fingerprint: string
 }
@@ -222,6 +224,7 @@ export function sameStageReview(
     && expected.status === actual.status
     && expected.inputFingerprint === actual.inputFingerprint
     && expected.rulerVersionId === actual.rulerVersionId
+    && expected.stageRevision === actual.stageRevision
     && expected.mutationVersion === actual.mutationVersion
     && expected.fingerprint === actual.fingerprint
 }
@@ -499,6 +502,9 @@ export function parseStageResponse(value: unknown): ParsedStageResponse | null {
     )
     || typeof value.current.mutation_version !== 'string'
     || !value.current.mutation_version
+    || typeof value.current.stage_revision !== 'number'
+    || !Number.isSafeInteger(value.current.stage_revision)
+    || value.current.stage_revision < 0
   ) return null
   const passed = parseRows(value.pass)
   const dropped = parseRows(value.drop)
@@ -519,6 +525,7 @@ export function parseStageResponse(value: unknown): ParsedStageResponse | null {
         : null,
       input_fingerprint: value.current.input_fingerprint,
       ruler_version_id: value.current.ruler_version_id as number | null,
+      stage_revision: value.current.stage_revision as number,
       mutation_version: value.current.mutation_version,
     },
     pass: passed,
