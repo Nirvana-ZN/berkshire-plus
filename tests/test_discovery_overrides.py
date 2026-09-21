@@ -215,6 +215,75 @@ def _advance_to_competition(client) -> int:
     return run_id
 
 
+def _stage_expectation(payload: dict[str, object]) -> dict[str, object]:
+    current = payload["current"]
+    assert isinstance(current, dict)
+    return {
+        "expected_stage_id": current["id"],
+        "expected_stage_attempt": current["attempt"],
+        "expected_stage_status": current["status"],
+        "expected_input_fingerprint": current["input_fingerprint"],
+        "expected_ruler_version_id": current["ruler_version_id"],
+        "expected_mutation_version": current["mutation_version"],
+    }
+
+
+def test_override_between_review_and_confirm_rejects_stale_session(
+    tmp_path,
+) -> None:
+    from fastapi.testclient import TestClient
+
+    app = _workflow_app(tmp_path)
+    with TestClient(app) as reviewing, TestClient(app) as editing:
+        run_id = _advance_to_competition(reviewing)
+        path = (
+            f"/api/discoveries/{run_id}/tracks/garp"
+            "/stages/competition"
+        )
+        reviewed = reviewing.get(path).json()
+        changed = editing.post(
+            f"/api/discoveries/{run_id}/overrides",
+            json={
+                "track": "garp",
+                "stage": "competition",
+                "attempt": reviewed["current"]["attempt"],
+                **_stage_expectation(reviewed),
+                "code": "600005.SH",
+                "action": "forced_drop",
+                "reason": "第二会话更新",
+            },
+        )
+        assert changed.status_code == 200
+
+        stale = reviewing.post(
+            f"{path}/confirm",
+            json={"sync": True, **_stage_expectation(reviewed)},
+        )
+        assert stale.status_code == 409
+        assert stale.json()["code"] == "DISCOVERY_STAGE_VERSION_MISMATCH"
+        assert reviewing.get(path).json()["current"]["status"] == (
+            "waiting_confirmation"
+        )
+
+
+def test_abandon_rejects_stale_run_week_identity(tmp_path) -> None:
+    from fastapi.testclient import TestClient
+
+    app = _workflow_app(tmp_path)
+    with TestClient(app) as client:
+        run = client.post("/api/discoveries", json={"sync": True}).json()
+        rejected = client.post(
+            f"/api/discoveries/{run['id']}/abandon",
+            json={
+                "expected_run_id": run["id"],
+                "expected_week_key": "1999-W01",
+            },
+        )
+        assert rejected.status_code == 409
+        assert rejected.json()["code"] == "DISCOVERY_RUN_VERSION_MISMATCH"
+        assert client.get("/api/discoveries/current").json()["current"] is True
+
+
 def test_current_partially_completed_run_can_be_abandoned(tmp_path) -> None:
     from fastapi.testclient import TestClient
 

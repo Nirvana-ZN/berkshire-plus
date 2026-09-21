@@ -48,10 +48,14 @@ interface ParsedDistribution {
 
 export interface ParsedStageResponse {
   current: {
+    id: number
     attempt: number
     status: DiscoveryStageStatus
     error: string | null
     failure_kind: DiscoveryFailureKind
+    input_fingerprint: string
+    ruler_version_id: number | null
+    mutation_version: string
   }
   pass: ParsedDiscoveryRow[]
   drop: ParsedDiscoveryRow[]
@@ -119,8 +123,12 @@ export interface StageReviewIdentity {
   runId: number
   track: DiscoveryTrack | null
   stage: DiscoveryStageName
+  stageId: number
   attempt: number
   status: DiscoveryStageStatus
+  inputFingerprint: string
+  rulerVersionId: number | null
+  mutationVersion: string
   fingerprint: string
 }
 
@@ -209,8 +217,12 @@ export function sameStageReview(
     && expected.runId === actual.runId
     && expected.track === actual.track
     && expected.stage === actual.stage
+    && expected.stageId === actual.stageId
     && expected.attempt === actual.attempt
     && expected.status === actual.status
+    && expected.inputFingerprint === actual.inputFingerprint
+    && expected.rulerVersionId === actual.rulerVersionId
+    && expected.mutationVersion === actual.mutationVersion
     && expected.fingerprint === actual.fingerprint
 }
 
@@ -477,6 +489,17 @@ export function parseStageResponse(value: unknown): ParsedStageResponse | null {
   if (!isRecord(value) || !isRecord(value.current) || !isStageStatus(value.current.status)) {
     return null
   }
+  if (
+    nonNegativeInteger(value.current.id) === null
+    || typeof value.current.input_fingerprint !== 'string'
+    || !value.current.input_fingerprint
+    || (
+      value.current.ruler_version_id !== null
+      && nonNegativeInteger(value.current.ruler_version_id) === null
+    )
+    || typeof value.current.mutation_version !== 'string'
+    || !value.current.mutation_version
+  ) return null
   const passed = parseRows(value.pass)
   const dropped = parseRows(value.drop)
   const insufficient = parseRows(value.insufficient)
@@ -486,6 +509,7 @@ export function parseStageResponse(value: unknown): ParsedStageResponse | null {
   if (overrides.some((item) => item === null)) return null
   return {
     current: {
+      id: value.current.id as number,
       attempt: nonNegativeInteger(value.current.attempt) ?? 0,
       status: value.current.status,
       error: textOrNull(value.current.error),
@@ -493,6 +517,9 @@ export function parseStageResponse(value: unknown): ParsedStageResponse | null {
         || value.current.failure_kind === 'permanent'
         ? value.current.failure_kind
         : null,
+      input_fingerprint: value.current.input_fingerprint,
+      ruler_version_id: value.current.ruler_version_id as number | null,
+      mutation_version: value.current.mutation_version,
     },
     pass: passed,
     drop: dropped,

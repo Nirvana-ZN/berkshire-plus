@@ -60,14 +60,22 @@ test('review identity mismatch fails closed before mutation', () => {
     runId: 7,
     track: 'garp' as const,
     stage: 'competition' as const,
+    stageId: 42,
     attempt: 2,
     status: 'waiting_confirmation' as const,
+    inputFingerprint: 'inputs-a',
+    rulerVersionId: 5,
+    mutationVersion: 'mutation-a',
     fingerprint: 'payload-a',
   }
   assert.equal(sameStageReview(reviewed, { ...reviewed }), true)
   assert.equal(sameStageReview(reviewed, { ...reviewed, runId: 8 }), false)
   assert.equal(sameStageReview(reviewed, { ...reviewed, stage: 'adjudication' }), false)
   assert.equal(sameStageReview(reviewed, { ...reviewed, attempt: 3 }), false)
+  assert.equal(
+    sameStageReview(reviewed, { ...reviewed, mutationVersion: 'mutation-b' }),
+    false,
+  )
   assert.equal(sameStageReview(reviewed, { ...reviewed, fingerprint: 'payload-b' }), false)
 })
 
@@ -134,10 +142,14 @@ function stagePayload(metrics: unknown) {
   }
   return {
     current: {
+      id: 42,
       attempt: 1,
       status: 'waiting_confirmation',
       error: null,
       failure_kind: null,
+      input_fingerprint: 'inputs-a',
+      ruler_version_id: 5,
+      mutation_version: 'mutation-a',
     },
     pass: [row],
     drop: [],

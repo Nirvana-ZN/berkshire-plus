@@ -57,10 +57,14 @@ type TrackStage = DiscoveryTrackStage
 type StageKey = 'safety' | `${Track}:${TrackStage}`
 
 interface RunStagePointer {
+  id?: number
   stage: string | null
   status: StageStatus | null
   created: boolean
   attempt?: number
+  input_fingerprint?: string
+  ruler_version_id?: number | null
+  mutation_version?: string
 }
 
 interface DiscoveryRun {
@@ -148,10 +152,14 @@ interface StageSummary {
 }
 
 interface StageCurrent {
+  id: number
   attempt: number
   status: StageStatus
   error: string | null
   failure_kind: DiscoveryFailureKind
+  input_fingerprint: string
+  ruler_version_id: number | null
+  mutation_version: string
 }
 
 interface StageResponse {
@@ -173,6 +181,11 @@ interface StageView {
   payload: StageResponse | null
   metricKeys: string[]
   error: string
+}
+
+interface ValidatedStage {
+  view: StageView
+  identity: StageReviewIdentity
 }
 
 type ViewState =
@@ -221,6 +234,7 @@ const RESULT_GROUPS = [
 ] as const
 const CURRENT_REFRESH_MS = 60_000
 const CURRENT_RETRY_MS = 5_000
+const MUTATION_FETCH_TIMEOUT_MS = 10_000
 
 const state = ref<ViewState>({ kind: 'loading' })
 const starting = ref(false)
@@ -253,6 +267,8 @@ let currentRefreshTimer: number | undefined
 let mounted = false
 let currentRequestSequence = 0
 let currentController: AbortController | null = null
+let mutationRequestSequence = 0
+let mutationController: AbortController | null = null
 const stageControllers = new Map<string, AbortController>()
 
 const announcement = computed(() => {
@@ -286,6 +302,20 @@ function isRunStagePointer(value: unknown): value is RunStagePointer {
     && (value.stage === null || typeof value.stage === 'string')
     && (value.status === null || isStageStatus(value.status))
     && typeof value.created === 'boolean'
+    && (
+      value.created === false
+      || (
+        nonNegativeInteger(value.id) !== null
+        && typeof value.input_fingerprint === 'string'
+        && !!value.input_fingerprint
+        && (
+          value.ruler_version_id === null
+          || nonNegativeInteger(value.ruler_version_id) !== null
+        )
+        && typeof value.mutation_version === 'string'
+        && !!value.mutation_version
+      )
+    )
     && (value.attempt === undefined || nonNegativeInteger(value.attempt) !== null)
 }
 
@@ -470,9 +500,24 @@ function reviewIdentity(
     runId,
     track: view.track,
     stage: view.stage,
+    stageId: payload.current.id,
     attempt: payload.current.attempt,
     status: payload.current.status,
+    inputFingerprint: payload.current.input_fingerprint,
+    rulerVersionId: payload.current.ruler_version_id,
+    mutationVersion: payload.current.mutation_version,
     fingerprint,
+  }
+}
+
+function stageExpectation(identity: StageReviewIdentity) {
+  return {
+    expected_stage_id: identity.stageId,
+    expected_stage_attempt: identity.attempt,
+    expected_stage_status: identity.status,
+    expected_input_fingerprint: identity.inputFingerprint,
+    expected_ruler_version_id: identity.rulerVersionId,
+    expected_mutation_version: identity.mutationVersion,
   }
 }
 
@@ -486,6 +531,10 @@ function pointerMatchesView(run: DiscoveryRun, view: StageView, payload: StageRe
       payload.current.attempt,
       payload.current.status,
     )
+    && pointer.id === payload.current.id
+    && pointer.input_fingerprint === payload.current.input_fingerprint
+    && pointer.ruler_version_id === payload.current.ruler_version_id
+    && pointer.mutation_version === payload.current.mutation_version
 }
 
 function reviewedIdentityFor(view: StageView): StageReviewIdentity | null {
@@ -507,44 +556,6 @@ function reviewedIdentityFor(view: StageView): StageReviewIdentity | null {
   ) return null
   const actual = reviewIdentity(current.run.id, view, view.payload, fingerprint)
   return sameStageReview(reviewedStages.value[key], actual) ? actual : null
-}
-
-function currentStageViews(): StageView[] | null {
-  const current = state.value
-  if (current.kind !== 'ready') return null
-  const views: StageView[] = []
-  if (current.run.safety?.created) {
-    const safety = stageViews.value.find((view) => view.track === null && view.stage === 'safety')
-    if (!safety) return null
-    views.push(safety)
-  }
-  for (const track of TRACKS) {
-    const pointer = current.run.tracks?.[track]
-    if (!pointer?.created) continue
-    if (!isTrackStage(pointer.stage)) return null
-    const view = stageViews.value.find(
-      (candidate) => candidate.track === track && candidate.stage === pointer.stage,
-    )
-    if (!view) return null
-    views.push(view)
-  }
-  return views.length ? views : null
-}
-
-function abandonReviewIdentities(): StageReviewIdentity[] | null {
-  const views = currentStageViews()
-  if (!views) return null
-  const identities = views.map(reviewedIdentityFor)
-  return identities.some((identity) => identity === null)
-    ? null
-    : identities as StageReviewIdentity[]
-}
-
-function canAbandonReviewedRun(): boolean {
-  const current = state.value
-  return current.kind === 'ready'
-    && canAbandonRun(current.run.current, current.run.status)
-    && abandonReviewIdentities() !== null
 }
 
 function stageAvailable(track: Track, stage: TrackStage): boolean {
@@ -570,8 +581,66 @@ function stopCurrentRefresh() {
 }
 
 function abortStageRequests() {
-  for (const controller of stageControllers.values()) controller.abort()
+  for (const [key, controller] of stageControllers) {
+    activeStageKey.value[key] = (activeStageKey.value[key] ?? 0) + 1
+    controller.abort()
+  }
   stageControllers.clear()
+}
+
+function beginMutation(): boolean {
+  if (mutating.value) return false
+  mutating.value = true
+  stopPoll()
+  stopCurrentRefresh()
+  currentRequestSequence += 1
+  currentController?.abort()
+  currentController = null
+  abortStageRequests()
+  mutationRequestSequence += 1
+  mutationController?.abort()
+  mutationController = null
+  return true
+}
+
+function endMutation() {
+  mutating.value = false
+  if (!mounted) return
+  schedulePoll()
+  const current = state.value
+  scheduleCurrentRefresh(
+    current.kind === 'error' ? CURRENT_RETRY_MS : CURRENT_REFRESH_MS,
+  )
+  if (current.kind === 'ready') {
+    void Promise.allSettled(
+      stageViews.value.map((view) => loadStage(view, current.run.id)),
+    )
+  }
+}
+
+async function postMutation(
+  url: string,
+  body: Record<string, unknown>,
+): Promise<{ response: Response; body: unknown } | null> {
+  const requestSequence = mutationRequestSequence
+  const controller = new AbortController()
+  const cancelTimeout = armFetchTimeout(controller, MUTATION_FETCH_TIMEOUT_MS)
+  mutationController = controller
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    })
+    const responseBody: unknown = await response.json()
+    return mounted && requestSequence === mutationRequestSequence
+      ? { response, body: responseBody }
+      : null
+  } finally {
+    cancelTimeout()
+    if (mutationController === controller) mutationController = null
+  }
 }
 
 function needsPolling(): boolean {
@@ -586,17 +655,17 @@ function needsPolling(): boolean {
 
 function schedulePoll() {
   stopPoll()
-  if (!mounted || !needsPolling()) return
+  if (!mounted || mutating.value || !needsPolling()) return
   pollTimer = window.setTimeout(() => {
-    if (mounted) void refreshRun()
+    if (mounted && !mutating.value) void refreshRun()
   }, STAGE_POLL_INTERVAL_MS)
 }
 
 function scheduleCurrentRefresh(delay = CURRENT_REFRESH_MS) {
   stopCurrentRefresh()
-  if (!mounted) return
+  if (!mounted || mutating.value) return
   currentRefreshTimer = window.setTimeout(() => {
-    if (mounted) void readCurrent()
+    if (mounted && !mutating.value) void readCurrent()
   }, delay)
 }
 
@@ -605,6 +674,7 @@ async function loadStage(
   runId: number,
   force = false,
 ): Promise<StageResponse | null> {
+  if (mutating.value && !force) return null
   const cacheKey = stageCacheKey(runId, view.track, view.stage)
   if (stageControllers.has(cacheKey)) {
     if (!force) return null
@@ -734,7 +804,9 @@ async function applyRun(
   if (!mounted || requestSequence !== currentRequestSequence || activeRunId.value !== run.id) return
   schedulePoll()
   scheduleCurrentRefresh()
-  void Promise.allSettled(stageViews.value.map((view) => loadStage(view, run.id)))
+  if (!mutating.value) {
+    void Promise.allSettled(stageViews.value.map((view) => loadStage(view, run.id)))
+  }
 }
 
 async function readCurrent(source: 'loaded' | 'created' = 'loaded'): Promise<boolean> {
@@ -826,8 +898,7 @@ async function startDiscovery() {
 
 async function beforeMutation(
   expected: StageReviewIdentity[],
-  requireAllCurrentStages = false,
-): Promise<StageView[] | null> {
+): Promise<ValidatedStage[] | null> {
   if (
     !expected.length
     || expected.some((identity) => !sameStageReview(
@@ -859,29 +930,17 @@ async function beforeMutation(
     if (
       pointer?.created !== true
       || (view.track !== null && pointer.stage !== view.stage)
+      || pointer.id !== identity.stageId
       || pointer.attempt !== identity.attempt
       || pointer.status !== identity.status
+      || pointer.input_fingerprint !== identity.inputFingerprint
+      || pointer.ruler_version_id !== identity.rulerVersionId
+      || pointer.mutation_version !== identity.mutationVersion
     ) {
       actionError.value = '阶段身份或状态已变化，请复核最新结果'
       return null
     }
     views.push(view)
-  }
-  if (requireAllCurrentStages) {
-    const allCurrent = currentStageViews()
-    const expectedKeys = new Set(expected.map(
-      (identity) => stageCacheKey(identity.runId, identity.track, identity.stage),
-    ))
-    if (
-      !allCurrent
-      || allCurrent.length !== expected.length
-      || allCurrent.some((view) => !expectedKeys.has(
-        stageCacheKey(expectedRunId, view.track, view.stage),
-      ))
-    ) {
-      actionError.value = '当前阶段集合已变化，请复核最新结果'
-      return null
-    }
   }
   const payloads = await Promise.all(
     views.map((view) => loadStage(view, expectedRunId, true)),
@@ -894,7 +953,10 @@ async function beforeMutation(
     actionError.value = '阶段结果已变化或无法验证，请复核最新结果后重试'
     return null
   }
-  return views
+  return views.map((view, index) => ({
+    view,
+    identity: actual[index] as StageReviewIdentity,
+  }))
 }
 
 async function stageMutation(view: StageView, action: 'confirm' | 'retry') {
@@ -904,30 +966,34 @@ async function stageMutation(view: StageView, action: 'confirm' | 'retry') {
     actionError.value = '当前阶段尚未成功加载并复核'
     return
   }
-  const runId = expected.runId
+  if (!beginMutation()) return
   actionError.value = ''
-  mutating.value = true
   try {
-    const currentView = (await beforeMutation([expected]))?.[0]
-    if (!currentView) return
-    const allowed = actionsFor(currentView)
+    const validated = (await beforeMutation([expected]))?.[0]
+    if (!validated) return
+    const allowed = actionsFor(validated.view)
     if ((action === 'confirm' && !allowed.confirm) || (action === 'retry' && !allowed.retry)) {
       actionError.value = '当前阶段状态不允许此操作'
       return
     }
-    clearReviewedStage(stageCacheKey(runId, currentView.track, currentView.stage))
-    const response = await fetch(`${endpoint(currentView, runId)}/${action}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: '{}',
-    })
-    const body: unknown = await response.json()
+    const validatedRunId = validated.identity.runId
+    clearReviewedStage(stageCacheKey(
+      validatedRunId,
+      validated.identity.track,
+      validated.identity.stage,
+    ))
+    const result = await postMutation(
+      `${endpoint(validated.view, validatedRunId)}/${action}`,
+      stageExpectation(validated.identity),
+    )
+    if (!result) return
+    const { response, body } = result
     if (!response.ok) actionError.value = errorMessage(body, '阶段操作失败')
     else await refreshRun()
   } catch {
     actionError.value = '阶段操作失败'
   } finally {
-    mutating.value = false
+    endMutation()
   }
 }
 
@@ -938,80 +1004,92 @@ async function saveOverride(view: StageView) {
     actionError.value = '当前阶段尚未成功加载并复核'
     return
   }
-  const runId = expected.runId
-  const track = expected.track
-  const stage = expected.stage
   const reason = overrideReason.value.trim()
   const code = overrideCode.value.trim()
   if (!code || !reason) {
     actionError.value = '代码和覆盖理由均为必填'
     return
   }
+  if (!beginMutation()) return
   actionError.value = ''
-  mutating.value = true
   try {
-    const currentView = (await beforeMutation([expected]))?.[0]
-    if (!currentView || !actionsFor(currentView).override) {
+    const validated = (await beforeMutation([expected]))?.[0]
+    if (!validated || !actionsFor(validated.view).override) {
       actionError.value = '当前阶段不可人工覆盖'
       return
     }
-    clearReviewedStage(stageCacheKey(runId, track, stage))
-    const response = await fetch(`/api/discoveries/${runId}/overrides`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        track,
-        stage,
-        attempt: currentView.payload?.current.attempt,
+    if (validated.identity.track === null || validated.identity.stage === 'safety') return
+    const validatedRunId = validated.identity.runId
+    const validatedTrack = validated.identity.track
+    const validatedStage = validated.identity.stage
+    clearReviewedStage(stageCacheKey(validatedRunId, validatedTrack, validatedStage))
+    const result = await postMutation(`/api/discoveries/${validatedRunId}/overrides`, {
+        track: validatedTrack,
+        stage: validatedStage,
+        attempt: validated.identity.attempt,
+        ...stageExpectation(validated.identity),
         code,
         action: overrideAction.value,
         reason,
-      }),
     })
-    const body: unknown = await response.json()
+    if (!result) return
+    const { response, body } = result
     if (!response.ok) {
       actionError.value = errorMessage(body, '人工覆盖保存失败')
     } else {
       overrideCode.value = ''
       overrideReason.value = ''
-      await loadStage(currentView, runId)
+      await refreshRun()
     }
   } catch {
     actionError.value = '人工覆盖保存失败'
   } finally {
-    mutating.value = false
+    endMutation()
   }
 }
 
 async function abandonRun() {
-  if (mutating.value || activeRunId.value === null) return
-  const expected = abandonReviewIdentities()
-  if (!expected) {
-    actionError.value = '请先成功加载并复核所有当前阶段'
-    return
-  }
-  const runId = expected[0]!.runId
+  const current = state.value
+  if (
+    mutating.value
+    || current.kind !== 'ready'
+    || !canAbandonRun(current.run.current, current.run.status)
+  ) return
+  const expectedRunId = current.run.id
+  const expectedWeekKey = current.run.week_key
+  if (!beginMutation()) return
   actionError.value = ''
-  mutating.value = true
   try {
-    if (!await beforeMutation(expected, true)) return
-    clearReviewedStage()
-    const response = await fetch(`/api/discoveries/${runId}/abandon`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: '{}',
+    const refreshed = await readCurrent()
+    if (
+      !refreshed
+      || state.value.kind !== 'ready'
+      || state.value.run.id !== expectedRunId
+      || state.value.run.week_key !== expectedWeekKey
+      || !canAbandonRun(state.value.run.current, state.value.run.status)
+    ) {
+      actionError.value = '当前批次或周次已变化，无法放弃旧批次'
+      return
+    }
+    const validatedRunId = state.value.run.id
+    const validatedWeekKey = state.value.run.week_key
+    const result = await postMutation(`/api/discoveries/${validatedRunId}/abandon`, {
+        expected_run_id: validatedRunId,
+        expected_week_key: validatedWeekKey,
     })
-    const body: unknown = await response.json()
+    if (!result) return
+    const { response, body } = result
     if (!response.ok) actionError.value = errorMessage(body, '无法放弃本批次')
     else await refreshRun()
   } catch {
     actionError.value = '无法放弃本批次'
   } finally {
-    mutating.value = false
+    endMutation()
   }
 }
 
 async function onStageSelection(track: Track) {
+  if (mutating.value) return
   const current = state.value
   if (current.kind !== 'ready') return
   pinnedTrackStages.value[track] = true
@@ -1082,8 +1160,11 @@ onMounted(() => {
 onBeforeUnmount(() => {
   mounted = false
   currentRequestSequence += 1
+  mutationRequestSequence += 1
   currentController?.abort()
   currentController = null
+  mutationController?.abort()
+  mutationController = null
   abortStageRequests()
   activeRunId.value = null
   stopPoll()
@@ -1371,7 +1452,7 @@ onBeforeUnmount(() => {
       </article>
 
       <div
-        v-if="canAbandonReviewedRun()"
+        v-if="canAbandonRun(state.run.current, state.run.status)"
         class="panel"
       >
         <h2>无法继续？</h2>

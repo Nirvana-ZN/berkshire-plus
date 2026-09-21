@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import threading
@@ -277,7 +278,9 @@ def _run_payload(session: Session, run: DiscoveryRun) -> dict[str, object]:
         "safety": (
             {"stage": "safety", "status": "queued", "created": False}
             if common is None
-            else _common_stage_json(common) | {"created": True}
+            else _common_stage_json(common)
+            | _stage_token_json(session, common)
+            | {"created": True}
         ),
         "tracks": {
             track: (
@@ -290,7 +293,9 @@ def _run_payload(session: Session, run: DiscoveryRun) -> dict[str, object]:
                     "created": False,
                 }
                 if row is None
-                else _track_stage_json(row) | {"created": True}
+                else _track_stage_json(row)
+                | _stage_token_json(session, row)
+                | {"created": True}
             )
             for track, row in tracks.items()
         },
@@ -347,6 +352,173 @@ def _track_stage_json(row: DiscoveryStage) -> dict[str, object]:
         "created_at": _iso(row.created_at),
         "updated_at": _iso(row.updated_at),
     }
+
+
+def _stage_mutation_version(
+    session: Session,
+    row: DiscoveryCommonStage | DiscoveryStage,
+) -> str:
+    overrides: list[dict[str, object]] = []
+    if isinstance(row, DiscoveryStage):
+        overrides = [
+            {
+                "id": override.id,
+                "code": override.code,
+                "action": override.action,
+                "reason": override.reason,
+            }
+            for override in session.scalars(
+                select(DiscoveryOverride)
+                .where(
+                    DiscoveryOverride.run_id == row.run_id,
+                    DiscoveryOverride.track == row.track,
+                    DiscoveryOverride.stage == row.stage,
+                    DiscoveryOverride.attempt == row.attempt,
+                )
+                .order_by(DiscoveryOverride.code, DiscoveryOverride.id)
+            ).all()
+        ]
+    value = canonical_json(
+        {
+            "id": row.id,
+            "attempt": row.attempt,
+            "status": row.status,
+            "input_fingerprint": row.input_fingerprint,
+            "ruler_version_id": (
+                row.ruler_version_id
+                if isinstance(row, DiscoveryStage)
+                else None
+            ),
+            "algorithm_version": row.algorithm_version,
+            "superseded_at": _iso(row.superseded_at),
+            "overrides": overrides,
+        }
+    )
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _stage_token_json(
+    session: Session,
+    row: DiscoveryCommonStage | DiscoveryStage,
+) -> dict[str, object]:
+    return {
+        "ruler_version_id": (
+            row.ruler_version_id
+            if isinstance(row, DiscoveryStage)
+            else None
+        ),
+        "mutation_version": _stage_mutation_version(session, row),
+    }
+
+
+_STAGE_EXPECTATION_KEYS = (
+    "expected_stage_id",
+    "expected_stage_attempt",
+    "expected_stage_status",
+    "expected_input_fingerprint",
+    "expected_ruler_version_id",
+    "expected_mutation_version",
+)
+
+
+def _stage_precondition_rejection(
+    session: Session,
+    payload: Mapping[str, object],
+    row: DiscoveryCommonStage | DiscoveryStage,
+) -> JSONResponse | None:
+    supplied = [key in payload for key in _STAGE_EXPECTATION_KEYS]
+    if not any(supplied):
+        # Legacy callers did not claim to act on a reviewed representation.
+        return None
+    expected_ruler = payload.get("expected_ruler_version_id")
+    if (
+        not all(supplied)
+        or type(payload.get("expected_stage_id")) is not int
+        or type(payload.get("expected_stage_attempt")) is not int
+        or type(payload.get("expected_stage_status")) is not str
+        or type(payload.get("expected_input_fingerprint")) is not str
+        or (
+            expected_ruler is not None
+            and type(expected_ruler) is not int
+        )
+        or type(payload.get("expected_mutation_version")) is not str
+        or not payload["expected_input_fingerprint"]
+        or not payload["expected_mutation_version"]
+    ):
+        return _error(
+            400,
+            error="阶段版本无效",
+            code="INVALID_DISCOVERY_STAGE_VERSION",
+            detail="阶段乐观并发字段必须完整且类型正确",
+        )
+    ruler_version_id = (
+        row.ruler_version_id if isinstance(row, DiscoveryStage) else None
+    )
+    active = (
+        _latest_track(session, row.run_id, row.track, row.stage)
+        if isinstance(row, DiscoveryStage)
+        else _latest_common(session, row.run_id)
+    )
+    actual_version = _stage_mutation_version(session, row)
+    if (
+        active is None
+        or active.id != row.id
+        or payload["expected_stage_id"] != row.id
+        or payload["expected_stage_attempt"] != row.attempt
+        or payload["expected_stage_status"] != row.status
+        or payload["expected_input_fingerprint"] != row.input_fingerprint
+        or expected_ruler != ruler_version_id
+        or payload["expected_mutation_version"] != actual_version
+    ):
+        return _error(
+            409,
+            error="阶段已变化",
+            code="DISCOVERY_STAGE_VERSION_MISMATCH",
+            detail="当前活动阶段与客户端复核版本不一致",
+            current_stage_id=row.id,
+            current_stage_attempt=row.attempt,
+            current_stage_status=row.status,
+            current_mutation_version=actual_version,
+        )
+    return None
+
+
+def _run_precondition_rejection(
+    payload: Mapping[str, object],
+    run: DiscoveryRun,
+) -> JSONResponse | None:
+    supplied = (
+        "expected_run_id" in payload,
+        "expected_week_key" in payload,
+    )
+    if not any(supplied):
+        return None
+    if (
+        not all(supplied)
+        or type(payload.get("expected_run_id")) is not int
+        or type(payload.get("expected_week_key")) is not str
+    ):
+        return _error(
+            400,
+            error="批次版本无效",
+            code="INVALID_DISCOVERY_RUN_VERSION",
+            detail="批次乐观并发字段必须完整且类型正确",
+        )
+    if (
+        payload["expected_run_id"] != run.id
+        or payload["expected_week_key"] != run.week_key
+        or not run.current
+        or run.status == "abandoned"
+    ):
+        return _error(
+            409,
+            error="批次已变化",
+            code="DISCOVERY_RUN_VERSION_MISMATCH",
+            detail="当前批次与客户端恢复目标不一致",
+            current_run_id=run.id,
+            current_week_key=run.week_key,
+        )
+    return None
 
 
 def _persisted_json(text: str) -> object:
@@ -588,6 +760,7 @@ def _common_payload(session: Session, run: DiscoveryRun):
         summaries[stage.id] = summary
         attempts.append(
             _common_stage_json(stage)
+            | _stage_token_json(session, stage)
             | _partition(rows, names)
             | {"summary": summary}
         )
@@ -595,7 +768,9 @@ def _common_payload(session: Session, run: DiscoveryRun):
     current_summary = summaries[current.id]
     return {
         "run": _run_payload(session, run),
-        "current": _common_stage_json(current) | {"summary": current_summary},
+        "current": _common_stage_json(current)
+        | _stage_token_json(session, current)
+        | {"summary": current_summary},
         "attempts": attempts,
         **_partition(current_rows, names),
         "summary": current_summary,
@@ -720,6 +895,7 @@ def _track_payload(
         summaries[attempt.id] = summary
         attempts.append(
             _track_stage_json(attempt)
+            | _stage_token_json(session, attempt)
             | _partition(rows, names, attempt_overrides)
             | {
                 "overrides": [
@@ -735,7 +911,9 @@ def _track_payload(
     changes = _stage_changes(session, run, track, stage)[:100]
     return {
         "run": _run_payload(session, run),
-        "current": _track_stage_json(current) | {"summary": current_summary},
+        "current": _track_stage_json(current)
+        | _stage_token_json(session, current)
+        | {"summary": current_summary},
         "attempts": attempts,
         **_partition(current_rows, names, current_overrides),
         "overrides": [
@@ -1390,6 +1568,7 @@ def _confirm_common(
     app,
     session: Session,
     run: DiscoveryRun,
+    expectation: Mapping[str, object],
 ) -> tuple[str | None, JSONResponse | None]:
     current = _latest_common(session, run.id)
     if current is None:
@@ -1399,6 +1578,9 @@ def _confirm_common(
             code="DISCOVERY_STAGE_NOT_FOUND",
             detail="没有共同排雷阶段",
         )
+    stale = _stage_precondition_rejection(session, expectation, current)
+    if stale is not None:
+        return False, stale
     if current.status == "confirmed":
         return False, None
     if current.status != "waiting_confirmation":
@@ -1434,6 +1616,10 @@ def _confirm_common(
             code="DISCOVERY_STAGE_NOT_FOUND",
             detail="没有共同排雷阶段",
         )
+    stale = _stage_precondition_rejection(session, expectation, current)
+    if stale is not None:
+        session.rollback()
+        return False, stale
     result = session.execute(
         update(DiscoveryCommonStage)
         .where(
@@ -1472,6 +1658,7 @@ def _confirm_track(
     run: DiscoveryRun,
     track: str,
     stage: str,
+    expectation: Mapping[str, object],
 ) -> tuple[str | None, JSONResponse | None]:
     current = _latest_track(session, run.id, track, stage)
     if current is None:
@@ -1481,6 +1668,9 @@ def _confirm_track(
             code="DISCOVERY_STAGE_NOT_FOUND",
             detail=f"没有 {track}/{stage} 阶段",
         )
+    stale = _stage_precondition_rejection(session, expectation, current)
+    if stale is not None:
+        return False, stale
     parent = _exact_parent(session, current)
     if parent is None:
         return False, _lineage_rejection(current)
@@ -1527,6 +1717,10 @@ def _confirm_track(
             code="DISCOVERY_STAGE_NOT_FOUND",
             detail=f"没有 {track}/{stage} 阶段",
         )
+    stale = _stage_precondition_rejection(session, expectation, current)
+    if stale is not None:
+        session.rollback()
+        return False, stale
     if stage == "adjudication":
         session.expire_all()
         current = session.get(DiscoveryStage, exact_stage_id)
@@ -1538,6 +1732,12 @@ def _confirm_track(
                 code="DISCOVERY_STAGE_NOT_FOUND",
                 detail=f"没有 {track}/{stage} 阶段",
             )
+        stale = _stage_precondition_rejection(
+            session, expectation, current
+        )
+        if stale is not None:
+            session.rollback()
+            return False, stale
         if current.status in {"confirmed", "insufficient_candidates"}:
             release(
                 session,
@@ -1645,6 +1845,12 @@ def _confirm_track(
                 code="DISCOVERY_STAGE_NOT_FOUND",
                 detail=f"没有 {track}/{stage} 阶段",
             )
+        stale = _stage_precondition_rejection(
+            session, expectation, current
+        )
+        if stale is not None:
+            session.rollback()
+            return False, stale
         keeper_rank = {
             row.code: index
             for index, row in enumerate(keepers, start=1)
@@ -1737,6 +1943,10 @@ def _confirm_track(
             code="DISCOVERY_STAGE_NOT_FOUND",
             detail=f"没有 {track}/{stage} 阶段",
         )
+    stale = _stage_precondition_rejection(session, expectation, current)
+    if stale is not None:
+        session.rollback()
+        return False, stale
     result = session.execute(
         update(DiscoveryStage)
         .where(
@@ -2354,6 +2564,7 @@ def create_discovery_router() -> APIRouter:
                 request.app,
                 session,
                 run,
+                payload,
             )
             if failed is not None:
                 return failed
@@ -2396,6 +2607,12 @@ def create_discovery_router() -> APIRouter:
             if immutable is not None:
                 return immutable
             observed = _latest_common(session, run.id)
+            if observed is not None:
+                stale = _stage_precondition_rejection(
+                    session, payload, observed
+                )
+                if stale is not None:
+                    return stale
             retry_target = _common_retry_target(session, observed)
             if (
                 observed is not None
@@ -2441,6 +2658,12 @@ def create_discovery_router() -> APIRouter:
                     code="DISCOVERY_STAGE_NOT_FOUND",
                     detail="没有共同排雷阶段",
                 )
+            stale = _stage_precondition_rejection(
+                session, payload, current
+            )
+            if stale is not None:
+                session.rollback()
+                return stale
             if (
                 retry_target is not None
                 and current.retry_of_stage_id == retry_target.id
@@ -2521,6 +2744,12 @@ def create_discovery_router() -> APIRouter:
                         code="DISCOVERY_STAGE_NOT_FOUND",
                         detail="没有共同排雷阶段",
                     )
+                stale = _stage_precondition_rejection(
+                    session, payload, current
+                )
+                if stale is not None:
+                    session.rollback()
+                    return stale
                 current.superseded_at = commit_at
                 session.add(
                     DiscoveryCommonStage(
@@ -2629,6 +2858,7 @@ def create_discovery_router() -> APIRouter:
                 run,
                 track,
                 stage,
+                payload,
             )
             if failed is not None:
                 return failed
@@ -2680,6 +2910,12 @@ def create_discovery_router() -> APIRouter:
             if immutable is not None:
                 return immutable
             observed = _latest_track(session, run.id, track, stage)
+            if observed is not None:
+                stale = _stage_precondition_rejection(
+                    session, payload, observed
+                )
+                if stale is not None:
+                    return stale
             retry_target = _track_retry_target(session, observed)
             if (
                 observed is not None
@@ -2732,6 +2968,12 @@ def create_discovery_router() -> APIRouter:
                     code="DISCOVERY_STAGE_NOT_FOUND",
                     detail="指定阶段不存在",
                 )
+            stale = _stage_precondition_rejection(
+                session, payload, current
+            )
+            if stale is not None:
+                session.rollback()
+                return stale
             if (
                 retry_target is not None
                 and current.retry_of_stage_id == retry_target.id
@@ -2824,6 +3066,12 @@ def create_discovery_router() -> APIRouter:
                         code="DISCOVERY_STAGE_NOT_FOUND",
                         detail="指定阶段不存在",
                     )
+                stale = _stage_precondition_rejection(
+                    session, payload, current
+                )
+                if stale is not None:
+                    session.rollback()
+                    return stale
                 current.superseded_at = commit_at
                 session.add(
                     DiscoveryStage(
@@ -3170,6 +3418,11 @@ def create_discovery_router() -> APIRouter:
                     code="DISCOVERY_STALE_ATTEMPT",
                     detail="客户端 attempt 不是当前阶段",
                 )
+            stale = _stage_precondition_rejection(
+                session, payload, stage_row
+            )
+            if stale is not None:
+                return stale
             stage_id = stage_row.id
             run, commit_at, rejection = _fresh_mutation_checkpoint(
                 request.app,
@@ -3187,6 +3440,12 @@ def create_discovery_router() -> APIRouter:
                     code="DISCOVERY_STAGE_NOT_FOUND",
                     detail="指定阶段不存在",
                 )
+            stale = _stage_precondition_rejection(
+                session, payload, stage_row
+            )
+            if stale is not None:
+                session.rollback()
+                return stale
             changed = session.execute(
                 update(DiscoveryStage)
                 .where(
@@ -3728,7 +3987,7 @@ def create_discovery_router() -> APIRouter:
 
     @router.post("/{run_id}/abandon")
     async def abandon_discovery(request: Request, run_id: int):
-        _payload, rejected = await _object_body(
+        payload, rejected = await _object_body(
             request, "INVALID_DISCOVERY_ABANDON"
         )
         if rejected is not None:
@@ -3744,6 +4003,9 @@ def create_discovery_router() -> APIRouter:
                     code="DISCOVERY_NOT_FOUND",
                     detail=f"没有发现批次 {run_id}",
                 )
+            stale = _run_precondition_rejection(payload, run)
+            if stale is not None:
+                return stale
             if (
                 run.week_key == china_week_key(now)
                 and (run.status == "abandoned" or not run.current)
@@ -3765,6 +4027,10 @@ def create_discovery_router() -> APIRouter:
             if rejection is not None:
                 return rejection
             assert run is not None
+            stale = _run_precondition_rejection(payload, run)
+            if stale is not None:
+                session.rollback()
+                return stale
             changed = session.execute(
                 update(DiscoveryRun)
                 .where(

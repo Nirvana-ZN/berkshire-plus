@@ -173,3 +173,21 @@ def test_discovery_view_review_guards_and_read_only_adjudication() -> None:
     assert "pointer.attempt !== identity.attempt" in preflight
     assert "CURRENT_FETCH_TIMEOUT_MS" in page
     assert "scheduleCurrentRefresh(CURRENT_RETRY_MS)" in page
+    assert "expected_stage_id" in page
+    assert "expected_input_fingerprint" in page
+    assert "expected_mutation_version" in page
+    assert "stageExpectation(validated.identity)" in page
+    assert "attempt: validated.identity.attempt" in page
+    assert "beginMutation" in page
+    assert "endMutation" in page
+    assert "expected_week_key" in page
+    assert 'v-if="canAbandonRun(state.run.current, state.run.status)"' in page
+    pause = page[page.index("function beginMutation") : page.index("function endMutation")]
+    assert "stopPoll()" in pause
+    assert "stopCurrentRefresh()" in pause
+    assert "currentRequestSequence += 1" in pause
+    assert "currentController?.abort()" in pause
+    assert "abortStageRequests()" in pause
+    resume = page[page.index("function endMutation") : page.index("async function postMutation")]
+    assert resume.count("schedulePoll()") == 1
+    assert resume.count("scheduleCurrentRefresh(") == 1
