@@ -71,6 +71,11 @@ FORMULAS = {
     "pb_median_ratio": "current.pb/median(monthly.pb)",
     "normalized_earnings": "normalized_earnings(annual.deducted_net_income)",
     "normalized_pe": "current.price*latest(annual.shares)/normalized_earnings",
+    "bank_capital_adequacy": "latest(annual.capital_adequacy)",
+    "bank_core_tier1_capital_adequacy": (
+        "latest(annual.core_tier1_capital_adequacy)"
+    ),
+    "bank_npl": "latest(annual.npl)",
 }
 
 
