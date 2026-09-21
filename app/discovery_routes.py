@@ -10,7 +10,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
@@ -1221,42 +1221,51 @@ def _settle_discovery_research_worker(
     *,
     status: str,
     error: str,
+    busy_timeout_ms: int | None = None,
 ) -> bool:
     with factory() as session:
         session.rollback()
-        owns_lease = (
-            select(JobLock.id)
-            .where(
-                JobLock.id == LOCK_ROW_ID,
-                JobLock.job_id == job_id,
-                JobLock.job_type == JOB_TYPE_RESEARCH,
-                JobLock.owner_token == owner_token,
+        try:
+            if busy_timeout_ms is not None:
+                session.execute(
+                    text(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
+                )
+            owns_lease = (
+                select(JobLock.id)
+                .where(
+                    JobLock.id == LOCK_ROW_ID,
+                    JobLock.job_id == job_id,
+                    JobLock.job_type == JOB_TYPE_RESEARCH,
+                    JobLock.owner_token == owner_token,
+                )
+                .exists()
             )
-            .exists()
-        )
-        session.execute(
-            update(ResearchJob)
-            .where(
-                ResearchJob.id == job_id,
-                ResearchJob.status.in_(ACTIVE_STATUSES),
-                owns_lease,
+            session.execute(
+                update(ResearchJob)
+                .where(
+                    ResearchJob.id == job_id,
+                    ResearchJob.status.in_(ACTIVE_STATUSES),
+                    owns_lease,
+                )
+                .values(
+                    status=status,
+                    error=error,
+                    updated_at=datetime.now(timezone.utc),
+                )
             )
-            .values(
-                status=status,
-                error=error,
-                updated_at=datetime.now(timezone.utc),
+            released = release(
+                session,
+                job_id,
+                JOB_TYPE_RESEARCH,
+                owner_token=owner_token,
             )
-        )
-        released = release(
-            session,
-            job_id,
-            JOB_TYPE_RESEARCH,
-            owner_token=owner_token,
-        )
-        if released:
-            session.commit()
-        else:
+            if released:
+                session.commit()
+            else:
+                session.rollback()
+        except OperationalError:
             session.rollback()
+            return False
         return released
 
 
@@ -1269,6 +1278,7 @@ def cancel_discovery_research_worker(
         owner_token,
         status="canceled",
         error="application shutdown canceled research worker",
+        busy_timeout_ms=100,
     )
 
 

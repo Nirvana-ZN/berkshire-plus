@@ -143,6 +143,7 @@ def ensure_financials(session: Session, code: str, market) -> None:
     if not code:
         return
     cached = load_financials(session, code)
+    session.rollback()
     # annual-only cache is from before interim rows; refetch so H1 lands
     if has_min_financials(cached) and _has_bps(cached) and _has_interim(cached):
         return
@@ -237,13 +238,16 @@ def _saved_price(session: Session, *, name: str, code: str) -> Decimal | None:
     return price
 
 
-def _price_for_eval(session: Session, quote_client, *, name: str, code: str) -> Decimal | None:
+def _price_for_eval(
+    quote_client,
+    *,
+    code: str,
+    saved_price: Decimal | None,
+) -> Decimal | None:
     price = fetch_price(quote_client, code)
     if price is None:
         price = fetch_price(quote_client, code)
-    if price is not None:
-        return price
-    return _saved_price(session, name=name, code=code)
+    return price if price is not None else saved_price
 
 
 def fetch_price(quote_client, code: str) -> Decimal | None:
@@ -407,8 +411,12 @@ def _run_one(
     lock_owner_token: str | None = None,
     require_research_lease: bool = False,
 ) -> None:
+    job_id = job.id
+    user_id = job.user_id
+    job_name = job.name
+    job_code = job.code
     if require_research_lease:
-        _claim_research_lease(session, job.id, lock_owner_token)
+        _claim_research_lease(session, job_id, lock_owner_token)
     job.status = "running"
     job.updated_at = _now()
     session.commit()
@@ -417,38 +425,57 @@ def _run_one(
     if model and hasattr(llm, "model"):
         llm.model = model
     try:
-        ensure_financials(session, job.code, market)
-        rows = load_financials(session, job.code)
+        ensure_financials(session, job_code, market)
+        rows = load_financials(session, job_code)
+        saved_price = _saved_price(
+            session, name=job_name, code=job_code
+        )
+        industry_name = _industry_of(
+            session, job_code, industry
+        )
+        credibility_gate = gate_is_open(session)
+        session.rollback()
+        if not credibility_gate:
+            credibility_gate = is_extreme_greed(session, market)
+            session.commit()
         output = run_checklist(
             llm,
             EvalInput(
-                name=job.name,
-                code=job.code,
+                name=job_name,
+                code=job_code,
                 financials=tuple(rows),
-                price=_price_for_eval(session, quote_client, name=job.name, code=job.code),
+                price=_price_for_eval(
+                    quote_client,
+                    code=job_code,
+                    saved_price=saved_price,
+                ),
                 book=book,
                 web_search=web_search,
                 as_of_date=as_of_date,
-                job_id=job.id,
+                job_id=job_id,
                 reports_dir=reports_dir,
-                valuation=fetch_valuation(market, job.code, rows),
-                industry=_industry_of(session, job.code, industry),
-                notices=tuple(_fetch_notices(market, job.code)),
+                valuation=fetch_valuation(market, job_code, rows),
+                industry=industry_name,
+                notices=tuple(_fetch_notices(market, job_code)),
             ),
         )
-        if gate_is_open(session) or is_extreme_greed(session, market):
+        if credibility_gate:
             apply_credibility_gate(output.structured)
             output = replace(
                 output,
                 markdown=render_markdown(
-                    job.name, output.structured, web_search=web_search
+                    job_name, output.structured, web_search=web_search
                 ),
             )
         if require_research_lease:
-            _claim_research_lease(session, job.id, lock_owner_token)
+            _claim_research_lease(session, job_id, lock_owner_token)
+        fresh = session.get(ResearchJob, job_id)
+        if fresh is None:
+            session.rollback()
+            return
         session.add(
             ResearchArtifact(
-                research_job_id=job.id,
+                research_job_id=job_id,
                 structured_json=json.dumps(output.structured, ensure_ascii=False),
                 markdown=output.markdown,
                 report_path=output.report_path,
@@ -456,21 +483,21 @@ def _run_one(
         )
         existing = session.scalars(
             select(Thesis).where(
-                Thesis.user_id == job.user_id,
-                Thesis.name == job.name,
+                Thesis.user_id == user_id,
+                Thesis.name == job_name,
             )
         ).first()
         if eligible(output.structured, replacing=existing is not None):
             upsert(
                 session,
-                user_id=job.user_id,
-                name=job.name,
-                research_job_id=job.id,
+                user_id=user_id,
+                name=job_name,
+                research_job_id=job_id,
                 structured=output.structured,
             )
-        job.status = "done"
-        job.error = None
-        job.updated_at = _now()
+        fresh.status = "done"
+        fresh.error = None
+        fresh.updated_at = _now()
         session.commit()
     except ResearchLeaseLostError:
         session.rollback()
@@ -478,14 +505,14 @@ def _run_one(
         session.rollback()
         if require_research_lease:
             try:
-                _claim_research_lease(session, job.id, lock_owner_token)
+                _claim_research_lease(session, job_id, lock_owner_token)
             except ResearchLeaseLostError:
                 session.rollback()
                 return
-        fresh = session.get(ResearchJob, job.id)
+        fresh = session.get(ResearchJob, job_id)
         if fresh is not None:
             fresh.status = "failed"
             fresh.error = str(exc)
             fresh.updated_at = _now()
             session.commit()
-        logger.exception("评估子任务失败: %s", job.name)
+        logger.exception("评估子任务失败: %s", job_name)

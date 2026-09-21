@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from threading import Event
 from time import monotonic, sleep
@@ -24,6 +26,7 @@ from app.discovery_models import (
 from app.envfile import OPENAI_API_KEY, write_env_value
 from app.main import create_app
 from app.models import (
+    Financial,
     JobLock,
     ResearchArtifact,
     ResearchJob,
@@ -34,6 +37,7 @@ from discovery.constants import china_week_key
 from jobs.lock import (
     JOB_TYPE_FUNNEL,
     JOB_TYPE_RESEARCH,
+    clear_stale_lock,
     lock_status,
     release,
     try_acquire,
@@ -46,13 +50,13 @@ NOW = datetime(2026, 9, 17, 3, 0, tzinfo=timezone.utc)
 TRACKS = ("quality_discount", "deep_value", "garp")
 
 
-def _app(tmp_path: Path):
+def _app(tmp_path: Path, *, market=None):
     write_env_value(tmp_path / ".env", OPENAI_API_KEY, "sk-test")
     return create_app(
         db_path=tmp_path / "app.db",
         env_path=tmp_path / ".env",
         quote_client=FakeQuoteClient(),
-        market_client=FakeMarketClient(),
+        market_client=market if market is not None else FakeMarketClient(),
         llm_client=FakeLLM(),
         reports_dir=tmp_path / "reports",
         allow_sync=True,
@@ -698,34 +702,55 @@ def test_shutdown_cancels_hung_worker_without_releasing_replacement_lease(
     tmp_path: Path, monkeypatch
 ) -> None:
     from jobs import research as research_job
+    from tests.test_screen import _success_market
 
     entered = Event()
     resume = Event()
     original_run_checklist = research_job.run_checklist
+    original_load_financials = research_job.load_financials
+
+    def load_and_dirty(session, code):
+        rows = original_load_financials(session, code)
+        financial = session.scalar(
+            select(Financial)
+            .where(Financial.code == code)
+            .order_by(Financial.period)
+            .limit(1)
+        )
+        if financial is not None:
+            financial.roe = Decimal(financial.roe or 0) + 1
+        return rows
 
     def blocked(*args, **kwargs):
         entered.set()
         assert resume.wait(5)
         return original_run_checklist(*args, **kwargs)
 
+    monkeypatch.setattr(research_job, "load_financials", load_and_dirty)
     monkeypatch.setattr(research_job, "run_checklist", blocked)
-    app = _app(tmp_path)
+    app = _app(tmp_path, market=_success_market())
     client = TestClient(app)
     client.__enter__()
     try:
         with app.state.session_factory() as session:
             run = _run(session)
             _seed_finalists(
-                session, run, {"quality_discount": ["600519.SH"]}
+                session, run, {"quality_discount": ["600036.SH"]}
             )
             run_id = run.id
         created = client.post(
             f"/api/discoveries/{run_id}/research",
-            json={"track": "quality_discount", "code": "600519.SH"},
+            json={"track": "quality_discount", "code": "600036.SH"},
         )
         assert created.status_code == 200
         job_id = created.json()["id"]
         assert entered.wait(5)
+        with app.state.session_factory() as session:
+            assert session.scalar(
+                select(func.count())
+                .select_from(Financial)
+                .where(Financial.code == "600036.SH")
+            )
         with app.state.discovery_workers_lock:
             research_workers = [
                 (worker, lease)
@@ -790,6 +815,119 @@ def test_shutdown_cancels_hung_worker_without_releasing_replacement_lease(
             )
             session.commit()
     finally:
+        resume.set()
+        if not app.state.discovery_shutting_down:
+            client.__exit__(None, None, None)
+
+
+def test_shutdown_tolerates_transient_lock_then_startup_cleans_stale_job(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from jobs import research as research_job
+
+    entered = Event()
+    resume = Event()
+    original_run_checklist = research_job.run_checklist
+
+    def blocked(*args, **kwargs):
+        entered.set()
+        assert resume.wait(5)
+        return original_run_checklist(*args, **kwargs)
+
+    monkeypatch.setattr(research_job, "run_checklist", blocked)
+    app = _app(tmp_path)
+    client = TestClient(app)
+    client.__enter__()
+    locker = None
+    try:
+        with app.state.session_factory() as session:
+            run = _run(session)
+            _seed_finalists(session, run, {"garp": ["600000.SH"]})
+            run_id = run.id
+        created = client.post(
+            f"/api/discoveries/{run_id}/research",
+            json={"track": "garp", "code": "600000.SH"},
+        )
+        job_id = created.json()["id"]
+        assert entered.wait(5)
+        with app.state.discovery_workers_lock:
+            worker, lease = next(
+                (worker, lease)
+                for worker, lease in app.state.discovery_worker_leases.items()
+                if len(lease) == 3 and lease[0] == job_id
+            )
+
+        locker = sqlite3.connect(
+            str(tmp_path / "app.db"), timeout=0.1
+        )
+        locker.execute("BEGIN IMMEDIATE")
+        locker.execute("UPDATE users SET name = name WHERE id = 1")
+        started = monotonic()
+        client.__exit__(None, None, None)
+        assert monotonic() - started < 1
+        locker.rollback()
+        locker.close()
+        locker = None
+
+        with app.state.session_factory() as session:
+            job = session.get(ResearchJob, job_id)
+            assert job is not None
+            assert job.status == "running"
+            assert lock_status(session) == {
+                "type": JOB_TYPE_RESEARCH,
+                "job_id": job_id,
+            }
+            clear_stale_lock(session, now_provider=lambda: NOW)
+
+        replacement_token = "startup-replacement"
+        with app.state.session_factory() as session:
+            job = session.get(ResearchJob, job_id)
+            assert job is not None
+            assert job.status == "failed"
+            assert lock_status(session) is None
+            replaced = session.execute(
+                update(JobLock)
+                .where(JobLock.id == 1, JobLock.job_id.is_(None))
+                .values(
+                    job_id=job_id,
+                    job_type=JOB_TYPE_RESEARCH,
+                    held_at=NOW,
+                    owner_token=replacement_token,
+                )
+            )
+            assert replaced.rowcount == 1
+            session.commit()
+
+        resume.set()
+        deadline = monotonic() + 5
+        while monotonic() < deadline:
+            with app.state.discovery_workers_lock:
+                if worker not in app.state.discovery_workers:
+                    break
+            sleep(0.01)
+        with app.state.session_factory() as session:
+            job = session.get(ResearchJob, job_id)
+            row = session.get(JobLock, 1)
+            assert job is not None
+            assert job.status == "failed"
+            assert row is not None
+            assert (
+                row.job_id,
+                row.job_type,
+                row.owner_token,
+            ) == (job_id, JOB_TYPE_RESEARCH, replacement_token)
+            assert lease[2] != replacement_token
+            release(
+                session,
+                job_id,
+                JOB_TYPE_RESEARCH,
+                owner_token=replacement_token,
+            )
+            session.commit()
+    finally:
+        if locker is not None:
+            locker.rollback()
+            locker.close()
         resume.set()
         if not app.state.discovery_shutting_down:
             client.__exit__(None, None, None)
