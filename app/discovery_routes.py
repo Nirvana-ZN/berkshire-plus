@@ -2394,9 +2394,30 @@ def create_discovery_router() -> APIRouter:
                 detail="track 或 code 无效",
             )
         code = code.strip()
+        factory = request.app.state.session_factory
+        with factory() as session:
+            run = _owned_run(session, run_id)
+            if run is None:
+                return _error(
+                    404,
+                    error="未找到",
+                    code="DISCOVERY_NOT_FOUND",
+                    detail=f"没有发现批次 {run_id}",
+                )
+            existing = _existing_discovery_research(
+                session, run.id, code
+            )
+            if existing is not None:
+                return _research_job_payload(existing)
         if not has_env_value(
             request.app.state.env_path, OPENAI_API_KEY
         ):
+            with factory() as session:
+                existing = _existing_discovery_research(
+                    session, run_id, code
+                )
+                if existing is not None:
+                    return _research_job_payload(existing)
             return _error(
                 400,
                 error="未配置模型密钥",
@@ -2406,7 +2427,6 @@ def create_discovery_router() -> APIRouter:
         sync = _truthy(payload.get("sync")) and bool(
             getattr(request.app.state, "allow_sync", False)
         )
-        factory = request.app.state.session_factory
         owner_token: str | None = None
         converted = False
         job_id: int | None = None

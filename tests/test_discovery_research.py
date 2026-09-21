@@ -501,6 +501,44 @@ def test_same_run_code_is_idempotent_across_tracks(
             assert session.scalar(select(func.count()).select_from(ResearchJob)) == 1
 
 
+def test_existing_job_is_returned_before_key_lock_and_quota_checks(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        discovery_routes,
+        "_dispatch_discovery_research",
+        _finish_dispatch,
+    )
+    app = _app(tmp_path)
+    with TestClient(app) as client:
+        with app.state.session_factory() as session:
+            run = _run(session)
+            _seed_finalists(
+                session,
+                run,
+                {"garp": ["600000.SH", "600001.SH"]},
+            )
+            run_id = run.id
+        created = _post(client, run_id, "garp", "600000.SH")
+        assert created.status_code == 200
+
+        write_env_value(tmp_path / ".env", OPENAI_API_KEY, "")
+        with app.state.session_factory() as session:
+            assert try_acquire(session, 999, JOB_TYPE_FUNNEL)
+            session.commit()
+
+        repeated = _post(client, run_id, "garp", "600000.SH")
+        rejected_new = _post(client, run_id, "garp", "600001.SH")
+        assert repeated.status_code == 200
+        assert repeated.json()["id"] == created.json()["id"]
+        assert rejected_new.status_code == 400
+        assert rejected_new.json()["code"] == "NO_API_KEY"
+
+        with app.state.session_factory() as session:
+            release(session, 999, JOB_TYPE_FUNNEL)
+            session.commit()
+
+
 def test_concurrent_same_code_requests_return_one_job(
     tmp_path: Path, monkeypatch
 ) -> None:

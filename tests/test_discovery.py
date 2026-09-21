@@ -204,7 +204,7 @@ def test_discovery_view_renders_actionable_case_cards() -> None:
         "关键证据",
         "风险与反方证据",
         "数据缺口与新鲜度",
-        "本周变化",
+        "变化分类",
         "值得深研",
         "观察",
         "排除",
@@ -248,3 +248,25 @@ def test_candidate_cards_fail_closed_with_retry_and_scoped_drafts() -> None:
     assert "`${item.track}:${item.code}`" in page
     assert "change.classifications" in page
     assert "weeklyChangeText(view, caseItem)" in page
+
+
+def test_case_cards_enforce_keeper_limit_and_show_weekly_details() -> None:
+    page = (ROOT / "web/src/views/DiscoveryView.vue").read_text(
+        encoding="utf-8"
+    )
+
+    assert "keeperRange(keeperCount(view)) === 'over-limit'" in page
+    assert "请先排除" in page
+    assert "将保留数降至 5 家" in page
+    assert "!canCompleteAdjudication(view)" in page
+    assert "已达到 3 家最低候选数" not in page
+    assert "通过候选竞争固定尺子" not in page
+    assert "candidateSurfacedReason(row" in page
+    for label in (
+        "变化分类",
+        "上周状态",
+        "本周状态",
+        "上周理由",
+        "本周理由",
+    ):
+        assert label in page

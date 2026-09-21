@@ -69,6 +69,10 @@ export interface ParsedDiscoveryChange {
   membership: DiscoveryMembership
   cause: DiscoveryChangeCause
   reason_changed: boolean
+  previous_state: DiscoveryResultState
+  current_state: DiscoveryResultState
+  previous_reason: string | null
+  current_reason: string | null
 }
 
 type DiscoveryMembership = 'new' | 'dropped' | 'reentered' | 'continuous'
@@ -82,6 +86,7 @@ type DiscoveryChangeClassification =
   | DiscoveryMembership
   | Exclude<DiscoveryChangeCause, null>
   | 'reason_changed'
+type DiscoveryResultState = 'absent' | 'pass' | 'drop' | 'insufficient'
 
 interface ParsedDistribution {
   status: 'available' | 'unavailable'
@@ -174,6 +179,7 @@ const CHANGE_CAUSES: readonly Exclude<DiscoveryChangeCause, null>[] = [
 ]
 const EVIDENCE_RULE_VERSION = 'deterministic-evidence-v2'
 const FALLBACK_RISK_TEXT = '尚无结构化反方证据'
+const CHANGE_REASON_MAX_LENGTH = 2_000
 const RISK_CATEGORIES = new Set([
   'metric_near_threshold',
   'worsening_trend',
@@ -213,6 +219,32 @@ export function stageCacheKey(
   stage: DiscoveryStageName,
 ): string {
   return `${runId}:${track ?? 'common'}:${stage}`
+}
+
+export function keeperRange(
+  count: number,
+): 'insufficient' | 'valid' | 'over-limit' {
+  if (count > 5) return 'over-limit'
+  return count >= 3 ? 'valid' : 'insufficient'
+}
+
+export function candidateSurfacedReason(
+  row: ParsedDiscoveryRow,
+  evidence: readonly ParsedDiscoveryEvidence[],
+): string {
+  if (row.override?.action === 'forced_pass') {
+    const original = {
+      pass: '入围',
+      drop: '未入围',
+      insufficient: '数据不足',
+    }[row.original_verdict]
+    return `人工覆盖改为入围：${row.override.reason}（原判定：${original}）`
+  }
+  return evidence
+    .filter((item) => item.code === row.code && item.kind === 'fact')
+    .slice(0, 5)
+    .map((item) => item.display_text)
+    .join('；')
 }
 
 export function shouldPollStage(created: boolean, status: DiscoveryStageStatus): boolean {
@@ -562,6 +594,14 @@ function parseChange(value: unknown): ParsedDiscoveryChange | null {
     )
     || typeof value.reason_changed !== 'boolean'
     || !Array.isArray(value.classifications)
+    || !['absent', 'pass', 'drop', 'insufficient'].includes(
+      String(value.previous_state),
+    )
+    || !['absent', 'pass', 'drop', 'insufficient'].includes(
+      String(value.current_state),
+    )
+    || !boundedChangeReason(value.previous_reason)
+    || !boundedChangeReason(value.current_reason)
   ) return null
   const expected: DiscoveryChangeClassification[] = [
     value.membership as DiscoveryMembership,
@@ -582,7 +622,16 @@ function parseChange(value: unknown): ParsedDiscoveryChange | null {
     membership: value.membership as DiscoveryMembership,
     cause: value.cause as DiscoveryChangeCause,
     reason_changed: value.reason_changed,
+    previous_state: value.previous_state as DiscoveryResultState,
+    current_state: value.current_state as DiscoveryResultState,
+    previous_reason: value.previous_reason as string | null,
+    current_reason: value.current_reason as string | null,
   }
+}
+
+function boundedChangeReason(value: unknown): value is string | null {
+  return value === null
+    || (typeof value === 'string' && value.length <= CHANGE_REASON_MAX_LENGTH)
 }
 
 function isIsoDate(value: string): boolean {

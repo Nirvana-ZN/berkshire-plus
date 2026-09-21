@@ -6,7 +6,9 @@ import {
   armStageFetchTimeout,
   canAbandonRun,
   collectMetricKeys,
+  candidateSurfacedReason,
   CURRENT_FETCH_TIMEOUT_MS,
+  keeperRange,
   latestStagesNeedPolling,
   matchesStagePointer,
   parseStageResponse,
@@ -270,6 +272,12 @@ const CHANGE_ZH: Record<string, string> = {
   rule_changed: '尺子变化',
   both_changed: '数据与尺子同时变化',
   decision_changed: '人工裁决变化',
+}
+const CHANGE_STATE_ZH: Record<ParsedDiscoveryChange['previous_state'], string> = {
+  absent: '未出现',
+  pass: '入围',
+  drop: '未入围',
+  insufficient: '数据不足',
 }
 
 const router = useRouter()
@@ -1282,23 +1290,26 @@ function adjudicationCases(view: StageView): AdjudicationCase[] {
   if (view.track === null || view.stage !== 'adjudication') return []
   const payload = adjudicationPayloads.value[view.track]
   if (!payload) return []
-  return payload.pass.map((row) => ({
-    code: row.code,
-    name: row.name,
-    surfacedReason: row.reason || '通过候选竞争固定尺子',
-    track: view.track as Track,
-    evidence: payload.evidence.filter(
+  return payload.pass.map((row) => {
+    const evidence = payload.evidence.filter(
       (item) => item.code === row.code
         && item.competition_stage_id === payload.current.id
         && item.competition_attempt === payload.current.attempt,
-    ).slice(0, 5),
-    decision: payload.decisions.find(
-      (item) => item.code === row.code
-        && item.competition_stage_id === payload.current.id
-        && item.competition_attempt === payload.current.attempt,
-    ) ?? null,
-    change: payload.changes.find((item) => item.code === row.code) ?? null,
-  }))
+    )
+    return {
+      code: row.code,
+      name: row.name,
+      surfacedReason: candidateSurfacedReason(row, evidence),
+      track: view.track as Track,
+      evidence,
+      decision: payload.decisions.find(
+        (item) => item.code === row.code
+          && item.competition_stage_id === payload.current.id
+          && item.competition_attempt === payload.current.attempt,
+      ) ?? null,
+      change: payload.changes.find((item) => item.code === row.code) ?? null,
+    }
+  })
 }
 
 function keeperCount(view: StageView): number {
@@ -1309,6 +1320,10 @@ function allCasesDecided(view: StageView): boolean {
   return view.track !== null
     && adjudicationPayloads.value[view.track] !== undefined
     && adjudicationCases(view).every((item) => item.decision !== null)
+}
+
+function canCompleteAdjudication(view: StageView): boolean {
+  return allCasesDecided(view) && keeperRange(keeperCount(view)) !== 'over-limit'
 }
 
 function casesLoaded(view: StageView): boolean {
@@ -1360,17 +1375,38 @@ function freshnessText(item: AdjudicationCase): string {
 }
 
 function weeklyChangeText(view: StageView, item: AdjudicationCase): string {
-  const terminal = view.status === 'confirmed' || view.status === 'insufficient_candidates'
-  const change = (
-    terminal
-      ? view.payload?.changes.find((candidate) => candidate.code === item.code)
-      : item.change
-  ) ?? null
+  const change = weeklyChange(view, item)
   return change
     ? change.classifications
       .map((classification) => CHANGE_ZH[classification] || classification)
       .join('；')
     : '本周首次形成可裁决候选'
+}
+
+function weeklyChange(
+  view: StageView,
+  item: AdjudicationCase,
+): ParsedDiscoveryChange | null {
+  const terminal = view.status === 'confirmed' || view.status === 'insufficient_candidates'
+  return (
+    terminal
+      ? view.payload?.changes.find((candidate) => candidate.code === item.code)
+      : item.change
+  ) ?? null
+}
+
+function weeklyStateText(
+  change: ParsedDiscoveryChange | null,
+  side: 'previous' | 'current',
+): string {
+  return change ? CHANGE_STATE_ZH[change[`${side}_state`]] : '无对比记录'
+}
+
+function weeklyReasonText(
+  change: ParsedDiscoveryChange | null,
+  side: 'previous' | 'current',
+): string {
+  return change?.[`${side}_reason`] || '无'
 }
 
 async function saveDecision(
@@ -1427,7 +1463,7 @@ async function saveDecision(
 }
 
 async function completeAdjudication(view: StageView) {
-  if (mutating.value || view.track === null || !allCasesDecided(view)) return
+  if (mutating.value || view.track === null || !canCompleteAdjudication(view)) return
   const expected = reviewedIdentityFor(view)
   if (!expected) {
     actionError.value = '当前裁决阶段尚未成功加载并复核'
@@ -1650,7 +1686,17 @@ onBeforeUnmount(() => {
               <span v-if="keeperCount(view) < 3" class="candidate-warning">
                 · 候选不足，不显示为成功
               </span>
-              <span v-else>· 已达到 3 家最低候选数</span>
+              <span v-else-if="keeperRange(keeperCount(view)) === 'valid'">
+                · 保留数量应为 3–5 家
+              </span>
+            </p>
+            <p
+              v-if="keeperRange(keeperCount(view)) === 'over-limit'"
+              class="candidate-error"
+              role="alert"
+            >
+              超过 5 家上限。请先排除 {{ keeperCount(view) - 5 }} 家，
+              将保留数降至 5 家后再完成。
             </p>
           </div>
 
@@ -1681,7 +1727,23 @@ onBeforeUnmount(() => {
               </div>
               <div><dt>风险与反方证据</dt><dd>{{ riskText(caseItem) }}</dd></div>
               <div><dt>数据缺口与新鲜度</dt><dd>{{ freshnessText(caseItem) }}</dd></div>
-              <div><dt>本周变化</dt><dd>{{ weeklyChangeText(view, caseItem) }}</dd></div>
+              <div><dt>变化分类</dt><dd>{{ weeklyChangeText(view, caseItem) }}</dd></div>
+              <div>
+                <dt>上周状态</dt>
+                <dd>{{ weeklyStateText(weeklyChange(view, caseItem), 'previous') }}</dd>
+              </div>
+              <div>
+                <dt>本周状态</dt>
+                <dd>{{ weeklyStateText(weeklyChange(view, caseItem), 'current') }}</dd>
+              </div>
+              <div>
+                <dt>上周理由</dt>
+                <dd>{{ weeklyReasonText(weeklyChange(view, caseItem), 'previous') }}</dd>
+              </div>
+              <div>
+                <dt>本周理由</dt>
+                <dd>{{ weeklyReasonText(weeklyChange(view, caseItem), 'current') }}</dd>
+              </div>
             </dl>
             <div v-if="view.status === 'waiting_confirmation'" class="case-actions">
               <button
@@ -1736,10 +1798,16 @@ onBeforeUnmount(() => {
           <button
             v-if="view.status === 'waiting_confirmation'"
             type="button"
-            :disabled="mutating || !allCasesDecided(view)"
+            :disabled="mutating || !canCompleteAdjudication(view)"
             @click="completeAdjudication(view)"
           >
-            {{ keeperCount(view) >= 3 ? '完成本轨道裁决' : '以候选不足完成' }}
+            {{
+              keeperRange(keeperCount(view)) === 'over-limit'
+                ? '请先将候选降至 5 家'
+                : keeperCount(view) >= 3
+                  ? '完成本轨道裁决'
+                  : '以候选不足完成'
+            }}
           </button>
           <p v-if="view.status === 'insufficient_candidates'" class="candidate-warning">
             候选不足：本轨道已明确结束，但未达到 3 家，不视为成功。
@@ -2083,6 +2151,11 @@ td {
 
 .candidate-warning {
   color: #8a4b08;
+  font-weight: 600;
+}
+
+.candidate-error {
+  color: #9f1d1d;
   font-weight: 600;
 }
 

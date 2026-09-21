@@ -5,9 +5,11 @@ import {
   armFetchTimeout,
   armStageFetchTimeout,
   canAbandonRun,
+  candidateSurfacedReason,
   collectMetricKeys,
   CURRENT_FETCH_TIMEOUT_MS,
   latestStagesNeedPolling,
+  keeperRange,
   matchesStagePointer,
   parseMetricRecord,
   parseStageResponse,
@@ -54,6 +56,13 @@ test('only actionable stage states expose controls', () => {
     reviewedStageActions(false, 'track_gate', 'waiting_confirmation', null),
     { confirm: false, override: false, retry: false },
   )
+})
+
+test('keeper range distinguishes insufficient, valid, and over-limit', () => {
+  assert.equal(keeperRange(2), 'insufficient')
+  assert.equal(keeperRange(3), 'valid')
+  assert.equal(keeperRange(5), 'valid')
+  assert.equal(keeperRange(6), 'over-limit')
 })
 
 test('review identity mismatch fails closed before mutation', () => {
@@ -232,6 +241,10 @@ test('competition schema requires exact card arrays and reliable evidence', () =
     membership: 'continuous',
     cause: 'both_changed',
     reason_changed: true,
+    previous_state: 'drop',
+    current_state: 'pass',
+    previous_reason: '估值偏高',
+    current_reason: '估值回落',
   }]
   const valid = parseStageResponse(payload)
   assert.ok(valid)
@@ -241,6 +254,8 @@ test('competition schema requires exact card arrays and reliable evidence', () =
     'reason_changed',
     'both_changed',
   ])
+  assert.equal(valid.changes[0]!.previous_state, 'drop')
+  assert.equal(valid.changes[0]!.current_reason, '估值回落')
 
   for (const key of ['decisions', 'evidence', 'changes'] as const) {
     const malformed = competitionPayload()
@@ -262,8 +277,54 @@ test('competition schema requires exact card arrays and reliable evidence', () =
     membership: 'entered',
     cause: null,
     reason_changed: false,
+    previous_state: 'absent',
+    current_state: 'pass',
+    previous_reason: null,
+    current_reason: null,
   }]
   assert.equal(parseStageResponse(unknownChange), null)
+
+  const oversizedReason = competitionPayload()
+  oversizedReason.changes = [{
+    code: '000001',
+    classification: 'continuous',
+    classifications: ['continuous'],
+    membership: 'continuous',
+    cause: null,
+    reason_changed: false,
+    previous_state: 'pass',
+    current_state: 'pass',
+    previous_reason: 'x'.repeat(2_001),
+    current_reason: null,
+  }]
+  assert.equal(parseStageResponse(oversizedReason), null)
+})
+
+test('case surfaced reason is specific and honors forced-pass provenance', () => {
+  const parsed = parseStageResponse(competitionPayload())
+  assert.ok(parsed)
+  const row = parsed.pass[0]!
+  assert.match(candidateSurfacedReason(row, parsed.evidence), /fact 0/)
+  assert.doesNotMatch(candidateSurfacedReason(row, parsed.evidence), /固定尺子/)
+
+  const forced = {
+    ...row,
+    original_verdict: 'insufficient' as const,
+    reason: 'evidence_facts_insufficient',
+    override: {
+      id: 9,
+      track: 'garp' as const,
+      stage: 'competition' as const,
+      attempt: 1,
+      code: row.code,
+      action: 'forced_pass' as const,
+      reason: '人工确认补充材料',
+    },
+  }
+  assert.equal(
+    candidateSurfacedReason(forced, parsed.evidence),
+    '人工覆盖改为入围：人工确认补充材料（原判定：数据不足）',
+  )
 })
 
 test('one invalid metric row stays visible with an explicit unavailable reason', () => {
