@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from functools import wraps
 import json
 
 import pytest
@@ -35,6 +36,38 @@ TRADING_DATES = {
         "2026-09-17",
     ],
 }
+
+
+@pytest.fixture(autouse=True)
+def _use_snapshot_week_for_worker_defaults(monkeypatch):
+    """Keep current-week worker tests independent of the wall clock."""
+
+    from jobs import discovery
+    from jobs import lock
+
+    def with_test_clock(function):
+        @wraps(function)
+        def call(*args, **kwargs):
+            kwargs.setdefault("now_provider", lambda: SNAPSHOT_AT)
+            return function(*args, **kwargs)
+
+        return call
+
+    monkeypatch.setattr(
+        discovery,
+        "execute_common_stage",
+        with_test_clock(discovery.execute_common_stage),
+    )
+    monkeypatch.setattr(
+        discovery,
+        "drain_run_queue",
+        with_test_clock(discovery.drain_run_queue),
+    )
+    monkeypatch.setattr(
+        lock,
+        "clear_stale_lock",
+        with_test_clock(lock.clear_stale_lock),
+    )
 
 
 def _freeze_run(
@@ -1040,19 +1073,65 @@ def test_drain_persists_validated_competition_evidence(tmp_path) -> None:
     from sqlalchemy import select
 
     from app.discovery_models import DiscoveryEvidence, DiscoveryStage
-    from discovery.evidence import EVIDENCE_RULE_VERSION, FALLBACK_RISK_TEXT
-    from discovery.snapshot import canonical_json
+    from discovery.builds import BUILD_VERSION
+    from discovery.rulers import activate
+    from discovery.snapshot import (
+        canonical_json,
+        freeze_discovery_ruler_payloads,
+        freeze_inputs,
+    )
     from jobs.discovery import (
-        TrackExecutionEvidence,
         TrackExecutionOutcome,
         TrackExecutionResult,
         drain_run_queue,
     )
+    from tests.test_discovery_overrides import (
+        _competition_execution_evidence,
+        _competition_metrics,
+    )
+    from tests.discovery_helpers import discovery_ruler_payload
 
     engine = init_db(tmp_path / "competition-evidence.db")
     factory = create_session_factory(engine)
     with factory() as session:
-        run = _freeze_run(session, [company("600000.SH")])
+        rulers = {
+            track: activate(
+                session,
+                discovery_ruler_payload(track),
+                f"test {track}",
+            ).id
+            for track in ("quality_discount", "deep_value", "garp")
+        }
+        seeded = company("600000.SH")
+        run = add_unfrozen_run(
+            session,
+            week_key="2026-W38",
+            ruler_ids=rulers,
+        )
+        run.ruler_payloads_json = freeze_discovery_ruler_payloads(
+            session, rulers, BUILD_VERSION
+        )
+        freeze_inputs(
+            session,
+            run,
+            [
+                replace(
+                    seeded,
+                    as_of={
+                        **seeded.as_of,
+                        "security": "2026-09-17",
+                        "financial": "2026-09-17",
+                        "valuation": "2026-09-17",
+                    },
+                )
+            ],
+            versions(ruler_ids=rulers),
+            TRADING_DATES,
+            snapshot_at=SNAPSHOT_AT,
+        )
+        run.current = True
+        run.status = "running"
+        session.flush()
         gate = _add_track_stage(
             session,
             run,
@@ -1085,8 +1164,11 @@ def test_drain_persists_validated_competition_evidence(tmp_path) -> None:
 
         def execute(context):
             assert context.candidate_codes == ("600000.SH",)
-            company_as_of = context.frozen_inputs.companies[0].as_of
-            source_as_of = {"price": company_as_of["price"]}
+            metrics = {
+                "600000.SH": _competition_metrics(
+                    "quality_discount", "600000.SH"
+                )
+            }
             return TrackExecutionOutcome(
                 status="waiting_confirmation",
                 results=(
@@ -1094,41 +1176,11 @@ def test_drain_persists_validated_competition_evidence(tmp_path) -> None:
                         code="600000.SH",
                         verdict="pass",
                         reason=None,
-                        metrics_json="{}",
+                        metrics_json=canonical_json(metrics["600000.SH"]),
                         rank=1,
                     ),
                 ),
-                evidence=(
-                    *(
-                        TrackExecutionEvidence(
-                            code="600000.SH",
-                            ruler_version_id=context.ruler_version_id,
-                            rule_version=EVIDENCE_RULE_VERSION,
-                            kind="fact",
-                            rule_id=f"quality_discount.fact.{field}",
-                            input_fields_json=canonical_json(
-                                {field: "1", "source": "price"}
-                            ),
-                            display_text=f"{field}=1",
-                            as_of=source_as_of["price"],
-                            data_completeness="complete",
-                        )
-                        for field in ("cash_conversion", "roe_cv", "valuation")
-                    ),
-                    TrackExecutionEvidence(
-                        code="600000.SH",
-                        ruler_version_id=context.ruler_version_id,
-                        rule_version=EVIDENCE_RULE_VERSION,
-                        kind="risk",
-                        rule_id="quality_discount.risk.none",
-                        input_fields_json=canonical_json(
-                            {"source_as_of": source_as_of}
-                        ),
-                        display_text=FALLBACK_RISK_TEXT,
-                        as_of=min(source_as_of.values()),
-                        data_completeness="complete",
-                    ),
-                ),
+                evidence=_competition_execution_evidence(context, metrics),
             )
 
         outcome = drain_run_queue(

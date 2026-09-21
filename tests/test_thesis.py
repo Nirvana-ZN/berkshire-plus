@@ -253,8 +253,11 @@ def test_aftermath_compares_old_paper_to_now(tmp_path: Path) -> None:
 
 def test_views_show_aftermath() -> None:
     home = (ROOT / "web/src/views/HomeView.vue").read_text(encoding="utf-8")
+    home_model = (
+        ROOT / "web/src/views/homeViewModel.ts"
+    ).read_text(encoding="utf-8")
     assert "事后簿" in home
-    assert "/api/aftermath" in home
+    assert "/api/aftermath" in home_model
     assert "夏普" not in home
     assert "收益率" not in home
 

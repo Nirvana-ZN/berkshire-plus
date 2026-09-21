@@ -350,7 +350,8 @@ def test_legacy_cheap_board_is_retained_but_demoted() -> None:
     assert 'to="/cheap"' in home
     assert "旧版低估值榜（次要）" in home
     assert "全市场" in home
-    assert "CheapView" in router
+    assert "path: '/cheap'" in router
+    assert "component: CheapView" in router
     assert "meta: { legacy: true }" in router
     assert "/api/cheap" in page
     assert "低估值" in page

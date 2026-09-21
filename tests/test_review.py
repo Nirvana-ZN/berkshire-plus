@@ -751,6 +751,9 @@ def test_review_module_does_not_import_ledger() -> None:
 def test_positions_and_home_have_review_entry_without_apply() -> None:
     positions = (ROOT / "web/src/views/PositionsView.vue").read_text(encoding="utf-8")
     home = (ROOT / "web/src/views/HomeView.vue").read_text(encoding="utf-8")
+    home_model = (
+        ROOT / "web/src/views/homeViewModel.ts"
+    ).read_text(encoding="utf-8")
     assert "高估" in positions
     assert "一键审视" in positions
     assert "/api/reviews" in positions
@@ -763,7 +766,7 @@ def test_positions_and_home_have_review_entry_without_apply() -> None:
     assert "再平衡提示" in positions
     assert "record_trade" not in positions
     assert "review: '审视'" in home or 'review: "审视"' in home
-    assert "/api/reviews/latest" in home
+    assert "/api/reviews/latest" in home_model
     assert "一键应用" not in home
     assert "今日推荐" not in positions
     assert "收益排行" not in positions

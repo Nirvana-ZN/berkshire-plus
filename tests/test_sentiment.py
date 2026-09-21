@@ -227,9 +227,12 @@ def test_dist_includes_sentiment() -> None:
 
 def test_views_show_sentiment() -> None:
     home = (ROOT / "web/src/views/HomeView.vue").read_text(encoding="utf-8")
+    home_model = (
+        ROOT / "web/src/views/homeViewModel.ts"
+    ).read_text(encoding="utf-8")
     screen = (ROOT / "web/src/views/ScreenView.vue").read_text(encoding="utf-8")
     panel = (ROOT / "web/src/components/SentimentPanel.vue").read_text(encoding="utf-8")
-    assert "/api/sentiment" in home
+    assert "/api/sentiment" in home_model
     assert "情绪指数" in panel
     assert "sentiment-meter" in panel
     css = (ROOT / "web/src/assets/main.css").read_text(encoding="utf-8")

@@ -317,6 +317,9 @@ def test_views_prefill_and_watchlist_without_direct_book_write() -> None:
     research = (ROOT / "web/src/views/ResearchView.vue").read_text(encoding="utf-8")
     positions = (ROOT / "web/src/views/PositionsView.vue").read_text(encoding="utf-8")
     home = (ROOT / "web/src/views/HomeView.vue").read_text(encoding="utf-8")
+    home_model = (
+        ROOT / "web/src/views/homeViewModel.ts"
+    ).read_text(encoding="utf-8")
     assert "加入观察池" in research
     assert "verdict.value === 'pass' || verdict.value === 'gray'" in research
     assert "/api/watchlist" in research
@@ -329,9 +332,9 @@ def test_views_prefill_and_watchlist_without_direct_book_write() -> None:
     assert "form.value.name = rawName" in positions
     assert "/api/trades" in positions
     assert "submitTrade" in positions
-    assert "/api/health" in home
-    assert "/api/jobs" in home
-    assert "/api/watchlist" in home
+    assert "/api/health" in home_model
+    assert "/api/jobs" in home_model
+    assert "/api/watchlist" in home_model
     assert "watchBody.items" in home
     assert "jobsBody.jobs" in home
     assert "观察池待办" in home
