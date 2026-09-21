@@ -1,5 +1,18 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import {
+  canAbandonRun,
+  matchesStagePointer,
+  stageActions,
+  stageAriaLabel,
+  stageCacheKey,
+  shouldPollStage,
+  type DiscoveryFailureKind,
+  type DiscoveryStageName,
+  type DiscoveryStageStatus,
+  type DiscoveryTrack,
+  type DiscoveryTrackStage,
+} from './discoveryViewModel'
 
 const DISCOVERY_RUN_STATUSES = [
   'queued',
@@ -26,9 +39,9 @@ const TRACKS = ['quality_discount', 'deep_value', 'garp'] as const
 const TRACK_STAGES = ['track_gate', 'competition', 'adjudication'] as const
 
 type DiscoveryRunStatus = (typeof DISCOVERY_RUN_STATUSES)[number]
-type StageStatus = (typeof STAGE_STATUSES)[number]
-type Track = (typeof TRACKS)[number]
-type TrackStage = (typeof TRACK_STAGES)[number]
+type StageStatus = DiscoveryStageStatus
+type Track = DiscoveryTrack
+type TrackStage = DiscoveryTrackStage
 type StageKey = 'safety' | `${Track}:${TrackStage}`
 type MetricValue = string | number | null
 
@@ -36,12 +49,18 @@ interface RunStagePointer {
   stage: string | null
   status: StageStatus | null
   created: boolean
+  attempt?: number
 }
 
 interface DiscoveryRun {
   id: number
+  current: boolean
   week_key: string
   status: DiscoveryRunStatus
+  snapshot_at: string | null
+  data_version: string | null
+  financial_version: string | null
+  valuation_version: string | null
   error?: string | null
   safety?: RunStagePointer
   tracks?: Partial<Record<Track, RunStagePointer>>
@@ -61,6 +80,7 @@ interface DiscoveryRow {
   code: string
   name: string
   verdict: 'pass' | 'drop' | 'insufficient'
+  original_verdict: 'pass' | 'drop' | 'insufficient'
   reason: string | null
   rank: number | null
   metrics: Record<string, string | number | null>
@@ -119,7 +139,7 @@ interface StageCurrent {
   attempt: number
   status: StageStatus
   error: string | null
-  failure_kind: 'transient' | 'permanent' | null
+  failure_kind: DiscoveryFailureKind
 }
 
 interface StageResponse {
@@ -135,7 +155,7 @@ interface StageView {
   key: StageKey
   title: string
   track: Track | null
-  stage: 'safety' | TrackStage
+  stage: DiscoveryStageName
   created: boolean
   status: StageStatus
   payload: StageResponse | null
@@ -181,6 +201,13 @@ const STAGE_ZH: Record<TrackStage, string> = {
   adjudication: '人工裁决',
 }
 
+const RESULT_GROUPS = [
+  { key: 'pass', title: '通过结果' },
+  { key: 'drop', title: '淘汰结果' },
+  { key: 'insufficient', title: '数据不足结果' },
+] as const
+const CURRENT_REFRESH_MS = 60_000
+
 const state = ref<ViewState>({ kind: 'loading' })
 const starting = ref(false)
 const mutating = ref(false)
@@ -188,10 +215,26 @@ const actionError = ref('')
 const stageViews = ref<StageView[]>([])
 const activeRunId = ref<number | null>(null)
 const activeStageKey = ref<Record<string, number>>({})
+const selectedTrackStages = ref<Record<Track, TrackStage>>({
+  quality_discount: 'track_gate',
+  deep_value: 'track_gate',
+  garp: 'track_gate',
+})
+const pinnedTrackStages = ref<Record<Track, boolean>>({
+  quality_discount: false,
+  deep_value: false,
+  garp: false,
+})
+const stagePayloadCache = ref<Record<string, StageResponse>>({})
 const overrideCode = ref('')
 const overrideAction = ref<'forced_pass' | 'forced_drop'>('forced_pass')
 const overrideReason = ref('')
 let pollTimer: number | undefined
+let currentRefreshTimer: number | undefined
+let mounted = false
+let currentRequestSequence = 0
+let currentController: AbortController | null = null
+const stageControllers = new Map<string, AbortController>()
 
 const announcement = computed(() => {
   if (starting.value) return '正在创建本周发现…'
@@ -228,6 +271,7 @@ function isRunStagePointer(value: unknown): value is RunStagePointer {
     && (value.stage === null || typeof value.stage === 'string')
     && (value.status === null || isStageStatus(value.status))
     && typeof value.created === 'boolean'
+    && (value.attempt === undefined || nonNegativeInteger(value.attempt) !== null)
 }
 
 function isDiscoveryRun(value: unknown): value is DiscoveryRun {
@@ -236,9 +280,14 @@ function isDiscoveryRun(value: unknown): value is DiscoveryRun {
     typeof value.id !== 'number'
     || !Number.isInteger(value.id)
     || value.id <= 0
+    || typeof value.current !== 'boolean'
     || typeof value.week_key !== 'string'
     || !value.week_key
     || !isDiscoveryRunStatus(value.status)
+    || (value.snapshot_at !== null && typeof value.snapshot_at !== 'string')
+    || (value.data_version !== null && typeof value.data_version !== 'string')
+    || (value.financial_version !== null && typeof value.financial_version !== 'string')
+    || (value.valuation_version !== null && typeof value.valuation_version !== 'string')
     || (value.error != null && typeof value.error !== 'string')
   ) return false
   if (value.safety !== undefined && !isRunStagePointer(value.safety)) return false
@@ -295,7 +344,14 @@ function parseRow(value: unknown): DiscoveryRow | null {
   if (
     !isRecord(value)
     || typeof value.code !== 'string'
+    || typeof value.name !== 'string'
+    || !value.name
     || (value.verdict !== 'pass' && value.verdict !== 'drop' && value.verdict !== 'insufficient')
+    || (
+      value.original_verdict !== 'pass'
+      && value.original_verdict !== 'drop'
+      && value.original_verdict !== 'insufficient'
+    )
     || (value.reason !== null && typeof value.reason !== 'string')
     || (value.rank !== undefined && value.rank !== null && nonNegativeInteger(value.rank) === null)
     || !isRecord(value.metrics)
@@ -310,8 +366,9 @@ function parseRow(value: unknown): DiscoveryRow | null {
   if (value.override != null && override === null) return null
   return {
     code: value.code,
-    name: typeof value.name === 'string' && value.name ? value.name : value.code,
+    name: value.name,
     verdict: value.verdict,
+    original_verdict: value.original_verdict,
     reason: textOrNull(value.reason),
     rank: value.rank == null ? null : value.rank as number,
     metrics,
@@ -433,38 +490,85 @@ function errorMessage(body: unknown, fallback: string): string {
 
 function viewsForRun(run: DiscoveryRun): StageView[] {
   const safetyStatus = run.safety?.status ?? 'queued'
+  const safetyKey = stageCacheKey(run.id, null, 'safety')
+  let safetyPayload = stagePayloadCache.value[safetyKey] ?? null
+  if (
+    safetyPayload
+    && !matchesStagePointer(
+      run.safety?.attempt,
+      run.safety?.status,
+      safetyPayload.current.attempt,
+      safetyPayload.current.status,
+    )
+  ) {
+    clearStageCache(safetyKey)
+    safetyPayload = null
+  }
   const views: StageView[] = [{
     key: 'safety',
     title: '共同排雷',
     track: null,
     stage: 'safety',
     created: run.safety?.created ?? true,
-    status: safetyStatus,
-    payload: null,
+    status: safetyPayload?.current.status ?? safetyStatus,
+    payload: safetyPayload,
     error: '',
   }]
   for (const track of TRACKS) {
     const pointer = run.tracks?.[track]
-    const stage = isTrackStage(pointer?.stage) ? pointer.stage : 'track_gate'
+    const stage = selectedTrackStages.value[track]
+    const cacheKey = stageCacheKey(run.id, track, stage)
+    const selectedIsLatest = pointer?.stage === stage
+    let payload = stagePayloadCache.value[cacheKey] ?? null
+    if (
+      payload
+      && selectedIsLatest
+      && !matchesStagePointer(
+        pointer?.attempt,
+        pointer?.status,
+        payload.current.attempt,
+        payload.current.status,
+      )
+    ) {
+      clearStageCache(cacheKey)
+      payload = null
+    }
     views.push({
       key: `${track}:${stage}`,
       title: `${TRACK_ZH[track]} · ${STAGE_ZH[stage]}`,
       track,
       stage,
-      created: pointer?.created ?? false,
-      status: pointer?.status ?? 'queued',
-      payload: null,
+      created: payload !== null || (selectedIsLatest && (pointer?.created ?? false)),
+      status: payload?.current.status ?? (selectedIsLatest ? pointer?.status ?? 'queued' : 'queued'),
+      payload,
       error: '',
     })
   }
   return views
 }
 
-function endpoint(view: StageView): string {
-  const runId = activeRunId.value
+function endpoint(view: StageView, runId: number): string {
   return view.track === null
     ? `/api/discoveries/${runId}/stages/safety`
     : `/api/discoveries/${runId}/tracks/${view.track}/stages/${view.stage}`
+}
+
+function clearStageCache(key?: string) {
+  if (key === undefined) {
+    stagePayloadCache.value = {}
+    return
+  }
+  const next = { ...stagePayloadCache.value }
+  delete next[key]
+  stagePayloadCache.value = next
+}
+
+function stageAvailable(track: Track, stage: TrackStage): boolean {
+  const current = state.value
+  if (current.kind !== 'ready') return false
+  const latest = current.run.tracks?.[track]
+  if (!latest?.created || !isTrackStage(latest.stage)) return false
+  return TRACK_STAGES.indexOf(stage) <= TRACK_STAGES.indexOf(latest.stage)
 }
 
 function stopPoll() {
@@ -474,86 +578,173 @@ function stopPoll() {
   }
 }
 
+function stopCurrentRefresh() {
+  if (currentRefreshTimer !== undefined) {
+    window.clearTimeout(currentRefreshTimer)
+    currentRefreshTimer = undefined
+  }
+}
+
+function abortStageRequests() {
+  for (const controller of stageControllers.values()) controller.abort()
+  stageControllers.clear()
+}
+
 function needsPolling(): boolean {
-  return stageViews.value.some(
-    (view) => view.created && (view.status === 'queued' || view.status === 'running'),
-  )
+  return stageViews.value.some((view) => shouldPollStage(view.created, view.status))
 }
 
 function schedulePoll() {
   stopPoll()
-  if (!needsPolling()) return
+  if (!mounted || !needsPolling()) return
   pollTimer = window.setTimeout(() => {
-    void refreshRun()
+    if (mounted) void refreshRun()
   }, 800)
 }
 
+function scheduleCurrentRefresh() {
+  stopCurrentRefresh()
+  if (!mounted) return
+  currentRefreshTimer = window.setTimeout(() => {
+    if (mounted) void readCurrent()
+  }, CURRENT_REFRESH_MS)
+}
+
 async function loadStage(view: StageView, runId: number) {
-  const requestNumber = (activeStageKey.value[view.key] ?? 0) + 1
-  activeStageKey.value[view.key] = requestNumber
+  const cacheKey = stageCacheKey(runId, view.track, view.stage)
+  const requestNumber = (activeStageKey.value[cacheKey] ?? 0) + 1
+  activeStageKey.value[cacheKey] = requestNumber
+  stageControllers.get(cacheKey)?.abort()
+  const controller = new AbortController()
+  stageControllers.set(cacheKey, controller)
   try {
-    const response = await fetch(endpoint(view))
+    const response = await fetch(endpoint(view, runId), { signal: controller.signal })
     const body: unknown = await response.json()
-    if (activeRunId.value !== runId || activeStageKey.value[view.key] !== requestNumber) return
+    if (
+      !mounted
+      || activeRunId.value !== runId
+      || activeStageKey.value[cacheKey] !== requestNumber
+    ) return
     const current = stageViews.value.find((item) => item.key === view.key)
     if (!current) return
-    if (response.status === 404 && (current.status === 'queued' || current.status === 'running')) return
+    if (response.status === 404) {
+      clearStageCache(cacheKey)
+      current.payload = null
+      current.created = false
+      current.error = shouldPollStage(view.created, view.status) ? '' : '阶段尚未生成'
+      return
+    }
     if (!response.ok) {
+      clearStageCache(cacheKey)
+      current.payload = null
       current.error = errorMessage(body, '无法读取阶段结果')
       return
     }
     const payload = parseStageResponse(body)
     if (!payload) {
+      clearStageCache(cacheKey)
+      current.payload = null
       current.error = '服务返回的阶段数据无效'
       return
     }
+    stagePayloadCache.value = { ...stagePayloadCache.value, [cacheKey]: payload }
     current.payload = payload
     current.created = true
     current.status = payload.current.status
     current.error = ''
-  } catch {
-    if (activeRunId.value !== runId || activeStageKey.value[view.key] !== requestNumber) return
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') return
+    if (
+      !mounted
+      || activeRunId.value !== runId
+      || activeStageKey.value[cacheKey] !== requestNumber
+    ) return
+    clearStageCache(cacheKey)
     const current = stageViews.value.find((item) => item.key === view.key)
-    if (current) current.error = '无法读取阶段结果'
+    if (current) {
+      current.payload = null
+      current.error = '无法读取阶段结果'
+    }
+  } finally {
+    if (stageControllers.get(cacheKey) === controller) stageControllers.delete(cacheKey)
   }
 }
 
-async function applyRun(run: DiscoveryRun, source: 'loaded' | 'created') {
+async function applyRun(
+  run: DiscoveryRun,
+  source: 'loaded' | 'created',
+  requestSequence: number,
+) {
   stopPoll()
+  const changedRun = activeRunId.value !== run.id
+  if (changedRun) {
+    abortStageRequests()
+    clearStageCache()
+    for (const track of TRACKS) {
+      const latest = run.tracks?.[track]?.stage
+      selectedTrackStages.value[track] = isTrackStage(latest) ? latest : 'track_gate'
+      pinnedTrackStages.value[track] = false
+    }
+  } else {
+    for (const track of TRACKS) {
+      const latest = run.tracks?.[track]?.stage
+      if (!pinnedTrackStages.value[track] && isTrackStage(latest)) {
+        selectedTrackStages.value[track] = latest
+      }
+    }
+  }
   activeRunId.value = run.id
-  const previous = new Map(stageViews.value.map((view) => [view.key, view]))
-  stageViews.value = viewsForRun(run).map((view) => {
-    const old = previous.get(view.key)
-    return old ? { ...view, payload: old.payload, error: old.error } : view
-  })
   state.value = { kind: 'ready', run, source }
+  stageViews.value = viewsForRun(run)
   await Promise.all(stageViews.value.map((view) => loadStage(view, run.id)))
+  if (!mounted || requestSequence !== currentRequestSequence || activeRunId.value !== run.id) return
   schedulePoll()
+  scheduleCurrentRefresh()
 }
 
 async function readCurrent(source: 'loaded' | 'created' = 'loaded'): Promise<boolean> {
+  const requestSequence = ++currentRequestSequence
+  currentController?.abort()
+  const controller = new AbortController()
+  currentController = controller
   try {
-    const response = await fetch('/api/discoveries/current')
+    const response = await fetch('/api/discoveries/current', { signal: controller.signal })
+    if (!mounted || requestSequence !== currentRequestSequence) return false
     if (response.status === 404) {
       stopPoll()
+      abortStageRequests()
+      clearStageCache()
       activeRunId.value = null
       stageViews.value = []
       state.value = { kind: 'empty' }
+      scheduleCurrentRefresh()
       return false
     }
     const body: unknown = await response.json()
+    if (!mounted || requestSequence !== currentRequestSequence) return false
     if (!response.ok) {
+      abortStageRequests()
+      clearStageCache()
       state.value = { kind: 'error', message: errorMessage(body, '无法读取本周发现') }
     } else if (!isDiscoveryRun(body)) {
+      abortStageRequests()
+      clearStageCache()
       state.value = { kind: 'error', message: '服务返回的本周批次数据无效' }
     } else {
-      await applyRun(body, source)
+      await applyRun(body, source, requestSequence)
       return true
     }
-  } catch {
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') return false
+    if (!mounted || requestSequence !== currentRequestSequence) return false
+    abortStageRequests()
+    clearStageCache()
     state.value = { kind: 'error', message: '无法读取本周发现' }
+  } finally {
+    if (currentController === controller) currentController = null
   }
   stopPoll()
+  scheduleCurrentRefresh()
   return false
 }
 
@@ -580,7 +771,7 @@ async function startDiscovery() {
     } else if (!isDiscoveryRun(body)) {
       state.value = { kind: 'error', message: '服务返回的本周批次数据无效' }
     } else {
-      await applyRun(body, 'created')
+      await readCurrent('created')
     }
   } catch {
     state.value = { kind: 'error', message: '无法开始本周发现' }
@@ -589,12 +780,41 @@ async function startDiscovery() {
   }
 }
 
+async function beforeMutation(expectedRunId: number): Promise<boolean> {
+  const refreshed = await readCurrent()
+  if (!refreshed || activeRunId.value !== expectedRunId) {
+    actionError.value = '周次或当前批次已变化，已重新加载，请复核后再操作'
+    return false
+  }
+  return true
+}
+
 async function stageMutation(view: StageView, action: 'confirm' | 'retry') {
   if (mutating.value || activeRunId.value === null) return
+  const runId = activeRunId.value
+  const track = view.track
+  const stage = view.stage
   actionError.value = ''
   mutating.value = true
   try {
-    const response = await fetch(`${endpoint(view)}/${action}`, {
+    if (!await beforeMutation(runId)) return
+    const currentView = stageViews.value.find(
+      (item) => item.track === track && item.stage === stage,
+    )
+    if (!currentView) {
+      actionError.value = '阶段已变化，请重新选择'
+      return
+    }
+    const allowed = stageActions(
+      currentView.stage,
+      currentView.status,
+      currentView.payload?.current.failure_kind ?? null,
+    )
+    if ((action === 'confirm' && !allowed.confirm) || (action === 'retry' && !allowed.retry)) {
+      actionError.value = '当前阶段状态不允许此操作'
+      return
+    }
+    const response = await fetch(`${endpoint(currentView, runId)}/${action}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: '{}',
@@ -611,6 +831,9 @@ async function stageMutation(view: StageView, action: 'confirm' | 'retry') {
 
 async function saveOverride(view: StageView) {
   if (mutating.value || activeRunId.value === null || view.track === null || view.stage === 'safety') return
+  const runId = activeRunId.value
+  const track = view.track
+  const stage = view.stage
   const reason = overrideReason.value.trim()
   const code = overrideCode.value.trim()
   if (!code || !reason) {
@@ -620,13 +843,28 @@ async function saveOverride(view: StageView) {
   actionError.value = ''
   mutating.value = true
   try {
-    const response = await fetch(`/api/discoveries/${activeRunId.value}/overrides`, {
+    if (!await beforeMutation(runId)) return
+    const currentView = stageViews.value.find(
+      (item) => item.track === track && item.stage === stage,
+    )
+    if (
+      !currentView
+      || !stageActions(
+        currentView.stage,
+        currentView.status,
+        currentView.payload?.current.failure_kind ?? null,
+      ).override
+    ) {
+      actionError.value = '当前阶段不可人工覆盖'
+      return
+    }
+    const response = await fetch(`/api/discoveries/${runId}/overrides`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        track: view.track,
-        stage: view.stage,
-        attempt: view.payload?.current.attempt,
+        track,
+        stage,
+        attempt: currentView.payload?.current.attempt,
         code,
         action: overrideAction.value,
         reason,
@@ -638,7 +876,7 @@ async function saveOverride(view: StageView) {
     } else {
       overrideCode.value = ''
       overrideReason.value = ''
-      await loadStage(view, activeRunId.value)
+      await loadStage(currentView, runId)
     }
   } catch {
     actionError.value = '人工覆盖保存失败'
@@ -649,10 +887,12 @@ async function saveOverride(view: StageView) {
 
 async function abandonRun() {
   if (mutating.value || activeRunId.value === null) return
+  const runId = activeRunId.value
   actionError.value = ''
   mutating.value = true
   try {
-    const response = await fetch(`/api/discoveries/${activeRunId.value}/abandon`, {
+    if (!await beforeMutation(runId)) return
+    const response = await fetch(`/api/discoveries/${runId}/abandon`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: '{}',
@@ -667,13 +907,49 @@ async function abandonRun() {
   }
 }
 
+async function onStageSelection(track: Track) {
+  const current = state.value
+  if (current.kind !== 'ready') return
+  pinnedTrackStages.value[track] = true
+  abortStageRequests()
+  stageViews.value = viewsForRun(current.run)
+  const view = stageViews.value.find((item) => item.track === track)
+  if (view) await loadStage(view, current.run.id)
+  schedulePoll()
+}
+
 function rows(view: StageView): DiscoveryRow[] {
   const payload = view.payload
   return payload ? [...payload.pass, ...payload.drop, ...payload.insufficient] : []
 }
 
+function resultRows(view: StageView, key: 'pass' | 'drop' | 'insufficient'): DiscoveryRow[] {
+  return view.payload?.[key] ?? []
+}
+
+function overrideResult(view: StageView, code: string): DiscoveryRow | undefined {
+  return rows(view).find((row) => row.code === code)
+}
+
+function overrideDirection(override: DiscoveryOverride): string {
+  return override.action === 'forced_pass' ? '改为通过' : '改为淘汰'
+}
+
+function overrideVerdict(view: StageView, code: string, original: boolean): string {
+  const row = overrideResult(view, code)
+  return row ? verdictLabel(original ? row.original_verdict : row.verdict) : '不可用'
+}
+
 function metricKeys(view: StageView): string[] {
   return [...new Set(rows(view).flatMap((row) => Object.keys(row.metrics)))].sort()
+}
+
+function actionsFor(view: StageView) {
+  return stageActions(
+    view.stage,
+    view.status,
+    view.payload?.current.failure_kind ?? null,
+  )
 }
 
 function verdictLabel(verdict: DiscoveryRow['verdict']): string {
@@ -686,6 +962,14 @@ function formatValue(value: unknown): string {
   return '不可用'
 }
 
+function formatTimestamp(value: string | null): string {
+  if (!value) return '不可用'
+  const timestamp = Date.parse(value)
+  return Number.isFinite(timestamp)
+    ? new Intl.DateTimeFormat('zh-CN', { dateStyle: 'medium', timeStyle: 'short' }).format(timestamp)
+    : '不可用'
+}
+
 function markerPosition(marker: ThresholdMarker): string {
   if (marker.status !== 'available' || marker.position === null) return '不可用'
   const position = Number(marker.position)
@@ -693,13 +977,19 @@ function markerPosition(marker: ThresholdMarker): string {
 }
 
 onMounted(() => {
+  mounted = true
   void loadCurrent()
 })
 
 onBeforeUnmount(() => {
+  mounted = false
+  currentRequestSequence += 1
+  currentController?.abort()
+  currentController = null
+  abortStageRequests()
   activeRunId.value = null
-  activeStageKey.value = {}
   stopPoll()
+  stopCurrentRefresh()
 })
 </script>
 
@@ -730,6 +1020,12 @@ onBeforeUnmount(() => {
       <div class="panel run-summary">
         <h2>本周批次</h2>
         <p>周次：{{ state.run.week_key }}　状态：{{ STATUS_ZH[state.run.status] }}</p>
+        <p>
+          快照时间：{{ formatTimestamp(state.run.snapshot_at) }}　
+          数据版本：{{ state.run.data_version || '不可用' }}　
+          财务版本：{{ state.run.financial_version || '不可用' }}　
+          估值版本：{{ state.run.valuation_version || '不可用' }}
+        </p>
         <p v-if="state.run.error" role="alert">{{ state.run.error }}</p>
       </div>
 
@@ -744,6 +1040,22 @@ onBeforeUnmount(() => {
         <div class="toolbar">
           <h2>{{ view.title }}</h2>
           <p class="muted">状态：{{ STAGE_STATUS_ZH[view.status] }}</p>
+          <label v-if="view.track" class="stage-selector">
+            查看阶段
+            <select
+              v-model="selectedTrackStages[view.track]"
+              @change="onStageSelection(view.track)"
+            >
+              <option
+                v-for="stage in TRACK_STAGES"
+                :key="stage"
+                :value="stage"
+                :disabled="!stageAvailable(view.track, stage)"
+              >
+                {{ STAGE_ZH[stage] }}
+              </option>
+            </select>
+          </label>
         </div>
 
         <p v-if="view.error" role="alert">{{ view.error }}</p>
@@ -760,9 +1072,12 @@ onBeforeUnmount(() => {
         <p v-else-if="view.status === 'failed'" class="muted">
           仅瞬时失败可重试；永久失败请放弃后重新创建。
         </p>
+        <p v-if="view.stage === 'adjudication'" class="muted">
+          人工裁决将在 Task 4 接入逐项决策；当前只读，不提供确认或人工覆盖。
+        </p>
 
         <template v-if="view.payload">
-          <section class="stage-summary" aria-label="阶段摘要">
+          <section class="stage-summary" :aria-label="stageAriaLabel(view.title, '阶段摘要')">
             <div>
               <h3>本层固定规则</h3>
               <ul v-if="view.payload.summary.rules.length">
@@ -792,7 +1107,11 @@ onBeforeUnmount(() => {
           <details class="summary-details">
             <summary>指标分布与阈值位置</summary>
             <h3>指标分布</h3>
-            <div class="table-wrap" tabindex="0" aria-label="指标分布，可横向滚动">
+            <div
+              class="table-wrap"
+              tabindex="0"
+              :aria-label="stageAriaLabel(view.title, '指标分布，可横向滚动')"
+            >
               <table>
                 <thead>
                   <tr>
@@ -828,41 +1147,80 @@ onBeforeUnmount(() => {
             <p v-else class="muted">不可用</p>
           </details>
 
-          <div class="table-wrap" tabindex="0" :aria-label="`${view.title}结果，可横向滚动`">
+          <div
+            v-for="group in RESULT_GROUPS"
+            :key="group.key"
+            class="table-wrap"
+            tabindex="0"
+            :aria-label="stageAriaLabel(view.title, `${group.title}，可横向滚动`)"
+          >
             <table>
-              <caption>{{ view.title }}结构化结果</caption>
+              <caption>{{ view.title }} · {{ group.title }}</caption>
               <thead>
                 <tr>
                   <th>名称</th>
                   <th>代码</th>
-                  <th>判定</th>
+                  <th>原判定</th>
+                  <th>有效判定</th>
                   <th>理由</th>
                   <th>排名</th>
                   <th v-for="metric in metricKeys(view)" :key="metric">{{ metric }}</th>
-                  <th>人工覆盖</th>
                 </tr>
               </thead>
               <tbody>
-                <tr v-for="row in rows(view)" :key="row.code">
+                <tr v-for="row in resultRows(view, group.key)" :key="row.code">
                   <td>{{ row.name }}</td>
                   <td>{{ row.code }}</td>
+                  <td>{{ verdictLabel(row.original_verdict) }}</td>
                   <td>{{ verdictLabel(row.verdict) }}</td>
                   <td>{{ row.reason || '—' }}</td>
                   <td>{{ row.rank ?? '—' }}</td>
                   <td v-for="metric in metricKeys(view)" :key="metric">
                     {{ formatValue(row.metrics[metric]) }}
                   </td>
-                  <td>{{ row.override?.reason || '—' }}</td>
                 </tr>
-                <tr v-if="!rows(view).length">
-                  <td :colspan="6 + metricKeys(view).length">暂无结构化结果</td>
+                <tr v-if="!resultRows(view, group.key).length">
+                  <td :colspan="6 + metricKeys(view).length">暂无{{ group.title }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div
+            class="table-wrap"
+            tabindex="0"
+            :aria-label="stageAriaLabel(view.title, '人工覆盖记录，可横向滚动')"
+          >
+            <table>
+              <caption>{{ view.title }} · 人工覆盖记录</caption>
+              <thead>
+                <tr>
+                  <th>名称</th>
+                  <th>代码</th>
+                  <th>覆盖方向</th>
+                  <th>原判定</th>
+                  <th>有效判定</th>
+                  <th>覆盖理由</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="override in view.payload.overrides" :key="override.id">
+                  <td>{{ overrideResult(view, override.code)?.name || override.code }}</td>
+                  <td>{{ override.code }}</td>
+                  <td>{{ overrideDirection(override) }}</td>
+                  <td>{{ overrideVerdict(view, override.code, true) }}</td>
+                  <td>{{ overrideVerdict(view, override.code, false) }}</td>
+                  <td>{{ override.reason }}</td>
+                </tr>
+                <tr v-if="!view.payload.overrides.length">
+                  <td colspan="6">暂无人工覆盖记录</td>
                 </tr>
               </tbody>
             </table>
           </div>
 
           <form
-            v-if="view.track && view.status === 'waiting_confirmation'"
+            v-if="view.track && actionsFor(view).override"
             class="inline-form override-form"
             @submit.prevent="saveOverride(view)"
           >
@@ -887,7 +1245,7 @@ onBeforeUnmount(() => {
 
         <div class="stage-actions">
           <button
-            v-if="view.status === 'waiting_confirmation'"
+            v-if="actionsFor(view).confirm"
             type="button"
             :disabled="mutating"
             @click="stageMutation(view, 'confirm')"
@@ -895,19 +1253,21 @@ onBeforeUnmount(() => {
             确认本层
           </button>
           <button
-            v-if="view.status === 'failed'"
+            v-if="actionsFor(view).retry"
             type="button"
             :disabled="mutating"
             @click="stageMutation(view, 'retry')"
           >
             重试本层
           </button>
-          <span class="muted">仅在等待确认时可确认。</span>
+          <span v-if="view.stage !== 'adjudication'" class="muted">
+            仅在等待确认时可确认。
+          </span>
         </div>
       </article>
 
       <div
-        v-if="state.run.status !== 'completed' && state.run.status !== 'partially_completed' && state.run.status !== 'abandoned'"
+        v-if="canAbandonRun(state.run.current, state.run.status)"
         class="panel"
       >
         <h2>无法继续？</h2>
@@ -931,6 +1291,13 @@ onBeforeUnmount(() => {
 .stage-panel h3 {
   font-size: 1rem;
   margin-bottom: 0.35rem;
+}
+
+.stage-selector {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.9rem;
 }
 
 .stage-summary {

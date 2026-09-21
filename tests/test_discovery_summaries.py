@@ -869,6 +869,7 @@ def test_routes_attach_attempt_local_summaries_without_market_queries(
     from app.discovery_models import (
         DiscoveryCommonResult,
         DiscoveryCommonStage,
+        DiscoveryInputSnapshot,
         DiscoveryOverride,
         DiscoveryResult,
         DiscoveryStage,
@@ -914,6 +915,25 @@ def test_routes_attach_attempt_local_summaries_without_market_queries(
         run.status = "running"
         run.input_fingerprint = "frozen-input"
         run.snapshot_at = SNAPSHOT_AT
+        session.add(
+            DiscoveryInputSnapshot(
+                run_id=run.id,
+                code="600000.SH",
+                name="冻结公司名",
+                industry="制造业",
+                security_status="{}",
+                fields_json="{}",
+                sources_json="{}",
+                as_of_json="{}",
+                data_version=run.data_version,
+                financial_version=run.financial_version,
+                valuation_version=run.valuation_version,
+                ruler_versions_json="{}",
+                algorithm_version=run.algorithm_version,
+                input_fingerprint="frozen-input",
+                snapshot_at=SNAPSHOT_AT,
+            )
+        )
         common = DiscoveryCommonStage(
             run_id=run.id,
             attempt=1,
@@ -1102,13 +1122,14 @@ def test_routes_attach_attempt_local_summaries_without_market_queries(
         assert quality_body["summary"]["counts"]["overrides"] == 1
         assert quality_body["pass"] == []
         assert quality_body["drop"][0]["code"] == "600000.SH"
+        assert quality_body["drop"][0]["name"] == "冻结公司名"
+        assert safety_body["pass"][0]["name"] == "冻结公司名"
         assert safety_body["pass"][0]["metrics"]["price"] == "12.5"
 
         forbidden = (
             "financials",
             "valuation_history",
             "settings",
-            "discovery_input_snapshots",
         )
         assert not any(
             table in statement

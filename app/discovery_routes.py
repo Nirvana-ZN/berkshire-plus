@@ -438,7 +438,9 @@ def _evidence_json(row: DiscoveryEvidence) -> dict[str, object]:
 
 
 def _result_json(
-    row: object, override: DiscoveryOverride | None = None
+    row: object,
+    name: str,
+    override: DiscoveryOverride | None = None,
 ) -> dict[str, object]:
     verdict = (
         row.verdict
@@ -447,6 +449,7 @@ def _result_json(
     )
     return {
         "code": row.code,
+        "name": name,
         "verdict": verdict,
         "original_verdict": row.verdict,
         "reason": row.reason,
@@ -455,6 +458,15 @@ def _result_json(
         **({"rank": row.rank} if isinstance(row, DiscoveryResult) else {}),
         "created_at": _iso(row.created_at),
     }
+
+
+def _frozen_name(names: Mapping[str, str], code: str) -> str:
+    name = names.get(code)
+    if type(name) is not str or not name.strip():
+        raise CorruptDiscoveryResult(
+            "persisted discovery result has no frozen company name"
+        )
+    return name
 
 
 def _stage_changes(
@@ -510,12 +522,17 @@ def _compact_changes(session: Session, run: DiscoveryRun) -> list[dict[str, obje
 
 def _partition(
     rows: list[object],
+    names: Mapping[str, str],
     overrides: Mapping[str, DiscoveryOverride] | None = None,
 ) -> dict[str, list[dict[str, object]]]:
     override_rows = overrides or {}
     return {
         verdict: [
-            _result_json(row, override_rows.get(row.code))
+            _result_json(
+                row,
+                _frozen_name(names, row.code),
+                override_rows.get(row.code),
+            )
             for row in rows
             if (
                 row.verdict
@@ -552,6 +569,12 @@ def _common_payload(session: Session, run: DiscoveryRun):
     by_attempt: dict[int, list[DiscoveryCommonResult]] = {}
     for row in result_rows:
         by_attempt.setdefault(row.attempt, []).append(row)
+    names = dict(
+        session.execute(
+            select(DiscoveryInputSnapshot.code, DiscoveryInputSnapshot.name)
+            .where(DiscoveryInputSnapshot.run_id == run.id)
+        ).all()
+    )
     current = next(
         (row for row in reversed(stages) if row.superseded_at is None), None
     )
@@ -565,7 +588,7 @@ def _common_payload(session: Session, run: DiscoveryRun):
         summaries[stage.id] = summary
         attempts.append(
             _common_stage_json(stage)
-            | _partition(rows)
+            | _partition(rows, names)
             | {"summary": summary}
         )
     current_rows = by_attempt.get(current.attempt, [])
@@ -574,7 +597,7 @@ def _common_payload(session: Session, run: DiscoveryRun):
         "run": _run_payload(session, run),
         "current": _common_stage_json(current) | {"summary": current_summary},
         "attempts": attempts,
-        **_partition(current_rows),
+        **_partition(current_rows, names),
         "summary": current_summary,
     }
 
@@ -610,6 +633,12 @@ def _track_payload(
     by_attempt: dict[int, list[DiscoveryResult]] = {}
     for row in result_rows:
         by_attempt.setdefault(row.attempt, []).append(row)
+    names = dict(
+        session.execute(
+            select(DiscoveryInputSnapshot.code, DiscoveryInputSnapshot.name)
+            .where(DiscoveryInputSnapshot.run_id == run.id)
+        ).all()
+    )
     override_rows = session.scalars(
         select(DiscoveryOverride)
         .where(
@@ -691,7 +720,7 @@ def _track_payload(
         summaries[attempt.id] = summary
         attempts.append(
             _track_stage_json(attempt)
-            | _partition(rows, attempt_overrides)
+            | _partition(rows, names, attempt_overrides)
             | {
                 "overrides": [
                     _override_json(row) for row in attempt_override_rows
@@ -708,7 +737,7 @@ def _track_payload(
         "run": _run_payload(session, run),
         "current": _track_stage_json(current) | {"summary": current_summary},
         "attempts": attempts,
-        **_partition(current_rows, current_overrides),
+        **_partition(current_rows, names, current_overrides),
         "overrides": [
             _override_json(row) for row in current_override_rows
         ],

@@ -8,6 +8,7 @@
     "build": "run-p type-check \"build-only {@}\" --",
     "preview": "vite preview",
     "build-only": "vite build",
+    "test:view-model": "node --experimental-strip-types --test src/views/__tests__/discoveryViewModel.test.ts",
     "type-check": "vue-tsc --build"
   },
   "dependencies": {

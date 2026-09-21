@@ -4765,6 +4765,7 @@ def test_stage_reads_preserve_zero_result_attempts_and_partitions(
     from app.discovery_models import (
         DiscoveryCommonResult,
         DiscoveryCommonStage,
+        DiscoveryInputSnapshot,
         DiscoveryResult,
         DiscoveryStage,
     )
@@ -4792,6 +4793,34 @@ def test_stage_reads_preserve_zero_result_attempts_and_partitions(
             common = session.query(DiscoveryCommonStage).filter_by(
                 run_id=run_id
             ).one()
+            frozen = session.query(DiscoveryInputSnapshot).filter_by(
+                run_id=run_id,
+                code="600000.SH",
+            ).one()
+            session.add_all(
+                DiscoveryInputSnapshot(
+                    run_id=run_id,
+                    code=code,
+                    name=name,
+                    industry=frozen.industry,
+                    security_status=frozen.security_status,
+                    fields_json=frozen.fields_json,
+                    sources_json=frozen.sources_json,
+                    as_of_json=frozen.as_of_json,
+                    data_version=frozen.data_version,
+                    financial_version=frozen.financial_version,
+                    valuation_version=frozen.valuation_version,
+                    ruler_versions_json=frozen.ruler_versions_json,
+                    algorithm_version=frozen.algorithm_version,
+                    input_fingerprint=frozen.input_fingerprint,
+                    snapshot_at=frozen.snapshot_at,
+                )
+                for code, name in (
+                    ("000001.SZ", "冻结公司一"),
+                    ("000002.SZ", "冻结公司二"),
+                    ("000003.SZ", "冻结公司三"),
+                )
+            )
             session.add_all(
                 [
                     DiscoveryCommonResult(

@@ -108,6 +108,12 @@ def test_discovery_view_guides_stages_with_typed_structured_results() -> None:
     assert "/overrides" in page
     assert "activeRunId" in page
     assert "activeStageKey" in page
+    assert "AbortController" in page
+    assert "currentRequestSequence" in page
+    assert "stagePayloadCache" in page
+    assert "selectedTrackStages" in page
+    assert "original_verdict" in page
+    assert "snapshot_at" in page
     assert "800" in page
     assert "onBeforeUnmount" in page
     assert "snapshot_json" not in page
@@ -126,3 +132,24 @@ def test_discovery_view_requires_override_reason_and_terminal_guidance() -> None
     assert "仅瞬时失败可重试" in page
     assert "放弃本批次并重新创建" in page
     assert "Number.isFinite" in page
+
+
+def test_discovery_view_review_guards_and_read_only_adjudication() -> None:
+    page = (ROOT / "web/src/views/DiscoveryView.vue").read_text(
+        encoding="utf-8"
+    )
+    helper = (ROOT / "web/src/views/discoveryViewModel.ts").read_text(
+        encoding="utf-8"
+    )
+
+    assert "stageCacheKey(runId, view.track, view.stage)" in page
+    assert "clearStageCache" in page
+    assert "CURRENT_REFRESH_MS" in page
+    assert "beforeMutation" in page
+    assert "人工裁决将在 Task 4" in page
+    assert "通过结果" in page
+    assert "淘汰结果" in page
+    assert "数据不足结果" in page
+    assert "人工覆盖记录" in page
+    assert "stageAriaLabel" in page
+    assert "stage !== 'adjudication'" in helper

@@ -163,6 +163,30 @@ def _advance_to_competition(client) -> int:
     return run_id
 
 
+def test_current_partially_completed_run_can_be_abandoned(tmp_path) -> None:
+    from fastapi.testclient import TestClient
+
+    from app.discovery_models import DiscoveryRun
+
+    app = _workflow_app(tmp_path)
+    with TestClient(app) as client:
+        run_id = client.post(
+            "/api/discoveries", json={"sync": True}
+        ).json()["id"]
+        with app.state.session_factory() as session:
+            run = session.get(DiscoveryRun, run_id)
+            assert run is not None
+            run.status = "partially_completed"
+            session.commit()
+
+        response = client.post(
+            f"/api/discoveries/{run_id}/abandon", json={}
+        )
+        assert response.status_code == 200
+        assert response.json()["status"] == "abandoned"
+        assert response.json()["current"] is False
+
+
 def test_prior_week_mutations_are_immutable_but_recompute_remains_allowed(
     tmp_path,
 ) -> None:
