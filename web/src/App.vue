@@ -10,7 +10,8 @@ import { RouterLink, RouterView } from 'vue-router'
         <RouterLink to="/" active-class="is-prefix" exact-active-class="router-link-active">首页</RouterLink>
         <RouterLink to="/positions">看仓</RouterLink>
         <RouterLink to="/screen">选股</RouterLink>
-        <RouterLink to="/cheap">低估值</RouterLink>
+        <RouterLink to="/discover">每周发现</RouterLink>
+        <RouterLink to="/cheap">低估值（旧版）</RouterLink>
         <RouterLink to="/settings">设置</RouterLink>
       </nav>
     </header>

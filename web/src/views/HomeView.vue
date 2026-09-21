@@ -276,7 +276,11 @@ onBeforeUnmount(() => {
         <p>漏斗、评估与观察池。</p>
       </article>
       <article>
-        <h2><RouterLink to="/cheap">低估值</RouterLink></h2>
+        <h2><RouterLink to="/discover">每周发现</RouterLink></h2>
+        <p>按周运行固定尺子，逐层确认候选。</p>
+      </article>
+      <article>
+        <h2><RouterLink to="/cheap">低估值（旧版）</RouterLink></h2>
         <p>沪深 A 股截面便宜榜，点进 Checklist。</p>
       </article>
     </div>
