@@ -252,6 +252,11 @@ def _fact_items(
                 if field in formulas
             }
         )
+        sources = {_source(field) for field in fields}
+        if len(sources) != 1:
+            raise ValueError("evidence fact spans incompatible sources")
+        source = sources.pop()
+        inputs["source"] = source
         result.append(
             _item(
                 kind="fact",
@@ -259,7 +264,7 @@ def _fact_items(
                 rule_id=f"{track}.fact.{rule_name}",
                 inputs=inputs,
                 text=",".join(f"{field}={metrics[field]}" for field in fields),
-                as_of=min(source_as_of[_source(field)] for field in fields),
+                as_of=source_as_of[source],
                 completeness="complete",
             )
         )
@@ -324,7 +329,11 @@ def _threshold_risk(
                     kind="risk",
                     category="metric_near_threshold",
                     rule_id=f"{track}.risk.metric_near_threshold.{field}",
-                    inputs={field: metrics[field], name: thresholds[name]},
+                    inputs={
+                        field: metrics[field],
+                        name: thresholds[name],
+                        "source": _source(field),
+                    },
                     text=f"{field}接近阈值",
                     as_of=source_as_of[_source(field)],
                     completeness="complete",
@@ -358,7 +367,7 @@ def _flag_risk(
                 kind="risk",
                 category=category,
                 rule_id=f"{track}.risk.{category}.{flag}",
-                inputs={"risk_flag": flag},
+                inputs={"risk_flag": flag, "source": "financial"},
                 text=flag,
                 as_of=source_as_of["financial"],
                 completeness="complete",
@@ -393,7 +402,7 @@ def _missing_risk(
                 kind="risk",
                 category="missing_non_gating_evidence",
                 rule_id=f"{track}.risk.missing_non_gating_evidence.{field}",
-                inputs={"missing_field": field},
+                inputs={"missing_field": field, "source": _source(field)},
                 text=f"{field}缺少非门槛证据",
                 as_of=source_as_of[_source(field)],
                 completeness="partial",
