@@ -339,7 +339,7 @@ onBeforeUnmount(() => {
       </article>
       <article>
         <h2><RouterLink to="/discover">每周发现</RouterLink></h2>
-        <p>按周运行固定尺子，逐层确认候选。</p>
+        <p>全市场按周运行固定尺子，逐层确认候选。</p>
         <p v-if="currentDiscovery">
           本周批次 {{ currentDiscovery.week_key }} ·
           {{ discoveryStatusText(currentDiscovery.status) }} ·
@@ -348,8 +348,8 @@ onBeforeUnmount(() => {
         <p v-else class="muted">本周批次：尚未创建</p>
       </article>
       <article>
-        <h2><RouterLink to="/cheap">低估值（旧版）</RouterLink></h2>
-        <p>沪深 A 股截面便宜榜，点进 Checklist。</p>
+        <h2><RouterLink to="/cheap">旧版低估值榜（次要）</RouterLink></h2>
+        <p>保留用于回退的旧版沪深 A 股截面便宜榜。</p>
       </article>
     </div>
 

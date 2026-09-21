@@ -169,6 +169,32 @@ def test_fastapi_hosts_spa_when_dist_exists(tmp_path: Path) -> None:
         assert client.get("/api/health").status_code == 200
 
 
+def test_legacy_cheap_rollback_route_and_health_remain_available(
+    tmp_path: Path,
+) -> None:
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text(
+        "<!doctype html><p>每周发现</p>",
+        encoding="utf-8",
+    )
+    app = create_app(
+        db_path=tmp_path / "app.db",
+        dist_path=dist,
+        quote_client=FakeQuoteClient(),
+        env_path=tmp_path / ".env",
+    )
+    with TestClient(app, follow_redirects=False) as client:
+        legacy = client.get("/cheap")
+        health = client.get("/api/health")
+
+    assert legacy.status_code == 200
+    assert legacy.headers.get("location") is None
+    assert "每周发现" in legacy.text
+    assert health.status_code == 200
+    assert health.json()["status"] == "ok"
+
+
 def test_missing_dist_root_is_envelope_404(tmp_path: Path) -> None:
     app = create_app(
         db_path=tmp_path / "app.db",

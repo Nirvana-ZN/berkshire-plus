@@ -35,6 +35,7 @@ const router = createRouter({
       path: '/cheap',
       name: 'cheap',
       component: CheapView,
+      meta: { legacy: true },
     },
     {
       path: '/research/:id',

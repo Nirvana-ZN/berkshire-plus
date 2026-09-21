@@ -340,14 +340,18 @@ def test_api_cheap_rejects_unknown_sort(tmp_path: Path) -> None:
         assert body.status_code == 400
 
 
-def test_views_show_cheap_board() -> None:
+def test_legacy_cheap_board_is_retained_but_demoted() -> None:
     home = (ROOT / "web/src/views/HomeView.vue").read_text(encoding="utf-8")
     app = (ROOT / "web/src/App.vue").read_text(encoding="utf-8")
     router = (ROOT / "web/src/router/index.ts").read_text(encoding="utf-8")
     page = (ROOT / "web/src/views/CheapView.vue").read_text(encoding="utf-8")
-    assert 'to="/cheap"' in app
+    assert 'to="/discover"' in app
+    assert 'to="/cheap"' not in app
     assert 'to="/cheap"' in home
+    assert "旧版低估值榜（次要）" in home
+    assert "全市场" in home
     assert "CheapView" in router
+    assert "meta: { legacy: true }" in router
     assert "/api/cheap" in page
     assert "低估值" in page
     assert "去劣" in page
