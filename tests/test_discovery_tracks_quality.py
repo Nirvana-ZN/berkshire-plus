@@ -209,6 +209,7 @@ def quality_payload(**threshold_overrides: str) -> dict[str, object]:
         "order": [
             ["pe_percentile", "asc", "nulls_last"],
             ["roe_cv", "asc", "nulls_last"],
+            ["cash_conversion", "desc", "nulls_last"],
             ["code", "asc", "nulls_last"],
         ],
         "industry_version": "test-industry-v1",
@@ -404,6 +405,12 @@ def test_quality_ruler_has_strict_semantic_schema() -> None:
 
     ruler = quality_discount_ruler(quality_payload())
     assert ruler.track == "quality_discount"
+    assert ruler.order == (
+        ("pe_percentile", "asc", "nulls_last"),
+        ("roe_cv", "asc", "nulls_last"),
+        ("cash_conversion", "desc", "nulls_last"),
+        ("code", "asc", "nulls_last"),
+    )
     for mutation in (
         lambda value: value["thresholds"].pop("roe_mean_min"),
         lambda value: value["thresholds"].pop("net_income_positive_min"),
@@ -439,6 +446,7 @@ def test_quality_ruler_has_strict_semantic_schema() -> None:
             "gate_order"
         ].reverse(),
         lambda value: value["formulas"].__setitem__("roe_mean", "vendor_roe"),
+        lambda value: value["order"].pop(2),
     ):
         value = json.loads(json.dumps(quality_payload()))
         mutation(value)
