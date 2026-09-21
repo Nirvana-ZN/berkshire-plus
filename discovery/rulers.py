@@ -74,6 +74,12 @@ QUALITY_DISCOUNT_FIELDS = (
     "bank_npl",
     "code",
 )
+QUALITY_DISCOUNT_ORDER = (
+    ("pe_percentile", "asc", "nulls_last"),
+    ("roe_cv", "asc", "nulls_last"),
+    ("cash_conversion", "desc", "nulls_last"),
+    ("code", "asc", "nulls_last"),
+)
 QUALITY_DISCOUNT_FORMULAS = MappingProxyType(
     {
         "roe_mean": "mean(annual.roe)",
@@ -615,6 +621,8 @@ def validate_quality_discount_ruler(ruler: TrackRuler) -> TrackRuler:
         raise ValueError("quality discount fields do not match the supported schema")
     if dict(ruler.formulas) != dict(QUALITY_DISCOUNT_FORMULAS):
         raise ValueError("quality discount formulas do not match the supported schema")
+    if ruler.order != QUALITY_DISCOUNT_ORDER:
+        raise ValueError("quality discount order does not match the supported schema")
     if set(ruler.thresholds) != QUALITY_DISCOUNT_THRESHOLDS:
         raise ValueError("quality discount thresholds must be complete and exact")
     if set(ruler.min_observations) != QUALITY_DISCOUNT_MINIMUMS:
