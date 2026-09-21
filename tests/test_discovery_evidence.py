@@ -363,6 +363,18 @@ def test_builtin_competition_emits_evidence_for_every_entrant() -> None:
         replace(
             outcome,
             evidence=(
+                replace(
+                    first_evidence,
+                    input_fields_json=canonical_json(
+                        {"metric": "1", "source": "financial"}
+                    ),
+                ),
+                *outcome.evidence[1:],
+            ),
+        ),
+        replace(
+            outcome,
+            evidence=(
                 replace(first_evidence, rule_version="ruler-digest"),
                 *outcome.evidence[1:],
             ),
