@@ -976,7 +976,9 @@ def test_calibrator_deep_value_emits_approval_ready_proxy_evidence(
     assert artifact["provenance_coverage"]["other_income"]["trusted"] == 1
     assert "conservative non-core-income proxy" in artifact["note"]
     assert "government grant" not in artifact["note"].lower()
-    assert artifact["candidate_counts"]["base"]["branches"]["bank"]["pass"] == 1
+    assert artifact["candidate_counts"]["base"]["branches"]["financial"][
+        "pass"
+    ] == 1
     assert hashlib.sha256(db.read_bytes()).hexdigest() == before
 
 
@@ -996,7 +998,12 @@ def test_calibrator_deep_value_blocks_missing_trusted_proxy_source(
     _calibration_preflight_db(db)
     company = _company(
         annual=tuple(
-            _deep_annual(year, other_income=None)
+            _deep_annual(
+                year,
+                ocf="10",
+                capex="20",
+                other_income=None,
+            )
             for year in range(2021, 2026)
         )
     )
@@ -1036,3 +1043,14 @@ def test_calibrator_deep_value_blocks_missing_trusted_proxy_source(
     assert artifact["blocked_reasons"] == [
         "trusted_field_coverage_below_readiness"
     ]
+    assert artifact["candidate_counts"]["base"]["drop"] == 1
+    assert artifact["provenance_coverage"]["other_income"] == {
+        "present": 0,
+        "trusted": 0,
+        "total": 1,
+        "ratio": "0",
+        "sources": [],
+    }
+    assert artifact["distributions"]["missing_reasons"][
+        "missing_trusted_other_income"
+    ] == 1

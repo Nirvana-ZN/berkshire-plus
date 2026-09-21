@@ -874,26 +874,14 @@ def test_growth_driver_trend_emits_generic_deterministic_risk() -> None:
     )
 
 
-def test_calibrator_garp_approves_declared_roe_fallback_separately(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
+def _garp_calibration_snapshot(company):
     from discovery.snapshot import (
         CompanySnapshotInput,
         ProductionSnapshot,
         SnapshotVersions,
     )
-    from scripts import calibrate_discovery
 
-    db = tmp_path / "production-contract.db"
-    _calibration_preflight_db(db)
-    company = _company(
-        annual=tuple(
-            _garp_annual(year, roic=None, roe="13")
-            for year in range(2021, 2026)
-        )
-    )
-    snapshot = ProductionSnapshot(
+    return ProductionSnapshot(
         fill_id=7,
         companies=(
             CompanySnapshotInput(
@@ -918,6 +906,23 @@ def test_calibrator_garp_approves_declared_roe_fallback_separately(
         trading_dates=MappingProxyType({"SH": ("2026-09-15",)}),
         snapshot_at=company.snapshot_at,
     )
+
+
+def test_calibrator_garp_approves_declared_roe_fallback_separately(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from scripts import calibrate_discovery
+
+    db = tmp_path / "production-contract.db"
+    _calibration_preflight_db(db)
+    company = _company(
+        annual=tuple(
+            _garp_annual(year, roic=None, roe="13")
+            for year in range(2021, 2026)
+        )
+    )
+    snapshot = _garp_calibration_snapshot(company)
     monkeypatch.setattr(
         calibrate_discovery,
         "build_production_snapshot",
@@ -936,10 +941,71 @@ def test_calibrator_garp_approves_declared_roe_fallback_separately(
     ] == "roic_then_roe"
     assert first["return_metric_coverage"] == {
         "policy": "roic_then_roe",
-        "roic": {"present": 0, "total": 1, "ratio": "0"},
-        "roe_fallback": {"present": 1, "total": 1, "ratio": "1"},
-        "insufficient": {"present": 0, "total": 1, "ratio": "0"},
+        "selected_labels": {
+            "roic": 0,
+            "roe_fallback": 1,
+            "insufficient": 0,
+        },
+        "roic": {
+            "companies": 0,
+            "observations": 0,
+            "total": 1,
+            "ratio": "0",
+        },
+        "roe_fallback": {
+            "companies": 1,
+            "observations": 5,
+            "total": 1,
+            "ratio": "1",
+        },
     }
     assert first["field_coverage"]["return_on_capital"]["ratio"] == "1"
     assert first["candidate_counts"]["base"]["pass"] == 1
     assert hashlib.sha256(db.read_bytes()).hexdigest() == before
+
+
+@pytest.mark.parametrize(
+    ("roic", "expected_observations"),
+    [("0", 0), ("-1", 0)],
+)
+def test_calibrator_garp_never_counts_zero_or_invalid_roic_as_coverage(
+    tmp_path: Path,
+    monkeypatch,
+    roic: str,
+    expected_observations: int,
+) -> None:
+    from scripts import calibrate_discovery
+
+    db = tmp_path / "invalid-return.db"
+    _calibration_preflight_db(db)
+    company = _company(
+        annual=tuple(
+            _garp_annual(year, roic=roic, roe="13")
+            for year in range(2021, 2026)
+        )
+    )
+    monkeypatch.setattr(
+        calibrate_discovery,
+        "build_production_snapshot",
+        lambda _session: _garp_calibration_snapshot(company),
+    )
+    artifact = calibrate_discovery.calibrate(db, track="garp")
+    assert artifact["status"] == "blocked"
+    assert artifact["return_metric_coverage"]["selected_labels"]["roic"] == 1
+    assert artifact["return_metric_coverage"]["roic"]["companies"] == 0
+    assert artifact["return_metric_coverage"]["roic"][
+        "observations"
+    ] == expected_observations
+    assert artifact["return_metric_coverage"]["roe_fallback"][
+        "observations"
+    ] == 0
+
+
+def test_calibrator_reports_exact_supported_and_unsupported_branches() -> None:
+    from scripts.calibrate_discovery import _ruler_branch
+
+    assert _ruler_branch("garp", "制造业") == "nonfinancial"
+    assert _ruler_branch("garp", "银行") == "unsupported_bank"
+    assert _ruler_branch("garp", "保险") == "unsupported_insurance"
+    assert _ruler_branch("garp", "证券") == "unsupported_other_financial"
+    assert _ruler_branch("garp", "-") == "unknown"

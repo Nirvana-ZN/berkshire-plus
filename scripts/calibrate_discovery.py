@@ -13,6 +13,7 @@ import sqlite3
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from decimal import Decimal, InvalidOperation
+from fractions import Fraction
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -50,8 +51,11 @@ from discovery.snapshot import (
     build_production_snapshot,
     canonical_json,
 )
+from discovery.summaries import _distribution
+from discovery.tracks.deep_value import _DOMAINS as DEEP_VALUE_DOMAINS
 from discovery.tracks.quality_discount import (
     QUALITY_DOMAIN_INVALID_REASONS,
+    _FINANCIAL_FIELD_DOMAINS as QUALITY_DOMAINS,
     MAX_FINANCIAL_ROWS,
     MAX_VALUATION_ROWS,
     bounded_ratio,
@@ -59,6 +63,7 @@ from discovery.tracks.quality_discount import (
     decimal_string,
 )
 from discovery.tracks.deep_value import classify as classify_deep_value
+from discovery.tracks.garp import _DOMAINS as GARP_DOMAINS
 from discovery.tracks.garp import classify as classify_garp
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -386,6 +391,8 @@ def _blocked(
         "universe": None,
         "field_coverage": None,
         "provenance_coverage": None,
+        "branch_coverage": None,
+        "source_coverage": None,
         "distributions": None,
         "candidate_counts": None,
         "source_as_of": None,
@@ -805,15 +812,14 @@ def _garp_payload(
 def _quantiles(values: Sequence[Decimal]) -> dict[str, str] | None:
     if not values:
         return None
-    ordered = sorted(values)
-    result = {}
-    for label, numerator in (("min", 0), ("p25", 1), ("p50", 2), ("p75", 3), ("max", 4)):
-        index = ((len(ordered) - 1) * numerator) // 4
-        text = decimal_string(ordered[index])
-        if text is None:
-            return None
-        result[label] = text
-    return result
+    distribution = _distribution(values)
+    return {
+        "min": str(distribution["min"]),
+        "p25": str(distribution["p25"]),
+        "p50": str(distribution["median"]),
+        "p75": str(distribution["p75"]),
+        "max": str(distribution["max"]),
+    }
 
 
 def _as_decimal(value: object) -> Decimal | None:
@@ -899,71 +905,6 @@ def _valuation_method_distribution(
     }
 
 
-_TRACK_INPUT_FIELDS: Mapping[str, Mapping[str, tuple[str, ...]]] = {
-    "quality_discount": {
-        "nonfinancial": (
-            "roe",
-            "net_income",
-            "net_assets",
-            "ocf",
-            "shares",
-            "interest_debt",
-            "interest_coverage",
-            "gross_margin",
-            "deducted_net_income",
-        ),
-        "bank": (
-            "roe",
-            "net_assets",
-            "capital_adequacy",
-            "core_tier1_capital_adequacy",
-            "npl",
-        ),
-    },
-    "deep_value": {
-        "nonfinancial": (
-            "deducted_net_income",
-            "ocf",
-            "capex",
-            "shares",
-            "cash",
-            "interest_debt",
-            "interest_coverage",
-            "revenue",
-            "net_income",
-            "impairment_loss",
-            "other_income",
-            "asset_disposal_gain",
-        ),
-        "bank": (
-            "roe",
-            "npl",
-            "capital_adequacy",
-            "core_tier1_capital_adequacy",
-        ),
-    },
-    "garp": {
-        "nonfinancial": (
-            "revenue",
-            "deducted_net_income",
-            "net_income",
-            "ocf",
-            "shares",
-            "roic",
-            "roe",
-            "interest_debt",
-            "goodwill",
-            "acquisition_cash_paid",
-            "gross_margin",
-            "net_margin",
-            "impairment_loss",
-            "other_income",
-            "asset_disposal_gain",
-        ),
-    },
-}
-
-
 def _coverage(present: int, total: int) -> dict[str, object]:
     return {
         "present": present,
@@ -974,60 +915,577 @@ def _coverage(present: int, total: int) -> dict[str, object]:
     }
 
 
-def _provenance_coverage(
+def _ruler_branch(track: str, industry: str | None) -> str:
+    shared = classify_industry_branch(industry)
+    if track == "quality_discount":
+        if shared == "nonfinancial":
+            value = (industry or "").strip()
+            return (
+                "cyclical"
+                if any(
+                    token in value
+                    for token in ("煤", "钢", "有色", "化工", "航运", "建材")
+                )
+                else "nonfinancial"
+            )
+        return shared if shared in {"bank", "unknown"} else f"unsupported_{shared}"
+    if track == "deep_value":
+        if shared == "bank":
+            return "financial"
+        if shared == "nonfinancial":
+            return "nonfinancial"
+        return "unknown" if shared == "unknown" else f"unsupported_{shared}"
+    if shared == "nonfinancial":
+        return "nonfinancial"
+    return "unknown" if shared == "unknown" else f"unsupported_{shared}"
+
+
+def _domain(track: str, field: str) -> str:
+    domains: Mapping[str, object] = (
+        QUALITY_DOMAINS
+        if track == "quality_discount"
+        else DEEP_VALUE_DOMAINS
+        if track == "deep_value"
+        else GARP_DOMAINS
+    )
+    value = domains[field]
+    return str(value[0] if isinstance(value, tuple) else value)
+
+
+def _trusted_decimal(
+    row: Mapping[str, object],
+    field: str,
+    track: str,
+) -> tuple[bool, Decimal | None]:
+    values = row.get("values")
+    metadata = row.get("field_sources")
+    provenance = row.get("provenance")
+    if not isinstance(values, Mapping):
+        return False, None
+    raw = values.get(field)
+    present = raw is not None
+    item = metadata.get(field) if isinstance(metadata, Mapping) else None
+    field_provenance = (
+        provenance.get(field) if isinstance(provenance, Mapping) else None
+    )
+    parsed = _as_decimal(raw)
+    if (
+        parsed is None
+        or not isinstance(item, Mapping)
+        or item.get("trusted") is not True
+        or item.get("source") != "discovery"
+        or isinstance(field_provenance, (str, bytes))
+        or not isinstance(field_provenance, Sequence)
+        or "discovery" not in field_provenance
+    ):
+        return present, None
+    domain = _domain(track, field)
+    if domain in {"positive", "positive_usable"} and parsed <= 0:
+        return present, None
+    if domain == "nonnegative" and parsed < 0:
+        return present, None
+    return present, parsed
+
+
+def _annual_rows(company: Any) -> dict[int, Mapping[str, object]]:
+    history = company.fields.get("financial_history")
+    if not isinstance(history, Sequence):
+        return {}
+    result: dict[int, Mapping[str, object]] = {}
+    for row in history:
+        if (
+            not isinstance(row, Mapping)
+            or row.get("period_type") != "annual"
+        ):
+            continue
+        period = row.get("period")
+        if type(period) is not str:
+            continue
+        year_text = period[:4]
+        if len(year_text) == 4 and year_text.isdigit():
+            result[int(year_text)] = row
+    return result
+
+
+def _requirements(
+    track: str,
+    branch: str,
+    proposal: Mapping[str, object],
+) -> tuple[tuple[str, tuple[str, ...], int, int, str], ...]:
+    minimums = proposal["min_observations"]
+    branches = proposal["sector_branches"]
+    assert isinstance(minimums, Mapping) and isinstance(branches, Mapping)
+    common = branches["common"]
+    assert isinstance(common, Mapping)
+    windows = (
+        common["annual_observations"]
+        if track == "garp"
+        else common["lookback_windows"]
+    )
+    assert isinstance(windows, Mapping)
+
+    def item(
+        name: str,
+        fields: tuple[str, ...],
+        window: str,
+        mode: str = "count",
+    ) -> tuple[str, tuple[str, ...], int, int, str]:
+        return (
+            name,
+            fields,
+            int(windows[window]),
+            int(minimums[name]),
+            mode,
+        )
+
+    if track == "quality_discount":
+        if branch == "bank":
+            return (
+                item("bank_roe", ("roe",), "roe"),
+                item("net_assets", ("net_assets",), "positive_equity", "latest"),
+                item(
+                    "bank_capital",
+                    ("capital_adequacy", "core_tier1_capital_adequacy"),
+                    "bank_capital",
+                    "latest",
+                ),
+                item("bank_npl", ("npl",), "bank_npl", "latest"),
+            )
+        requirements = [
+            item("roe", ("roe",), "roe"),
+            item(
+                "positive_net_income",
+                ("net_income",),
+                "profitability",
+            ),
+            item(
+                "net_assets",
+                ("net_assets",),
+                "positive_equity",
+                "latest",
+            ),
+            item(
+                "cash_conversion",
+                ("ocf", "net_income"),
+                "cash_conversion",
+            ),
+            item("dilution", ("shares",), "dilution", "endpoints"),
+            item(
+                "leverage",
+                ("interest_debt", "net_assets"),
+                "leverage",
+                "latest",
+            ),
+            item(
+                "interest_coverage",
+                ("interest_coverage",),
+                "interest_coverage",
+                "latest",
+            ),
+            item("margin", ("gross_margin",), "margin", "endpoints"),
+        ]
+        if branch == "cyclical":
+            requirements.append(
+                item(
+                    "normalized_earnings",
+                    ("deducted_net_income",),
+                    "normalized_earnings",
+                )
+            )
+        return tuple(requirements)
+    if track == "deep_value":
+        if branch == "financial":
+            return (
+                item("bank_roe", ("roe",), "bank_roe"),
+                item("bank_npl", ("npl",), "bank_npl", "endpoints"),
+                item(
+                    "bank_capital",
+                    ("capital_adequacy", "core_tier1_capital_adequacy"),
+                    "bank_capital",
+                    "latest",
+                ),
+            )
+        return (
+            item(
+                "normalized_earnings",
+                ("deducted_net_income",),
+                "normalized_earnings",
+            ),
+            item("fcf", ("ocf", "capex"), "fcf"),
+            item(
+                "net_debt",
+                ("interest_debt", "cash"),
+                "net_debt",
+                "latest",
+            ),
+            item(
+                "interest_coverage",
+                ("interest_coverage",),
+                "interest_coverage",
+                "latest",
+            ),
+            item("dilution", ("shares",), "dilution", "endpoints"),
+            item("revenue", ("revenue",), "revenue", "endpoints"),
+            item(
+                "one_time_profit",
+                ("net_income", "deducted_net_income"),
+                "one_time_profit",
+                "latest",
+            ),
+            item(
+                "impairment",
+                ("impairment_loss",),
+                "impairment",
+                "latest",
+            ),
+            item(
+                "non_core_income_proxy",
+                ("other_income", "asset_disposal_gain"),
+                "non_core_income_proxy",
+                "latest",
+            ),
+        )
+    return (
+        item(
+            "revenue_growth",
+            ("revenue",),
+            "growth",
+            "exact",
+        ),
+        item(
+            "deducted_profit_growth",
+            ("deducted_net_income",),
+            "growth",
+            "exact",
+        ),
+        item(
+            "cash_conversion",
+            ("ocf", "net_income"),
+            "cash_conversion",
+        ),
+        item("dilution", ("shares",), "dilution", "endpoints"),
+        item(
+            "growth_drivers",
+            ("revenue", "interest_debt", "goodwill", "acquisition_cash_paid"),
+            "growth_drivers",
+            "endpoints",
+        ),
+        item(
+            "margin",
+            ("gross_margin", "net_margin"),
+            "margin",
+            "endpoints",
+        ),
+        item(
+            "quality_adjustments",
+            (
+                "deducted_net_income",
+                "impairment_loss",
+                "other_income",
+                "asset_disposal_gain",
+            ),
+            "quality_adjustments",
+            "latest",
+        ),
+    )
+
+
+def _requirement_result(
+    company: Any,
+    track: str,
+    fields: tuple[str, ...],
+    window: int,
+    minimum: int,
+    mode: str,
+    allowed_staleness: int,
+) -> tuple[dict[str, bool], bool]:
+    history = _annual_rows(company)
+    if not history:
+        return {field: False for field in fields}, False
+    latest = max(history)
+    completed = (
+        company.snapshot_at.year
+        if (
+            company.snapshot_at.month,
+            company.snapshot_at.day,
+        )
+        == (12, 31)
+        else company.snapshot_at.year - 1
+    )
+    stale = completed - latest
+    start = latest - window + 1
+    rows = [
+        (year, history[year])
+        for year in sorted(history)
+        if start <= year <= latest
+    ]
+    present = {field: False for field in fields}
+    available: list[int] = []
+    for year, row in rows:
+        trusted: dict[str, Decimal | None] = {}
+        for field in fields:
+            is_present, value = _trusted_decimal(row, field, track)
+            present[field] = present[field] or is_present
+            trusted[field] = value
+        if all(trusted[field] is not None for field in fields) and not (
+            track == "quality_discount"
+            and fields == ("ocf", "net_income")
+            and trusted["net_income"] <= 0  # type: ignore[operator]
+        ):
+            available.append(year)
+    passed = len(available) >= minimum
+    passed = passed and 0 <= stale <= allowed_staleness
+    if mode == "latest":
+        passed = passed and latest in available
+    elif mode == "endpoints":
+        passed = passed and start in available and latest in available
+    elif mode == "exact":
+        passed = (
+            len(available) == window
+            and minimum == window
+            and available == list(range(start, latest + 1))
+        )
+    return present, passed
+
+
+def _valuation_result(
+    company: Any,
+    field: str,
+    minimum: int,
+    method: str,
+) -> tuple[bool, bool]:
+    history = company.fields.get("valuation_history")
+    if not isinstance(history, Sequence):
+        return False, False
+    present = False
+    trusted = 0
+    for row in history:
+        if not isinstance(row, Mapping) or row.get("ratio_method") != method:
+            continue
+        raw = row.get(field)
+        present = present or raw is not None
+        value = _as_decimal(raw)
+        if (
+            value is not None
+            and value > 0
+            and type(row.get("source")) is str
+            and bool(row.get("source"))
+            and row.get("fetched_at") is not None
+            and row.get("trade_date") is not None
+        ):
+            trusted += 1
+    return present, trusted >= minimum
+
+
+def _source_coverage(
+    companies: Sequence[Any],
+) -> dict[str, dict[str, object]]:
+    keys = ("security", "financial", "valuation", "price", "fill")
+    result = {}
+    total = len(companies)
+    for key in keys:
+        present = sum(
+            (
+                company.sources.get(key) is not None
+                if key in {"security", "price"}
+                else company.as_of.get(key) is not None
+            )
+            for company in companies
+        )
+        result[key] = _coverage(present, total)
+    return result
+
+
+def _coverage_audit(
     companies: Sequence[Any],
     track: str,
-) -> dict[str, dict[str, object]]:
+    proposal: Mapping[str, object],
+    selected_labels: Sequence[str | None],
+) -> tuple[
+    dict[str, dict[str, object]],
+    dict[str, dict[str, dict[str, object]]],
+    dict[str, dict[str, object]],
+    dict[str, int],
+    dict[str, object] | None,
+    bool,
+]:
+    thresholds = proposal["thresholds"]
+    branches = proposal["sector_branches"]
+    minimums = proposal["min_observations"]
+    assert all(
+        isinstance(value, Mapping)
+        for value in (thresholds, branches, minimums)
+    )
+    threshold = Decimal(thresholds["readiness_min"])  # type: ignore[index]
+    common = branches["common"]  # type: ignore[index]
+    assert isinstance(common, Mapping)
+    method = str(common["valuation_ratio_method"])
     applicable: Counter[str] = Counter()
     present: Counter[str] = Counter()
     trusted: Counter[str] = Counter()
+    branch_applicable: Counter[tuple[str, str]] = Counter()
+    branch_present: Counter[tuple[str, str]] = Counter()
+    branch_trusted: Counter[tuple[str, str]] = Counter()
     sources: dict[str, set[str]] = {}
-    for company in companies:
-        branch = classify_industry_branch(company.industry)
-        fields = _TRACK_INPUT_FIELDS[track].get(branch, ())
-        history = company.fields.get("financial_history")
-        if not isinstance(history, Sequence):
+    missing: Counter[str] = Counter()
+    branch_counts: Counter[str] = Counter()
+    return_observations = Counter[str]()
+    return_companies = Counter[str]()
+    label_counts = Counter[str]()
+    supported_total = 0
+
+    for company, selected_label in zip(
+        companies, selected_labels, strict=True
+    ):
+        branch = _ruler_branch(track, company.industry)
+        branch_counts[branch] += 1
+        if branch.startswith("unsupported_") or branch == "unknown":
             continue
-        for field in fields:
-            applicable[field] += 1
+        supported_total += 1
+        states: dict[str, list[bool]] = {}
+        for _name, fields, window, minimum, mode in _requirements(
+            track, branch, proposal
+        ):
+            field_present, passed = _requirement_result(
+                company,
+                track,
+                fields,
+                window,
+                minimum,
+                mode,
+                int(common["latest_annual_staleness_years"]),
+            )
+            for field in fields:
+                state = states.setdefault(field, [False, True])
+                state[0] = state[0] or field_present[field]
+                state[1] = state[1] and passed
+
+        valuation_requirements: tuple[tuple[str, int], ...]
+        if track == "quality_discount":
+            valuation_requirements = (
+                (("pb", int(minimums["valuation_pb"])),)  # type: ignore[index]
+                if branch == "bank"
+                else (
+                    ("pe", int(minimums["valuation_pe"])),  # type: ignore[index]
+                    ("pb", int(minimums["valuation_pb"])),  # type: ignore[index]
+                )
+            )
+        elif track == "deep_value":
+            valuation_requirements = (
+                (("pb", int(minimums["valuation_pb"])),)  # type: ignore[index]
+                if branch == "financial"
+                else (("price", 1),)
+            )
+        else:
+            valuation_requirements = (
+                ("pe", int(minimums["valuation_pe"])),  # type: ignore[index]
+            )
+        for field, minimum in valuation_requirements:
+            raw_present, passed = _valuation_result(
+                company, field, minimum, method
+            )
+            states[f"valuation_{field}"] = [raw_present, passed]
+
+        if track == "garp":
+            history = _annual_rows(company)
+            latest = max(history, default=0)
+            completed = (
+                company.snapshot_at.year
+                if (
+                    company.snapshot_at.month,
+                    company.snapshot_at.day,
+                )
+                == (12, 31)
+                else company.snapshot_at.year - 1
+            )
+            return_staleness_valid = (
+                0
+                <= completed - latest
+                <= int(common["latest_annual_staleness_years"])
+            )
+            window = int(common["annual_observations"]["return_on_capital"])  # type: ignore[index]
             rows = [
                 row
-                for row in history
-                if isinstance(row, Mapping)
-                and isinstance(row.get("values"), Mapping)
-                and row["values"].get(field) is not None
+                for year, row in sorted(history.items())
+                if latest - window + 1 <= year <= latest
             ]
-            if not rows:
-                continue
-            present[field] += 1
-            valid = True
+            parsed: dict[str, list[Decimal]] = {"roic": [], "roe": []}
             for row in rows:
-                metadata = row.get("field_sources")
-                provenance = row.get("provenance")
-                item = (
-                    metadata.get(field)
-                    if isinstance(metadata, Mapping)
-                    else None
+                for field in parsed:
+                    _is_present, value = _trusted_decimal(
+                        row, field, track
+                    )
+                    if value is not None and value > 0:
+                        parsed[field].append(value)
+            label = selected_label or "insufficient"
+            label_counts[label] += 1
+            selected = (
+                "roe"
+                if label == "roe_fallback"
+                else "roic"
+                if label == "roic"
+                else None
+            )
+            selected_passed = False
+            for field in ("roic", "roe"):
+                key = "roe_fallback" if field == "roe" else field
+                applicable[field] += 1
+                branch_applicable[(branch, field)] += 1
+                raw_present = any(
+                    isinstance(row.get("values"), Mapping)
+                    and row["values"].get(field) is not None
+                    for row in rows
                 )
-                field_provenance = (
-                    provenance.get(field)
-                    if isinstance(provenance, Mapping)
-                    else None
+                present[field] += int(raw_present)
+                branch_present[(branch, field)] += int(raw_present)
+                observations = (
+                    len(parsed[field]) if selected == field else 0
                 )
-                if (
-                    not isinstance(item, Mapping)
-                    or item.get("trusted") is not True
-                    or item.get("source") != "discovery"
-                    or isinstance(field_provenance, (str, bytes))
-                    or not isinstance(field_provenance, Sequence)
-                    or "discovery" not in field_provenance
-                ):
-                    valid = False
-                    continue
-                sources.setdefault(field, set()).add("discovery")
-            if valid:
-                trusted[field] += 1
-    return {
+                return_observations[key] += observations
+                required = int(
+                    minimums["roe_fallback" if field == "roe" else "roic"]  # type: ignore[index]
+                )
+                passed = (
+                    selected == field
+                    and observations >= required
+                    and return_staleness_valid
+                    and bool(rows)
+                    and latest
+                    == max(
+                        (
+                            year
+                            for year, row in history.items()
+                            if _trusted_decimal(row, field, track)[1]
+                            is not None
+                            and _trusted_decimal(row, field, track)[1] > 0
+                        ),
+                        default=0,
+                    )
+                )
+                trusted[field] += int(passed)
+                branch_trusted[(branch, field)] += int(passed)
+                return_companies[key] += int(passed)
+                selected_passed = selected_passed or passed
+                if passed:
+                    sources.setdefault(field, set()).add("discovery")
+            if not selected_passed:
+                missing["missing_trusted_return_on_capital"] += 1
+
+        for field, (is_present, passed) in states.items():
+            applicable[field] += 1
+            present[field] += int(is_present)
+            trusted[field] += int(passed)
+            branch_applicable[(branch, field)] += 1
+            branch_present[(branch, field)] += int(is_present)
+            branch_trusted[(branch, field)] += int(passed)
+            if passed:
+                sources.setdefault(field, set()).add(
+                    "valuation" if field.startswith("valuation_") else "discovery"
+                )
+            else:
+                missing[f"missing_trusted_{field}"] += 1
+
+    provenance = {
         field: {
             "present": present[field],
             "trusted": trusted[field],
@@ -1043,6 +1501,104 @@ def _provenance_coverage(
         }
         for field in sorted(applicable)
     }
+    branch_coverage = {
+        branch: {
+            field: {
+                "present": branch_present[(branch, field)],
+                "trusted": branch_trusted[(branch, field)],
+                "total": branch_applicable[(branch, field)],
+                "ratio": (
+                    decimal_string(
+                        bounded_ratio(
+                            branch_trusted[(branch, field)],
+                            branch_applicable[(branch, field)],
+                        )
+                    )
+                    if branch_applicable[(branch, field)]
+                    else "0"
+                ),
+            }
+            for candidate_branch, field in sorted(branch_applicable)
+            if candidate_branch == branch
+        }
+        for branch in sorted(
+            {candidate_branch for candidate_branch, _field in branch_applicable}
+        )
+    }
+    source_coverage = _source_coverage(companies)
+    ready = (
+        supported_total > 0
+        and all(
+            row["trusted"] > 0
+            and Fraction(int(row["trusted"]), int(row["total"]))
+            >= Fraction(threshold)
+            for field, row in provenance.items()
+            if not (track == "garp" and field in {"roic", "roe"})
+        )
+        and all(
+            row["trusted"] > 0
+            and Fraction(int(row["trusted"]), int(row["total"]))
+            >= Fraction(threshold)
+            for fields in branch_coverage.values()
+            for field, row in fields.items()
+            if not (track == "garp" and field in {"roic", "roe"})
+        )
+        and all(
+            row["present"] > 0
+            and Fraction(int(row["present"]), int(row["total"]))
+            >= Fraction(threshold)
+            for row in source_coverage.values()
+        )
+    )
+    return_coverage = None
+    if track == "garp":
+        selected_ready = (
+            return_companies["roic"] + return_companies["roe_fallback"]
+        )
+        ready = (
+            ready
+            and selected_ready > 0
+            and supported_total > 0
+            and Fraction(selected_ready, supported_total)
+            >= Fraction(threshold)
+        )
+        return_coverage = {
+            "policy": "roic_then_roe",
+            "selected_labels": {
+                key: label_counts[key]
+                for key in ("roic", "roe_fallback", "insufficient")
+            },
+            "roic": {
+                "companies": return_companies["roic"],
+                "observations": return_observations["roic"],
+                **{
+                    key: value
+                    for key, value in _coverage(
+                        return_companies["roic"], supported_total
+                    ).items()
+                    if key != "present"
+                },
+            },
+            "roe_fallback": {
+                "companies": return_companies["roe_fallback"],
+                "observations": return_observations["roe_fallback"],
+                **{
+                    key: value
+                    for key, value in _coverage(
+                        return_companies["roe_fallback"], supported_total
+                    ).items()
+                    if key != "present"
+                },
+            },
+        }
+    return (
+        provenance,
+        branch_coverage,
+        source_coverage,
+        dict(sorted(missing.items())),
+        return_coverage,
+        ready,
+    )
 
 
 def _domain_valid(track: str, reason: str | None) -> bool:
@@ -1212,7 +1768,14 @@ def _ready_artifact(
                 metric_values.setdefault(key, []).append(parsed)
                 coverage_counts[key] += 1
     total = len(snapshot.companies)
-    branch_counts = _branch_counts(industries)
+    branch_counts = dict(
+        sorted(
+            Counter(
+                _ruler_branch(track, company.industry)
+                for company in snapshot.companies
+            ).items()
+        )
+    )
     declared_fields = proposals["base"]["fields"]
     if not isinstance(declared_fields, Sequence):
         return _blocked("ruler_payload_incomplete", track=track)
@@ -1244,59 +1807,45 @@ def _ready_artifact(
         for key in source_keys
     ):
         return _blocked("source_as_of_incomplete", track=track)
-    readiness_threshold = _as_decimal(
-        proposals["base"]["thresholds"]["readiness_min"]
-    )
-    sufficient = sum(row.verdict != "insufficient" for row in base)
-    readiness_ratio = bounded_ratio(sufficient, total)
-    if (
-        readiness_threshold is None
-        or readiness_ratio < readiness_threshold
-    ):
-        return _blocked(
-            "trusted_field_coverage_below_readiness",
-            track=track,
+    selected_labels = tuple(
+        (
+            str(row.metrics.get("return_metric_label"))
+            if row.metrics.get("return_metric_label") is not None
+            else None
         )
-    provenance_coverage = _provenance_coverage(
-        snapshot.companies, track
+        for row in base
     )
-    if any(
-        row["present"] != row["trusted"]
-        for row in provenance_coverage.values()
-    ):
-        return _blocked("source_provenance_incomplete", track=track)
+    (
+        provenance_coverage,
+        branch_coverage,
+        source_coverage,
+        coverage_missing,
+        return_metric_coverage,
+        coverage_ready,
+    ) = _coverage_audit(
+        frozen_companies,
+        track,
+        proposals["base"],
+        selected_labels,
+    )
     domain_policy = {
         "quality_discount": QUALITY_FIELD_DOMAIN_POLICY,
         "deep_value": DEEP_VALUE_FIELD_DOMAIN_POLICY,
         "garp": GARP_FIELD_DOMAIN_POLICY,
     }[track]
-    return_metric_coverage = None
-    if track == "garp":
-        labels = Counter(
-            str(row.metrics.get("return_metric_label"))
-            for row in base
-            if row.metrics.get("return_metric_label") is not None
-        )
-        return_metric_coverage = {
-            "policy": "roic_then_roe",
-            "roic": _coverage(labels["roic"], total),
-            "roe_fallback": _coverage(labels["roe_fallback"], total),
-            "insufficient": _coverage(
-                total - labels["roic"] - labels["roe_fallback"],
-                total,
-            ),
-        }
     bands = {
         "quality_discount": HYPOTHESIS_BANDS,
         "deep_value": DEEP_VALUE_BANDS,
         "garp": GARP_BANDS,
     }[track]
-    return {
+    artifact = {
         "schema_version": 1,
         "track": track,
-        "status": "ready",
-        "approval_ready": True,
-        "blocked_reasons": [],
+        "status": "ready" if coverage_ready else "blocked",
+        "approval_ready": coverage_ready,
+        "blocked_reasons": (
+            [] if coverage_ready else ["trusted_field_coverage_below_readiness"]
+        ),
         "universe": {
             "fill_id": snapshot.fill_id,
             "total": total,
@@ -1311,6 +1860,8 @@ def _ready_artifact(
         },
         "field_coverage": field_coverage,
         "provenance_coverage": provenance_coverage,
+        "branch_coverage": branch_coverage,
+        "source_coverage": source_coverage,
         "distributions": {
             "valuation_ratio_methods": method_distribution,
             "valid_valuation_months": {
@@ -1327,11 +1878,14 @@ def _ready_artifact(
             },
             "missing_reasons": dict(
                 sorted(
-                    Counter(
-                        verdict.primary_reason
-                        for verdict in base
-                        if verdict.verdict == "insufficient"
-                        and verdict.primary_reason is not None
+                    (
+                        Counter(
+                            verdict.primary_reason
+                            for verdict in base
+                            if verdict.verdict == "insufficient"
+                            and verdict.primary_reason is not None
+                        )
+                        + Counter(coverage_missing)
                     ).items()
                 )
             ),
@@ -1346,15 +1900,14 @@ def _ready_artifact(
                     branch: {
                         verdict: sum(
                             row.verdict == verdict
-                            and classify_industry_branch(company.industry)
-                            == branch
+                            and _ruler_branch(track, company.industry) == branch
                             for company, row in zip(
                                 snapshot.companies, rows, strict=True
                             )
                         )
                         for verdict in ("pass", "drop", "insufficient")
                     }
-                    for branch in INDUSTRY_BRANCHES
+                    for branch in branch_counts
                 },
             }
             for name, rows in verdicts.items()
@@ -1400,6 +1953,7 @@ def _ready_artifact(
             "and a nonblank reason."
         ),
     }
+    return artifact
 
 
 def calibrate(
@@ -1444,6 +1998,15 @@ def calibrate(
         return _blocked("snapshot_incomplete_or_corrupt", track=track)
 
 
+def _paths_alias(left: Path, right: Path) -> bool:
+    if left.resolve() == right.resolve():
+        return True
+    try:
+        return left.exists() and right.exists() and left.samefile(right)
+    except OSError:
+        return False
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -1454,6 +2017,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--db", type=Path, default=DEFAULT_DB)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
+    if _paths_alias(args.db, args.output):
+        parser.error("--output must not alias --db")
     artifact = calibrate(args.db, track=args.track)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(

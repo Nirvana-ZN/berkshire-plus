@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 from dataclasses import FrozenInstanceError, fields, replace
 from datetime import datetime, timezone
@@ -1779,11 +1780,9 @@ def test_calibrator_ready_full_market_proposal_is_deterministic_and_read_only(
     assert first["universe"]["total"] == 3
     assert first["universe"]["scope"] == "latest_completed_full_market_fill"
     assert first["universe"]["branches"] == {
+        "nonfinancial": 1,
+        "cyclical": 1,
         "bank": 1,
-        "insurance": 0,
-        "other_financial": 0,
-        "nonfinancial": 2,
-        "unknown": 0,
     }
     assert first["proposal"]["track"] == "quality_discount"
     assert first["proposal"]["thresholds"]["readiness_min"] == "0.8"
@@ -1839,6 +1838,55 @@ def test_calibrator_ready_full_market_proposal_is_deterministic_and_read_only(
         "calibration hypothesis"
     )
     assert hashlib.sha256(db.read_bytes()).hexdigest() == before
+
+
+def test_calibrator_uses_exact_linear_quartiles() -> None:
+    from scripts.calibrate_discovery import _quantiles
+
+    assert _quantiles((Decimal("1"), Decimal("2"))) == {
+        "min": "1",
+        "p25": "1.25",
+        "p50": "1.5",
+        "p75": "1.75",
+        "max": "2",
+    }
+
+
+@pytest.mark.parametrize("alias_kind", ["same", "hardlink", "symlink"])
+def test_calibrator_cli_rejects_database_output_alias_without_writing(
+    tmp_path: Path,
+    alias_kind: str,
+) -> None:
+    from scripts.calibrate_discovery import main
+
+    db = tmp_path / "calibration.db"
+    _calibration_preflight_db(db)
+    output = db
+    if alias_kind != "same":
+        output = tmp_path / f"{alias_kind}.json"
+        try:
+            if alias_kind == "hardlink":
+                os.link(db, output)
+            else:
+                output.symlink_to(db)
+        except OSError as error:
+            pytest.skip(f"{alias_kind} unavailable: {error}")
+    before = db.read_bytes()
+    before_hash = hashlib.sha256(before).hexdigest()
+    with pytest.raises(SystemExit) as raised:
+        main(
+            [
+                "--track",
+                "quality_discount",
+                "--db",
+                str(db),
+                "--output",
+                str(output),
+            ]
+        )
+    assert raised.value.code == 2
+    assert db.read_bytes() == before
+    assert hashlib.sha256(db.read_bytes()).hexdigest() == before_hash
 
 
 def test_api_uses_builtin_quality_gate_and_keeps_other_tracks_independent(
