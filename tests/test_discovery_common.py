@@ -1040,6 +1040,7 @@ def test_drain_persists_validated_competition_evidence(tmp_path) -> None:
     from sqlalchemy import select
 
     from app.discovery_models import DiscoveryEvidence, DiscoveryStage
+    from discovery.evidence import EVIDENCE_RULE_VERSION, FALLBACK_RISK_TEXT
     from jobs.discovery import (
         TrackExecutionEvidence,
         TrackExecutionOutcome,
@@ -1095,14 +1096,31 @@ def test_drain_persists_validated_competition_evidence(tmp_path) -> None:
                     ),
                 ),
                 evidence=(
+                    *(
+                        TrackExecutionEvidence(
+                            code="600000.SH",
+                            ruler_version_id=context.ruler_version_id,
+                            rule_version=EVIDENCE_RULE_VERSION,
+                            kind="fact",
+                            rule_id=f"quality_discount.fact.{field}",
+                            input_fields_json=f'{{"{field}":"1"}}',
+                            display_text=f"{field}=1",
+                            as_of="2026-09-17",
+                            data_completeness="complete",
+                        )
+                        for field in ("cash_conversion", "roe_cv", "valuation")
+                    ),
                     TrackExecutionEvidence(
                         code="600000.SH",
-                        rule_version="rules-v1",
-                        kind="quality",
-                        rule_id="roe",
-                        input_fields_json='{"roe":"12"}',
-                        display_text="ROE 通过",
-                        as_of="2026-09-18",
+                        ruler_version_id=context.ruler_version_id,
+                        rule_version=EVIDENCE_RULE_VERSION,
+                        kind="risk",
+                        rule_id="quality_discount.risk.none",
+                        input_fields_json=(
+                            '{"source_as_of":{"price":"2026-09-17"}}'
+                        ),
+                        display_text=FALLBACK_RISK_TEXT,
+                        as_of="2026-09-17",
                         data_completeness="complete",
                     ),
                 ),
