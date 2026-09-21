@@ -1103,7 +1103,9 @@ def test_drain_persists_validated_competition_evidence(tmp_path) -> None:
                             rule_version=EVIDENCE_RULE_VERSION,
                             kind="fact",
                             rule_id=f"quality_discount.fact.{field}",
-                            input_fields_json=f'{{"{field}":"1"}}',
+                            input_fields_json=(
+                                f'{{"{field}":"1","source":"price"}}'
+                            ),
                             display_text=f"{field}=1",
                             as_of="2026-09-17",
                             data_completeness="complete",
