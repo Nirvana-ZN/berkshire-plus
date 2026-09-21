@@ -1085,7 +1085,11 @@ def test_drain_persists_validated_competition_evidence(tmp_path) -> None:
 
         def execute(context):
             assert context.candidate_codes == ("600000.SH",)
-            source_as_of = context.frozen_inputs.companies[0].as_of
+            company_as_of = context.frozen_inputs.companies[0].as_of
+            source_as_of = {
+                key: company_as_of[key]
+                for key in ("security", "financial", "valuation")
+            }
             return TrackExecutionOutcome(
                 status="waiting_confirmation",
                 results=(
@@ -1106,10 +1110,10 @@ def test_drain_persists_validated_competition_evidence(tmp_path) -> None:
                             kind="fact",
                             rule_id=f"quality_discount.fact.{field}",
                             input_fields_json=(
-                                    f'{{"{field}":"1","source":"security"}}'
+                                f'{{"{field}":"1","source":"security"}}'
                             ),
                             display_text=f"{field}=1",
-                                as_of=source_as_of["security"],
+                            as_of=source_as_of["security"],
                             data_completeness="complete",
                         )
                         for field in ("cash_conversion", "roe_cv", "valuation")

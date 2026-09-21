@@ -319,6 +319,8 @@ def _add_track_stage(
 def test_discovery_schema_has_all_tables_columns_foreign_keys_and_index(
     tmp_path: Path,
 ) -> None:
+    from datetime import date
+
     engine = init_db(tmp_path / "schema.db")
     schema = inspect(engine)
 
@@ -4043,10 +4045,27 @@ def test_three_tracks_advance_independently_with_injected_executor(
 
     executed: list[tuple[str, str]] = []
 
+    def canonical_source_dates(company):
+        result = {}
+        for source, value in company.as_of.items():
+            if type(value) is not str:
+                continue
+            try:
+                parsed = date.fromisoformat(value)
+            except ValueError:
+                continue
+            if parsed.isoformat() == value:
+                result[source] = value
+        return result
+
     def execute(context):
         executed.append((context.track, context.stage))
         companies = {
             company.code: company for company in context.frozen_inputs.companies
+        }
+        source_dates = {
+            code: canonical_source_dates(company)
+            for code, company in companies.items()
         }
         return TrackExecutionOutcome(
             status="waiting_confirmation",
@@ -4071,10 +4090,13 @@ def test_three_tracks_advance_independently_with_injected_executor(
                         kind="fact",
                         rule_id=f"{context.track}.fact.score_{number}",
                         input_fields_json=canonical_json(
-                            {"score": "1", "source": "security"}
+                            {
+                                "score": "1",
+                                "source": next(iter(source_dates[code])),
+                            }
                         ),
                         display_text="score=1",
-                        as_of=companies[code].as_of["security"],
+                        as_of=next(iter(source_dates[code].values())),
                         data_completeness="complete",
                     )
                     for code in context.candidate_codes
@@ -4088,10 +4110,10 @@ def test_three_tracks_advance_independently_with_injected_executor(
                         kind="risk",
                         rule_id=f"{context.track}.risk.none",
                         input_fields_json=canonical_json(
-                            {"source_as_of": companies[code].as_of}
+                            {"source_as_of": source_dates[code]}
                         ),
                         display_text=FALLBACK_RISK_TEXT,
-                        as_of=min(companies[code].as_of.values()),
+                        as_of=min(source_dates[code].values()),
                         data_completeness="complete",
                     )
                     for code in context.candidate_codes
@@ -4135,10 +4157,14 @@ def test_three_tracks_advance_independently_with_injected_executor(
                 "/stages/track_gate/confirm",
                 json={"sync": True},
             )
-            assert client.get(
+            competition_body = client.get(
                 f"/api/discoveries/{run_id}/tracks/{track}"
                 "/stages/competition"
-            ).json()["current"]["status"] == "waiting_confirmation"
+            ).json()
+            assert (
+                competition_body["current"]["status"]
+                == "waiting_confirmation"
+            ), competition_body["current"]["error"]
             client.post(
                 f"/api/discoveries/{run_id}/tracks/{track}"
                 "/stages/competition/confirm",
