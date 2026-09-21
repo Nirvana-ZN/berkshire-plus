@@ -322,6 +322,14 @@ def test_builtin_competition_emits_evidence_for_every_entrant() -> None:
     assert _validate_track_outcome(context, allowed) is allowed
 
     first_evidence = outcome.evidence[0]
+    first_code_items = tuple(
+        item for item in outcome.evidence if item.code == first_evidence.code
+    )
+    fallback = next(
+        item
+        for item in first_code_items
+        if item.rule_id == "quality_discount.risk.none"
+    )
     malformed = (
         replace(
             outcome,
@@ -364,6 +372,37 @@ def test_builtin_competition_emits_evidence_for_every_entrant() -> None:
             evidence=(
                 replace(first_evidence, ruler_version_id=8),
                 *outcome.evidence[1:],
+            ),
+        ),
+        replace(
+            outcome,
+            evidence=tuple(
+                item
+                for item in outcome.evidence
+                if item != first_code_items[0]
+            ),
+        ),
+        replace(
+            outcome,
+            evidence=tuple(
+                replace(item, display_text="not the fallback")
+                if item == fallback
+                else item
+                for item in outcome.evidence
+            ),
+        ),
+        replace(
+            outcome,
+            evidence=(
+                *outcome.evidence,
+                replace(
+                    fallback,
+                    rule_id=(
+                        "quality_discount.risk.worsening_trend.synthetic"
+                    ),
+                    input_fields_json='{"risk_flag":"synthetic"}',
+                    display_text="synthetic",
+                ),
             ),
         ),
     )
