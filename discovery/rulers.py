@@ -442,6 +442,196 @@ _DEEP_GATE_SETS = MappingProxyType(
         ),
     }
 )
+GARP_FIELDS = (
+    "revenue_cagr",
+    "deducted_profit_cagr",
+    "revenue_positive_growth_periods",
+    "deducted_profit_positive_growth_periods",
+    "latest_revenue_growth",
+    "latest_deducted_profit_growth",
+    "revenue_growth_slowdown",
+    "deducted_profit_growth_slowdown",
+    "return_on_capital",
+    "return_metric_label",
+    "cash_conversion",
+    "dilution_rate",
+    "interest_debt_increase_to_revenue",
+    "goodwill_increase_to_revenue",
+    "acquisition_cash_increase_to_revenue",
+    "gross_margin_change",
+    "net_margin_change",
+    "impairment_share",
+    "subsidy_disposal_share",
+    "capped_growth",
+    "peg",
+    "pe_percentile",
+    "current_pe",
+    "code",
+)
+GARP_FORMULAS = MappingProxyType(
+    {
+        "revenue_cagr": "cagr(exact_annual.revenue,revenue_cagr_periods)",
+        "deducted_profit_cagr": (
+            "cagr(exact_annual.deducted_net_income,"
+            "deducted_profit_cagr_periods)"
+        ),
+        "revenue_positive_growth_periods": (
+            "count(exact_annual.revenue_yoy>0)"
+        ),
+        "deducted_profit_positive_growth_periods": (
+            "count(exact_annual.deducted_net_income_yoy>0)"
+        ),
+        "latest_revenue_growth": "latest(annual.revenue_yoy)",
+        "latest_deducted_profit_growth": (
+            "latest(annual.deducted_net_income_yoy)"
+        ),
+        "revenue_growth_slowdown": (
+            "max(0,revenue_cagr-latest_revenue_growth)"
+        ),
+        "deducted_profit_growth_slowdown": (
+            "max(0,deducted_profit_cagr-latest_deducted_profit_growth)"
+        ),
+        "return_on_capital": (
+            "mean(primary(annual.roic,fallback=annual.roe))"
+        ),
+        "return_metric_label": (
+            "label(primary(annual.roic,fallback=annual.roe))"
+        ),
+        "cash_conversion": (
+            "cash_conversion(annual.ocf,annual.net_income>0)"
+        ),
+        "dilution_rate": (
+            "latest(annual.shares)/earliest(annual.shares)-1"
+        ),
+        "interest_debt_increase_to_revenue": (
+            "max(0,latest(annual.interest_debt)-"
+            "earliest(annual.interest_debt))/latest(annual.revenue)"
+        ),
+        "goodwill_increase_to_revenue": (
+            "max(0,latest(annual.goodwill)-earliest(annual.goodwill))/"
+            "latest(annual.revenue)"
+        ),
+        "acquisition_cash_increase_to_revenue": (
+            "max(0,latest(annual.acquisition_cash_paid)-"
+            "earliest(annual.acquisition_cash_paid))/latest(annual.revenue)"
+        ),
+        "gross_margin_change": (
+            "latest(annual.gross_margin)-earliest(annual.gross_margin)"
+        ),
+        "net_margin_change": (
+            "latest(annual.net_margin)-earliest(annual.net_margin)"
+        ),
+        "impairment_share": (
+            "copy_abs(latest(annual.impairment_loss))/"
+            "copy_abs(latest(annual.deducted_net_income))"
+        ),
+        "subsidy_disposal_share": (
+            "(copy_abs(latest(annual.government_grants))+"
+            "copy_abs(latest(annual.asset_disposal_gain)))/"
+            "copy_abs(latest(annual.deducted_net_income))"
+        ),
+        "capped_growth": "min(deducted_profit_cagr,peg_growth_cap)",
+        "peg": "current.pe/(capped_growth*100)",
+        "pe_percentile": "percentile_rank(current.pe,monthly.pe)",
+        "current_pe": "current.pe",
+    }
+)
+GARP_ORDER = (
+    ("peg", "asc", "nulls_last"),
+    ("pe_percentile", "asc", "nulls_last"),
+    ("cash_conversion", "desc", "nulls_last"),
+    ("code", "asc", "nulls_last"),
+)
+GARP_THRESHOLDS = frozenset(
+    {
+        "revenue_cagr_min",
+        "deducted_profit_cagr_min",
+        "revenue_growth_slowdown_max",
+        "deducted_profit_growth_slowdown_max",
+        "return_on_capital_min",
+        "cash_conversion_min",
+        "dilution_rate_max",
+        "interest_debt_increase_to_revenue_max",
+        "goodwill_increase_to_revenue_max",
+        "acquisition_cash_increase_to_revenue_max",
+        "gross_margin_deterioration_max",
+        "net_margin_deterioration_max",
+        "impairment_share_max",
+        "subsidy_disposal_share_max",
+        "peg_growth_cap",
+        "peg_max",
+        "pe_percentile_max",
+        "pe_max",
+        "readiness_min",
+    }
+)
+GARP_MINIMUMS = frozenset(
+    {
+        "revenue_growth",
+        "deducted_profit_growth",
+        "sustained_revenue_growth",
+        "sustained_profit_growth",
+        "latest_growth",
+        "roic",
+        "roe_fallback",
+        "cash_conversion",
+        "dilution",
+        "growth_drivers",
+        "margin",
+        "quality_adjustments",
+        "valuation_pe",
+    }
+)
+GARP_FIELD_DOMAIN_POLICY = "garp-domain-v1"
+_GARP_COMMON_KEYS = frozenset(
+    {
+        "valuation_ratio_method",
+        "field_domain_policy",
+        "annual_observations",
+        "cagr_periods",
+        "latest_annual_staleness_years",
+    }
+)
+_GARP_WINDOW_KEYS = frozenset(
+    {
+        "growth",
+        "return_on_capital",
+        "cash_conversion",
+        "dilution",
+        "growth_drivers",
+        "margin",
+        "quality_adjustments",
+    }
+)
+_GARP_BRANCH_POLICIES = MappingProxyType(
+    {
+        "bank": "unsupported",
+        "insurance": "unsupported",
+        "other_financial": "unsupported",
+        "nonfinancial": "nonfinancial",
+        "unknown": "insufficient",
+    }
+)
+_GARP_GATE_SET = frozenset(
+    {
+        "revenue_growth",
+        "deducted_profit_growth",
+        "sustained_growth",
+        "growth_slowdown",
+        "return_on_capital",
+        "cash_conversion",
+        "dilution",
+        "interest_debt_trend",
+        "goodwill_trend",
+        "acquisition_cash_trend",
+        "gross_margin",
+        "net_margin",
+        "impairment",
+        "subsidy_disposal",
+        "peg",
+        "valuation",
+    }
+)
 
 
 class RulerNotReadyError(ValueError):
@@ -1151,6 +1341,144 @@ def deep_value_ruler(
     return validate_deep_value_ruler(parse_payload(value))
 
 
+def validate_garp_ruler(ruler: TrackRuler) -> TrackRuler:
+    """Require the exact GARP contract implemented by this build."""
+
+    if not isinstance(ruler, TrackRuler) or ruler.track != "garp":
+        raise ValueError("GARP ruler scope is required")
+    if ruler.fields != GARP_FIELDS:
+        raise ValueError("GARP fields do not match the supported schema")
+    if dict(ruler.formulas) != dict(GARP_FORMULAS):
+        raise ValueError("GARP formulas do not match the supported schema")
+    if ruler.order != GARP_ORDER:
+        raise ValueError("GARP order does not match the supported schema")
+    if set(ruler.thresholds) != GARP_THRESHOLDS:
+        raise ValueError("GARP thresholds must be complete and exact")
+    if set(ruler.min_observations) != GARP_MINIMUMS:
+        raise ValueError("GARP observation minimums must be complete and exact")
+    if set(ruler.missing_policy) != set(GARP_FIELDS) or any(
+        policy != "insufficient"
+        for policy in ruler.missing_policy.values()
+    ):
+        raise ValueError("GARP missing policies must all be insufficient")
+
+    branches = ruler.sector_branches
+    if set(branches) != {"common", "branch_policies", "nonfinancial"}:
+        raise ValueError("GARP sector branches must be complete and exact")
+    common = branches["common"]
+    if (
+        not isinstance(common, Mapping)
+        or set(common) != _GARP_COMMON_KEYS
+        or common["field_domain_policy"] != GARP_FIELD_DOMAIN_POLICY
+        or type(common["valuation_ratio_method"]) is not str
+        or not common["valuation_ratio_method"]
+        or common["valuation_ratio_method"]
+        != common["valuation_ratio_method"].strip()
+    ):
+        raise ValueError("GARP common config is invalid")
+    windows = common["annual_observations"]
+    cagr_periods = common["cagr_periods"]
+    if (
+        not isinstance(windows, Mapping)
+        or set(windows) != _GARP_WINDOW_KEYS
+        or any(
+            type(value) is not int or value <= 0 or value > 128
+            for value in windows.values()
+        )
+        or not isinstance(cagr_periods, Mapping)
+        or set(cagr_periods) != {"revenue", "deducted_profit"}
+        or any(
+            type(value) is not int or value <= 0 or value > 127
+            for value in cagr_periods.values()
+        )
+        or cagr_periods["revenue"] != windows["growth"] - 1
+        or cagr_periods["deducted_profit"] != windows["growth"] - 1
+        or type(common["latest_annual_staleness_years"]) is not int
+        or common["latest_annual_staleness_years"] < 0
+        or common["latest_annual_staleness_years"] > 128
+    ):
+        raise ValueError("GARP exact annual windows are invalid")
+    if (
+        not isinstance(branches["branch_policies"], Mapping)
+        or dict(branches["branch_policies"]) != dict(_GARP_BRANCH_POLICIES)
+    ):
+        raise ValueError("GARP branch policies are invalid")
+    config = branches["nonfinancial"]
+    if (
+        not isinstance(config, Mapping)
+        or set(config)
+        != {"gate_order", "return_metric_policy", "evidence_fields"}
+        or config["return_metric_policy"] != "roic_then_roe"
+        or tuple(config["evidence_fields"])
+        != (
+            "revenue_cagr",
+            "deducted_profit_cagr",
+            "return_on_capital",
+            "peg",
+        )
+    ):
+        raise ValueError("GARP nonfinancial branch policy is invalid")
+    gates = config["gate_order"]
+    if (
+        isinstance(gates, (str, bytes))
+        or not isinstance(gates, Sequence)
+        or len(gates) != len(_GARP_GATE_SET)
+        or set(gates) != _GARP_GATE_SET
+        or any(type(gate) is not str for gate in gates)
+    ):
+        raise ValueError("GARP gate order is invalid")
+
+    thresholds = {
+        key: Decimal(value) for key, value in ruler.thresholds.items()
+    }
+    if any(value < 0 for value in thresholds.values()):
+        raise ValueError("GARP thresholds cannot be negative")
+    if thresholds["readiness_min"] > 1:
+        raise ValueError("GARP readiness threshold exceeds one")
+    if thresholds["pe_percentile_max"] > 100:
+        raise ValueError("GARP percentile threshold exceeds 100")
+    if thresholds["peg_growth_cap"] <= 0:
+        raise ValueError("GARP PEG growth cap must be positive")
+    observation_windows = {
+        "revenue_growth": "growth",
+        "deducted_profit_growth": "growth",
+        "latest_growth": "growth",
+        "roic": "return_on_capital",
+        "roe_fallback": "return_on_capital",
+        "cash_conversion": "cash_conversion",
+        "dilution": "dilution",
+        "growth_drivers": "growth_drivers",
+        "margin": "margin",
+        "quality_adjustments": "quality_adjustments",
+    }
+    if any(
+        ruler.min_observations[minimum] > windows[window]
+        for minimum, window in observation_windows.items()
+    ):
+        raise ValueError("GARP observation minimum exceeds its annual window")
+    if (
+        ruler.min_observations["revenue_growth"] != windows["growth"]
+        or ruler.min_observations["deducted_profit_growth"]
+        != windows["growth"]
+        or ruler.min_observations["latest_growth"] != 2
+        or ruler.min_observations["sustained_revenue_growth"]
+        > cagr_periods["revenue"]
+        or ruler.min_observations["sustained_profit_growth"]
+        > cagr_periods["deducted_profit"]
+        or ruler.min_observations["valuation_pe"] > 240
+    ):
+        raise ValueError("GARP exact observation policy is invalid")
+    return ruler
+
+
+def garp_ruler(
+    value: TrackRuler | Mapping[str, object] | str,
+) -> TrackRuler:
+    """Build and semantically validate one supplied GARP ruler."""
+
+    return validate_garp_ruler(parse_payload(value))
+
+
 def _validate_track_semantics(ruler: TrackRuler) -> TrackRuler:
     """Dispatch only semantics implemented by this build."""
 
@@ -1158,6 +1486,8 @@ def _validate_track_semantics(ruler: TrackRuler) -> TrackRuler:
         return validate_quality_discount_ruler(ruler)
     if ruler.track == "deep_value":
         return validate_deep_value_ruler(ruler)
+    if ruler.track == "garp":
+        return validate_garp_ruler(ruler)
     return ruler
 
 

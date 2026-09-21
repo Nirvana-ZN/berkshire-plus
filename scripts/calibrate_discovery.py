@@ -26,6 +26,7 @@ from discovery.industry import INDUSTRY_BRANCHES, classify_industry_branch
 from discovery.quality_contract import quality_ruler_branch_policies
 from discovery.rulers import (
     DEEP_VALUE_FIELD_DOMAIN_POLICY,
+    GARP_FIELD_DOMAIN_POLICY,
     QUALITY_DISCOUNT_FIELDS,
     QUALITY_DISCOUNT_FORMULAS,
     QUALITY_FIELD_DOMAIN_POLICY,
@@ -189,6 +190,8 @@ def _blocked(
         "field_domain_policy": (
             DEEP_VALUE_FIELD_DOMAIN_POLICY
             if track == "deep_value"
+            else GARP_FIELD_DOMAIN_POLICY
+            if track == "garp"
             else QUALITY_FIELD_DOMAIN_POLICY
         ),
         "proposed_readiness_threshold": None,
@@ -748,7 +751,7 @@ def calibrate(
 ) -> dict[str, object]:
     """Return deterministic evidence without initializing or writing the DB."""
 
-    if track not in {"quality_discount", "deep_value"}:
+    if track not in {"quality_discount", "deep_value", "garp"}:
         raise ValueError("unsupported discovery calibration track")
     path = Path(db_path)
     if not path.is_file():
@@ -761,6 +764,11 @@ def calibrate(
             if track == "deep_value":
                 return _blocked(
                     "trusted_government_grants_unavailable",
+                    track=track,
+                )
+            if track == "garp":
+                return _blocked(
+                    "trusted_roic_goodwill_acquisition_cash_unavailable",
                     track=track,
                 )
             preflight = _preflight_latest_fill(connection)
@@ -783,7 +791,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--track",
         required=True,
-        choices=["quality_discount", "deep_value"],
+        choices=["quality_discount", "deep_value", "garp"],
     )
     parser.add_argument("--db", type=Path, default=DEFAULT_DB)
     parser.add_argument("--output", type=Path, required=True)

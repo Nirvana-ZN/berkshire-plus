@@ -73,6 +73,27 @@ _OBSERVATION_REQUIREMENTS = MappingProxyType(
             "subsidy_disposal",
             "subsidy_disposal_observations",
         ),
+        "revenue_cagr": (
+            "revenue_growth",
+            "revenue_growth_observations",
+        ),
+        "deducted_profit_cagr": (
+            "deducted_profit_growth",
+            "deducted_profit_growth_observations",
+        ),
+        "return_on_capital": ("roic", "roic_observations"),
+        "peg": (
+            "deducted_profit_growth",
+            "deducted_profit_growth_observations",
+        ),
+        "revenue_growth_slowdown": (
+            "latest_growth",
+            "revenue_growth_observations",
+        ),
+        "deducted_profit_growth_slowdown": (
+            "latest_growth",
+            "deducted_profit_growth_observations",
+        ),
     }
 )
 _QUALITY_BANK_FACTS = (
@@ -145,7 +166,7 @@ def _decimal(value: object) -> Decimal | None:
 
 
 def _sources(field: str) -> tuple[str, ...]:
-    if field == "normalized_pe":
+    if field in {"normalized_pe", "peg"}:
         return ("financial", "valuation")
     if field.startswith(("pe_", "pb_")):
         return ("valuation",)
@@ -179,6 +200,36 @@ def _risk_specs(
     track: str,
     branch: object,
 ) -> tuple[tuple[str, str, str], ...]:
+    if track == "garp":
+        return (
+            (
+                "revenue_growth_slowdown",
+                "revenue_growth_slowdown_max",
+                "max",
+            ),
+            (
+                "deducted_profit_growth_slowdown",
+                "deducted_profit_growth_slowdown_max",
+                "max",
+            ),
+            ("peg", "peg_max", "max"),
+            ("pe_percentile", "pe_percentile_max", "max"),
+            (
+                "interest_debt_increase_to_revenue",
+                "interest_debt_increase_to_revenue_max",
+                "max",
+            ),
+            (
+                "goodwill_increase_to_revenue",
+                "goodwill_increase_to_revenue_max",
+                "max",
+            ),
+            (
+                "acquisition_cash_increase_to_revenue",
+                "acquisition_cash_increase_to_revenue_max",
+                "max",
+            ),
+        )
     if track != "deep_value":
         return ()
     return (
@@ -357,6 +408,11 @@ def _reliable_inputs(
         count_name = "bank_roe_observations"
     elif field == "roe_mean" and branch == "bank":
         minimum_name = "bank_roe"
+    elif field == "return_on_capital" and metrics.get(
+        "return_metric_label"
+    ) == "roe_fallback":
+        minimum_name = "roe_fallback"
+        count_name = "roe_fallback_observations"
     minimum = minimums.get(minimum_name)
     count = _decimal(metrics.get(count_name))
     if (

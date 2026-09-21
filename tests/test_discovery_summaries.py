@@ -132,7 +132,7 @@ def _generic_ruler(
 
     payload = discovery_ruler_payload("garp")
     if thresholds is not None:
-        payload["thresholds"] = thresholds
+        payload["thresholds"].update(thresholds)
     return RulerVersion(
         id=7,
         user_id=1,
@@ -162,7 +162,12 @@ def _summary(
         [
             _result(
                 f"{index:06d}.SZ",
-                {"metric": value},
+                {
+                    "metric": value,
+                    "revenue_cagr": value,
+                    "return_on_capital": value,
+                    "peg": value,
+                },
                 track="garp",
                 stage="track_gate",
             )
@@ -299,7 +304,7 @@ def test_empty_null_bool_date_and_text_metrics_stay_visible_unavailable() -> Non
     )
     mixed = _summary([None, True, "2026-09-17", "not-a-number"])
 
-    assert empty["distributions"]["metric"]["status"] == "unavailable"
+    assert empty["distributions"]["revenue_cagr"]["status"] == "unavailable"
     assert mixed["distributions"]["metric"] == {
         "status": "unavailable",
         "reason": "no_numeric_values",
@@ -316,22 +321,22 @@ def test_threshold_markers_cover_endpoints_ties_and_unresolved_keys() -> None:
     summary = _summary(
         ["1", "2", "2", "3"],
         thresholds={
-            "metric_floor": "1",
-            "metric": "2",
-            "metric_ceiling": "3",
-            "mystery_floor": "2",
+            "revenue_cagr_min": "1",
+            "return_on_capital_min": "2",
+            "peg_max": "3",
+            "readiness_min": "0.5",
         },
     )
     markers = {marker["id"]: marker for marker in summary["threshold_markers"]}
 
-    assert markers["metric_floor"]["position"] == "0"
-    assert markers["metric"]["position"] == "50"
-    assert markers["metric_ceiling"]["position"] == "100"
-    assert markers["metric_floor"]["direction"] == "gte"
-    assert markers["metric_ceiling"]["direction"] == "lte"
-    assert markers["mystery_floor"] == {
-        "id": "mystery_floor",
-        "threshold": "2",
+    assert markers["revenue_cagr_min"]["position"] == "0"
+    assert markers["return_on_capital_min"]["position"] == "50"
+    assert markers["peg_max"]["position"] == "100"
+    assert markers["revenue_cagr_min"]["direction"] == "gte"
+    assert markers["peg_max"]["direction"] == "lte"
+    assert markers["readiness_min"] == {
+        "id": "readiness_min",
+        "threshold": "0.5",
         "metric": None,
         "direction": "gte",
         "position": None,
@@ -342,11 +347,11 @@ def test_threshold_markers_cover_endpoints_ties_and_unresolved_keys() -> None:
 def test_threshold_markers_rank_signed_values() -> None:
     summary = _summary(
         ["-5", "-1", "3"],
-        thresholds={"metric_floor": "-1", "metric_ceiling": "1"},
+        thresholds={"revenue_cagr_min": "0", "peg_max": "1"},
     )
     markers = {marker["id"]: marker for marker in summary["threshold_markers"]}
-    assert markers["metric_floor"]["position"] == "50"
-    assert markers["metric_ceiling"]["position"] == "75"
+    assert markers["revenue_cagr_min"]["position"] == "75"
+    assert markers["peg_max"]["position"] == "75"
 
 
 def test_extreme_quartiles_are_exact_and_context_independent() -> None:
@@ -378,7 +383,8 @@ def test_summary_is_deterministic_under_hostile_decimal_context() -> None:
         assert getcontext().prec == 2
         second = _summary(["1", "2", "3", "4"])
         assert first == second
-        assert list(first["distributions"]) == ["metric"]
+        assert list(first["distributions"]) == sorted(first["distributions"])
+        assert "metric" in first["distributions"]
         common = build_stage_summary(
             _stage(counts=(1, 1, 0, 0)),
             [_result("600000.SH", {"z": "2", "a": "1"})],
@@ -849,7 +855,7 @@ def _activate(session, track: str, threshold: str, reason: str):
     elif track == "deep_value":
         payload["thresholds"]["normalized_pe_max"] = threshold
     else:
-        payload["thresholds"] = {"metric_floor": threshold}
+        payload["thresholds"]["return_on_capital_min"] = threshold
     return activate(session, payload, reason)
 
 
@@ -882,7 +888,8 @@ def test_routes_attach_attempt_local_summaries_without_market_queries(
         import hashlib
 
         bomb_json = garp.payload_json.replace(
-            '"metric_floor":"2"', '"metric_floor":"1e100000000"'
+            '"return_on_capital_min":"2"',
+            '"return_on_capital_min":"1e100000000"',
         )
         bomb_ruler = RulerVersion(
             user_id=1,

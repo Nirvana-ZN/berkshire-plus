@@ -55,8 +55,9 @@ from discovery.snapshot import (
     canonical_json,
     load_frozen_inputs,
 )
-from discovery.rulers import deep_value_ruler, quality_discount_ruler
+from discovery.rulers import deep_value_ruler, garp_ruler, quality_discount_ruler
 from discovery.tracks.deep_value import classify as classify_deep_value
+from discovery.tracks.garp import classify as classify_garp
 from discovery.tracks.quality_discount import (
     bounded_ratio,
     classify as classify_quality_discount,
@@ -177,6 +178,7 @@ _UNRANKED_COMPETITION_REASONS = frozenset({"industry_unknown"})
 _TRACK_CLASSIFIERS = {
     "quality_discount": (quality_discount_ruler, classify_quality_discount),
     "deep_value": (deep_value_ruler, classify_deep_value),
+    "garp": (garp_ruler, classify_garp),
 }
 
 

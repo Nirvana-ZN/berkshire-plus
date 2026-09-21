@@ -27,6 +27,10 @@ def discovery_ruler_payload(track: str) -> dict[str, object]:
         from tests.test_discovery_tracks_deep_value import deep_value_payload
 
         return deep_value_payload()
+    if track == "garp":
+        from tests.test_discovery_tracks_garp import garp_payload
+
+        return garp_payload()
     return {
         "scope": "weekly-discovery",
         "track": track,
