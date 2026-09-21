@@ -64,6 +64,7 @@ export interface ParsedDiscoveryEvidence {
 
 export interface ParsedDiscoveryChange {
   code: string
+  name?: string
   classification: DiscoveryChangeClassification
   classifications: DiscoveryChangeClassification[]
   membership: DiscoveryMembership
@@ -586,6 +587,10 @@ function parseChange(value: unknown): ParsedDiscoveryChange | null {
     !isRecord(value)
     || typeof value.code !== 'string'
     || !value.code
+    || (
+      value.name !== undefined
+      && (typeof value.name !== 'string' || !value.name.trim())
+    )
     || typeof value.classification !== 'string'
     || !CHANGE_MEMBERSHIPS.includes(value.membership as DiscoveryMembership)
     || (
@@ -617,6 +622,7 @@ function parseChange(value: unknown): ParsedDiscoveryChange | null {
   ) return null
   return {
     code: value.code,
+    ...(typeof value.name === 'string' ? { name: value.name } : {}),
     classification: value.classification as DiscoveryChangeClassification,
     classifications: expected,
     membership: value.membership as DiscoveryMembership,

@@ -1376,11 +1376,7 @@ function freshnessText(item: AdjudicationCase): string {
 
 function weeklyChangeText(view: StageView, item: AdjudicationCase): string {
   const change = weeklyChange(view, item)
-  return change
-    ? change.classifications
-      .map((classification) => CHANGE_ZH[classification] || classification)
-      .join('；')
-    : '本周首次形成可裁决候选'
+  return change ? weeklyChangeLabels(change) : '本周首次形成可裁决候选'
 }
 
 function weeklyChange(
@@ -1393,6 +1389,16 @@ function weeklyChange(
       ? view.payload?.changes.find((candidate) => candidate.code === item.code)
       : item.change
   ) ?? null
+}
+
+function changeName(view: StageView, change: ParsedDiscoveryChange): string {
+  return change.name || rows(view).find((row) => row.code === change.code)?.name || change.code
+}
+
+function weeklyChangeLabels(change: ParsedDiscoveryChange): string {
+  return change.classifications
+    .map((classification) => CHANGE_ZH[classification] || classification)
+    .join('；')
 }
 
 function weeklyStateText(
@@ -1812,6 +1818,36 @@ onBeforeUnmount(() => {
           <p v-if="view.status === 'insufficient_candidates'" class="candidate-warning">
             候选不足：本轨道已明确结束，但未达到 3 家，不视为成功。
           </p>
+        </section>
+
+        <section v-if="view.payload?.changes.length" class="weekly-changes">
+          <h3>本周变化</h3>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>名称（代码）</th>
+                  <th>变化分类</th>
+                  <th>上周状态 / 理由</th>
+                  <th>本周状态 / 理由</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="change in view.payload.changes" :key="change.code">
+                  <td>{{ changeName(view, change) }}（{{ change.code }}）</td>
+                  <td>{{ weeklyChangeLabels(change) }}</td>
+                  <td>
+                    {{ weeklyStateText(change, 'previous') }} /
+                    {{ weeklyReasonText(change, 'previous') }}
+                  </td>
+                  <td>
+                    {{ weeklyStateText(change, 'current') }} /
+                    {{ weeklyReasonText(change, 'current') }}
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
         </section>
 
         <template v-if="view.payload && view.stage !== 'adjudication'">

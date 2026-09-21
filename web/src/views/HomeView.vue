@@ -17,6 +17,12 @@ interface JobRow {
   updated_at?: string | null
 }
 
+interface CurrentDiscovery {
+  id: number
+  week_key: string
+  status: string
+}
+
 interface WatchItem {
   id: number
   name: string
@@ -57,6 +63,7 @@ const LOCK_ZH: Record<string, string> = {
   funnel: '漏斗',
   research: '评估',
   review: '审视',
+  discovery: '每周发现',
   cheap: '低估值',
 }
 const JOB_STATUS: Record<string, string> = {
@@ -64,6 +71,15 @@ const JOB_STATUS: Record<string, string> = {
   running: '进行中',
   done: '完成',
   failed: '失败',
+}
+const DISCOVERY_STATUS: Record<string, string> = {
+  queued: '排队中',
+  running: '进行中',
+  waiting_confirmation: '等待确认',
+  completed: '已完成',
+  partially_completed: '部分完成',
+  failed: '失败',
+  abandoned: '已放弃',
 }
 const PAPER_ZH: Record<string, string> = {
   current: '现行',
@@ -87,6 +103,7 @@ const watchlist = ref<WatchItem[]>([])
 const latestReview = ref<ReviewSummary | null>(null)
 const aftermath = ref<AftermathItem[]>([])
 const sentiment = ref<SentimentState | null>(null)
+const currentDiscovery = ref<CurrentDiscovery | null>(null)
 const errorText = ref('')
 const removing = ref<number | null>(null)
 
@@ -105,6 +122,7 @@ function jobLink(job: JobRow): string | null {
   if (job.type === 'research') return `/research/${job.id}`
   if (job.type === 'funnel') return '/screen'
   if (job.type === 'review') return '/positions'
+  if (job.type === 'discovery') return '/discover'
   return null
 }
 
@@ -166,17 +184,27 @@ async function loadWorkbench() {
   errorText.value = ''
   const messages: string[] = []
   try {
-    const [healthRes, jobsRes, watchRes, reviewRes, sentRes, afterRes] = await Promise.all([
+    const [
+      healthRes,
+      jobsRes,
+      watchRes,
+      reviewRes,
+      sentRes,
+      afterRes,
+      discoveryRes,
+    ] = await Promise.all([
       fetch('/api/health'),
       fetch('/api/jobs'),
       fetch('/api/watchlist'),
       fetch('/api/reviews/latest'),
       fetch('/api/sentiment'),
       fetch('/api/aftermath'),
+      fetch('/api/discoveries/current'),
     ])
     const health = await healthRes.json()
     const jobsBody = await jobsRes.json()
     const watchBody = await watchRes.json()
+    const discoveryBody = await discoveryRes.json()
     if (reviewRes.ok) {
       latestReview.value = await reviewRes.json()
     } else if (reviewRes.status === 404) {
@@ -219,6 +247,13 @@ async function loadWorkbench() {
           || (afterBody as { error?: string }).error
           || '无法读取事后簿',
       )
+    }
+    if (discoveryRes.ok) {
+      currentDiscovery.value = discoveryBody
+    } else if (discoveryRes.status === 404) {
+      currentDiscovery.value = null
+    } else {
+      messages.push(discoveryBody.detail || discoveryBody.error || '无法读取本周发现')
     }
     errorText.value = messages[0] || ''
   } catch {
@@ -278,6 +313,12 @@ onBeforeUnmount(() => {
       <article>
         <h2><RouterLink to="/discover">每周发现</RouterLink></h2>
         <p>按周运行固定尺子，逐层确认候选。</p>
+        <p v-if="currentDiscovery">
+          本周批次 {{ currentDiscovery.week_key }} ·
+          {{ DISCOVERY_STATUS[currentDiscovery.status] || currentDiscovery.status }} ·
+          <RouterLink to="/discover">查看进度</RouterLink>
+        </p>
+        <p v-else class="muted">本周批次：尚未创建</p>
       </article>
       <article>
         <h2><RouterLink to="/cheap">低估值（旧版）</RouterLink></h2>

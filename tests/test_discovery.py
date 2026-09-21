@@ -1,7 +1,13 @@
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 
+from fastapi.testclient import TestClient
+
+from app.discovery_models import DiscoveryRun
+from app.main import create_app
 from discovery.constants import RUN_STATUSES
+from market.quotes import FakeQuoteClient
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -270,3 +276,80 @@ def test_case_cards_enforce_keeper_limit_and_show_weekly_details() -> None:
         "本周理由",
     ):
         assert label in page
+
+
+def test_discovery_view_renders_compact_weekly_change_rows() -> None:
+    page = (ROOT / "web/src/views/DiscoveryView.vue").read_text(
+        encoding="utf-8"
+    )
+
+    mappings = {
+        "new": "本周新入围",
+        "dropped": "本周退出",
+        "reentered": "本周重新入围",
+        "continuous": "连续入围",
+        "reason_changed": "入围原因变化",
+        "data_changed": "数据变化",
+        "rule_changed": "尺子变化",
+        "both_changed": "数据与尺子同时变化",
+        "decision_changed": "人工裁决变化",
+    }
+    for value, label in mappings.items():
+        assert re.search(rf"\b{value}: '{label}'", page)
+
+    assert "本周变化" in page
+    assert 'v-for="change in view.payload.changes"' in page
+    assert "changeName(view, change)" in page
+    assert "weeklyChangeLabels(change)" in page
+    assert "weeklyStateText(change, 'previous')" in page
+    assert "weeklyStateText(change, 'current')" in page
+    assert "weeklyReasonText(change, 'previous')" in page
+    assert "weeklyReasonText(change, 'current')" in page
+
+
+def test_home_reuses_refresh_for_current_discovery_and_links_jobs() -> None:
+    home = (ROOT / "web/src/views/HomeView.vue").read_text(encoding="utf-8")
+
+    assert "discovery: '每周发现'" in home
+    assert "if (job.type === 'discovery') return '/discover'" in home
+    assert "fetch('/api/discoveries/current')" in home
+    assert "本周批次" in home
+    assert home.count("window.setInterval(") == 1
+    assert "}, 3000)" in home
+
+
+def test_jobs_include_discovery_runs(tmp_path: Path) -> None:
+    app = create_app(
+        db_path=tmp_path / "app.db",
+        quote_client=FakeQuoteClient(),
+        env_path=tmp_path / ".env",
+    )
+    now = datetime.now(timezone.utc)
+    with TestClient(app) as client:
+        with app.state.session_factory() as session:
+            run = DiscoveryRun(
+                user_id=1,
+                week_key="2026-W38",
+                current=True,
+                status="running",
+                created_at=now,
+                updated_at=now,
+                snapshot_at=now,
+                data_version="data-v1",
+                financial_version="financial-v1",
+                valuation_version="valuation-v1",
+                algorithm_version="discovery-v1",
+            )
+            session.add(run)
+            session.commit()
+            run_id = run.id
+
+        jobs = client.get("/api/jobs").json()["jobs"]
+
+    assert any(
+        item["id"] == run_id
+        and item["type"] == "discovery"
+        and item["status"] == "running"
+        and item["name"] == "2026-W38"
+        for item in jobs
+    )

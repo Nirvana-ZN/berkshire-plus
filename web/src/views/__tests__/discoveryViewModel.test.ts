@@ -236,6 +236,7 @@ test('competition schema requires exact card arrays and reliable evidence', () =
   const payload = competitionPayload()
   payload.changes = [{
     code: '000001',
+    name: '示例公司',
     classification: 'both_changed',
     classifications: ['continuous', 'reason_changed', 'both_changed'],
     membership: 'continuous',
@@ -256,6 +257,7 @@ test('competition schema requires exact card arrays and reliable evidence', () =
   ])
   assert.equal(valid.changes[0]!.previous_state, 'drop')
   assert.equal(valid.changes[0]!.current_reason, '估值回落')
+  assert.equal(valid.changes[0]!.name, '示例公司')
 
   for (const key of ['decisions', 'evidence', 'changes'] as const) {
     const malformed = competitionPayload()

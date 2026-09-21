@@ -15,6 +15,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from app.db import PROJECT_ROOT, create_session_factory, init_db
+from app.discovery_models import DiscoveryRun
 from app.discovery_routes import (
     cancel_discovery_research_worker,
     create_discovery_router,
@@ -690,7 +691,20 @@ def _review_job_payload(row: PortfolioReview) -> dict[str, object]:
     }
 
 
-_JOB_TYPE_NAMES = frozenset({JOB_TYPE_FUNNEL, JOB_TYPE_RESEARCH, JOB_TYPE_REVIEW})
+def _discovery_job_payload(run: DiscoveryRun) -> dict[str, object]:
+    return {
+        "id": run.id,
+        "type": JOB_TYPE_DISCOVERY,
+        "status": run.status,
+        "error": run.error,
+        "name": run.week_key,
+        "updated_at": _iso_time(run.updated_at or run.created_at),
+    }
+
+
+_JOB_TYPE_NAMES = frozenset(
+    {JOB_TYPE_FUNNEL, JOB_TYPE_RESEARCH, JOB_TYPE_REVIEW, JOB_TYPE_DISCOVERY}
+)
 
 
 def _jobs_with_id(session, job_id: int) -> list[dict[str, object]]:
@@ -704,6 +718,9 @@ def _jobs_with_id(session, job_id: int) -> list[dict[str, object]]:
     review = session.get(PortfolioReview, job_id)
     if review is not None:
         found.append(_review_job_payload(review))
+    discovery = session.get(DiscoveryRun, job_id)
+    if discovery is not None:
+        found.append(_discovery_job_payload(discovery))
     return found
 
 
@@ -1829,9 +1846,13 @@ def create_app(
             reviews = session.scalars(
                 select(PortfolioReview).order_by(PortfolioReview.id.desc())
             ).all()
+            discoveries = session.scalars(
+                select(DiscoveryRun).order_by(DiscoveryRun.id.desc())
+            ).all()
             listed = [_job_payload(run) for run in runs]
             listed.extend(_research_job_payload(job) for job in research)
             listed.extend(_review_job_payload(row) for row in reviews)
+            listed.extend(_discovery_job_payload(run) for run in discoveries)
             listed.sort(
                 key=lambda item: (str(item.get("updated_at") or ""), item["type"], item["id"]),
                 reverse=True,
@@ -1850,7 +1871,7 @@ def create_app(
                 400,
                 error="请求无效",
                 code="INVALID_JOB",
-                detail="type 只能是 funnel、research 或 review",
+                detail="type 只能是 funnel、research、review 或 discovery",
             )
         factory = request.app.state.session_factory
         with factory() as session:
@@ -1872,7 +1893,7 @@ def create_app(
                     code="JOB_AMBIGUOUS",
                     detail=(
                         f"编号 {job_id} 同时存在 { '、'.join(types) }，"
-                        "请带 type=funnel|research|review 查询"
+                        "请带 type=funnel|research|review|discovery 查询"
                     ),
                     types=types,
                 )
