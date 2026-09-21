@@ -2,6 +2,13 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { RouterLink } from 'vue-router'
 import SentimentPanel from '../components/SentimentPanel.vue'
+import {
+  discoveryStatusText,
+  jobStatusText,
+  WORKBENCH_FETCH_TIMEOUT_MS,
+  WORKBENCH_PATHS,
+  WORKBENCH_REFRESH_MS,
+} from './homeViewModel'
 
 interface LockState {
   type?: string
@@ -66,21 +73,6 @@ const LOCK_ZH: Record<string, string> = {
   discovery: '每周发现',
   cheap: '低估值',
 }
-const JOB_STATUS: Record<string, string> = {
-  queued: '排队',
-  running: '进行中',
-  done: '完成',
-  failed: '失败',
-}
-const DISCOVERY_STATUS: Record<string, string> = {
-  queued: '排队中',
-  running: '进行中',
-  waiting_confirmation: '等待确认',
-  completed: '已完成',
-  partially_completed: '部分完成',
-  failed: '失败',
-  abandoned: '已放弃',
-}
 const PAPER_ZH: Record<string, string> = {
   current: '现行',
   updated: '已更新',
@@ -117,6 +109,9 @@ const ACTION_ZH: Record<string, string> = {
 
 const recentJobs = computed(() => jobs.value.slice(0, 8))
 let pollTimer: number | undefined
+let mounted = false
+let requestSequence = 0
+let workbenchController: AbortController | null = null
 
 function jobLink(job: JobRow): string | null {
   if (job.type === 'research') return `/research/${job.id}`
@@ -181,9 +176,18 @@ function jobDate(value?: string | null): string {
 }
 
 async function loadWorkbench() {
+  if (workbenchController !== null) return
+  const sequence = ++requestSequence
+  const controller = new AbortController()
+  const timeoutSignal = AbortSignal.timeout(WORKBENCH_FETCH_TIMEOUT_MS)
+  const signal = AbortSignal.any([controller.signal, timeoutSignal])
+  workbenchController = controller
   errorText.value = ''
   const messages: string[] = []
   try {
+    const responses = await Promise.all(
+      WORKBENCH_PATHS.map((path) => fetch(path, { signal })),
+    )
     const [
       healthRes,
       jobsRes,
@@ -192,25 +196,42 @@ async function loadWorkbench() {
       sentRes,
       afterRes,
       discoveryRes,
+    ] = responses as [
+      Response,
+      Response,
+      Response,
+      Response,
+      Response,
+      Response,
+      Response,
+    ]
+    const [
+      health,
+      jobsBody,
+      watchBody,
+      reviewBody,
+      sentBody,
+      afterBody,
+      discoveryBody,
     ] = await Promise.all([
-      fetch('/api/health'),
-      fetch('/api/jobs'),
-      fetch('/api/watchlist'),
-      fetch('/api/reviews/latest'),
-      fetch('/api/sentiment'),
-      fetch('/api/aftermath'),
-      fetch('/api/discoveries/current'),
+      healthRes.json().catch(() => ({})),
+      jobsRes.json().catch(() => ({})),
+      watchRes.json().catch(() => ({})),
+      reviewRes.json().catch(() => ({})),
+      sentRes.json().catch(() => ({})),
+      afterRes.json().catch(() => ({})),
+      discoveryRes.json().catch(() => ({})),
     ])
-    const health = await healthRes.json()
-    const jobsBody = await jobsRes.json()
-    const watchBody = await watchRes.json()
-    const discoveryBody = await discoveryRes.json()
+    if (!mounted || sequence !== requestSequence) return
+    if (signal.aborted) {
+      if (timeoutSignal.aborted) errorText.value = '工作台刷新超时'
+      return
+    }
     if (reviewRes.ok) {
-      latestReview.value = await reviewRes.json()
+      latestReview.value = reviewBody
     } else if (reviewRes.status === 404) {
       latestReview.value = null
     } else {
-      const reviewBody = await reviewRes.json().catch(() => ({}))
       messages.push(
         (reviewBody as { detail?: string }).detail
           || (reviewBody as { error?: string }).error
@@ -233,15 +254,13 @@ async function loadWorkbench() {
       messages.push(watchBody.detail || watchBody.error || '无法读取观察池')
     }
     if (sentRes.ok) {
-      sentiment.value = await sentRes.json()
+      sentiment.value = sentBody
     } else {
       sentiment.value = { score: null, label: '情绪不可用' }
     }
     if (afterRes.ok) {
-      const afterBody = await afterRes.json()
       aftermath.value = afterBody.items ?? []
     } else {
-      const afterBody = await afterRes.json().catch(() => ({}))
       messages.push(
         (afterBody as { detail?: string }).detail
           || (afterBody as { error?: string }).error
@@ -257,7 +276,10 @@ async function loadWorkbench() {
     }
     errorText.value = messages[0] || ''
   } catch {
-    errorText.value = '无法加载工作台'
+    if (!mounted || sequence !== requestSequence) return
+    errorText.value = timeoutSignal.aborted ? '工作台刷新超时' : '无法加载工作台'
+  } finally {
+    if (workbenchController === controller) workbenchController = null
   }
 }
 
@@ -282,13 +304,18 @@ async function removeWatch(id: number) {
 }
 
 onMounted(() => {
+  mounted = true
   void loadWorkbench()
   pollTimer = window.setInterval(() => {
     void loadWorkbench()
-  }, 3000)
+  }, WORKBENCH_REFRESH_MS)
 })
 
 onBeforeUnmount(() => {
+  mounted = false
+  requestSequence += 1
+  workbenchController?.abort()
+  workbenchController = null
   if (pollTimer != null) window.clearInterval(pollTimer)
 })
 </script>
@@ -315,7 +342,7 @@ onBeforeUnmount(() => {
         <p>按周运行固定尺子，逐层确认候选。</p>
         <p v-if="currentDiscovery">
           本周批次 {{ currentDiscovery.week_key }} ·
-          {{ DISCOVERY_STATUS[currentDiscovery.status] || currentDiscovery.status }} ·
+          {{ discoveryStatusText(currentDiscovery.status) }} ·
           <RouterLink to="/discover">查看进度</RouterLink>
         </p>
         <p v-else class="muted">本周批次：尚未创建</p>
@@ -366,7 +393,7 @@ onBeforeUnmount(() => {
     <p v-if="!latestReview">暂无审视</p>
     <template v-else>
       <p>
-        {{ JOB_STATUS[latestReview.status] || latestReview.status }}
+        {{ jobStatusText('review', latestReview.status) }}
         <span v-if="latestReview.has_stale">　本轮含过期价</span>
       </p>
       <p v-if="latestReview.status === 'failed'">{{ latestReview.error || '审视失败' }}</p>
@@ -432,7 +459,7 @@ onBeforeUnmount(() => {
         <tbody>
           <tr v-for="job in recentJobs" :key="`${job.type}-${job.id}`">
             <td>{{ LOCK_ZH[job.type] || job.type }}</td>
-            <td>{{ JOB_STATUS[job.status] || job.status }}</td>
+            <td>{{ jobStatusText(job.type, job.status) }}</td>
             <td>
               <RouterLink v-if="jobLink(job)" :to="jobLink(job)!">{{ job.name || LOCK_ZH[job.type] || job.type }}</RouterLink>
               <span v-else>{{ job.name || '—' }}</span>

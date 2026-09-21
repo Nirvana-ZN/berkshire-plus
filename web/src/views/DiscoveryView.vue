@@ -8,6 +8,7 @@ import {
   collectMetricKeys,
   candidateSurfacedReason,
   CURRENT_FETCH_TIMEOUT_MS,
+  discoveryChangeLabels,
   keeperRange,
   latestStagesNeedPolling,
   matchesStagePointer,
@@ -262,17 +263,6 @@ const RESULT_GROUPS = [
 const CURRENT_REFRESH_MS = 60_000
 const CURRENT_RETRY_MS = 5_000
 const MUTATION_FETCH_TIMEOUT_MS = 10_000
-const CHANGE_ZH: Record<string, string> = {
-  new: '本周新入围',
-  dropped: '本周退出',
-  reentered: '本周重新入围',
-  continuous: '连续入围',
-  reason_changed: '入围原因变化',
-  data_changed: '数据变化',
-  rule_changed: '尺子变化',
-  both_changed: '数据与尺子同时变化',
-  decision_changed: '人工裁决变化',
-}
 const CHANGE_STATE_ZH: Record<ParsedDiscoveryChange['previous_state'], string> = {
   absent: '未出现',
   pass: '入围',
@@ -1376,7 +1366,7 @@ function freshnessText(item: AdjudicationCase): string {
 
 function weeklyChangeText(view: StageView, item: AdjudicationCase): string {
   const change = weeklyChange(view, item)
-  return change ? weeklyChangeLabels(change) : '本周首次形成可裁决候选'
+  return change ? discoveryChangeLabels(change) : '本周首次形成可裁决候选'
 }
 
 function weeklyChange(
@@ -1393,12 +1383,6 @@ function weeklyChange(
 
 function changeName(view: StageView, change: ParsedDiscoveryChange): string {
   return change.name || rows(view).find((row) => row.code === change.code)?.name || change.code
-}
-
-function weeklyChangeLabels(change: ParsedDiscoveryChange): string {
-  return change.classifications
-    .map((classification) => CHANGE_ZH[classification] || classification)
-    .join('；')
 }
 
 function weeklyStateText(
@@ -1835,7 +1819,7 @@ onBeforeUnmount(() => {
               <tbody>
                 <tr v-for="change in view.payload.changes" :key="change.code">
                   <td>{{ changeName(view, change) }}（{{ change.code }}）</td>
-                  <td>{{ weeklyChangeLabels(change) }}</td>
+                  <td>{{ discoveryChangeLabels(change) }}</td>
                   <td>
                     {{ weeklyStateText(change, 'previous') }} /
                     {{ weeklyReasonText(change, 'previous') }}

@@ -238,6 +238,9 @@ def test_candidate_cards_fail_closed_with_retry_and_scoped_drafts() -> None:
     page = (ROOT / "web/src/views/DiscoveryView.vue").read_text(
         encoding="utf-8"
     )
+    helper = (ROOT / "web/src/views/discoveryViewModel.ts").read_text(
+        encoding="utf-8"
+    )
 
     loader = page[
         page.index("async function loadAdjudicationPayload(") :
@@ -252,7 +255,7 @@ def test_candidate_cards_fail_closed_with_retry_and_scoped_drafts() -> None:
     assert "候选案例不可用于裁决" in page
     assert "draftKey(caseItem)" in page
     assert "`${item.track}:${item.code}`" in page
-    assert "change.classifications" in page
+    assert "change.classifications" in helper
     assert "weeklyChangeText(view, caseItem)" in page
 
 
@@ -282,6 +285,9 @@ def test_discovery_view_renders_compact_weekly_change_rows() -> None:
     page = (ROOT / "web/src/views/DiscoveryView.vue").read_text(
         encoding="utf-8"
     )
+    helper = (ROOT / "web/src/views/discoveryViewModel.ts").read_text(
+        encoding="utf-8"
+    )
 
     mappings = {
         "new": "本周新入围",
@@ -295,12 +301,12 @@ def test_discovery_view_renders_compact_weekly_change_rows() -> None:
         "decision_changed": "人工裁决变化",
     }
     for value, label in mappings.items():
-        assert re.search(rf"\b{value}: '{label}'", page)
+        assert re.search(rf"\b{value}: '{label}'", helper)
 
     assert "本周变化" in page
     assert 'v-for="change in view.payload.changes"' in page
     assert "changeName(view, change)" in page
-    assert "weeklyChangeLabels(change)" in page
+    assert "discoveryChangeLabels(change)" in page
     assert "weeklyStateText(change, 'previous')" in page
     assert "weeklyStateText(change, 'current')" in page
     assert "weeklyReasonText(change, 'previous')" in page
@@ -309,13 +315,23 @@ def test_discovery_view_renders_compact_weekly_change_rows() -> None:
 
 def test_home_reuses_refresh_for_current_discovery_and_links_jobs() -> None:
     home = (ROOT / "web/src/views/HomeView.vue").read_text(encoding="utf-8")
+    helper = (ROOT / "web/src/views/homeViewModel.ts").read_text(
+        encoding="utf-8"
+    )
 
     assert "discovery: '每周发现'" in home
     assert "if (job.type === 'discovery') return '/discover'" in home
-    assert "fetch('/api/discoveries/current')" in home
+    assert "'/api/discoveries/current'" in helper
     assert "本周批次" in home
+    assert "if (workbenchController !== null) return" in home
+    assert "requestSequence" in home
+    assert "new AbortController()" in home
+    assert "AbortSignal.timeout(WORKBENCH_FETCH_TIMEOUT_MS)" in home
+    assert "workbenchController?.abort()" in home
+    assert "signal," in home
+    assert "jobStatusText(job.type, job.status)" in home
     assert home.count("window.setInterval(") == 1
-    assert "}, 3000)" in home
+    assert "WORKBENCH_REFRESH_MS" in home
 
 
 def test_jobs_include_discovery_runs(tmp_path: Path) -> None:

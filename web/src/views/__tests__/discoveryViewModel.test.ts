@@ -8,6 +8,7 @@ import {
   candidateSurfacedReason,
   collectMetricKeys,
   CURRENT_FETCH_TIMEOUT_MS,
+  discoveryChangeLabels,
   latestStagesNeedPolling,
   keeperRange,
   matchesStagePointer,
@@ -258,6 +259,10 @@ test('competition schema requires exact card arrays and reliable evidence', () =
   assert.equal(valid.changes[0]!.previous_state, 'drop')
   assert.equal(valid.changes[0]!.current_reason, '估值回落')
   assert.equal(valid.changes[0]!.name, '示例公司')
+  assert.equal(
+    discoveryChangeLabels(valid.changes[0]!),
+    '连续入围；入围原因变化；数据与尺子同时变化',
+  )
 
   for (const key of ['decisions', 'evidence', 'changes'] as const) {
     const malformed = competitionPayload()

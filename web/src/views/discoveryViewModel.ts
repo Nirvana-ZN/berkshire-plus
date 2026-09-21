@@ -89,6 +89,18 @@ type DiscoveryChangeClassification =
   | 'reason_changed'
 type DiscoveryResultState = 'absent' | 'pass' | 'drop' | 'insufficient'
 
+const DISCOVERY_CHANGE_ZH: Record<DiscoveryChangeClassification, string> = {
+  new: '本周新入围',
+  dropped: '本周退出',
+  reentered: '本周重新入围',
+  continuous: '连续入围',
+  reason_changed: '入围原因变化',
+  data_changed: '数据变化',
+  rule_changed: '尺子变化',
+  both_changed: '数据与尺子同时变化',
+  decision_changed: '人工裁决变化',
+}
+
 interface ParsedDistribution {
   status: 'available' | 'unavailable'
   reason?: string
@@ -227,6 +239,14 @@ export function keeperRange(
 ): 'insufficient' | 'valid' | 'over-limit' {
   if (count > 5) return 'over-limit'
   return count >= 3 ? 'valid' : 'insufficient'
+}
+
+export function discoveryChangeLabels(
+  change: Pick<ParsedDiscoveryChange, 'classifications'>,
+): string {
+  return change.classifications
+    .map((classification) => DISCOVERY_CHANGE_ZH[classification])
+    .join('；')
 }
 
 export function candidateSurfacedReason(
