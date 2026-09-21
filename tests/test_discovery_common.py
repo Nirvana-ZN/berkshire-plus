@@ -1127,7 +1127,10 @@ def test_drain_persists_validated_competition_evidence(tmp_path) -> None:
             )
 
         outcome = drain_run_queue(
-            session, run.id, track_executor=execute
+            session,
+            run.id,
+            track_executor=execute,
+            now_provider=lambda: SNAPSHOT_AT,
         )
         assert outcome.executed == 1
         evidence = session.scalar(select(DiscoveryEvidence))
