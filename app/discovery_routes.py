@@ -4,8 +4,9 @@ import json
 import logging
 import threading
 from collections.abc import Callable, Mapping
-from datetime import datetime
+from datetime import datetime, timezone
 from math import isfinite
+from uuid import uuid4
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
@@ -24,7 +25,8 @@ from app.discovery_models import (
     DiscoveryRun,
     DiscoveryStage,
 )
-from app.models import RulerVersion
+from app.envfile import OPENAI_API_KEY, has_env_value
+from app.models import JobLock, ResearchJob, RulerVersion
 from discovery.aggregate import aggregate_run_status
 from discovery.builds import AVAILABLE_BUILDS, BUILD_VERSION, _is_build_available
 from discovery.constants import (
@@ -46,15 +48,21 @@ from discovery.snapshot import (
 from jobs.discovery import drain_run_queue
 from jobs.lock import (
     JOB_TYPE_DISCOVERY,
+    JOB_TYPE_RESEARCH,
+    LOCK_ROW_ID,
     acquire_discovery,
+    ensure_lock_row,
     lock_status,
     release,
 )
+from jobs.research import create_research_job, execute_research
 from ledger.positions import LOCAL_USER_ID
 
 logger = logging.getLogger(__name__)
 _TRACK_ORDER = ("quality_discount", "deep_value", "garp")
 _STAGE_ORDER = {"track_gate": 0, "competition": 1, "adjudication": 2}
+_DISCOVERY_RESEARCH_RESERVATION = "discovery_research_accept"
+_DISCOVERY_RESEARCH_WEEKLY_QUOTA = 3
 SnapshotProvider = Callable[..., ProductionSnapshot]
 
 
@@ -1034,6 +1042,214 @@ def _exact_parent(
     )
 
 
+def _discovery_research_name(
+    session: Session,
+    run: DiscoveryRun,
+    *,
+    track: str,
+    code: str,
+) -> str | None:
+    adjudication = _latest_track(
+        session, run.id, track, "adjudication"
+    )
+    if (
+        adjudication is None
+        or adjudication.status not in {"confirmed", "insufficient_candidates"}
+    ):
+        return None
+    competition = _exact_parent(session, adjudication)
+    if not isinstance(competition, DiscoveryStage):
+        return None
+    final_result = session.scalar(
+        select(DiscoveryResult).where(
+            DiscoveryResult.run_id == run.id,
+            DiscoveryResult.track == track,
+            DiscoveryResult.stage == "adjudication",
+            DiscoveryResult.attempt == adjudication.attempt,
+            DiscoveryResult.code == code,
+            DiscoveryResult.verdict == "pass",
+        )
+    )
+    decision = session.scalar(
+        select(DiscoveryDecision).where(
+            DiscoveryDecision.run_id == run.id,
+            DiscoveryDecision.track == track,
+            DiscoveryDecision.competition_attempt == competition.attempt,
+            DiscoveryDecision.competition_stage_id == competition.id,
+            DiscoveryDecision.code == code,
+            DiscoveryDecision.decision == "keep",
+        )
+    )
+    evidence = session.scalar(
+        select(DiscoveryEvidence.id)
+        .where(
+            DiscoveryEvidence.run_id == run.id,
+            DiscoveryEvidence.track == track,
+            DiscoveryEvidence.competition_attempt == competition.attempt,
+            DiscoveryEvidence.competition_stage_id == competition.id,
+            DiscoveryEvidence.code == code,
+        )
+        .limit(1)
+    )
+    frozen = session.scalar(
+        select(DiscoveryInputSnapshot).where(
+            DiscoveryInputSnapshot.run_id == run.id,
+            DiscoveryInputSnapshot.code == code,
+        )
+    )
+    if (
+        final_result is None
+        or decision is None
+        or evidence is None
+        or frozen is None
+    ):
+        return None
+    return frozen.name
+
+
+def _existing_discovery_research(
+    session: Session, run_id: int, code: str
+) -> ResearchJob | None:
+    return session.scalar(
+        select(ResearchJob).where(
+            ResearchJob.discovery_run_id == run_id,
+            ResearchJob.code == code,
+        )
+    )
+
+
+def _research_job_payload(job: ResearchJob) -> dict[str, object]:
+    return {
+        "id": job.id,
+        "status": job.status,
+        "type": JOB_TYPE_RESEARCH,
+    }
+
+
+def _acquire_discovery_research_reservation(
+    session: Session, run_id: int, now: datetime
+) -> str | None:
+    ensure_lock_row(session)
+    owner_token = uuid4().hex
+    acquired = session.execute(
+        update(JobLock)
+        .where(
+            JobLock.id == LOCK_ROW_ID,
+            JobLock.job_id.is_(None),
+        )
+        .values(
+            job_id=run_id,
+            job_type=_DISCOVERY_RESEARCH_RESERVATION,
+            held_at=now,
+            owner_token=owner_token,
+        )
+    )
+    return owner_token if int(acquired.rowcount or 0) == 1 else None
+
+
+def _replace_research_reservation(
+    session: Session,
+    *,
+    run_id: int,
+    job_id: int,
+    owner_token: str,
+    now: datetime,
+) -> bool:
+    replaced = session.execute(
+        update(JobLock)
+        .where(
+            JobLock.id == LOCK_ROW_ID,
+            JobLock.job_id == run_id,
+            JobLock.job_type == _DISCOVERY_RESEARCH_RESERVATION,
+            JobLock.owner_token == owner_token,
+        )
+        .values(
+            job_id=job_id,
+            job_type=JOB_TYPE_RESEARCH,
+            held_at=now,
+        )
+    )
+    return int(replaced.rowcount or 0) == 1
+
+
+def _release_discovery_research_reservation(
+    factory, run_id: int, owner_token: str
+) -> None:
+    with factory() as session:
+        release(
+            session,
+            run_id,
+            _DISCOVERY_RESEARCH_RESERVATION,
+            owner_token=owner_token,
+        )
+        session.commit()
+
+
+def _run_discovery_research(
+    app, job_id: int, owner_token: str
+) -> None:
+    with app.state.session_factory() as session:
+        execute_research(
+            session,
+            job_id,
+            llm=app.state.llm_client,
+            quote_client=app.state.quote_client,
+            reports_dir=app.state.reports_dir,
+            market=app.state.market_client,
+            lock_owner_token=owner_token,
+        )
+
+
+def _fail_discovery_research_dispatch(
+    factory, job_id: int, owner_token: str, error: Exception
+) -> None:
+    with factory() as session:
+        job = session.get(ResearchJob, job_id)
+        if job is not None and job.status == "queued":
+            job.status = "failed"
+            job.error = str(error)
+            job.updated_at = datetime.now(timezone.utc)
+        release(
+            session,
+            job_id,
+            JOB_TYPE_RESEARCH,
+            owner_token=owner_token,
+        )
+        session.commit()
+
+
+def _dispatch_discovery_research(
+    app,
+    job_id: int,
+    owner_token: str,
+    *,
+    sync: bool,
+) -> JSONResponse | None:
+    if sync:
+        _run_discovery_research(app, job_id, owner_token)
+        return None
+    error = _start_discovery_worker(
+        app,
+        _run_discovery_research,
+        (app, job_id, owner_token),
+    )
+    if error is None:
+        return None
+    logger.error("发现评估线程启动失败: %s", error)
+    _fail_discovery_research_dispatch(
+        app.state.session_factory,
+        job_id,
+        owner_token,
+        error,
+    )
+    return _error(
+        500,
+        error="任务启动失败",
+        code="DISCOVERY_RESEARCH_DISPATCH_FAILED",
+        detail=str(error),
+    )
+
+
 def _lineage_rejection(row: DiscoveryStage) -> JSONResponse:
     missing = (
         row.common_stage_id is None
@@ -1584,6 +1800,197 @@ def resume_discovery_queues(app) -> None:
 
 def create_discovery_router() -> APIRouter:
     router = APIRouter(prefix="/api/discoveries")
+
+    @router.post("/{run_id}/research")
+    async def create_discovery_research(request: Request, run_id: int):
+        payload, rejected = await _object_body(
+            request, "INVALID_DISCOVERY_RESEARCH"
+        )
+        if rejected is not None:
+            return rejected
+        track = payload.get("track")
+        code = payload.get("code")
+        if (
+            type(track) is not str
+            or track not in TRACKS
+            or type(code) is not str
+            or not code.strip()
+        ):
+            return _error(
+                400,
+                error="请求无效",
+                code="INVALID_DISCOVERY_RESEARCH",
+                detail="track 或 code 无效",
+            )
+        code = code.strip()
+        if not has_env_value(
+            request.app.state.env_path, OPENAI_API_KEY
+        ):
+            return _error(
+                400,
+                error="未配置模型密钥",
+                code="NO_API_KEY",
+                detail="评估需要模型密钥，请到设置页配置",
+            )
+        sync = _truthy(payload.get("sync")) and bool(
+            getattr(request.app.state, "allow_sync", False)
+        )
+        factory = request.app.state.session_factory
+        owner_token: str | None = None
+        converted = False
+        job_id: int | None = None
+        try:
+            with factory() as session:
+                run = _owned_run(session, run_id)
+                if run is None:
+                    return _error(
+                        404,
+                        error="未找到",
+                        code="DISCOVERY_NOT_FOUND",
+                        detail=f"没有发现批次 {run_id}",
+                    )
+                immutable = _mutation_guard(run, _now(request.app))
+                if immutable is not None:
+                    return immutable
+                name = _discovery_research_name(
+                    session, run, track=track, code=code
+                )
+                if name is None:
+                    return _error(
+                        409,
+                        error="候选不可评估",
+                        code="DISCOVERY_CANDIDATE_NOT_RESEARCHABLE",
+                        detail="仅可评估已有最终保留决定和证据的候选",
+                    )
+                existing = _existing_discovery_research(
+                    session, run.id, code
+                )
+                if existing is not None:
+                    return _research_job_payload(existing)
+                try:
+                    owner_token = _acquire_discovery_research_reservation(
+                        session, run.id, _now(request.app)
+                    )
+                except OperationalError:
+                    session.rollback()
+                    existing = _existing_discovery_research(
+                        session, run.id, code
+                    )
+                    if existing is not None:
+                        return _research_job_payload(existing)
+                    return _locked(session)
+                if owner_token is None:
+                    session.rollback()
+                    existing = _existing_discovery_research(
+                        session, run.id, code
+                    )
+                    if existing is not None:
+                        return _research_job_payload(existing)
+                    return _locked(session)
+
+                session.expire_all()
+                run = _owned_run(session, run_id)
+                if run is None:
+                    session.rollback()
+                    return _error(
+                        404,
+                        error="未找到",
+                        code="DISCOVERY_NOT_FOUND",
+                        detail=f"没有发现批次 {run_id}",
+                    )
+                immutable = _mutation_guard(run, _now(request.app))
+                if immutable is not None:
+                    session.rollback()
+                    return immutable
+                name = _discovery_research_name(
+                    session, run, track=track, code=code
+                )
+                if name is None:
+                    session.rollback()
+                    return _error(
+                        409,
+                        error="候选不可评估",
+                        code="DISCOVERY_CANDIDATE_NOT_RESEARCHABLE",
+                        detail="仅可评估已有最终保留决定和证据的候选",
+                    )
+                existing = _existing_discovery_research(
+                    session, run.id, code
+                )
+                if existing is not None:
+                    session.rollback()
+                    return _research_job_payload(existing)
+                accepted = session.scalar(
+                    select(func.count(func.distinct(ResearchJob.code)))
+                    .join(
+                        DiscoveryRun,
+                        ResearchJob.discovery_run_id == DiscoveryRun.id,
+                    )
+                    .where(
+                        DiscoveryRun.user_id == run.user_id,
+                        DiscoveryRun.week_key == run.week_key,
+                    )
+                )
+                if int(accepted or 0) >= _DISCOVERY_RESEARCH_WEEKLY_QUOTA:
+                    session.rollback()
+                    return _error(
+                        409,
+                        error="本周评估名额已满",
+                        code="DISCOVERY_RESEARCH_QUOTA",
+                        detail="每个自然周最多评估 3 家不同公司",
+                    )
+                job = create_research_job(
+                    session,
+                    name=name,
+                    code=code,
+                    discovery_run_id=run.id,
+                    discovery_track=track,
+                )
+                try:
+                    session.flush()
+                except IntegrityError:
+                    session.rollback()
+                    existing = _existing_discovery_research(
+                        session, run.id, code
+                    )
+                    if existing is not None:
+                        return _research_job_payload(existing)
+                    return _error(
+                        409,
+                        error="评估请求冲突",
+                        code="DISCOVERY_RESEARCH_CONFLICT",
+                        detail="候选评估请求已被其他会话接受",
+                    )
+                if not _replace_research_reservation(
+                    session,
+                    run_id=run.id,
+                    job_id=job.id,
+                    owner_token=owner_token,
+                    now=_now(request.app),
+                ):
+                    session.rollback()
+                    return _locked(session)
+                session.commit()
+                converted = True
+                job_id = job.id
+        finally:
+            if owner_token is not None and not converted:
+                _release_discovery_research_reservation(
+                    factory, run_id, owner_token
+                )
+
+        assert job_id is not None and owner_token is not None
+        failed = _dispatch_discovery_research(
+            request.app,
+            job_id,
+            owner_token,
+            sync=sync,
+        )
+        if failed is not None:
+            return failed
+        with factory() as session:
+            job = session.get(ResearchJob, job_id)
+            assert job is not None
+            return _research_job_payload(job)
 
     @router.post("")
     async def create_discovery(request: Request):

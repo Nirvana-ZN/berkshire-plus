@@ -32,6 +32,32 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def create_research_job(
+    session: Session,
+    *,
+    name: str,
+    code: str,
+    screen_run_id: int | None = None,
+    discovery_run_id: int | None = None,
+    discovery_track: str | None = None,
+) -> ResearchJob:
+    now = _now()
+    job = ResearchJob(
+        user_id=LOCAL_USER_ID,
+        screen_run_id=screen_run_id,
+        discovery_run_id=discovery_run_id,
+        discovery_track=discovery_track,
+        name=name,
+        code=code,
+        status="queued",
+        error=None,
+        created_at=now,
+        updated_at=now,
+    )
+    session.add(job)
+    return job
+
+
 def _json_optional(value: Decimal | None) -> int | float | None:
     if value is None:
         return None
@@ -248,17 +274,12 @@ def evaluate_finalists(
     search = web_search_enabled(session)
     as_of = _now().date().isoformat()
     for row in finalists[:3]:
-        job = ResearchJob(
-            user_id=LOCAL_USER_ID,
+        job = create_research_job(
+            session,
             screen_run_id=run_id,
             name=row.name,
             code=row.code,
-            status="queued",
-            error=None,
-            created_at=_now(),
-            updated_at=_now(),
         )
-        session.add(job)
         session.commit()
         _run_one(
             session,
@@ -282,11 +303,17 @@ def execute_research(
     quote_client,
     reports_dir: Path,
     market=None,
+    lock_owner_token: str | None = None,
 ) -> None:
     job = session.get(ResearchJob, job_id)
     if job is None:
         try:
-            release(session, job_id, JOB_TYPE_RESEARCH)
+            release(
+                session,
+                job_id,
+                JOB_TYPE_RESEARCH,
+                owner_token=lock_owner_token,
+            )
             session.commit()
         except Exception:
             session.rollback()
@@ -305,7 +332,12 @@ def execute_research(
         )
     finally:
         try:
-            release(session, job_id, JOB_TYPE_RESEARCH)
+            release(
+                session,
+                job_id,
+                JOB_TYPE_RESEARCH,
+                owner_token=lock_owner_token,
+            )
             session.commit()
         except Exception:
             session.rollback()

@@ -581,7 +581,7 @@ def test_shutdown_revokes_hung_discovery_worker_without_waiting(
     engine = init_db(db_path)
     factory = create_session_factory(engine)
     with factory() as session:
-        clear_stale_lock(session)
+        clear_stale_lock(session, now_provider=lambda: SNAPSHOT_AT)
         assert session.scalar(
             select(func.count()).select_from(DiscoveryCommonResult)
         ) == 0
@@ -5181,6 +5181,7 @@ def test_exact_discovery_endpoint_surface(tmp_path: Path) -> None:
     }
     assert surface == {
         ("POST", "/api/discoveries"),
+        ("POST", "/api/discoveries/{run_id}/research"),
         ("GET", "/api/discoveries/current"),
         ("GET", "/api/discoveries/{run_id}/stages/safety"),
         (

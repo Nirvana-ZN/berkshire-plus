@@ -536,6 +536,14 @@ def _ensure_research_columns(engine: Engine) -> None:
                     "ALTER TABLE research_jobs ADD COLUMN discovery_track VARCHAR"
                 )
             )
+        conn.execute(
+            text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "ux_research_discovery_candidate "
+                "ON research_jobs(discovery_run_id, code) "
+                "WHERE discovery_run_id IS NOT NULL"
+            )
+        )
         invalid_provenance = """
             (NEW.discovery_track IS NOT NULL AND NEW.discovery_track NOT IN (
                 'quality_discount', 'deep_value', 'garp'
