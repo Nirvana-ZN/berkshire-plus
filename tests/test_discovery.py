@@ -146,6 +146,9 @@ def test_discovery_view_review_guards_and_read_only_adjudication() -> None:
     assert "clearStageCache" in page
     assert "CURRENT_REFRESH_MS" in page
     assert "beforeMutation" in page
+    assert "current.run.tracks" in page
+    assert "transitionAnnouncement" in page
+    assert 'aria-labelledby="`discovery-stage-' in page
     assert "人工裁决将在 Task 4" in page
     assert "通过结果" in page
     assert "淘汰结果" in page

@@ -4,6 +4,8 @@ import test from 'node:test'
 import {
   canAbandonRun,
   matchesStagePointer,
+  parseMetricRecord,
+  renderMetricValue,
   stageActions,
   stageCacheKey,
   shouldPollStage,
@@ -45,4 +47,27 @@ test('polling and abandon follow backend mutability', () => {
   assert.equal(canAbandonRun(true, 'partially_completed'), true)
   assert.equal(canAbandonRun(false, 'running'), false)
   assert.equal(canAbandonRun(true, 'abandoned'), false)
+})
+
+test('metric parser accepts bounded scalar arrays and rejects unsafe values', () => {
+  const parsed = parseMetricRecord({
+    risk_flags: ['margin_deterioration', ['bank_asset_quality']],
+    score: 1.25,
+    active: true,
+    note: null,
+  })
+  assert.ok(parsed)
+  assert.equal(
+    renderMetricValue(parsed.risk_flags!),
+    '[margin_deterioration、[bank_asset_quality]]',
+  )
+  assert.equal(renderMetricValue(parsed.active!), '是')
+  assert.equal(parseMetricRecord({ unsafe: { nested: true } }), null)
+  assert.equal(parseMetricRecord({ nonfinite: Number.POSITIVE_INFINITY }), null)
+  assert.equal(parseMetricRecord({ tooDeep: [[[['value']]]] }), null)
+  assert.equal(parseMetricRecord({ tooWide: Array.from({ length: 65 }, () => 'x') }), null)
+  assert.equal(
+    parseMetricRecord({ tooMuchText: Array.from({ length: 17 }, () => 'x'.repeat(4096)) }),
+    null,
+  )
 })

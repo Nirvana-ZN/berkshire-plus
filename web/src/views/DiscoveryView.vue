@@ -3,6 +3,8 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import {
   canAbandonRun,
   matchesStagePointer,
+  parseStageResponse,
+  renderMetricValue,
   stageActions,
   stageAriaLabel,
   stageCacheKey,
@@ -12,6 +14,7 @@ import {
   type DiscoveryStageStatus,
   type DiscoveryTrack,
   type DiscoveryTrackStage,
+  type MetricValue,
 } from './discoveryViewModel'
 
 const DISCOVERY_RUN_STATUSES = [
@@ -43,7 +46,6 @@ type StageStatus = DiscoveryStageStatus
 type Track = DiscoveryTrack
 type TrackStage = DiscoveryTrackStage
 type StageKey = 'safety' | `${Track}:${TrackStage}`
-type MetricValue = string | number | null
 
 interface RunStagePointer {
   stage: string | null
@@ -83,7 +85,7 @@ interface DiscoveryRow {
   original_verdict: 'pass' | 'drop' | 'insufficient'
   reason: string | null
   rank: number | null
-  metrics: Record<string, string | number | null>
+  metrics: Record<string, MetricValue>
   override: DiscoveryOverride | null
 }
 
@@ -212,6 +214,7 @@ const state = ref<ViewState>({ kind: 'loading' })
 const starting = ref(false)
 const mutating = ref(false)
 const actionError = ref('')
+const transitionAnnouncement = ref('')
 const stageViews = ref<StageView[]>([])
 const activeRunId = ref<number | null>(null)
 const activeStageKey = ref<Record<string, number>>({})
@@ -256,10 +259,6 @@ function isDiscoveryRunStatus(value: unknown): value is DiscoveryRunStatus {
 
 function isStageStatus(value: unknown): value is StageStatus {
   return STAGE_STATUSES.some((status) => status === value)
-}
-
-function isTrack(value: unknown): value is Track {
-  return TRACKS.some((track) => track === value)
 }
 
 function isTrackStage(value: unknown): value is TrackStage {
@@ -309,183 +308,39 @@ function nonNegativeInteger(value: unknown): number | null {
   return number !== null && Number.isInteger(number) && number >= 0 ? number : null
 }
 
-function textOrNull(value: unknown): string | null {
-  return typeof value === 'string' ? value : null
-}
-
-function metricValue(value: unknown): MetricValue | undefined {
-  if (value === null || typeof value === 'string') return value
-  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
-}
-
-function parseOverride(value: unknown): DiscoveryOverride | null {
-  if (
-    !isRecord(value)
-    || nonNegativeInteger(value.id) === null
-    || !isTrack(value.track)
-    || !isTrackStage(value.stage)
-    || nonNegativeInteger(value.attempt) === null
-    || typeof value.code !== 'string'
-    || (value.action !== 'forced_pass' && value.action !== 'forced_drop')
-    || typeof value.reason !== 'string'
-  ) return null
-  return {
-    id: value.id as number,
-    track: value.track,
-    stage: value.stage,
-    attempt: value.attempt as number,
-    code: value.code,
-    action: value.action,
-    reason: value.reason,
-  }
-}
-
-function parseRow(value: unknown): DiscoveryRow | null {
-  if (
-    !isRecord(value)
-    || typeof value.code !== 'string'
-    || typeof value.name !== 'string'
-    || !value.name
-    || (value.verdict !== 'pass' && value.verdict !== 'drop' && value.verdict !== 'insufficient')
-    || (
-      value.original_verdict !== 'pass'
-      && value.original_verdict !== 'drop'
-      && value.original_verdict !== 'insufficient'
-    )
-    || (value.reason !== null && typeof value.reason !== 'string')
-    || (value.rank !== undefined && value.rank !== null && nonNegativeInteger(value.rank) === null)
-    || !isRecord(value.metrics)
-  ) return null
-  const metrics: Record<string, MetricValue> = {}
-  for (const [key, raw] of Object.entries(value.metrics)) {
-    const parsed = metricValue(raw)
-    if (parsed === undefined) return null
-    metrics[key] = parsed
-  }
-  const override = value.override == null ? null : parseOverride(value.override)
-  if (value.override != null && override === null) return null
-  return {
-    code: value.code,
-    name: value.name,
-    verdict: value.verdict,
-    original_verdict: value.original_verdict,
-    reason: textOrNull(value.reason),
-    rank: value.rank == null ? null : value.rank as number,
-    metrics,
-    override,
-  }
-}
-
-function parseRows(value: unknown): DiscoveryRow[] | null {
-  if (!Array.isArray(value)) return null
-  const rows = value.map(parseRow)
-  return rows.some((row) => row === null) ? null : rows as DiscoveryRow[]
-}
-
-function parseSummary(value: unknown): StageSummary | null {
-  if (!isRecord(value) || !Array.isArray(value.rules) || !isRecord(value.ruler)
-    || !isRecord(value.counts) || !isRecord(value.distributions)
-    || !Array.isArray(value.threshold_markers)) return null
-  const rules: SummaryRule[] = []
-  for (const rule of value.rules) {
-    if (!isRecord(rule) || typeof rule.id !== 'string' || typeof rule.text !== 'string') return null
-    rules.push({ id: rule.id, text: rule.text })
-  }
-  const counts = value.counts
-  const parsedCounts = {
-    input: nonNegativeInteger(counts.input),
-    pass: nonNegativeInteger(counts.pass),
-    drop: nonNegativeInteger(counts.drop),
-    insufficient: nonNegativeInteger(counts.insufficient),
-    overrides: nonNegativeInteger(counts.overrides),
-  }
-  if (Object.values(parsedCounts).some((count) => count === null)) return null
-  const distributions: Record<string, MetricDistribution> = {}
-  for (const [metric, raw] of Object.entries(value.distributions)) {
-    if (!isRecord(raw) || (raw.status !== 'available' && raw.status !== 'unavailable')) return null
-    const count = nonNegativeInteger(raw.count)
-    if (count === null) return null
-    distributions[metric] = {
-      status: raw.status,
-      reason: typeof raw.reason === 'string' ? raw.reason : undefined,
-      count,
-      min: textOrNull(raw.min),
-      p25: textOrNull(raw.p25),
-      median: textOrNull(raw.median),
-      p75: textOrNull(raw.p75),
-      max: textOrNull(raw.max),
-    }
-  }
-  const markers: ThresholdMarker[] = []
-  for (const marker of value.threshold_markers) {
-    if (
-      !isRecord(marker)
-      || typeof marker.id !== 'string'
-      || typeof marker.threshold !== 'string'
-      || (marker.metric !== null && typeof marker.metric !== 'string')
-      || ![null, 'gt', 'gte', 'lte'].includes(marker.direction as null | string)
-      || (marker.position !== null && typeof marker.position !== 'string')
-      || !['available', 'unavailable', 'unresolved'].includes(String(marker.status))
-    ) return null
-    markers.push(marker as unknown as ThresholdMarker)
-  }
-  const ruler = value.ruler
-  if (
-    (ruler.version_id !== null && nonNegativeInteger(ruler.version_id) === null)
-    || typeof ruler.reason !== 'string'
-    || typeof ruler.scope !== 'string'
-    || (ruler.algorithm_version !== null && typeof ruler.algorithm_version !== 'string')
-    || typeof ruler.status !== 'string'
-  ) return null
-  return {
-    schema_version: typeof value.schema_version === 'string' ? value.schema_version : 'unavailable',
-    rules,
-    ruler: {
-      version_id: ruler.version_id as number | null,
-      reason: ruler.reason,
-      scope: ruler.scope,
-      algorithm_version: ruler.algorithm_version as string | null,
-      status: ruler.status,
-    },
-    counts: parsedCounts as StageCounts,
-    distributions,
-    threshold_markers: markers,
-  }
-}
-
-function parseStageResponse(value: unknown): StageResponse | null {
-  if (!isRecord(value) || !isRecord(value.current) || !isStageStatus(value.current.status)) return null
-  const passed = parseRows(value.pass)
-  const dropped = parseRows(value.drop)
-  const insufficient = parseRows(value.insufficient)
-  const summary = parseSummary(value.summary)
-  if (passed === null || dropped === null || insufficient === null || summary === null) return null
-  const overrides = Array.isArray(value.overrides)
-    ? value.overrides.map(parseOverride)
-    : []
-  if (overrides.some((item) => item === null)) return null
-  return {
-    current: {
-      attempt: nonNegativeInteger(value.current.attempt) ?? 0,
-      status: value.current.status,
-      error: textOrNull(value.current.error),
-      failure_kind: value.current.failure_kind === 'transient' || value.current.failure_kind === 'permanent'
-        ? value.current.failure_kind
-        : null,
-    },
-    pass: passed,
-    drop: dropped,
-    insufficient,
-    overrides: overrides as DiscoveryOverride[],
-    summary,
-  }
-}
-
 function errorMessage(body: unknown, fallback: string): string {
   if (!isRecord(body)) return fallback
   if (typeof body.detail === 'string' && body.detail) return body.detail
   if (typeof body.error === 'string' && body.error) return body.error
   return fallback
+}
+
+function announceStageTransitions(previous: DiscoveryRun | null, next: DiscoveryRun) {
+  if (previous === null || previous.id !== next.id) {
+    transitionAnnouncement.value = ''
+    return
+  }
+  const messages: string[] = []
+  if (
+    previous.safety?.status !== next.safety?.status
+    && next.safety?.status != null
+  ) {
+    messages.push(`共同排雷状态更新为${STAGE_STATUS_ZH[next.safety.status]}`)
+  }
+  for (const track of TRACKS) {
+    const before = previous.tracks?.[track]
+    const after = next.tracks?.[track]
+    if (
+      after?.status != null
+      && (before?.stage !== after.stage || before?.status !== after.status)
+    ) {
+      const stage = isTrackStage(after.stage) ? STAGE_ZH[after.stage] : '待开始'
+      messages.push(
+        `${TRACK_ZH[track]}进入${stage}，状态${STAGE_STATUS_ZH[after.status]}`,
+      )
+    }
+  }
+  if (messages.length) transitionAnnouncement.value = messages.join('；')
 }
 
 function viewsForRun(run: DiscoveryRun): StageView[] {
@@ -591,7 +446,16 @@ function abortStageRequests() {
 }
 
 function needsPolling(): boolean {
-  return stageViews.value.some((view) => shouldPollStage(view.created, view.status))
+  const current = state.value
+  if (current.kind !== 'ready') return false
+  const pointers = [
+    current.run.safety,
+    ...TRACKS.map((track) => current.run.tracks?.[track]),
+  ]
+  return pointers.some(
+    (pointer) => pointer?.status != null
+      && shouldPollStage(pointer.created, pointer.status),
+  )
 }
 
 function schedulePoll() {
@@ -676,6 +540,8 @@ async function applyRun(
   requestSequence: number,
 ) {
   stopPoll()
+  const previousRun = state.value.kind === 'ready' ? state.value.run : null
+  announceStageTransitions(previousRun, run)
   const changedRun = activeRunId.value !== run.id
   if (changedRun) {
     abortStageRequests()
@@ -716,6 +582,7 @@ async function readCurrent(source: 'loaded' | 'created' = 'loaded'): Promise<boo
       clearStageCache()
       activeRunId.value = null
       stageViews.value = []
+      transitionAnnouncement.value = ''
       state.value = { kind: 'empty' }
       scheduleCurrentRefresh()
       return false
@@ -956,10 +823,8 @@ function verdictLabel(verdict: DiscoveryRow['verdict']): string {
   return { pass: '通过', drop: '淘汰', insufficient: '数据不足' }[verdict]
 }
 
-function formatValue(value: unknown): string {
-  if (typeof value === 'number') return Number.isFinite(value) ? String(value) : '不可用'
-  if (typeof value === 'string' && value) return value
-  return '不可用'
+function formatValue(value: MetricValue | undefined): string {
+  return value === undefined ? '不可用' : renderMetricValue(value)
 }
 
 function formatTimestamp(value: string | null): string {
@@ -1001,6 +866,9 @@ onBeforeUnmount(() => {
     </div>
 
     <p role="status" aria-live="polite" aria-atomic="true">{{ announcement }}</p>
+    <p class="sr-only" role="status" aria-live="polite" aria-atomic="true">
+      {{ transitionAnnouncement }}
+    </p>
 
     <div v-if="state.kind === 'empty'" class="panel">
       <h2>本周尚未创建批次</h2>
@@ -1036,9 +904,10 @@ onBeforeUnmount(() => {
         :key="view.key"
         class="panel stage-panel"
         :aria-busy="view.created && (view.status === 'queued' || view.status === 'running')"
+        :aria-labelledby="`discovery-stage-${view.key.replace(':', '-')}`"
       >
         <div class="toolbar">
-          <h2>{{ view.title }}</h2>
+          <h2 :id="`discovery-stage-${view.key.replace(':', '-')}`">{{ view.title }}</h2>
           <p class="muted">状态：{{ STAGE_STATUS_ZH[view.status] }}</p>
           <label v-if="view.track" class="stage-selector">
             查看阶段
@@ -1279,6 +1148,18 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 .run-summary p {
   margin-bottom: 0.35rem;
 }

@@ -75,6 +75,53 @@ def test_effective_verdict_rejects_non_value_objects() -> None:
         )
 
 
+def _competition_execution_evidence(context):
+    from discovery.evidence import EVIDENCE_RULE_VERSION, FALLBACK_RISK_TEXT
+    from discovery.snapshot import canonical_json
+    from jobs.discovery import TrackExecutionEvidence
+
+    companies = {
+        company.code: company for company in context.frozen_inputs.companies
+    }
+    evidence = []
+    for code in context.candidate_codes:
+        company = companies[code]
+        source, as_of = next(
+            (key, value)
+            for key, value in company.as_of.items()
+            if isinstance(value, str)
+        )
+        input_fields = canonical_json({"source": source, "value": "fixture"})
+        evidence.extend(
+            TrackExecutionEvidence(
+                code=code,
+                ruler_version_id=context.ruler_version_id,
+                rule_version=EVIDENCE_RULE_VERSION,
+                kind="fact",
+                rule_id=f"{context.track}.fact.fixture_{index}",
+                input_fields_json=input_fields,
+                display_text=f"fixture fact {index}",
+                as_of=as_of,
+                data_completeness="complete",
+            )
+            for index in range(1, 4)
+        )
+        evidence.append(
+            TrackExecutionEvidence(
+                code=code,
+                ruler_version_id=context.ruler_version_id,
+                rule_version=EVIDENCE_RULE_VERSION,
+                kind="risk",
+                rule_id=f"{context.track}.risk.none",
+                input_fields_json=input_fields,
+                display_text=FALLBACK_RISK_TEXT,
+                as_of=as_of,
+                data_completeness="complete",
+            )
+        )
+    return tuple(evidence)
+
+
 def _workflow_app(tmp_path, *, clock=None):
     from dataclasses import replace
 
@@ -125,7 +172,12 @@ def _workflow_app(tmp_path, *, clock=None):
                 for index, code in enumerate(
                     context.candidate_codes, start=1
                 )
-            )
+            ),
+            evidence=(
+                _competition_execution_evidence(context)
+                if context.stage == "competition"
+                else ()
+            ),
         )
 
     def snapshot(session, **kwargs):
@@ -1161,26 +1213,6 @@ def test_competition_reopen_preserves_old_decisions_and_starts_new_set(
                 )
             )
             assert old_competition is not None
-            session.add(
-                DiscoveryEvidence(
-                    run_id=run_id,
-                    track="garp",
-                    competition_attempt=1,
-                    competition_stage_id=old_competition.id,
-                    stage="competition",
-                    code="600000.SH",
-                    ruler_version_id=old_competition.ruler_version_id,
-                    rule_version="old",
-                    kind="evidence",
-                    rule_id="old-rule",
-                    input_fields_json="{}",
-                    display_text="old evidence",
-                    as_of="2026-09-17",
-                    data_completeness="complete",
-                    created_at=old_competition.created_at,
-                )
-            )
-            session.commit()
             old_counts = (
                 session.scalar(
                     select(func.count()).select_from(DiscoveryDecision)
@@ -1221,12 +1253,28 @@ def test_competition_reopen_preserves_old_decisions_and_starts_new_set(
             )
             == old_counts[0] + 1
         )
-        assert (
-            session.scalar(
-                select(func.count()).select_from(DiscoveryEvidence)
+        new_competition = session.scalar(
+            select(DiscoveryStage).where(
+                DiscoveryStage.run_id == run_id,
+                DiscoveryStage.track == "garp",
+                DiscoveryStage.stage == "competition",
+                DiscoveryStage.attempt == 2,
             )
-            == old_counts[1]
         )
+        assert new_competition is not None
+        assert session.scalar(
+            select(func.count())
+            .select_from(DiscoveryEvidence)
+            .where(
+                DiscoveryEvidence.competition_stage_id == new_competition.id,
+                DiscoveryEvidence.competition_attempt == 2,
+            )
+        ) == 24
+        assert session.scalar(
+            select(func.count())
+            .select_from(DiscoveryEvidence)
+            .where(DiscoveryEvidence.competition_attempt == 1)
+        ) == old_counts[1]
         assert (
             session.scalar(
                 select(func.count()).select_from(DiscoveryResult)
@@ -1247,7 +1295,7 @@ def test_abandoned_historical_http_reads_artifacts_without_executor(
     from fastapi.testclient import TestClient
     from sqlalchemy import select
 
-    from app.discovery_models import DiscoveryEvidence, DiscoveryStage
+    from app.discovery_models import DiscoveryStage
 
     app = _workflow_app(tmp_path)
     with TestClient(app) as client:
@@ -1286,26 +1334,7 @@ def test_abandoned_historical_http_reads_artifacts_without_executor(
                 )
             )
             assert competition is not None
-            session.add(
-                DiscoveryEvidence(
-                    run_id=run_id,
-                    track="garp",
-                    competition_attempt=1,
-                    competition_stage_id=competition.id,
-                    stage="competition",
-                    code="600000.SH",
-                    ruler_version_id=competition.ruler_version_id,
-                    rule_version="history",
-                    kind="rule",
-                    rule_id="history",
-                    input_fields_json="{}",
-                    display_text="history",
-                    as_of="2026-09-17",
-                    data_completeness="complete",
-                    created_at=competition.created_at,
-                )
-            )
-            session.commit()
+            competition_id = competition.id
         assert client.post(
             f"/api/discoveries/{run_id}/abandon", json={}
         ).status_code == 200
@@ -1319,7 +1348,10 @@ def test_abandoned_historical_http_reads_artifacts_without_executor(
         ).json()
         assert body["overrides"][0]["id"] == override["id"]
         assert body["decisions"][0]["keep_note"] == "history"
-        assert body["evidence"][0]["rule_version"] == "history"
+        assert body["evidence"]
+        assert {
+            row["competition_stage_id"] for row in body["evidence"]
+        } == {competition_id}
         paths = [
             (
                 "post",

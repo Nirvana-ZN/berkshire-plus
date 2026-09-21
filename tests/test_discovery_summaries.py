@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from datetime import timedelta
 from decimal import Decimal, DivisionByZero, getcontext, setcontext
 from fractions import Fraction
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -1057,7 +1059,13 @@ def test_routes_attach_attempt_local_summaries_without_market_queries(
                     code="600000.SH",
                     verdict="pass",
                     reason=None,
-                    metrics_json=f'{{"metric":"{value}"}}',
+                    metrics_json=json.dumps(
+                        {
+                            "metric": value,
+                            "risk_flags": ["margin_deterioration"],
+                        },
+                        separators=(",", ":"),
+                    ),
                     rank=1,
                     created_at=SNAPSHOT_AT,
                 )
@@ -1125,6 +1133,23 @@ def test_routes_attach_attempt_local_summaries_without_market_queries(
         assert quality_body["drop"][0]["name"] == "冻结公司名"
         assert safety_body["pass"][0]["name"] == "冻结公司名"
         assert safety_body["pass"][0]["metrics"]["price"] == "12.5"
+        parser = (
+            Path(__file__).resolve().parents[1]
+            / "web/src/views/__tests__/parseStagePayload.ts"
+        )
+        parsed = subprocess.run(
+            ["node", "--experimental-strip-types", str(parser)],
+            input=json.dumps(quality_body),
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+        assert parsed.returncode == 0, parsed.stderr
+        assert json.loads(parsed.stdout) == {
+            "code": "600000.SH",
+            "risk_flags": "[margin_deterioration]",
+        }
 
         forbidden = (
             "financials",
