@@ -33,6 +33,7 @@ from discovery.constants import (
     aware_utc_now,
     china_week_key,
 )
+from discovery.diff import CorruptDiscoveryHistory, load_weekly_changes
 from discovery.overrides import OVERRIDE_ACTIONS
 from discovery.summaries import DiscoverySummaryError, build_stage_summary
 from discovery.snapshot import (
@@ -447,6 +448,60 @@ def _result_json(
     }
 
 
+def _stage_changes(
+    session: Session,
+    run: DiscoveryRun,
+    track: str,
+    stage: str,
+):
+    try:
+        return load_weekly_changes(
+            session,
+            run.id,
+            track=track,
+            stage=stage,
+        )
+    except CorruptDiscoveryHistory as error:
+        raise CorruptDiscoveryResult(
+            "persisted discovery history is corrupt"
+        ) from error
+
+
+def _compact_changes(session: Session, run: DiscoveryRun) -> list[dict[str, object]]:
+    values = []
+    for track in _TRACK_ORDER:
+        stages = [
+            row
+            for row in _track_stages(session, run.id)
+            if row.track == track
+        ]
+        if not stages:
+            continue
+        current = max(
+            stages,
+            key=lambda row: (
+                _STAGE_ORDER.get(row.stage, -1),
+                row.attempt,
+                row.id,
+            ),
+        )
+        try:
+            changes = _stage_changes(session, run, track, current.stage)
+        except CorruptDiscoveryResult:
+            continue
+        values.extend(
+            change.as_dict(compact=True) for change in changes[:10]
+        )
+    return sorted(
+        values,
+        key=lambda row: (
+            _TRACK_ORDER.index(str(row["track"])),
+            _STAGE_ORDER.get(str(row["stage"]), -1),
+            str(row["code"]),
+        ),
+    )
+
+
 def _partition(
     rows: list[object],
     overrides: Mapping[str, DiscoveryOverride] | None = None,
@@ -642,6 +697,10 @@ def _track_payload(
     current_overrides = {row.code: row for row in current_override_rows}
     current_rows = by_attempt.get(current.attempt, [])
     current_summary = summaries[current.id]
+    try:
+        changes = _stage_changes(session, run, track, stage)[:100]
+    except CorruptDiscoveryResult:
+        changes = ()
     return {
         "run": _run_payload(session, run),
         "current": _track_stage_json(current) | {"summary": current_summary},
@@ -653,6 +712,7 @@ def _track_payload(
         "decisions": [_decision_json(row) for row in decision_rows],
         "evidence": [_evidence_json(row) for row in evidence_rows],
         "summary": current_summary,
+        "changes": [change.as_dict() for change in changes],
     }
 
 
@@ -1730,7 +1790,16 @@ def create_discovery_router() -> APIRouter:
                     code="DISCOVERY_NOT_FOUND",
                     detail="本周尚未创建发现批次",
                 )
-            return _run_payload(session, run)
+            try:
+                changes = _compact_changes(session, run)
+            except CorruptDiscoveryResult:
+                return _error(
+                    500,
+                    error="结果损坏",
+                    code="DISCOVERY_RESULT_CORRUPT",
+                    detail="持久化周度变化无法安全读取",
+                )
+            return _run_payload(session, run) | {"changes": changes}
 
     @router.get("/{run_id}/stages/safety")
     def get_safety(request: Request, run_id: int):
