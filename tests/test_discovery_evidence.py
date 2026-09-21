@@ -308,14 +308,14 @@ def test_builtin_competition_emits_evidence_for_every_entrant() -> None:
     allowed = TrackExecutionOutcome(
         status="waiting_confirmation",
         results=(
-            outcome.results[0],
-            outcome.results[1],
             replace(
-                outcome.results[2],
+                outcome.results[0],
                 verdict="insufficient",
                 reason="industry_unknown",
                 rank=None,
             ),
+            replace(outcome.results[1], rank=1),
+            replace(outcome.results[2], rank=2),
         ),
         evidence=outcome.evidence,
     )
