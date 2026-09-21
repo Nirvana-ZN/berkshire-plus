@@ -4012,8 +4012,13 @@ def test_three_tracks_advance_independently_with_injected_executor(
     from app.discovery_models import DiscoveryStage
     from app.main import create_app
     from app.models import RulerVersion
+    from discovery.evidence import EVIDENCE_RULE_VERSION, FALLBACK_RISK_TEXT
     from discovery.snapshot import canonical_json
-    from jobs.discovery import TrackExecutionOutcome, TrackExecutionResult
+    from jobs.discovery import (
+        TrackExecutionEvidence,
+        TrackExecutionOutcome,
+        TrackExecutionResult,
+    )
     from market.quotes import FakeQuoteClient
 
     db_path = tmp_path / "discovery-tracks.db"
@@ -4040,6 +4045,9 @@ def test_three_tracks_advance_independently_with_injected_executor(
 
     def execute(context):
         executed.append((context.track, context.stage))
+        companies = {
+            company.code: company for company in context.frozen_inputs.companies
+        }
         return TrackExecutionOutcome(
             status="waiting_confirmation",
             results=tuple(
@@ -4053,6 +4061,43 @@ def test_three_tracks_advance_independently_with_injected_executor(
                 for index, code in enumerate(
                     context.candidate_codes, start=1
                 )
+            ),
+            evidence=(
+                tuple(
+                    TrackExecutionEvidence(
+                        code=code,
+                        ruler_version_id=context.ruler_version_id,
+                        rule_version=EVIDENCE_RULE_VERSION,
+                        kind="fact",
+                        rule_id=f"{context.track}.fact.score_{number}",
+                        input_fields_json=canonical_json(
+                            {"score": "1", "source": "security"}
+                        ),
+                        display_text="score=1",
+                        as_of=companies[code].as_of["security"],
+                        data_completeness="complete",
+                    )
+                    for code in context.candidate_codes
+                    for number in range(1, 4)
+                )
+                + tuple(
+                    TrackExecutionEvidence(
+                        code=code,
+                        ruler_version_id=context.ruler_version_id,
+                        rule_version=EVIDENCE_RULE_VERSION,
+                        kind="risk",
+                        rule_id=f"{context.track}.risk.none",
+                        input_fields_json=canonical_json(
+                            {"source_as_of": companies[code].as_of}
+                        ),
+                        display_text=FALLBACK_RISK_TEXT,
+                        as_of=min(companies[code].as_of.values()),
+                        data_completeness="complete",
+                    )
+                    for code in context.candidate_codes
+                )
+                if context.stage == "competition"
+                else ()
             ),
         )
 
