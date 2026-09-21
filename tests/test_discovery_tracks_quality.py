@@ -1630,6 +1630,79 @@ def test_calibrator_preflight_blocks_resources_before_snapshot_build(
     assert hashlib.sha256(db.read_bytes()).hexdigest() == before
 
 
+def test_calibrator_blocks_incomplete_and_corrupt_current_fills(
+    tmp_path: Path,
+) -> None:
+    from scripts.calibrate_discovery import calibrate
+
+    incomplete = tmp_path / "incomplete.db"
+    _calibration_preflight_db(incomplete)
+    with sqlite3.connect(incomplete) as connection:
+        connection.execute(
+            "UPDATE discovery_data_fills SET total = 2 WHERE id = 7"
+        )
+    assert calibrate(
+        incomplete, track="quality_discount"
+    )["blocked_reasons"] == ["snapshot_incomplete_or_corrupt"]
+
+    corrupt = tmp_path / "corrupt.db"
+    corrupt.write_bytes(b"not sqlite")
+    assert calibrate(
+        corrupt, track="quality_discount"
+    )["blocked_reasons"] == ["database_corrupt"]
+
+
+def test_calibrator_blocks_noncurrent_algorithm_build(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from discovery.snapshot import (
+        CompanySnapshotInput,
+        ProductionSnapshot,
+        SnapshotVersions,
+    )
+    from scripts import calibrate_discovery
+
+    db = tmp_path / "wrong-build.db"
+    _calibration_preflight_db(db)
+    company = frozen_company()
+    snapshot = ProductionSnapshot(
+        fill_id=7,
+        companies=(
+            CompanySnapshotInput(
+                code=company.code,
+                name=company.name,
+                industry=company.industry,
+                security_status=company.security_status,
+                fields=company.fields,
+                sources=company.sources,
+                as_of=company.as_of,
+            ),
+        ),
+        versions=SnapshotVersions(
+            data_version="data",
+            financial_version="financial",
+            valuation_version="valuation",
+            ruler_version_ids=MappingProxyType(
+                {"quality_discount": None, "deep_value": None, "garp": None}
+            ),
+            algorithm_version="retired-build",
+        ),
+        trading_dates=MappingProxyType({"SH": ("2026-09-15",)}),
+        snapshot_at=SNAPSHOT_AT,
+    )
+    monkeypatch.setattr(
+        calibrate_discovery,
+        "build_production_snapshot",
+        lambda _session: snapshot,
+    )
+    artifact = calibrate_discovery.calibrate(
+        db, track="quality_discount"
+    )
+    assert artifact["blocked_reasons"] == ["algorithm_build_mismatch"]
+    assert artifact["approval_ready"] is False
+
+
 def test_calibrator_ready_full_market_proposal_is_deterministic_and_read_only(
     tmp_path: Path,
     monkeypatch,

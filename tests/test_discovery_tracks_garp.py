@@ -874,22 +874,72 @@ def test_growth_driver_trend_emits_generic_deterministic_risk() -> None:
     )
 
 
-def test_calibrator_garp_has_no_false_direct_roic_blocker_and_is_read_only(
+def test_calibrator_garp_approves_declared_roe_fallback_separately(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
-    from scripts.calibrate_discovery import calibrate
+    from discovery.snapshot import (
+        CompanySnapshotInput,
+        ProductionSnapshot,
+        SnapshotVersions,
+    )
+    from scripts import calibrate_discovery
 
     db = tmp_path / "production-contract.db"
     _calibration_preflight_db(db)
+    company = _company(
+        annual=tuple(
+            _garp_annual(year, roic=None, roe="13")
+            for year in range(2021, 2026)
+        )
+    )
+    snapshot = ProductionSnapshot(
+        fill_id=7,
+        companies=(
+            CompanySnapshotInput(
+                code=company.code,
+                name=company.name,
+                industry=company.industry,
+                security_status=company.security_status,
+                fields=company.fields,
+                sources=company.sources,
+                as_of=company.as_of,
+            ),
+        ),
+        versions=SnapshotVersions(
+            data_version="data",
+            financial_version="financial",
+            valuation_version="valuation",
+            ruler_version_ids=MappingProxyType(
+                {"quality_discount": None, "deep_value": None, "garp": None}
+            ),
+            algorithm_version=BUILD_VERSION,
+        ),
+        trading_dates=MappingProxyType({"SH": ("2026-09-15",)}),
+        snapshot_at=company.snapshot_at,
+    )
+    monkeypatch.setattr(
+        calibrate_discovery,
+        "build_production_snapshot",
+        lambda _session: snapshot,
+    )
     before = hashlib.sha256(db.read_bytes()).hexdigest()
-    first = calibrate(db, track="garp")
-    second = calibrate(db, track="garp")
+    first = calibrate_discovery.calibrate(db, track="garp")
+    second = calibrate_discovery.calibrate(db, track="garp")
     assert first == second
     assert first["track"] == "garp"
-    assert first["status"] == "blocked"
-    assert first["approval_ready"] is False
-    assert first["blocked_reasons"] == [
-        "track_calibration_not_implemented"
-    ]
-    assert first["proposal"] is None
+    assert first["status"] == "ready"
+    assert first["approval_ready"] is True
+    assert first["proposal"] == first["hypotheses"]["base"]
+    assert first["proposal"]["sector_branches"]["nonfinancial"][
+        "return_metric_policy"
+    ] == "roic_then_roe"
+    assert first["return_metric_coverage"] == {
+        "policy": "roic_then_roe",
+        "roic": {"present": 0, "total": 1, "ratio": "0"},
+        "roe_fallback": {"present": 1, "total": 1, "ratio": "1"},
+        "insufficient": {"present": 0, "total": 1, "ratio": "0"},
+    }
+    assert first["field_coverage"]["return_on_capital"]["ratio"] == "1"
+    assert first["candidate_counts"]["base"]["pass"] == 1
     assert hashlib.sha256(db.read_bytes()).hexdigest() == before

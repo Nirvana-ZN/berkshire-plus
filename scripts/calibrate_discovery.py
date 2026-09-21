@@ -29,12 +29,20 @@ from discovery.company_payload import (
 from discovery.industry import INDUSTRY_BRANCHES, classify_industry_branch
 from discovery.quality_contract import quality_ruler_branch_policies
 from discovery.rulers import (
+    DEEP_VALUE_FIELDS,
+    DEEP_VALUE_FORMULAS,
+    DEEP_VALUE_ORDER,
     DEEP_VALUE_FIELD_DOMAIN_POLICY,
+    GARP_FIELDS,
+    GARP_FORMULAS,
+    GARP_ORDER,
     GARP_FIELD_DOMAIN_POLICY,
     QUALITY_DISCOUNT_FIELDS,
     QUALITY_DISCOUNT_FORMULAS,
     QUALITY_FIELD_DOMAIN_POLICY,
     canonical_payload,
+    deep_value_ruler,
+    garp_ruler,
     quality_discount_ruler,
 )
 from discovery.snapshot import (
@@ -50,6 +58,8 @@ from discovery.tracks.quality_discount import (
     classify,
     decimal_string,
 )
+from discovery.tracks.deep_value import classify as classify_deep_value
+from discovery.tracks.garp import classify as classify_garp
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DB = PROJECT_ROOT / "data" / "app.db"
@@ -172,6 +182,195 @@ HYPOTHESIS_BANDS: Mapping[str, Mapping[str, str]] = {
         "readiness_min": "0.7",
     },
 }
+DEEP_VALUE_MINIMUMS = {
+    "normalized_earnings": 5,
+    "fcf": 5,
+    "net_debt": 1,
+    "interest_coverage": 1,
+    "dilution": 2,
+    "revenue": 2,
+    "one_time_profit": 1,
+    "impairment": 1,
+    "non_core_income_proxy": 1,
+    "valuation_pb": 60,
+    "bank_roe": 5,
+    "bank_npl": 2,
+    "bank_capital": 1,
+}
+DEEP_VALUE_LOOKBACKS = {
+    "normalized_earnings": 5,
+    "fcf": 5,
+    "net_debt": 1,
+    "interest_coverage": 1,
+    "dilution": 5,
+    "revenue": 5,
+    "one_time_profit": 1,
+    "impairment": 1,
+    "non_core_income_proxy": 1,
+    "bank_roe": 5,
+    "bank_npl": 5,
+    "bank_capital": 5,
+}
+DEEP_VALUE_BANDS: Mapping[str, Mapping[str, str]] = {
+    "conservative": {
+        "listing_years_min": "5",
+        "normalized_earnings_min": "0",
+        "normalized_pe_max": "10",
+        "cumulative_fcf_min": "0",
+        "normalized_fcf_min": "0",
+        "net_debt_to_normalized_fcf_max": "2",
+        "interest_coverage_min": "3",
+        "dilution_rate_max": "0.05",
+        "revenue_decline_max": "0.1",
+        "one_time_profit_share_max": "0.2",
+        "impairment_share_max": "0.2",
+        "non_core_income_proxy_share_max": "0.1",
+        "pb_percentile_max": "20",
+        "pb_median_ratio_max": "0.7",
+        "bank_roe_min": "10",
+        "bank_npl_increase_max": "0.1",
+        "bank_capital_adequacy_min": "14",
+        "bank_core_tier1_min": "10",
+        "readiness_min": "0.9",
+    },
+    "base": {
+        "listing_years_min": "5",
+        "normalized_earnings_min": "0",
+        "normalized_pe_max": "12",
+        "cumulative_fcf_min": "0",
+        "normalized_fcf_min": "0",
+        "net_debt_to_normalized_fcf_max": "3",
+        "interest_coverage_min": "2",
+        "dilution_rate_max": "0.1",
+        "revenue_decline_max": "0.2",
+        "one_time_profit_share_max": "0.3",
+        "impairment_share_max": "0.3",
+        "non_core_income_proxy_share_max": "0.2",
+        "pb_percentile_max": "30",
+        "pb_median_ratio_max": "0.8",
+        "bank_roe_min": "8",
+        "bank_npl_increase_max": "0.2",
+        "bank_capital_adequacy_min": "12",
+        "bank_core_tier1_min": "9",
+        "readiness_min": "0.8",
+    },
+    "relaxed": {
+        "listing_years_min": "5",
+        "normalized_earnings_min": "0",
+        "normalized_pe_max": "15",
+        "cumulative_fcf_min": "0",
+        "normalized_fcf_min": "0",
+        "net_debt_to_normalized_fcf_max": "4",
+        "interest_coverage_min": "1.5",
+        "dilution_rate_max": "0.15",
+        "revenue_decline_max": "0.3",
+        "one_time_profit_share_max": "0.4",
+        "impairment_share_max": "0.4",
+        "non_core_income_proxy_share_max": "0.3",
+        "pb_percentile_max": "40",
+        "pb_median_ratio_max": "0.9",
+        "bank_roe_min": "6",
+        "bank_npl_increase_max": "0.3",
+        "bank_capital_adequacy_min": "11",
+        "bank_core_tier1_min": "8",
+        "readiness_min": "0.7",
+    },
+}
+GARP_MINIMUMS = {
+    "revenue_growth": 5,
+    "deducted_profit_growth": 5,
+    "sustained_revenue_growth": 3,
+    "sustained_profit_growth": 3,
+    "latest_growth": 2,
+    "roic": 3,
+    "roe_fallback": 3,
+    "cash_conversion": 5,
+    "dilution": 2,
+    "growth_drivers": 5,
+    "margin": 2,
+    "quality_adjustments": 1,
+    "valuation_pe": 60,
+}
+GARP_WINDOWS = {
+    "growth": 5,
+    "return_on_capital": 5,
+    "cash_conversion": 5,
+    "dilution": 5,
+    "growth_drivers": 5,
+    "margin": 5,
+    "quality_adjustments": 1,
+}
+GARP_BANDS: Mapping[str, Mapping[str, str]] = {
+    "conservative": {
+        "revenue_cagr_min": "0.1",
+        "deducted_profit_cagr_min": "0.12",
+        "revenue_period_growth_min": "0.06",
+        "deducted_profit_period_growth_min": "0.06",
+        "revenue_growth_slowdown_max": "0.08",
+        "deducted_profit_growth_slowdown_max": "0.08",
+        "return_on_capital_min": "12",
+        "cash_conversion_min": "1.1",
+        "dilution_rate_max": "0",
+        "interest_debt_increase_to_revenue_max": "0.1",
+        "goodwill_increase_to_revenue_max": "0.05",
+        "acquisition_cash_to_revenue_max": "0.05",
+        "gross_margin_deterioration_max": "1",
+        "net_margin_deterioration_max": "1",
+        "impairment_share_max": "0.1",
+        "non_core_income_proxy_share_max": "0.1",
+        "peg_growth_cap": "0.2",
+        "peg_max": "1.2",
+        "pe_percentile_max": "60",
+        "pe_max": "30",
+        "readiness_min": "0.9",
+    },
+    "base": {
+        "revenue_cagr_min": "0.08",
+        "deducted_profit_cagr_min": "0.1",
+        "revenue_period_growth_min": "0.05",
+        "deducted_profit_period_growth_min": "0.05",
+        "revenue_growth_slowdown_max": "0.1",
+        "deducted_profit_growth_slowdown_max": "0.1",
+        "return_on_capital_min": "10",
+        "cash_conversion_min": "1",
+        "dilution_rate_max": "0.05",
+        "interest_debt_increase_to_revenue_max": "0.2",
+        "goodwill_increase_to_revenue_max": "0.1",
+        "acquisition_cash_to_revenue_max": "0.1",
+        "gross_margin_deterioration_max": "2",
+        "net_margin_deterioration_max": "2",
+        "impairment_share_max": "0.2",
+        "non_core_income_proxy_share_max": "0.2",
+        "peg_growth_cap": "0.25",
+        "peg_max": "1.5",
+        "pe_percentile_max": "70",
+        "pe_max": "35",
+        "readiness_min": "0.8",
+    },
+    "relaxed": {
+        "revenue_cagr_min": "0.06",
+        "deducted_profit_cagr_min": "0.08",
+        "revenue_period_growth_min": "0.03",
+        "deducted_profit_period_growth_min": "0.03",
+        "revenue_growth_slowdown_max": "0.15",
+        "deducted_profit_growth_slowdown_max": "0.15",
+        "return_on_capital_min": "8",
+        "cash_conversion_min": "0.8",
+        "dilution_rate_max": "0.1",
+        "interest_debt_increase_to_revenue_max": "0.3",
+        "goodwill_increase_to_revenue_max": "0.15",
+        "acquisition_cash_to_revenue_max": "0.15",
+        "gross_margin_deterioration_max": "3",
+        "net_margin_deterioration_max": "3",
+        "impairment_share_max": "0.3",
+        "non_core_income_proxy_share_max": "0.3",
+        "peg_growth_cap": "0.3",
+        "peg_max": "1.8",
+        "pe_percentile_max": "80",
+        "pe_max": "40",
+        "readiness_min": "0.7",
+    },
+}
 
 
 def _blocked(
@@ -186,6 +385,7 @@ def _blocked(
         "blocked_reasons": list(reasons),
         "universe": None,
         "field_coverage": None,
+        "provenance_coverage": None,
         "distributions": None,
         "candidate_counts": None,
         "source_as_of": None,
@@ -198,7 +398,10 @@ def _blocked(
             if track == "garp"
             else QUALITY_FIELD_DOMAIN_POLICY
         ),
+        "hypotheses": None,
+        "hypothesis_labels": None,
         "proposed_readiness_threshold": None,
+        "return_metric_coverage": None,
         "proposal": None,
         "note": (
             "Calibration checkpoint only; no ruler was activated or persisted."
@@ -358,7 +561,7 @@ def _branch_counts(
     return {branch: counts[branch] for branch in INDUSTRY_BRANCHES}
 
 
-def _payload(
+def _quality_payload(
     thresholds: Mapping[str, str],
     *,
     industry_version: str,
@@ -450,6 +653,153 @@ def _payload(
     }
     ruler = quality_discount_ruler(payload)
     return json.loads(canonical_payload(ruler))
+
+
+def _deep_value_payload(
+    thresholds: Mapping[str, str],
+    *,
+    industry_version: str,
+    valuation_ratio_method: str,
+) -> dict[str, object]:
+    payload = {
+        "scope": "weekly-discovery",
+        "track": "deep_value",
+        "fields": list(DEEP_VALUE_FIELDS),
+        "formulas": dict(DEEP_VALUE_FORMULAS),
+        "thresholds": dict(thresholds),
+        "min_observations": dict(DEEP_VALUE_MINIMUMS),
+        "missing_policy": {
+            field: "insufficient" for field in DEEP_VALUE_FIELDS
+        },
+        "sector_branches": {
+            "common": {
+                "valuation_ratio_method": valuation_ratio_method,
+                "field_domain_policy": DEEP_VALUE_FIELD_DOMAIN_POLICY,
+                "lookback_windows": dict(DEEP_VALUE_LOOKBACKS),
+                "latest_annual_staleness_years": (
+                    LATEST_ANNUAL_STALENESS_YEARS
+                ),
+            },
+            "branch_policies": {
+                "bank": "financial",
+                "insurance": "unsupported",
+                "other_financial": "unsupported",
+                "nonfinancial": "nonfinancial",
+                "unknown": "insufficient",
+            },
+            "nonfinancial": {
+                "gate_order": [
+                    "listing_age",
+                    "normalized_earnings",
+                    "normalized_valuation",
+                    "positive_cumulative_fcf",
+                    "net_debt",
+                    "interest_coverage",
+                    "dilution",
+                    "revenue_decline",
+                    "one_time_profit",
+                    "impairment",
+                    "non_core_income_proxy",
+                ],
+                "evidence_fields": [
+                    "normalized_pe",
+                    "cumulative_fcf",
+                    "net_debt_to_normalized_fcf",
+                    "interest_coverage",
+                ],
+            },
+            "financial": {
+                "gate_order": [
+                    "listing_age",
+                    "bank_valuation",
+                    "bank_roe",
+                    "bank_npl_trend",
+                    "bank_capital",
+                ],
+                "evidence_fields": [
+                    "pb_percentile",
+                    "roe_mean",
+                    "npl_change",
+                    "bank_capital_adequacy",
+                ],
+            },
+        },
+        "order": [list(item) for item in DEEP_VALUE_ORDER],
+        "industry_version": industry_version,
+        "algorithm_version": BUILD_VERSION,
+    }
+    return json.loads(canonical_payload(deep_value_ruler(payload)))
+
+
+def _garp_payload(
+    thresholds: Mapping[str, str],
+    *,
+    industry_version: str,
+    valuation_ratio_method: str,
+) -> dict[str, object]:
+    payload = {
+        "scope": "weekly-discovery",
+        "track": "garp",
+        "fields": list(GARP_FIELDS),
+        "formulas": dict(GARP_FORMULAS),
+        "thresholds": dict(thresholds),
+        "min_observations": dict(GARP_MINIMUMS),
+        "missing_policy": {
+            field: "insufficient" for field in GARP_FIELDS
+        },
+        "sector_branches": {
+            "common": {
+                "valuation_ratio_method": valuation_ratio_method,
+                "field_domain_policy": GARP_FIELD_DOMAIN_POLICY,
+                "annual_observations": dict(GARP_WINDOWS),
+                "cagr_periods": {
+                    "revenue": 4,
+                    "deducted_profit": 4,
+                },
+                "latest_annual_staleness_years": (
+                    LATEST_ANNUAL_STALENESS_YEARS
+                ),
+            },
+            "branch_policies": {
+                "bank": "unsupported",
+                "insurance": "unsupported",
+                "other_financial": "unsupported",
+                "nonfinancial": "nonfinancial",
+                "unknown": "insufficient",
+            },
+            "nonfinancial": {
+                "gate_order": [
+                    "revenue_growth",
+                    "deducted_profit_growth",
+                    "sustained_growth",
+                    "growth_slowdown",
+                    "return_on_capital",
+                    "cash_conversion",
+                    "dilution",
+                    "interest_debt_trend",
+                    "goodwill_trend",
+                    "acquisition_cash_trend",
+                    "gross_margin",
+                    "net_margin",
+                    "impairment",
+                    "non_core_income_proxy",
+                    "peg",
+                    "valuation",
+                ],
+                "return_metric_policy": "roic_then_roe",
+                "evidence_fields": [
+                    "revenue_cagr",
+                    "deducted_profit_cagr",
+                    "return_on_capital",
+                    "peg",
+                ],
+            },
+        },
+        "order": [list(item) for item in GARP_ORDER],
+        "industry_version": industry_version,
+        "algorithm_version": BUILD_VERSION,
+    }
+    return json.loads(canonical_payload(garp_ruler(payload)))
 
 
 def _quantiles(values: Sequence[Decimal]) -> dict[str, str] | None:
@@ -549,9 +899,210 @@ def _valuation_method_distribution(
     }
 
 
+_TRACK_INPUT_FIELDS: Mapping[str, Mapping[str, tuple[str, ...]]] = {
+    "quality_discount": {
+        "nonfinancial": (
+            "roe",
+            "net_income",
+            "net_assets",
+            "ocf",
+            "shares",
+            "interest_debt",
+            "interest_coverage",
+            "gross_margin",
+            "deducted_net_income",
+        ),
+        "bank": (
+            "roe",
+            "net_assets",
+            "capital_adequacy",
+            "core_tier1_capital_adequacy",
+            "npl",
+        ),
+    },
+    "deep_value": {
+        "nonfinancial": (
+            "deducted_net_income",
+            "ocf",
+            "capex",
+            "shares",
+            "cash",
+            "interest_debt",
+            "interest_coverage",
+            "revenue",
+            "net_income",
+            "impairment_loss",
+            "other_income",
+            "asset_disposal_gain",
+        ),
+        "bank": (
+            "roe",
+            "npl",
+            "capital_adequacy",
+            "core_tier1_capital_adequacy",
+        ),
+    },
+    "garp": {
+        "nonfinancial": (
+            "revenue",
+            "deducted_net_income",
+            "net_income",
+            "ocf",
+            "shares",
+            "roic",
+            "roe",
+            "interest_debt",
+            "goodwill",
+            "acquisition_cash_paid",
+            "gross_margin",
+            "net_margin",
+            "impairment_loss",
+            "other_income",
+            "asset_disposal_gain",
+        ),
+    },
+}
+
+
+def _coverage(present: int, total: int) -> dict[str, object]:
+    return {
+        "present": present,
+        "total": total,
+        "ratio": (
+            decimal_string(bounded_ratio(present, total)) if total else "0"
+        ),
+    }
+
+
+def _provenance_coverage(
+    companies: Sequence[Any],
+    track: str,
+) -> dict[str, dict[str, object]]:
+    applicable: Counter[str] = Counter()
+    present: Counter[str] = Counter()
+    trusted: Counter[str] = Counter()
+    sources: dict[str, set[str]] = {}
+    for company in companies:
+        branch = classify_industry_branch(company.industry)
+        fields = _TRACK_INPUT_FIELDS[track].get(branch, ())
+        history = company.fields.get("financial_history")
+        if not isinstance(history, Sequence):
+            continue
+        for field in fields:
+            applicable[field] += 1
+            rows = [
+                row
+                for row in history
+                if isinstance(row, Mapping)
+                and isinstance(row.get("values"), Mapping)
+                and row["values"].get(field) is not None
+            ]
+            if not rows:
+                continue
+            present[field] += 1
+            valid = True
+            for row in rows:
+                metadata = row.get("field_sources")
+                provenance = row.get("provenance")
+                item = (
+                    metadata.get(field)
+                    if isinstance(metadata, Mapping)
+                    else None
+                )
+                field_provenance = (
+                    provenance.get(field)
+                    if isinstance(provenance, Mapping)
+                    else None
+                )
+                if (
+                    not isinstance(item, Mapping)
+                    or item.get("trusted") is not True
+                    or item.get("source") != "discovery"
+                    or isinstance(field_provenance, (str, bytes))
+                    or not isinstance(field_provenance, Sequence)
+                    or "discovery" not in field_provenance
+                ):
+                    valid = False
+                    continue
+                sources.setdefault(field, set()).add("discovery")
+            if valid:
+                trusted[field] += 1
+    return {
+        field: {
+            "present": present[field],
+            "trusted": trusted[field],
+            "total": applicable[field],
+            "ratio": (
+                decimal_string(
+                    bounded_ratio(trusted[field], applicable[field])
+                )
+                if applicable[field]
+                else "0"
+            ),
+            "sources": sorted(sources.get(field, set())),
+        }
+        for field in sorted(applicable)
+    }
+
+
+def _domain_valid(track: str, reason: str | None) -> bool:
+    if track == "quality_discount":
+        return reason not in QUALITY_DOMAIN_INVALID_REASONS
+    return not (
+        reason == "annual_fiscal_year_duplicate"
+        or (reason or "").endswith(("_negative", "_not_positive"))
+    )
+
+
+def _hypotheses(
+    track: str,
+    *,
+    industry_version: str,
+    industries: Sequence[str | None],
+    valuation_ratio_method: str,
+) -> dict[str, dict[str, object]]:
+    if track == "quality_discount":
+        return {
+            name: _quality_payload(
+                thresholds,
+                industry_version=industry_version,
+                industries=industries,
+                valuation_ratio_method=valuation_ratio_method,
+            )
+            for name, thresholds in HYPOTHESIS_BANDS.items()
+        }
+    if track == "deep_value":
+        return {
+            name: _deep_value_payload(
+                thresholds,
+                industry_version=industry_version,
+                valuation_ratio_method=valuation_ratio_method,
+            )
+            for name, thresholds in DEEP_VALUE_BANDS.items()
+        }
+    return {
+        name: _garp_payload(
+            thresholds,
+            industry_version=industry_version,
+            valuation_ratio_method=valuation_ratio_method,
+        )
+        for name, thresholds in GARP_BANDS.items()
+    }
+
+
+def _classify(track: str, company: FrozenCompanyInput, payload: object) -> Any:
+    assert isinstance(payload, Mapping)
+    if track == "quality_discount":
+        return classify(company, quality_discount_ruler(payload))
+    if track == "deep_value":
+        return classify_deep_value(company, deep_value_ruler(payload))
+    return classify_garp(company, garp_ruler(payload))
+
+
 def _ready_artifact(
     path: Path,
     preflight: Mapping[str, int],
+    track: str,
 ) -> dict[str, object]:
     engine = create_engine(
         "sqlite://",
@@ -563,10 +1114,15 @@ def _ready_artifact(
             snapshot = build_production_snapshot(session)
     finally:
         engine.dispose()
-    if len(snapshot.companies) != preflight["security_count"]:
-        return _blocked("snapshot_incomplete_or_corrupt")
+    if (
+        snapshot.fill_id != preflight["fill_id"]
+        or len(snapshot.companies) != preflight["security_count"]
+    ):
+        return _blocked("snapshot_incomplete_or_corrupt", track=track)
+    if snapshot.versions.algorithm_version != BUILD_VERSION:
+        return _blocked("algorithm_build_mismatch", track=track)
     if len(snapshot.companies) > MAX_COMPANIES:
-        return _blocked("universe_row_limit_exceeded")
+        return _blocked("universe_row_limit_exceeded", track=track)
     snapshot_bytes = 0
     for company in snapshot.companies:
         financial = company.fields.get("financial_history")
@@ -577,7 +1133,7 @@ def _ready_artifact(
             or len(financial) > MAX_FINANCIAL_ROWS
             or len(valuation) > MAX_VALUATION_ROWS
         ):
-            return _blocked("snapshot_history_limit_exceeded")
+            return _blocked("snapshot_history_limit_exceeded", track=track)
         snapshot_bytes += len(
             canonical_json(
                 {
@@ -589,7 +1145,7 @@ def _ready_artifact(
             ).encode("utf-8")
         )
         if snapshot_bytes > MAX_SNAPSHOT_BYTES:
-            return _blocked("snapshot_byte_limit_exceeded")
+            return _blocked("snapshot_byte_limit_exceeded", track=track)
 
     versions = sorted(
         {
@@ -599,7 +1155,7 @@ def _ready_artifact(
         }
     )
     if len(versions) != 1:
-        return _blocked("industry_version_not_unique")
+        return _blocked("industry_version_not_unique", track=track)
     industries = [company.industry for company in snapshot.companies]
     method_distribution = _valuation_method_distribution(snapshot.companies)
     if (
@@ -607,26 +1163,25 @@ def _ready_artifact(
         or next(iter(method_distribution.values()))["companies"]
         != len(snapshot.companies)
     ):
-        return _blocked("valuation_ratio_method_not_homogeneous")
+        return _blocked(
+            "valuation_ratio_method_not_homogeneous", track=track
+        )
     valuation_ratio_method = next(iter(method_distribution))
     try:
-        proposals = {
-            name: _payload(
-                thresholds,
-                industry_version=versions[0],
-                industries=industries,
-                valuation_ratio_method=valuation_ratio_method,
-            )
-            for name, thresholds in HYPOTHESIS_BANDS.items()
-        }
+        proposals = _hypotheses(
+            track,
+            industry_version=versions[0],
+            industries=industries,
+            valuation_ratio_method=valuation_ratio_method,
+        )
     except ValueError:
-        return _blocked("sector_branch_coverage_incomplete")
+        return _blocked("sector_branch_coverage_incomplete", track=track)
     if any(
         set(proposal["sector_branches"]["branch_policies"])
         != set(INDUSTRY_BRANCHES)
         for proposal in proposals.values()
     ):
-        return _blocked("branch_policy_incomplete")
+        return _blocked("branch_policy_incomplete", track=track)
 
     frozen_companies = tuple(
         _classifier_input(company, snapshot)
@@ -634,12 +1189,20 @@ def _ready_artifact(
     )
     verdicts = {
         name: tuple(
-            classify(company, quality_discount_ruler(payload))
+            _classify(track, company, payload)
             for company in frozen_companies
         )
         for name, payload in proposals.items()
     }
     base = verdicts["base"]
+    corrupt_reasons = {
+        "snapshot_schema_invalid",
+        "financial_history_invalid",
+        "valuation_history_invalid",
+        "industry_version_mismatch",
+    }
+    if any(row.primary_reason in corrupt_reasons for row in base):
+        return _blocked("snapshot_incomplete_or_corrupt", track=track)
     metric_values: dict[str, list[Decimal]] = {}
     coverage_counts: Counter[str] = Counter()
     for verdict in base:
@@ -650,31 +1213,24 @@ def _ready_artifact(
                 coverage_counts[key] += 1
     total = len(snapshot.companies)
     branch_counts = _branch_counts(industries)
+    declared_fields = proposals["base"]["fields"]
+    if not isinstance(declared_fields, Sequence):
+        return _blocked("ruler_payload_incomplete", track=track)
     field_coverage = {
-        key: {
-            "present": coverage_counts[key],
-            "total": total,
-            "ratio": (
-                decimal_string(bounded_ratio(coverage_counts[key], total))
-                if total
-                else "0"
-            ),
-        }
-        for key in sorted(metric_values)
+        key: _coverage(coverage_counts[key], total)
+        for key in sorted(
+            set(coverage_counts)
+            | {
+                str(field)
+                for field in declared_fields
+                if field != "code"
+            }
+        )
     }
     domain_valid = sum(
-        verdict.primary_reason not in QUALITY_DOMAIN_INVALID_REASONS
-        for verdict in base
+        _domain_valid(track, verdict.primary_reason) for verdict in base
     )
-    field_coverage["field_domain_valid"] = {
-        "present": domain_valid,
-        "total": total,
-        "ratio": (
-            decimal_string(bounded_ratio(domain_valid, total))
-            if total
-            else "0"
-        ),
-    }
+    field_coverage["field_domain_valid"] = _coverage(domain_valid, total)
     source_keys = (
         "security",
         "financial",
@@ -682,9 +1238,62 @@ def _ready_artifact(
         "valuation_fetched_at",
         "fill",
     )
+    if any(
+        company.as_of.get(key) is None
+        for company in snapshot.companies
+        for key in source_keys
+    ):
+        return _blocked("source_as_of_incomplete", track=track)
+    readiness_threshold = _as_decimal(
+        proposals["base"]["thresholds"]["readiness_min"]
+    )
+    sufficient = sum(row.verdict != "insufficient" for row in base)
+    readiness_ratio = bounded_ratio(sufficient, total)
+    if (
+        readiness_threshold is None
+        or readiness_ratio < readiness_threshold
+    ):
+        return _blocked(
+            "trusted_field_coverage_below_readiness",
+            track=track,
+        )
+    provenance_coverage = _provenance_coverage(
+        snapshot.companies, track
+    )
+    if any(
+        row["present"] != row["trusted"]
+        for row in provenance_coverage.values()
+    ):
+        return _blocked("source_provenance_incomplete", track=track)
+    domain_policy = {
+        "quality_discount": QUALITY_FIELD_DOMAIN_POLICY,
+        "deep_value": DEEP_VALUE_FIELD_DOMAIN_POLICY,
+        "garp": GARP_FIELD_DOMAIN_POLICY,
+    }[track]
+    return_metric_coverage = None
+    if track == "garp":
+        labels = Counter(
+            str(row.metrics.get("return_metric_label"))
+            for row in base
+            if row.metrics.get("return_metric_label") is not None
+        )
+        return_metric_coverage = {
+            "policy": "roic_then_roe",
+            "roic": _coverage(labels["roic"], total),
+            "roe_fallback": _coverage(labels["roe_fallback"], total),
+            "insufficient": _coverage(
+                total - labels["roic"] - labels["roe_fallback"],
+                total,
+            ),
+        }
+    bands = {
+        "quality_discount": HYPOTHESIS_BANDS,
+        "deep_value": DEEP_VALUE_BANDS,
+        "garp": GARP_BANDS,
+    }[track]
     return {
         "schema_version": 1,
-        "track": "quality_discount",
+        "track": track,
         "status": "ready",
         "approval_ready": True,
         "blocked_reasons": [],
@@ -701,6 +1310,7 @@ def _ready_artifact(
             "branches": branch_counts,
         },
         "field_coverage": field_coverage,
+        "provenance_coverage": provenance_coverage,
         "distributions": {
             "valuation_ratio_methods": method_distribution,
             "valid_valuation_months": {
@@ -765,17 +1375,28 @@ def _ready_artifact(
         },
         "industry_versions": versions,
         "algorithm_build": snapshot.versions.algorithm_version,
-        "field_domain_policy": QUALITY_FIELD_DOMAIN_POLICY,
+        "field_domain_policy": domain_policy,
+        "hypotheses": proposals,
         "hypothesis_labels": {
             name: "calibration hypothesis; never a runtime fallback"
-            for name in HYPOTHESIS_BANDS
+            for name in bands
         },
-        "proposed_readiness_threshold": HYPOTHESIS_BANDS["base"][
+        "proposed_readiness_threshold": bands["base"][
             "readiness_min"
         ],
+        "return_metric_coverage": return_metric_coverage,
         "proposal": proposals["base"],
         "note": (
-            "Evidence-only proposal; activation requires explicit approval "
+            (
+                "Evidence-only proposal. other_income is used only as a "
+                "trusted conservative non-core-income proxy; it is not a "
+                "government-grant claim. "
+            )
+            if track == "deep_value"
+            else "Evidence-only proposal. "
+        )
+        + (
+            "No ruler was activated; activation requires explicit approval "
             "and a nonblank reason."
         ),
     }
@@ -806,24 +1427,21 @@ def calibrate(
                 return _blocked(PAYLOAD_SCHEMA_BLOCK_REASON, track=track)
             if status != "done" or snapshot_status != "ready":
                 return _blocked("no_completed_fill", track=track)
-            if track != "quality_discount":
-                return _blocked(
-                    "track_calibration_not_implemented",
-                    track=track,
-                )
             preflight = _preflight_latest_fill(connection)
             if preflight is None:
                 return _blocked("no_completed_fill", track=track)
             if _preflight_resource_limit(preflight):
-                return _blocked("resource_limit")
+                return _blocked("resource_limit", track=track)
             if _preflight_incomplete(preflight):
-                return _blocked("snapshot_incomplete_or_corrupt")
+                return _blocked(
+                    "snapshot_incomplete_or_corrupt", track=track
+                )
     except sqlite3.DatabaseError:
         return _blocked("database_corrupt", track=track)
     try:
-        return _ready_artifact(path, preflight)
+        return _ready_artifact(path, preflight, track)
     except (KeyError, TypeError, ValueError, sqlite3.DatabaseError):
-        return _blocked("snapshot_incomplete_or_corrupt")
+        return _blocked("snapshot_incomplete_or_corrupt", track=track)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

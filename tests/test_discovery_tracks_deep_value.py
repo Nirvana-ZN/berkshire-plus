@@ -892,19 +892,147 @@ def test_calibrator_deep_value_is_deterministic_blocked_and_read_only(
     assert hashlib.sha256(db.read_bytes()).hexdigest() == before
 
 
-def test_calibrator_no_longer_mislabels_other_income_as_untrusted_grants(
+def test_calibrator_deep_value_emits_approval_ready_proxy_evidence(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
-    from scripts.calibrate_discovery import calibrate
+    from discovery.snapshot import (
+        CompanySnapshotInput,
+        ProductionSnapshot,
+        SnapshotVersions,
+    )
+    from scripts import calibrate_discovery
     from tests.test_discovery_tracks_quality import _calibration_preflight_db
 
     db = tmp_path / "production-contract.db"
     _calibration_preflight_db(db)
+    with sqlite3.connect(db) as connection:
+        connection.execute(
+            "UPDATE discovery_data_fills SET total = 2 WHERE id = 7"
+        )
+        connection.execute(
+            "INSERT INTO discovery_data_checkpoints VALUES "
+            "(7, '600001.SH', 'done', 60, '{}')"
+        )
+        connection.execute(
+            "INSERT INTO discovery_universe_securities VALUES "
+            "(7, '600001.SH')"
+        )
+
+    def recode(company, code: str) -> CompanySnapshotInput:
+        fields = dict(company.fields)
+        fields["valuation_history"] = tuple(
+            dict(row, code=code) for row in fields["valuation_history"]
+        )
+        return CompanySnapshotInput(
+            code=code,
+            name=company.name,
+            industry=company.industry,
+            security_status=company.security_status,
+            fields=MappingProxyType(fields),
+            sources=company.sources,
+            as_of=company.as_of,
+        )
+
+    snapshot = ProductionSnapshot(
+        fill_id=7,
+        companies=(
+            recode(_company(), "600000.SH"),
+            recode(_company(industry="银行"), "600001.SH"),
+        ),
+        versions=SnapshotVersions(
+            data_version="data",
+            financial_version="financial",
+            valuation_version="valuation",
+            ruler_version_ids=MappingProxyType(
+                {"quality_discount": None, "deep_value": None, "garp": None}
+            ),
+            algorithm_version=BUILD_VERSION,
+        ),
+        trading_dates=MappingProxyType({"SH": ("2026-09-15",)}),
+        snapshot_at=_company().snapshot_at,
+    )
+    monkeypatch.setattr(
+        calibrate_discovery,
+        "build_production_snapshot",
+        lambda _session: snapshot,
+    )
     before = hashlib.sha256(db.read_bytes()).hexdigest()
-    artifact = calibrate(db, track="deep_value")
-    assert artifact["blocked_reasons"] == [
-        "track_calibration_not_implemented"
-    ]
-    assert artifact["approval_ready"] is False
-    assert artifact["proposal"] is None
+    artifact = calibrate_discovery.calibrate(db, track="deep_value")
+    assert artifact["status"] == "ready"
+    assert artifact["approval_ready"] is True
+    assert artifact["proposal"] == artifact["hypotheses"]["base"]
+    assert set(artifact["hypotheses"]) == {
+        "conservative",
+        "base",
+        "relaxed",
+    }
+    assert artifact["proposal"]["track"] == "deep_value"
+    assert artifact["proposal"]["formulas"]["non_core_income_proxy_share"] == (
+        "(copy_abs(latest(annual.other_income))+"
+        "copy_abs(latest(annual.asset_disposal_gain)))/"
+        "copy_abs(normalized_earnings)"
+    )
+    assert artifact["provenance_coverage"]["other_income"]["trusted"] == 1
+    assert "conservative non-core-income proxy" in artifact["note"]
+    assert "government grant" not in artifact["note"].lower()
+    assert artifact["candidate_counts"]["base"]["branches"]["bank"]["pass"] == 1
     assert hashlib.sha256(db.read_bytes()).hexdigest() == before
+
+
+def test_calibrator_deep_value_blocks_missing_trusted_proxy_source(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from discovery.snapshot import (
+        CompanySnapshotInput,
+        ProductionSnapshot,
+        SnapshotVersions,
+    )
+    from scripts import calibrate_discovery
+    from tests.test_discovery_tracks_quality import _calibration_preflight_db
+
+    db = tmp_path / "missing-trusted.db"
+    _calibration_preflight_db(db)
+    company = _company(
+        annual=tuple(
+            _deep_annual(year, other_income=None)
+            for year in range(2021, 2026)
+        )
+    )
+    snapshot = ProductionSnapshot(
+        fill_id=7,
+        companies=(
+            CompanySnapshotInput(
+                code=company.code,
+                name=company.name,
+                industry=company.industry,
+                security_status=company.security_status,
+                fields=company.fields,
+                sources=company.sources,
+                as_of=company.as_of,
+            ),
+        ),
+        versions=SnapshotVersions(
+            data_version="data",
+            financial_version="financial",
+            valuation_version="valuation",
+            ruler_version_ids=MappingProxyType(
+                {"quality_discount": None, "deep_value": None, "garp": None}
+            ),
+            algorithm_version=BUILD_VERSION,
+        ),
+        trading_dates=MappingProxyType({"SH": ("2026-09-15",)}),
+        snapshot_at=company.snapshot_at,
+    )
+    monkeypatch.setattr(
+        calibrate_discovery,
+        "build_production_snapshot",
+        lambda _session: snapshot,
+    )
+    artifact = calibrate_discovery.calibrate(db, track="deep_value")
+    assert artifact["status"] == "blocked"
+    assert artifact["approval_ready"] is False
+    assert artifact["blocked_reasons"] == [
+        "trusted_field_coverage_below_readiness"
+    ]
