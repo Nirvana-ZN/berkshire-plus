@@ -16,6 +16,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.db import PROJECT_ROOT, create_session_factory, init_db
 from app.discovery_routes import (
+    cancel_discovery_research_worker,
     create_discovery_router,
     resume_discovery_queues,
 )
@@ -858,7 +859,7 @@ def create_app(
             with session_factory() as session:
                 for worker in alive:
                     lease = discovery_leases.get(worker)
-                    if lease is not None:
+                    if lease is not None and len(lease) == 2:
                         run_id, owner_token = lease
                         release(
                             session,
@@ -867,6 +868,19 @@ def create_app(
                             owner_token=owner_token,
                         )
                 session.commit()
+            for worker in alive:
+                lease = discovery_leases.get(worker)
+                if (
+                    lease is not None
+                    and len(lease) == 3
+                    and lease[1] == JOB_TYPE_RESEARCH
+                ):
+                    job_id, _job_type, owner_token = lease
+                    cancel_discovery_research_worker(
+                        session_factory,
+                        job_id,
+                        owner_token,
+                    )
         engine.dispose()
 
     app = FastAPI(title="本机工作台", lifespan=lifespan)

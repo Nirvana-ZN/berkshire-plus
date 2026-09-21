@@ -8,12 +8,21 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.envfile import TAVILY_API_KEY
-from app.models import Financial, Instrument, Quote, ResearchArtifact, ResearchJob, Setting, Thesis
-from jobs.lock import JOB_TYPE_RESEARCH, release
+from app.models import (
+    Financial,
+    Instrument,
+    JobLock,
+    Quote,
+    ResearchArtifact,
+    ResearchJob,
+    Setting,
+    Thesis,
+)
+from jobs.lock import JOB_TYPE_RESEARCH, LOCK_ROW_ID, release
 from ledger.positions import LOCAL_USER_ID, load_positions
 from ledger.quotes import BookSnapshot, project_book
 from market.sentiment import is_extreme_greed
@@ -26,6 +35,10 @@ logger = logging.getLogger(__name__)
 
 WEB_SEARCH_KEY = "web_search"
 LLM_MODEL_KEY = "llm_model"
+
+
+class ResearchLeaseLostError(RuntimeError):
+    pass
 
 
 def _now() -> datetime:
@@ -308,6 +321,7 @@ def execute_research(
     job = session.get(ResearchJob, job_id)
     if job is None:
         try:
+            session.rollback()
             release(
                 session,
                 job_id,
@@ -329,9 +343,12 @@ def execute_research(
             web_search=web_search_enabled(session),
             as_of_date=_now().date().isoformat(),
             market=market,
+            lock_owner_token=lock_owner_token,
+            require_research_lease=True,
         )
     finally:
         try:
+            session.rollback()
             release(
                 session,
                 job_id,
@@ -351,6 +368,30 @@ def _industry_of(session: Session, code: str, industry: str = "") -> str:
     return (inst.industry or "") if inst is not None else ""
 
 
+def _claim_research_lease(
+    session: Session,
+    job_id: int,
+    owner_token: str | None,
+) -> None:
+    token_clause = (
+        JobLock.owner_token.is_(None)
+        if owner_token is None
+        else JobLock.owner_token == owner_token
+    )
+    claimed = session.execute(
+        update(JobLock)
+        .where(
+            JobLock.id == LOCK_ROW_ID,
+            JobLock.job_id == job_id,
+            JobLock.job_type == JOB_TYPE_RESEARCH,
+            token_clause,
+        )
+        .values(held_at=JobLock.held_at)
+    )
+    if int(claimed.rowcount or 0) != 1:
+        raise ResearchLeaseLostError("research job lock ownership was lost")
+
+
 def _run_one(
     session: Session,
     job: ResearchJob,
@@ -363,7 +404,11 @@ def _run_one(
     as_of_date: str,
     market=None,
     industry: str = "",
+    lock_owner_token: str | None = None,
+    require_research_lease: bool = False,
 ) -> None:
+    if require_research_lease:
+        _claim_research_lease(session, job.id, lock_owner_token)
     job.status = "running"
     job.updated_at = _now()
     session.commit()
@@ -399,6 +444,8 @@ def _run_one(
                     job.name, output.structured, web_search=web_search
                 ),
             )
+        if require_research_lease:
+            _claim_research_lease(session, job.id, lock_owner_token)
         session.add(
             ResearchArtifact(
                 research_job_id=job.id,
@@ -425,8 +472,16 @@ def _run_one(
         job.error = None
         job.updated_at = _now()
         session.commit()
+    except ResearchLeaseLostError:
+        session.rollback()
     except Exception as exc:
         session.rollback()
+        if require_research_lease:
+            try:
+                _claim_research_lease(session, job.id, lock_owner_token)
+            except ResearchLeaseLostError:
+                session.rollback()
+                return
         fresh = session.get(ResearchJob, job.id)
         if fresh is not None:
             fresh.status = "failed"

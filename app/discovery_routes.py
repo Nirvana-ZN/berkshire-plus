@@ -47,6 +47,7 @@ from discovery.snapshot import (
 )
 from jobs.discovery import drain_run_queue
 from jobs.lock import (
+    ACTIVE_STATUSES,
     JOB_TYPE_DISCOVERY,
     JOB_TYPE_RESEARCH,
     LOCK_ROW_ID,
@@ -873,7 +874,7 @@ def _start_discovery_worker(
     target,
     args: tuple[object, ...],
     *,
-    lease: tuple[int, str] | None = None,
+    lease: tuple[int, str] | tuple[int, str, str] | None = None,
 ) -> Exception | None:
     if (
         lease is None
@@ -1188,34 +1189,87 @@ def _release_discovery_research_reservation(
 def _run_discovery_research(
     app, job_id: int, owner_token: str
 ) -> None:
-    with app.state.session_factory() as session:
-        execute_research(
-            session,
+    failure = "research worker exited without releasing its lease"
+    try:
+        with app.state.session_factory() as session:
+            execute_research(
+                session,
+                job_id,
+                llm=app.state.llm_client,
+                quote_client=app.state.quote_client,
+                reports_dir=app.state.reports_dir,
+                market=app.state.market_client,
+                lock_owner_token=owner_token,
+            )
+    except Exception as error:  # noqa: BLE001 - worker boundary
+        failure = str(error)
+        logger.exception("发现评估任务执行失败")
+    finally:
+        _settle_discovery_research_worker(
+            app.state.session_factory,
             job_id,
-            llm=app.state.llm_client,
-            quote_client=app.state.quote_client,
-            reports_dir=app.state.reports_dir,
-            market=app.state.market_client,
-            lock_owner_token=owner_token,
+            owner_token,
+            status="failed",
+            error=failure,
         )
 
 
-def _fail_discovery_research_dispatch(
-    factory, job_id: int, owner_token: str, error: Exception
-) -> None:
+def _settle_discovery_research_worker(
+    factory,
+    job_id: int,
+    owner_token: str,
+    *,
+    status: str,
+    error: str,
+) -> bool:
     with factory() as session:
-        job = session.get(ResearchJob, job_id)
-        if job is not None and job.status == "queued":
-            job.status = "failed"
-            job.error = str(error)
-            job.updated_at = datetime.now(timezone.utc)
-        release(
+        session.rollback()
+        owns_lease = (
+            select(JobLock.id)
+            .where(
+                JobLock.id == LOCK_ROW_ID,
+                JobLock.job_id == job_id,
+                JobLock.job_type == JOB_TYPE_RESEARCH,
+                JobLock.owner_token == owner_token,
+            )
+            .exists()
+        )
+        session.execute(
+            update(ResearchJob)
+            .where(
+                ResearchJob.id == job_id,
+                ResearchJob.status.in_(ACTIVE_STATUSES),
+                owns_lease,
+            )
+            .values(
+                status=status,
+                error=error,
+                updated_at=datetime.now(timezone.utc),
+            )
+        )
+        released = release(
             session,
             job_id,
             JOB_TYPE_RESEARCH,
             owner_token=owner_token,
         )
-        session.commit()
+        if released:
+            session.commit()
+        else:
+            session.rollback()
+        return released
+
+
+def cancel_discovery_research_worker(
+    factory, job_id: int, owner_token: str
+) -> bool:
+    return _settle_discovery_research_worker(
+        factory,
+        job_id,
+        owner_token,
+        status="canceled",
+        error="application shutdown canceled research worker",
+    )
 
 
 def _dispatch_discovery_research(
@@ -1232,15 +1286,17 @@ def _dispatch_discovery_research(
         app,
         _run_discovery_research,
         (app, job_id, owner_token),
+        lease=(job_id, JOB_TYPE_RESEARCH, owner_token),
     )
     if error is None:
         return None
     logger.error("发现评估线程启动失败: %s", error)
-    _fail_discovery_research_dispatch(
+    _settle_discovery_research_worker(
         app.state.session_factory,
         job_id,
         owner_token,
-        error,
+        status="failed",
+        error=str(error),
     )
     return _error(
         500,

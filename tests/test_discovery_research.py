@@ -3,10 +3,12 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Event
+from time import monotonic, sleep
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import IntegrityError
 
 import app.discovery_routes as discovery_routes
@@ -21,7 +23,13 @@ from app.discovery_models import (
 )
 from app.envfile import OPENAI_API_KEY, write_env_value
 from app.main import create_app
-from app.models import ResearchJob, RulerVersion, Watchlist
+from app.models import (
+    JobLock,
+    ResearchArtifact,
+    ResearchJob,
+    RulerVersion,
+    Watchlist,
+)
 from discovery.constants import china_week_key
 from jobs.lock import (
     JOB_TYPE_FUNNEL,
@@ -639,6 +647,152 @@ def test_dispatch_failure_marks_job_failed_and_releases_exact_lease(
         )
         assert repeated.status_code == 200
         assert repeated.json()["id"] == job.id
+
+
+def test_async_worker_body_exception_fails_job_and_releases_own_lease(
+    tmp_path: Path, monkeypatch
+) -> None:
+    def explode(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("worker body exploded")
+
+    monkeypatch.setattr(discovery_routes, "execute_research", explode)
+    app = _app(tmp_path)
+    with TestClient(app) as client:
+        with app.state.session_factory() as session:
+            run = _run(session)
+            _seed_finalists(session, run, {"garp": ["600000.SH"]})
+            run_id = run.id
+        created = client.post(
+            f"/api/discoveries/{run_id}/research",
+            json={"track": "garp", "code": "600000.SH"},
+        )
+        assert created.status_code == 200
+        job_id = created.json()["id"]
+        deadline = monotonic() + 5
+        while monotonic() < deadline:
+            with app.state.session_factory() as session:
+                job = session.get(ResearchJob, job_id)
+                held = lock_status(session)
+            with app.state.discovery_workers_lock:
+                registered = any(
+                    len(lease) == 3 and lease[0] == job_id
+                    for lease in app.state.discovery_worker_leases.values()
+                )
+            if (
+                job is not None
+                and job.status == "failed"
+                and held is None
+                and not registered
+            ):
+                break
+            sleep(0.01)
+        assert job is not None
+        assert job.status == "failed"
+        assert job.error == "worker body exploded"
+        assert held is None
+        assert registered is False
+
+
+def test_shutdown_cancels_hung_worker_without_releasing_replacement_lease(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from jobs import research as research_job
+
+    entered = Event()
+    resume = Event()
+    original_run_checklist = research_job.run_checklist
+
+    def blocked(*args, **kwargs):
+        entered.set()
+        assert resume.wait(5)
+        return original_run_checklist(*args, **kwargs)
+
+    monkeypatch.setattr(research_job, "run_checklist", blocked)
+    app = _app(tmp_path)
+    client = TestClient(app)
+    client.__enter__()
+    try:
+        with app.state.session_factory() as session:
+            run = _run(session)
+            _seed_finalists(
+                session, run, {"quality_discount": ["600519.SH"]}
+            )
+            run_id = run.id
+        created = client.post(
+            f"/api/discoveries/{run_id}/research",
+            json={"track": "quality_discount", "code": "600519.SH"},
+        )
+        assert created.status_code == 200
+        job_id = created.json()["id"]
+        assert entered.wait(5)
+        with app.state.discovery_workers_lock:
+            research_workers = [
+                (worker, lease)
+                for worker, lease in app.state.discovery_worker_leases.items()
+                if len(lease) == 3
+                and lease[:2] == (job_id, JOB_TYPE_RESEARCH)
+            ]
+        assert len(research_workers) == 1
+        worker, lease = research_workers[0]
+        old_token = lease[2]
+
+        started = monotonic()
+        client.__exit__(None, None, None)
+        assert monotonic() - started < 1
+
+        replacement_token = "replacement-owner"
+        with app.state.session_factory() as session:
+            job = session.get(ResearchJob, job_id)
+            assert job is not None
+            assert job.status == "canceled"
+            assert lock_status(session) is None
+            replaced = session.execute(
+                update(JobLock)
+                .where(JobLock.id == 1, JobLock.job_id.is_(None))
+                .values(
+                    job_id=job_id,
+                    job_type=JOB_TYPE_RESEARCH,
+                    held_at=NOW,
+                    owner_token=replacement_token,
+                )
+            )
+            assert replaced.rowcount == 1
+            session.commit()
+
+        resume.set()
+        deadline = monotonic() + 5
+        while monotonic() < deadline:
+            with app.state.discovery_workers_lock:
+                if worker not in app.state.discovery_workers:
+                    break
+            sleep(0.01)
+        with app.state.session_factory() as session:
+            job = session.get(ResearchJob, job_id)
+            row = session.get(JobLock, 1)
+            assert job is not None
+            assert job.status == "canceled"
+            assert session.scalar(
+                select(func.count()).select_from(ResearchArtifact)
+            ) == 0
+            assert row is not None
+            assert (
+                row.job_id,
+                row.job_type,
+                row.owner_token,
+            ) == (job_id, JOB_TYPE_RESEARCH, replacement_token)
+            assert old_token != replacement_token
+            release(
+                session,
+                job_id,
+                JOB_TYPE_RESEARCH,
+                owner_token=replacement_token,
+            )
+            session.commit()
+    finally:
+        resume.set()
+        if not app.state.discovery_shutting_down:
+            client.__exit__(None, None, None)
 
 
 def test_ordinary_research_keeps_discovery_provenance_null(
