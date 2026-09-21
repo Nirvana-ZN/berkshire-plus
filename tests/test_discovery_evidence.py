@@ -6,6 +6,7 @@ from types import MappingProxyType
 
 import pytest
 
+from discovery.builds import BUILD_VERSION
 from discovery.evidence import (
     ALLOWED_RISK_CATEGORIES,
     EVIDENCE_RULE_VERSION,
@@ -61,7 +62,7 @@ def ruler_payload() -> dict[str, object]:
             ["cash_conversion", "desc", "nulls_last"],
             ["code", "asc", "nulls_last"],
         ],
-        "algorithm_version": "discovery-v1",
+        "algorithm_version": BUILD_VERSION,
     }
 
 
@@ -311,7 +312,7 @@ def test_builtin_competition_emits_evidence_for_every_entrant() -> None:
             {"quality_discount": 7, "deep_value": None, "garp": None}
         ),
         ruler_payloads=MappingProxyType({}),
-        algorithm_version="discovery-v1",
+        algorithm_version=BUILD_VERSION,
         trading_dates=MappingProxyType({"SH": ("2026-09-17",)}),
         snapshot_at=SNAPSHOT_AT,
         companies=(first, second, third),
@@ -351,7 +352,7 @@ def test_builtin_competition_emits_evidence_for_every_entrant() -> None:
         attempt=3,
         input_fingerprint="run",
         ruler_version_id=7,
-        algorithm_version="discovery-v1",
+        algorithm_version=BUILD_VERSION,
         common_stage_id=None,
         predecessor_stage_id=10,
         predecessor_stage="track_gate",

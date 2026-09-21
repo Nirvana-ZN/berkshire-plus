@@ -5,7 +5,7 @@ from copy import deepcopy
 from math import isfinite
 from typing import TypeVar
 
-BUILD_VERSION = "discovery-v1"
+BUILD_VERSION = "discovery-v2"
 AVAILABLE_BUILDS = frozenset({BUILD_VERSION})
 
 T = TypeVar("T")

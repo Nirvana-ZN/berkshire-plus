@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from decimal import Decimal
 
+from discovery.builds import BUILD_VERSION
 
 SNAPSHOT_AT = datetime(2026, 9, 17, 3, 0, tzinfo=timezone.utc)
 RULER_IDS = {
@@ -48,7 +49,7 @@ def discovery_ruler_payload(track: str) -> dict[str, object]:
             ["code", "asc", "nulls_last"],
         ],
         "industry_version": "test-industry-v1",
-        "algorithm_version": "discovery-v1",
+        "algorithm_version": BUILD_VERSION,
     }
 
 
@@ -73,7 +74,7 @@ def ruler_payloads_json(
         payload = {
             "scope": "weekly-discovery",
             "track": track,
-            "algorithm_version": "discovery-v1",
+            "algorithm_version": BUILD_VERSION,
         }
         values[track] = {
             "id": ruler_id,
@@ -109,7 +110,7 @@ def add_unfrozen_run(
         quality_discount_ruler_version_id=ids["quality_discount"],
         deep_value_ruler_version_id=ids["deep_value"],
         garp_ruler_version_id=ids["garp"],
-        algorithm_version="discovery-v1",
+        algorithm_version=BUILD_VERSION,
         ruler_payloads_json=ruler_payloads_json(ids),
         input_fingerprint=None,
     )
@@ -132,7 +133,7 @@ def versions(
         financial_version=financial_version,
         valuation_version=valuation_version,
         ruler_version_ids=ruler_ids or RULER_IDS,
-        algorithm_version="discovery-v1",
+        algorithm_version=BUILD_VERSION,
     )
 
 

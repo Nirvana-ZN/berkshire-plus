@@ -22,6 +22,10 @@ from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
 from discovery.builds import BUILD_VERSION
+from discovery.company_payload import (
+    PAYLOAD_SCHEMA_BLOCK_REASON,
+    SCHEMA_VERSION as COMPANY_PAYLOAD_SCHEMA_VERSION,
+)
 from discovery.industry import INDUSTRY_BRANCHES, classify_industry_branch
 from discovery.quality_contract import quality_ruler_branch_policies
 from discovery.rulers import (
@@ -266,6 +270,39 @@ def _preflight_latest_fill(
         "trading_dates",
     )
     return {key: int(value or 0) for key, value in zip(keys, row, strict=True)}
+
+
+def _latest_fill_header(
+    connection: sqlite3.Connection,
+) -> tuple[int, str, str | None, int | None] | None:
+    columns = {
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info(discovery_data_fills)"
+        )
+    }
+    schema_column = (
+        "payload_schema_version"
+        if "payload_schema_version" in columns
+        else "NULL"
+    )
+    row = connection.execute(
+        f"""
+        SELECT id, status, snapshot_status, {schema_column}
+        FROM discovery_data_fills
+        ORDER BY id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    if row is None:
+        return None
+    fill_id, status, snapshot_status, schema_version = row
+    return (
+        int(fill_id),
+        str(status),
+        None if snapshot_status is None else str(snapshot_status),
+        None if schema_version is None else int(schema_version),
+    )
 
 
 def _preflight_resource_limit(preflight: Mapping[str, int]) -> bool:
@@ -753,8 +790,6 @@ def calibrate(
 
     if track not in {"quality_discount", "deep_value", "garp"}:
         raise ValueError("unsupported discovery calibration track")
-    if track != "quality_discount":
-        return _blocked("track_calibration_not_implemented", track=track)
     path = Path(db_path)
     if not path.is_file():
         return _blocked("database_missing", track=track)
@@ -763,9 +798,22 @@ def calibrate(
             tables = _tables(connection)
             if not REQUIRED_TABLES <= tables:
                 return _blocked("missing_schema", track=track)
+            header = _latest_fill_header(connection)
+            if header is None:
+                return _blocked("no_completed_fill", track=track)
+            _fill_id, status, snapshot_status, schema_version = header
+            if schema_version != COMPANY_PAYLOAD_SCHEMA_VERSION:
+                return _blocked(PAYLOAD_SCHEMA_BLOCK_REASON, track=track)
+            if status != "done" or snapshot_status != "ready":
+                return _blocked("no_completed_fill", track=track)
+            if track != "quality_discount":
+                return _blocked(
+                    "track_calibration_not_implemented",
+                    track=track,
+                )
             preflight = _preflight_latest_fill(connection)
             if preflight is None:
-                return _blocked("no_completed_fill")
+                return _blocked("no_completed_fill", track=track)
             if _preflight_resource_limit(preflight):
                 return _blocked("resource_limit")
             if _preflight_incomplete(preflight):

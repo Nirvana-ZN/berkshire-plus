@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 
 from app.discovery_models import DiscoveryRun
 from app.main import create_app
+from discovery.builds import BUILD_VERSION
 from discovery.constants import RUN_STATUSES
 from market.quotes import FakeQuoteClient
 
@@ -354,7 +355,7 @@ def test_jobs_include_discovery_runs(tmp_path: Path) -> None:
                 data_version="data-v1",
                 financial_version="financial-v1",
                 valuation_version="valuation-v1",
-                algorithm_version="discovery-v1",
+                algorithm_version=BUILD_VERSION,
             )
             session.add(run)
             session.commit()

@@ -702,6 +702,7 @@ def _ensure_discovery_fill_columns(engine: Engine) -> None:
             "run_started_at": "DATETIME",
             "last_request_at": "DATETIME",
             "snapshot_status": "VARCHAR",
+            "payload_schema_version": "INTEGER",
         }
         for column, sql_type in columns.items():
             if names and column not in names:
@@ -711,6 +712,19 @@ def _ensure_discovery_fill_columns(engine: Engine) -> None:
                         f"ADD COLUMN {column} {sql_type}"
                     )
                 )
+        if names:
+            conn.execute(
+                text(
+                    "CREATE TRIGGER IF NOT EXISTS "
+                    "trg_discovery_fill_payload_schema_immutable "
+                    "BEFORE UPDATE OF payload_schema_version "
+                    "ON discovery_data_fills "
+                    "WHEN NEW.payload_schema_version "
+                    "IS NOT OLD.payload_schema_version "
+                    "BEGIN SELECT RAISE(ABORT, "
+                    "'discovery fill payload schema is immutable'); END"
+                )
+            )
 
 
 def _ensure_discovery_universe_seals(engine: Engine) -> None:

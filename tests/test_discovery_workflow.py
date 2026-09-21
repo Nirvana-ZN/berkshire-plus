@@ -8,6 +8,7 @@ from sqlalchemy import inspect, text
 from sqlalchemy.exc import IntegrityError
 
 from app.db import create_session_factory, init_db
+from discovery.builds import BUILD_VERSION
 from tests.discovery_helpers import (
     RULER_IDS,
     SNAPSHOT_AT,
@@ -1545,7 +1546,7 @@ def _stage_state(
     attempt: object = 1,
     input_fingerprint: object = "input-1",
     ruler_version_id: object = 7,
-    algorithm_version: object = "discovery-v1",
+    algorithm_version: object = BUILD_VERSION,
     superseded: object = False,
     failure_kind: object = None,
     stage_id: object = _UNSET,
@@ -2376,6 +2377,7 @@ def test_recomputation_requires_complete_available_saved_build() -> None:
         validate_recomputation,
     )
 
+    assert BUILD_VERSION == "discovery-v2"
     assert AVAILABLE_BUILDS == frozenset({BUILD_VERSION})
     validate_recomputation(
         BUILD_VERSION,
@@ -2387,6 +2389,15 @@ def test_recomputation_requires_complete_available_saved_build() -> None:
         requested_ruler_version_id=7,
     )
     for values in (
+        {
+            "algorithm_version": "discovery-v1",
+            "snapshot_complete": True,
+            "ruler_payload_complete": True,
+            "persisted_input_fingerprint": "input-1",
+            "requested_input_fingerprint": "input-1",
+            "persisted_ruler_version_id": 7,
+            "requested_ruler_version_id": 7,
+        },
         {
             "algorithm_version": "retired-build",
             "snapshot_complete": True,
@@ -4014,7 +4025,7 @@ def test_three_tracks_advance_independently_with_injected_executor(
     from app.discovery_models import DiscoveryStage
     from app.main import create_app
     from app.models import RulerVersion
-    from discovery.evidence import EVIDENCE_RULE_VERSION, FALLBACK_RISK_TEXT
+    from discovery.evidence import build_evidence_card
     from discovery.snapshot import canonical_json
     from jobs.discovery import (
         TrackExecutionEvidence,
@@ -4067,6 +4078,62 @@ def test_three_tracks_advance_independently_with_injected_executor(
             code: canonical_source_dates(company)
             for code, company in companies.items()
         }
+        metrics_by_code = {}
+        evidence_by_code = {}
+        for code in context.candidate_codes:
+            metrics = {
+                field: "1" for field in context.ruler_payload["formulas"]
+            }
+            metrics.update(
+                {
+                    "code": code,
+                    "branch": "bank",
+                    "quality_branch": "bank",
+                }
+            )
+            for count in (
+                "valuation_pe_observations",
+                "valuation_pb_observations",
+                "roe_observations",
+                "cash_conversion_observations",
+                "bank_roe_observations",
+                "bank_capital_available_count",
+                "bank_npl_available_count",
+                "normalized_earnings_observations",
+                "fcf_observations",
+                "net_debt_observations",
+                "interest_coverage_observations",
+                "bank_npl_observations",
+                "dilution_observations",
+                "revenue_observations",
+                "one_time_profit_observations",
+                "impairment_observations",
+                "non_core_income_proxy_observations",
+                "revenue_growth_observations",
+                "deducted_profit_growth_observations",
+                "roic_observations",
+                "roe_fallback_observations",
+            ):
+                metrics[count] = "999"
+            if context.track == "deep_value":
+                policy = context.ruler_payload["sector_branches"][
+                    "branch_policies"
+                ]["bank"]
+                metrics["branch"] = (
+                    "bank"
+                    if policy in {"unsupported", "insufficient"}
+                    else policy
+                )
+            metrics_by_code[code] = metrics
+            if context.stage == "competition":
+                card = build_evidence_card(
+                    code,
+                    metrics,
+                    context.ruler_payload,
+                    source_as_of=source_dates[code],
+                )
+                assert card.verdict == "pass"
+                evidence_by_code[code] = card.items
         return TrackExecutionOutcome(
             status="waiting_confirmation",
             results=tuple(
@@ -4074,7 +4141,7 @@ def test_three_tracks_advance_independently_with_injected_executor(
                     code=code,
                     verdict="pass",
                     reason=None,
-                    metrics_json='{"score":"1"}',
+                    metrics_json=canonical_json(metrics_by_code[code]),
                     rank=index,
                 )
                 for index, code in enumerate(
@@ -4086,37 +4153,16 @@ def test_three_tracks_advance_independently_with_injected_executor(
                     TrackExecutionEvidence(
                         code=code,
                         ruler_version_id=context.ruler_version_id,
-                        rule_version=EVIDENCE_RULE_VERSION,
-                        kind="fact",
-                        rule_id=f"{context.track}.fact.score_{number}",
-                        input_fields_json=canonical_json(
-                            {
-                                "score": "1",
-                                "source": next(iter(source_dates[code])),
-                            }
-                        ),
-                        display_text="score=1",
-                        as_of=next(iter(source_dates[code].values())),
-                        data_completeness="complete",
+                        rule_version=item.rule_version,
+                        kind=item.kind,
+                        rule_id=item.rule_id,
+                        input_fields_json=canonical_json(item.input_fields),
+                        display_text=item.display_text,
+                        as_of=item.as_of,
+                        data_completeness=item.data_completeness,
                     )
                     for code in context.candidate_codes
-                    for number in range(1, 4)
-                )
-                + tuple(
-                    TrackExecutionEvidence(
-                        code=code,
-                        ruler_version_id=context.ruler_version_id,
-                        rule_version=EVIDENCE_RULE_VERSION,
-                        kind="risk",
-                        rule_id=f"{context.track}.risk.none",
-                        input_fields_json=canonical_json(
-                            {"source_as_of": source_dates[code]}
-                        ),
-                        display_text=FALLBACK_RISK_TEXT,
-                        as_of=min(source_dates[code].values()),
-                        data_completeness="complete",
-                    )
-                    for code in context.candidate_codes
+                    for item in evidence_by_code[code]
                 )
                 if context.stage == "competition"
                 else ()
@@ -4151,7 +4197,7 @@ def test_three_tracks_advance_independently_with_injected_executor(
                 "/stages/track_gate"
             ).json()
             assert gate["current"]["status"] == "waiting_confirmation"
-            assert gate["pass"][0]["metrics"] == {"score": "1"}
+            assert gate["pass"][0]["metrics"]["code"] == "600000.SH"
             client.post(
                 f"/api/discoveries/{run_id}/tracks/{track}"
                 "/stages/track_gate/confirm",

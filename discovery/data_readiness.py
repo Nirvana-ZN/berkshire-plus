@@ -21,6 +21,7 @@ from app.models import (
     ValuationHistory,
 )
 from discovery.builds import BUILD_VERSION
+from discovery.company_payload import SCHEMA_VERSION as COMPANY_PAYLOAD_SCHEMA_VERSION
 from discovery.field_dictionary import FIELD_DICTIONARY
 from discovery.industry import IndustryBranch, classify_industry_branch
 from discovery.quality_contract import quality_branch_data_contract
@@ -150,6 +151,11 @@ def _minimums(
             raise ValueError(f"unknown discovery track: {track}")
         if not isinstance(fields, Mapping):
             raise ValueError(f"{track} observation requirements must be a mapping")
+        if track == GARP and "roic" in fields:
+            raise ValueError(
+                "GARP readiness uses the ruler-declared ROE fallback; "
+                "configure roe, not roic"
+            )
         parsed = dict(_MEASUREMENT_MINIMUMS[track])
         for field, minimum in fields.items():
             if field not in _ALLOWED_MINIMUMS[track]:
@@ -205,6 +211,10 @@ def _persisted_universe(
         )
         .where(DiscoveryUniverseSecurity.snapshot_at < end)
         .where(DiscoveryDataFill.snapshot_status == "ready")
+        .where(
+            DiscoveryDataFill.payload_schema_version
+            == COMPANY_PAYLOAD_SCHEMA_VERSION
+        )
         .order_by(DiscoveryUniverseSecurity.fill_id.desc())
         .limit(1)
         .scalar_subquery()

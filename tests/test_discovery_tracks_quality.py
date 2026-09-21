@@ -1556,7 +1556,8 @@ def _calibration_preflight_db(
                 id INTEGER PRIMARY KEY,
                 status TEXT,
                 snapshot_status TEXT,
-                total INTEGER
+                total INTEGER,
+                payload_schema_version INTEGER
             );
             CREATE TABLE discovery_data_checkpoints (
                 fill_id INTEGER,
@@ -1578,7 +1579,8 @@ def _calibration_preflight_db(
             """
         )
         connection.execute(
-            "INSERT INTO discovery_data_fills VALUES (7, 'done', 'ready', 1)"
+            "INSERT INTO discovery_data_fills "
+            "VALUES (7, 'done', 'ready', 1, 2)"
         )
         connection.execute(
             "INSERT INTO discovery_data_checkpoints VALUES "

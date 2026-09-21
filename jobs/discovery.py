@@ -33,6 +33,7 @@ from app.discovery_models import (
 )
 from app.models import JobLock
 from discovery.aggregate import aggregate_run_status
+from discovery.builds import AVAILABLE_BUILDS, _is_build_available
 from discovery.common import CommonVerdict, classify_common
 from discovery.competition import CompetitionCandidate, rank_competition
 from discovery.constants import (
@@ -501,6 +502,13 @@ def execute_common_stage(
         ):
             raise PermanentDiscoveryError(
                 "common stage algorithm version mismatch"
+            )
+        if not _is_build_available(
+            stage.algorithm_version,
+            AVAILABLE_BUILDS,
+        ):
+            raise PermanentDiscoveryError(
+                "algorithm_unavailable: saved build is unavailable"
             )
         existing = session.scalar(
             select(func.count())
@@ -1053,7 +1061,8 @@ def _execute_track_stage(
     frozen = load_frozen_inputs(session, stage.run_id)
     frozen_ruler = frozen.ruler_payloads.get(stage.track)
     if (
-        stage.input_fingerprint != frozen.input_fingerprint
+        not _is_build_available(stage.algorithm_version, AVAILABLE_BUILDS)
+        or stage.input_fingerprint != frozen.input_fingerprint
         or stage.algorithm_version != frozen.algorithm_version
         or stage.ruler_version_id is None
         or not isinstance(frozen_ruler, Mapping)

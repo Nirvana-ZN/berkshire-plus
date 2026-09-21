@@ -24,6 +24,8 @@ from app.models import (
     ValuationSeries,
 )
 from discovery.company_payload import (
+    PAYLOAD_SCHEMA_RESTART_GUIDANCE,
+    SCHEMA_VERSION as COMPANY_PAYLOAD_SCHEMA_VERSION,
     company_payload_digest,
     parse_company_payload,
     serialize_company_payload,
@@ -263,10 +265,12 @@ def _snapshot_parts(
 def _mark_snapshot_unavailable(
     fill: DiscoveryDataFill,
     now: datetime,
+    *,
+    guidance: str = SNAPSHOT_UNAVAILABLE_GUIDANCE,
 ) -> None:
     fill.status = SNAPSHOT_UNAVAILABLE_STATUS
     fill.snapshot_status = "unavailable"
-    fill.last_error = SNAPSHOT_UNAVAILABLE_GUIDANCE
+    fill.last_error = guidance
     fill.updated_at = _aware_utc(now)
 
 
@@ -284,6 +288,21 @@ def start_discovery_data_fill(
         .where(DiscoveryDataFill.status.in_(("queued", "running", "paused")))
         .order_by(DiscoveryDataFill.id.desc())
     ).first()
+    if active is not None:
+        if active.payload_schema_version != COMPANY_PAYLOAD_SCHEMA_VERSION:
+            _mark_snapshot_unavailable(
+                active,
+                stamp,
+                guidance=PAYLOAD_SCHEMA_RESTART_GUIDANCE,
+            )
+            if current_lock == {
+                "type": JOB_TYPE_DISCOVERY_DATA,
+                "job_id": active.id,
+            }:
+                release(session, active.id, JOB_TYPE_DISCOVERY_DATA)
+            session.commit()
+            current_lock = lock_status(session)
+            active = None
     if active is not None:
         checkpoints, snapshots, has_dates, payloads_complete = _snapshot_parts(
             session, active.id
@@ -331,6 +350,7 @@ def start_discovery_data_fill(
             updated_at=stamp,
             last_error=None,
             snapshot_status=None,
+            payload_schema_version=COMPANY_PAYLOAD_SCHEMA_VERSION,
         )
         session.add(active)
         session.flush()
@@ -357,6 +377,14 @@ def _initialize_checkpoints(
     fill: DiscoveryDataFill,
     request_gate: DiscoveryRequestGate,
 ) -> bool:
+    if fill.payload_schema_version != COMPANY_PAYLOAD_SCHEMA_VERSION:
+        _mark_snapshot_unavailable(
+            fill,
+            request_gate.clock.now(),
+            guidance=PAYLOAD_SCHEMA_RESTART_GUIDANCE,
+        )
+        session.commit()
+        return False
     checkpoints, snapshots, has_dates, payloads_complete = _snapshot_parts(
         session, fill.id
     )
@@ -697,6 +725,12 @@ def _persist_company(
     result: DiscoveryCompanyData,
     now: datetime,
 ) -> None:
+    fill = session.get(DiscoveryDataFill, checkpoint.fill_id)
+    if (
+        fill is None
+        or fill.payload_schema_version != COMPANY_PAYLOAD_SCHEMA_VERSION
+    ):
+        raise ValueError(PAYLOAD_SCHEMA_RESTART_GUIDANCE)
     if result.code != checkpoint.code or any(
         row.code != checkpoint.code
         for row in (*result.financial_rows, *result.valuation_points)
@@ -728,6 +762,14 @@ def execute_discovery_data_fill(
     try:
         fill = session.get(DiscoveryDataFill, fill_id)
         if fill is None:
+            return
+        if fill.payload_schema_version != COMPANY_PAYLOAD_SCHEMA_VERSION:
+            _mark_snapshot_unavailable(
+                fill,
+                run_started,
+                guidance=PAYLOAD_SCHEMA_RESTART_GUIDANCE,
+            )
+            session.commit()
             return
         if fill.status == "paused" and fill.snapshot_status is None:
             checkpoints, _snapshots, _has_dates, _payloads_complete = _snapshot_parts(
@@ -964,6 +1006,28 @@ def discovery_data_status(
             "restart_required": False,
             "guidance": None,
             **base,
+        }
+    if fill.payload_schema_version != COMPANY_PAYLOAD_SCHEMA_VERSION:
+        pending = max(fill.total - fill.completed - fill.failed, 0)
+        return {
+            "id": fill.id,
+            "type": JOB_TYPE_DISCOVERY_DATA,
+            "status": SNAPSHOT_UNAVAILABLE_STATUS,
+            "total": fill.total,
+            "completed": fill.completed,
+            "failed": fill.failed,
+            "pending": pending,
+            "retryable": 0,
+            "running": 0,
+            "request_count": fill.request_count,
+            "daily_requests": fill.daily_requests,
+            "budget_day": fill.budget_day,
+            "last_error": PAYLOAD_SCHEMA_RESTART_GUIDANCE,
+            "snapshot_status": "unavailable",
+            "restart_required": True,
+            "guidance": PAYLOAD_SCHEMA_RESTART_GUIDANCE,
+            **base,
+            "daily_budget": fill.daily_budget,
         }
     counts = _checkpoint_counts(session, fill.id)
     remaining = counts["pending"] + counts["retryable"] + counts["running"]

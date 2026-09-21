@@ -18,6 +18,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.types import TypeDecorator
 
 from app.db import Base
+from discovery.company_payload import SCHEMA_VERSION as COMPANY_PAYLOAD_SCHEMA_VERSION
 
 
 class CanonicalDecimalText(TypeDecorator[Decimal]):
@@ -370,6 +371,9 @@ class DiscoveryDataFill(Base):
     updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     snapshot_status: Mapped[str | None] = mapped_column(String, nullable=True)
+    payload_schema_version: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, default=COMPANY_PAYLOAD_SCHEMA_VERSION
+    )
 
 
 class DiscoveryDataCheckpoint(Base):

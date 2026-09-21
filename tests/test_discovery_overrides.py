@@ -1886,7 +1886,7 @@ def test_recompute_rejects_incomplete_frozen_provenance_but_history_reads(
                 assert row is not None
                 row.fields_json = '{"broken":NaN}'
             elif corruption == "build":
-                source.algorithm_version = "retired-build"
+                source.algorithm_version = "discovery-v1"
             else:
                 source.ruler_payloads_json = None
             session.commit()

@@ -43,6 +43,8 @@ from app.models import (
 )
 from discovery.builds import BUILD_VERSION
 from discovery.company_payload import (
+    PAYLOAD_SCHEMA_RESTART_GUIDANCE,
+    SCHEMA_VERSION as COMPANY_PAYLOAD_SCHEMA_VERSION,
     parse_company_payload,
     verify_company_payload_digest,
 )
@@ -747,6 +749,11 @@ def build_production_snapshot(
         .order_by(DiscoveryDataFill.id.desc())
         .limit(1)
     ).first()
+    if (
+        fill is not None
+        and fill.payload_schema_version != COMPANY_PAYLOAD_SCHEMA_VERSION
+    ):
+        raise ValueError(PAYLOAD_SCHEMA_RESTART_GUIDANCE)
     if (
         fill is not None
         and fill.status == "snapshot_unavailable"

@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 from sqlalchemy import event
 
+from discovery.builds import BUILD_VERSION
 from tests.discovery_helpers import (
     SNAPSHOT_AT,
     add_unfrozen_run,
@@ -37,7 +38,7 @@ def _stage(
         "pass_count": passed,
         "drop_count": dropped,
         "insufficient_count": insufficient,
-        "algorithm_version": "discovery-v1",
+        "algorithm_version": BUILD_VERSION,
     }
     if track is not None:
         common_stage_id = 1 if stage == "track_gate" else None
@@ -220,7 +221,7 @@ def test_common_and_track_share_schema_rules_ruler_and_effective_counts() -> Non
         "version_id": None,
         "reason": "built_in_common_safety",
         "scope": "discovery:common:safety",
-        "algorithm_version": "discovery-v1",
+        "algorithm_version": BUILD_VERSION,
         "status": "built_in",
     }
     assert track["ruler"]["reason"] == "首次校准"
@@ -945,7 +946,7 @@ def test_routes_attach_attempt_local_summaries_without_market_queries(
             drop_count=0,
             insufficient_count=0,
             input_fingerprint="frozen-input",
-            algorithm_version="discovery-v1",
+            algorithm_version=BUILD_VERSION,
             confirmed_at=SNAPSHOT_AT,
             created_at=SNAPSHOT_AT,
             updated_at=SNAPSHOT_AT,
@@ -977,7 +978,7 @@ def test_routes_attach_attempt_local_summaries_without_market_queries(
                 insufficient_count=0,
                 input_fingerprint="frozen-input",
                 ruler_version_id=old.id,
-                algorithm_version="discovery-v1",
+                algorithm_version=BUILD_VERSION,
                 common_stage_id=common.id,
                 predecessor_stage_id=None,
                 predecessor_stage=None,
@@ -998,7 +999,7 @@ def test_routes_attach_attempt_local_summaries_without_market_queries(
                 insufficient_count=0,
                 input_fingerprint="frozen-input",
                 ruler_version_id=newer.id,
-                algorithm_version="discovery-v1",
+                algorithm_version=BUILD_VERSION,
                 common_stage_id=common.id,
                 predecessor_stage_id=None,
                 predecessor_stage=None,
@@ -1017,7 +1018,7 @@ def test_routes_attach_attempt_local_summaries_without_market_queries(
                 insufficient_count=0,
                 input_fingerprint="frozen-input",
                 ruler_version_id=deep.id,
-                algorithm_version="discovery-v1",
+                algorithm_version=BUILD_VERSION,
                 common_stage_id=common.id,
                 predecessor_stage_id=None,
                 predecessor_stage=None,
@@ -1039,7 +1040,7 @@ def test_routes_attach_attempt_local_summaries_without_market_queries(
                 insufficient_count=0,
                 input_fingerprint="frozen-input",
                 ruler_version_id=bomb_ruler.id,
-                algorithm_version="discovery-v1",
+                algorithm_version=BUILD_VERSION,
                 common_stage_id=common.id,
                 predecessor_stage_id=None,
                 predecessor_stage=None,

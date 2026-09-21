@@ -15,6 +15,7 @@ from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import IntegrityError
 
 import app.discovery_routes as discovery_routes
+from discovery.builds import BUILD_VERSION
 from app.discovery_models import (
     DiscoveryCommonStage,
     DiscoveryDecision,
@@ -112,9 +113,9 @@ def _run(session) -> DiscoveryRun:
         quality_discount_ruler_version_id=rulers["quality_discount"],
         deep_value_ruler_version_id=rulers["deep_value"],
         garp_ruler_version_id=rulers["garp"],
-        algorithm_version="discovery-v1",
+        algorithm_version=BUILD_VERSION,
         ruler_payloads_json=freeze_discovery_ruler_payloads(
-            session, rulers, "discovery-v1"
+            session, rulers, BUILD_VERSION
         ),
         input_fingerprint=None,
     )

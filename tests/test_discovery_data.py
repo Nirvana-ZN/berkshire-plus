@@ -4266,6 +4266,7 @@ def test_discovery_fill_resume_skips_completed_and_retries_due_checkpoint(
             now=now,
             status="paused",
         )
+        assert fill.payload_schema_version == 2
         fill_id = fill.id
         done = session.get(DiscoveryDataCheckpoint, (fill_id, done_code))
         retry = session.get(DiscoveryDataCheckpoint, (fill_id, retry_code))
@@ -4300,6 +4301,7 @@ def test_discovery_fill_resume_skips_completed_and_retries_due_checkpoint(
     with factory() as session:
         fill = session.get(DiscoveryDataFill, fill_id)
         assert fill is not None
+        assert fill.payload_schema_version == 2
         assert (fill.status, fill.completed, fill.failed) == ("done", 3, 0)
     engine.dispose()
 
@@ -6075,7 +6077,11 @@ def test_init_db_adds_discovery_request_timing_columns(tmp_path) -> None:
         column["name"]
         for column in inspect(engine).get_columns("discovery_data_fills")
     }
-    assert {"last_request_at", "run_started_at"} <= columns
+    assert {
+        "last_request_at",
+        "run_started_at",
+        "payload_schema_version",
+    } <= columns
     factory = create_session_factory(engine)
     code = "000001.SZ"
     with factory() as session:
@@ -6083,6 +6089,7 @@ def test_init_db_adds_discovery_request_timing_columns(tmp_path) -> None:
         assert fill is not None
         assert fill.request_count == 3
         assert fill.last_request_at is None
+        assert fill.payload_schema_version is None
         session.add(
             DiscoveryDataCheckpoint(
                 fill_id=fill.id,
@@ -6220,8 +6227,10 @@ def test_init_db_preserves_completed_presnapshot_fill_but_requires_restart(
         assert legacy.status == "done"
         assert legacy.snapshot_status is None
         status = discovery_data_status(session, now=now)
+        assert status["status"] == "snapshot_unavailable"
+        assert status["snapshot_status"] == "unavailable"
         assert status["restart_required"] is True
-        assert "new fill" in str(status["guidance"])
+        assert "payload schema" in str(status["guidance"])
         assert discovery_data_readiness(
             session, as_of=now.date()
         ).observations == {}
@@ -6230,6 +6239,81 @@ def test_init_db_preserves_completed_presnapshot_fill_but_requires_restart(
         )
         assert replacement is not None and dispatch
         assert replacement.id != legacy.id
+        assert replacement.payload_schema_version == 2
+    engine.dispose()
+
+
+def test_legacy_payload_schema_is_o1_unavailable_everywhere(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from discovery.company_payload import (
+        PAYLOAD_SCHEMA_BLOCK_REASON,
+        PAYLOAD_SCHEMA_RESTART_GUIDANCE,
+    )
+    from discovery.data_readiness import discovery_data_readiness
+    from discovery.snapshot import build_production_snapshot
+    from jobs import discovery_data
+    from scripts.calibrate_discovery import calibrate
+
+    db_path = tmp_path / "legacy-payload-schema.db"
+    engine = init_db(db_path)
+    now = datetime(2026, 9, 16, 14, tzinfo=timezone.utc)
+    with Session(engine) as session:
+        session.add(
+            DiscoveryDataFill(
+                status="done",
+                total=5559,
+                completed=5559,
+                failed=0,
+                request_count=0,
+                daily_budget=1000,
+                budget_day="2026-09-16",
+                daily_requests=0,
+                started_at=now,
+                updated_at=now,
+                last_error=None,
+                snapshot_status="ready",
+                payload_schema_version=1,
+            )
+        )
+        session.commit()
+
+        def forbidden_parse(*_args, **_kwargs):
+            raise AssertionError("status must not parse company payloads")
+
+        monkeypatch.setattr(
+            discovery_data,
+            "parse_company_payload",
+            forbidden_parse,
+        )
+        monkeypatch.setattr(
+            discovery_data,
+            "_checkpoint_counts",
+            forbidden_parse,
+        )
+        status = discovery_data.discovery_data_status(session, now=now)
+        assert status["status"] == "snapshot_unavailable"
+        assert status["snapshot_status"] == "unavailable"
+        assert status["restart_required"] is True
+        assert status["guidance"] == PAYLOAD_SCHEMA_RESTART_GUIDANCE
+        with pytest.raises(ValueError, match="payload schema"):
+            build_production_snapshot(session)
+        assert discovery_data_readiness(
+            session,
+            as_of=now.date(),
+        ).observations == {}
+
+    artifact = calibrate(db_path, track="quality_discount")
+    assert artifact["blocked_reasons"] == [PAYLOAD_SCHEMA_BLOCK_REASON]
+    with engine.begin() as conn:
+        with pytest.raises(IntegrityError, match="payload schema is immutable"):
+            conn.execute(
+                text(
+                    "UPDATE discovery_data_fills "
+                    "SET payload_schema_version = 2"
+                )
+            )
     engine.dispose()
 
 
@@ -7372,6 +7456,12 @@ def test_readiness_activation_is_per_track_and_configuration_is_strict(
                 as_of=date(2026, 9, 16),
                 minimum_observations={"garp": {"profit": 2}},
             )
+        with pytest.raises(ValueError, match="ROE fallback"):
+            discovery_data_readiness(
+                session,
+                as_of=date(2026, 9, 16),
+                minimum_observations={"garp": {"roic": 2}},
+            )
         with pytest.raises(ValueError, match="valuation policy"):
             discovery_data_readiness(
                 session,
@@ -7423,7 +7513,7 @@ def test_partial_observation_minimums_merge_over_measurement_defaults(
                 period=period,
                 capex=Decimal("1"),
                 revenue=Decimal("1"),
-                    roe=Decimal("1"),
+                roe=Decimal("1"),
             )
         _store_readiness_financial(
             session,
