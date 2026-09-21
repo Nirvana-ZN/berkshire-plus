@@ -1041,6 +1041,7 @@ def test_drain_persists_validated_competition_evidence(tmp_path) -> None:
 
     from app.discovery_models import DiscoveryEvidence, DiscoveryStage
     from discovery.evidence import EVIDENCE_RULE_VERSION, FALLBACK_RISK_TEXT
+    from discovery.snapshot import canonical_json
     from jobs.discovery import (
         TrackExecutionEvidence,
         TrackExecutionOutcome,
@@ -1084,6 +1085,7 @@ def test_drain_persists_validated_competition_evidence(tmp_path) -> None:
 
         def execute(context):
             assert context.candidate_codes == ("600000.SH",)
+            source_as_of = context.frozen_inputs.companies[0].as_of
             return TrackExecutionOutcome(
                 status="waiting_confirmation",
                 results=(
@@ -1104,10 +1106,10 @@ def test_drain_persists_validated_competition_evidence(tmp_path) -> None:
                             kind="fact",
                             rule_id=f"quality_discount.fact.{field}",
                             input_fields_json=(
-                                f'{{"{field}":"1","source":"price"}}'
+                                    f'{{"{field}":"1","source":"security"}}'
                             ),
                             display_text=f"{field}=1",
-                            as_of="2026-09-17",
+                                as_of=source_as_of["security"],
                             data_completeness="complete",
                         )
                         for field in ("cash_conversion", "roe_cv", "valuation")
@@ -1118,11 +1120,11 @@ def test_drain_persists_validated_competition_evidence(tmp_path) -> None:
                         rule_version=EVIDENCE_RULE_VERSION,
                         kind="risk",
                         rule_id="quality_discount.risk.none",
-                        input_fields_json=(
-                            '{"source_as_of":{"price":"2026-09-17"}}'
+                        input_fields_json=canonical_json(
+                            {"source_as_of": source_as_of}
                         ),
                         display_text=FALLBACK_RISK_TEXT,
-                        as_of="2026-09-17",
+                        as_of=min(source_as_of.values()),
                         data_completeness="complete",
                     ),
                 ),
