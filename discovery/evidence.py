@@ -53,6 +53,20 @@ _OBSERVATION_REQUIREMENTS = MappingProxyType(
             "interest_coverage_observations",
         ),
         "npl_change": ("bank_npl", "bank_npl_observations"),
+        "dilution_rate": ("dilution", "dilution_observations"),
+        "revenue_decline": ("revenue", "revenue_observations"),
+        "one_time_profit_share": (
+            "one_time_profit",
+            "one_time_profit_observations",
+        ),
+        "impairment_share": (
+            "impairment",
+            "impairment_observations",
+        ),
+        "subsidy_disposal_share": (
+            "subsidy_disposal",
+            "subsidy_disposal_observations",
+        ),
     }
 )
 _QUALITY_BANK_FACTS = (
@@ -107,12 +121,94 @@ def _decimal(value: object) -> Decimal | None:
     return result if result.is_finite() else None
 
 
-def _source(field: str) -> str:
-    if field.startswith(("pe_", "pb_")) or field == "normalized_pe":
-        return "valuation"
+def _sources(field: str) -> tuple[str, ...]:
+    if field == "normalized_pe":
+        return ("financial", "valuation")
+    if field.startswith(("pe_", "pb_")):
+        return ("valuation",)
     if field == "listing_years":
-        return "security"
-    return "financial"
+        return ("security",)
+    return ("financial",)
+
+
+def _provenance(
+    fields: Sequence[str],
+    source_as_of: Mapping[str, str],
+) -> tuple[dict[str, object], str]:
+    sources = tuple(
+        dict.fromkeys(
+            source
+            for field in fields
+            for source in _sources(field)
+        )
+    )
+    if len(sources) == 1:
+        source = sources[0]
+        return {"source": source}, source_as_of[source]
+    dates = {source: source_as_of[source] for source in sources}
+    return {
+        "sources": sources,
+        "source_as_of": dates,
+    }, min(dates.values())
+
+
+def _risk_specs(
+    track: str,
+    branch: object,
+) -> tuple[tuple[str, str, str], ...]:
+    if track != "deep_value":
+        return ()
+    return (
+        (
+            (
+                "normalized_pe",
+                "normalized_pe_max",
+                "max",
+            ),
+            (
+                "net_debt_to_normalized_fcf",
+                "net_debt_to_normalized_fcf_max",
+                "max",
+            ),
+            (
+                "interest_coverage",
+                "interest_coverage_min",
+                "min",
+            ),
+            ("dilution_rate", "dilution_rate_max", "max"),
+            ("revenue_decline", "revenue_decline_max", "max"),
+            (
+                "one_time_profit_share",
+                "one_time_profit_share_max",
+                "max",
+            ),
+            ("impairment_share", "impairment_share_max", "max"),
+            (
+                "subsidy_disposal_share",
+                "subsidy_disposal_share_max",
+                "max",
+            ),
+        )
+        if branch == "nonfinancial"
+        else (
+            ("pb_percentile", "pb_percentile_max", "max"),
+            ("pb_median_ratio", "pb_median_ratio_max", "max"),
+            ("roe_mean", "bank_roe_min", "min"),
+            ("npl_change", "bank_npl_increase_max", "max"),
+            (
+                "bank_capital_adequacy",
+                "bank_capital_adequacy_min",
+                "min",
+            ),
+            (
+                "bank_core_tier1_capital_adequacy",
+                "bank_core_tier1_min",
+                "min",
+            ),
+        )
+        if branch == "financial"
+        else ()
+    )
 
 
 def _source_dates(value: Mapping[str, object]) -> Mapping[str, str]:
@@ -284,11 +380,8 @@ def _fact_items(
                 if field in formulas
             }
         )
-        sources = {_source(field) for field in fields}
-        if len(sources) != 1:
-            raise ValueError("evidence fact spans incompatible sources")
-        source = sources.pop()
-        inputs["source"] = source
+        provenance, as_of = _provenance(fields, source_as_of)
+        inputs.update(provenance)
         result.append(
             _item(
                 kind="fact",
@@ -296,7 +389,7 @@ def _fact_items(
                 rule_id=f"{track}.fact.{rule_name}",
                 inputs=inputs,
                 text=",".join(f"{field}={metrics[field]}" for field in fields),
-                as_of=source_as_of[source],
+                as_of=as_of,
                 completeness="complete",
             )
         )
@@ -315,11 +408,6 @@ def _threshold_risk(
     if not isinstance(thresholds, Mapping):
         raise ValueError("evidence ruler thresholds are invalid")
     branch = metrics.get("quality_branch") or metrics.get("branch")
-    fields = (
-        field
-        for _, fact_fields in _fact_specs(track, metrics, ruler)
-        for field in fact_fields
-    )
     threshold_names = {
         "bank_capital_adequacy": (
             "bank_capital_adequacy_min",
@@ -331,14 +419,27 @@ def _threshold_risk(
         ),
         "bank_npl": ("bank_npl_max", "max"),
     }
-    if branch == "bank":
+    if branch in {"bank", "financial"}:
         threshold_names["roe_mean"] = ("bank_roe_min", "min")
-    for field in fields:
+    configured = _risk_specs(track, branch)
+    fields = (
+        configured
+        if track == "deep_value"
+        else tuple(
+            (field, "", "")
+            for _, fact_fields in _fact_specs(track, metrics, ruler)
+            for field in fact_fields
+        )
+    )
+    for field, configured_name, configured_direction in fields:
         if _reliable_inputs(field, metrics, ruler, branch) is None:
             continue
         value = _decimal(metrics.get(field))
         assert value is not None
         names = (
+            ((configured_name, configured_direction),)
+            if configured_name
+            else
             (threshold_names[field],)
             if field in threshold_names
             else (
@@ -357,6 +458,7 @@ def _threshold_risk(
                 else threshold <= value <= threshold + distance
             )
             if near:
+                provenance, as_of = _provenance((field,), source_as_of)
                 return _item(
                     kind="risk",
                     category="metric_near_threshold",
@@ -364,10 +466,10 @@ def _threshold_risk(
                     inputs={
                         field: metrics[field],
                         name: thresholds[name],
-                        "source": _source(field),
+                        **provenance,
                     },
                     text=f"{field}接近阈值",
-                    as_of=source_as_of[_source(field)],
+                    as_of=as_of,
                     completeness="complete",
                 )
     return None
@@ -376,6 +478,7 @@ def _threshold_risk(
 def _flag_risk(
     track: str,
     metrics: Mapping[str, object],
+    ruler: Mapping[str, object],
     source_as_of: Mapping[str, str],
 ) -> EvidenceItem | None:
     flags = metrics.get("risk_flags", ())
@@ -395,13 +498,55 @@ def _flag_risk(
             )
         )
         if category is not None:
+            field = (
+                flag.removesuffix("_worsening")
+                if flag.endswith("_worsening")
+                else None
+            )
+            inputs: dict[str, object] = {"risk_flag": flag}
+            as_of = source_as_of["financial"]
+            if field is not None:
+                spec = next(
+                    (
+                        item
+                        for item in _risk_specs(
+                            track,
+                            metrics.get("quality_branch")
+                            or metrics.get("branch"),
+                        )
+                        if item[0] == field
+                    ),
+                    None,
+                )
+                thresholds = ruler.get("thresholds")
+                formulas = ruler.get("formulas")
+                if (
+                    spec is None
+                    or not isinstance(thresholds, Mapping)
+                    or not isinstance(formulas, Mapping)
+                    or field not in formulas
+                    or spec[1] not in thresholds
+                    or metrics.get(field) is None
+                ):
+                    continue
+                provenance, as_of = _provenance((field,), source_as_of)
+                inputs.update(
+                    {
+                        field: metrics[field],
+                        spec[1]: thresholds[spec[1]],
+                        f"formula.{field}": formulas[field],
+                        **provenance,
+                    }
+                )
+            else:
+                inputs["source"] = "financial"
             return _item(
                 kind="risk",
                 category=category,
                 rule_id=f"{track}.risk.{category}.{flag}",
-                inputs={"risk_flag": flag, "source": "financial"},
+                inputs=inputs,
                 text=flag,
-                as_of=source_as_of["financial"],
+                as_of=as_of,
                 completeness="complete",
             )
     return None
@@ -430,13 +575,14 @@ def _missing_risk(
             and policies.get(field) == "skip"
             and metrics.get(field) is None
         ):
+            provenance, as_of = _provenance((field,), source_as_of)
             return _item(
                 kind="risk",
                 category="missing_non_gating_evidence",
                 rule_id=f"{track}.risk.missing_non_gating_evidence.{field}",
-                inputs={"missing_field": field, "source": _source(field)},
+                inputs={"missing_field": field, **provenance},
                 text=f"{field}缺少非门槛证据",
-                as_of=source_as_of[_source(field)],
+                as_of=as_of,
                 completeness="partial",
             )
     return None
@@ -465,11 +611,11 @@ def build_evidence_card(
         item
         for item in (
             _threshold_risk(track, metrics, ruler, dates),
-            _flag_risk(track, metrics, dates),
+            _flag_risk(track, metrics, ruler, dates),
             _missing_risk(track, metrics, ruler, dates),
         )
         if item is not None
-    )[:2]
+    )[: max(1, 5 - len(facts))]
     if not risks:
         risks = (
             _item(

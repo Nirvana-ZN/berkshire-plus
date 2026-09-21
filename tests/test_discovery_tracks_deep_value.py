@@ -374,6 +374,48 @@ def test_financial_missing_capital_is_insufficient() -> None:
 
 
 @pytest.mark.parametrize(
+    ("missing", "reason", "metric"),
+    [
+        ("npl", "bank_npl_insufficient", "npl_change"),
+        (
+            "capital_adequacy",
+            "bank_capital_adequacy_insufficient",
+            "bank_capital_adequacy",
+        ),
+        (
+            "core_tier1_capital_adequacy",
+            "bank_core_tier1_capital_adequacy_insufficient",
+            "bank_core_tier1_capital_adequacy",
+        ),
+    ],
+)
+def test_bank_latest_required_year_never_falls_back_to_stale_fields(
+    missing: str,
+    reason: str,
+    metric: str,
+) -> None:
+    annual = tuple(
+        _deep_annual(year, **({missing: None} if year == 2025 else {}))
+        for year in range(2021, 2026)
+    )
+    verdict = _classify(_company(industry="银行", annual=annual))
+    assert (verdict.verdict, verdict.primary_reason) == (
+        "insufficient",
+        reason,
+    )
+    assert verdict.metrics[metric] is None
+
+
+def test_bank_latest_accepted_stale_year_is_used_when_ruler_allows_it() -> None:
+    annual = tuple(_deep_annual(year) for year in range(2020, 2025))
+    verdict = _classify(_company(industry="银行", annual=annual))
+    assert verdict.verdict == "pass"
+    assert verdict.metrics["latest_fiscal_year"] == "2024"
+    assert verdict.metrics["latest_fiscal_year_staleness"] == "1"
+    assert verdict.metrics["bank_capital_adequacy"] == "14"
+
+
+@pytest.mark.parametrize(
     ("industry", "reason"),
     [
         ("保险", "industry_branch_insurance_unsupported"),
@@ -488,6 +530,8 @@ def test_builtin_dispatches_deep_value_gate_and_competition() -> None:
     from jobs.discovery import (
         TrackExecutionCandidate,
         TrackExecutionContext,
+        TrackExecutorContractError,
+        _validate_track_outcome,
         builtin_track_executor,
     )
 
@@ -531,6 +575,14 @@ def test_builtin_dispatches_deep_value_gate_and_competition() -> None:
         ruler_payload=MappingProxyType(deep_value_payload()),
         candidates=(candidate,),
     )
+    inactive = builtin_track_executor(
+        replace(gate, ruler_payload=MappingProxyType({}))
+    )
+    assert (
+        inactive.status,
+        inactive.results,
+        inactive.evidence,
+    ) == ("ruler_not_ready", (), ())
     outcome = builtin_track_executor(gate)
     assert outcome.status == "waiting_confirmation"
     assert outcome.results[0].verdict == "pass"
@@ -553,6 +605,132 @@ def test_builtin_dispatches_deep_value_gate_and_competition() -> None:
     assert ranked.results[0].rank == 1
     assert len(ranked.evidence) >= 3
     assert all(row.rule_id.startswith("deep_value.") for row in ranked.evidence)
+    normalized_pe = next(
+        row
+        for row in ranked.evidence
+        if row.rule_id == "deep_value.fact.normalized_pe"
+    )
+    inputs = json.loads(normalized_pe.input_fields_json)
+    assert inputs["sources"] == ["financial", "valuation"]
+    assert inputs["source_as_of"] == {
+        "financial": company.as_of["financial"],
+        "valuation": company.as_of["valuation"],
+    }
+    assert "source" not in inputs
+    assert normalized_pe.as_of == company.as_of["financial"]
+    assert _validate_track_outcome(competition, ranked) is ranked
+    with pytest.raises(
+        TrackExecutorContractError,
+        match="as-of is not source-bounded",
+    ):
+        _validate_track_outcome(
+            competition,
+            replace(
+                ranked,
+                evidence=tuple(
+                    replace(
+                        row,
+                        input_fields_json=canonical_json(
+                            inputs
+                            | {
+                                "sources": ["valuation"],
+                            }
+                        ),
+                    )
+                    if row == normalized_pe
+                    else row
+                    for row in ranked.evidence
+                ),
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    ("latest", "expected_rule", "expected_category", "threshold"),
+    [
+        (
+            {"shares": "109"},
+            "deep_value.risk.metric_near_threshold.dilution_rate",
+            "metric_near_threshold",
+            ("dilution_rate_max", "0.1"),
+        ),
+        (
+            {"revenue": "162"},
+            "deep_value.risk.metric_near_threshold.revenue_decline",
+            "metric_near_threshold",
+            ("revenue_decline_max", "0.2"),
+        ),
+    ],
+)
+def test_passing_nonfinancial_competition_emits_threshold_risk(
+    latest: dict[str, str],
+    expected_rule: str,
+    expected_category: str,
+    threshold: tuple[str, str],
+) -> None:
+    from discovery.evidence import build_evidence_card
+
+    annual = tuple(
+        _deep_annual(year, **(latest if year == 2025 else {}))
+        for year in range(2021, 2026)
+    )
+    company = _company(annual=annual)
+    payload = deep_value_payload(
+        normalized_pe_max="20" if "shares" in latest else "12"
+    )
+    verdict = _classify(company, payload)
+    assert verdict.verdict == "pass"
+    card = build_evidence_card(
+        company.code,
+        verdict.metrics,
+        payload,
+        source_as_of={
+            key: company.as_of[key]
+            for key in ("security", "financial", "valuation")
+        },
+    )
+    risk = next(item for item in card.items if item.kind == "risk")
+    assert (risk.rule_id, risk.category) == (
+        expected_rule,
+        expected_category,
+    )
+    assert risk.input_fields[threshold[0]] == threshold[1]
+
+
+def test_passing_bank_npl_worsening_emits_frozen_threshold_trend_risk() -> None:
+    from discovery.evidence import build_evidence_card
+
+    annual = tuple(
+        _deep_annual(
+            year,
+            npl="1.1" if year == 2025 else "1",
+        )
+        for year in range(2021, 2026)
+    )
+    company = _company(industry="银行", annual=annual)
+    verdict = _classify(company)
+    assert verdict.verdict == "pass"
+    card = build_evidence_card(
+        company.code,
+        verdict.metrics,
+        deep_value_payload(),
+        source_as_of={
+            key: company.as_of[key]
+            for key in ("security", "financial", "valuation")
+        },
+    )
+    risk = next(item for item in card.items if item.kind == "risk")
+    assert (
+        risk.rule_id,
+        risk.category,
+        risk.input_fields["npl_change"],
+        risk.input_fields["bank_npl_increase_max"],
+    ) == (
+        "deep_value.risk.worsening_trend.npl_change_worsening",
+        "worsening_trend",
+        "0.1",
+        "0.2",
+    )
 
 
 def test_calibrator_deep_value_is_deterministic_blocked_and_read_only(

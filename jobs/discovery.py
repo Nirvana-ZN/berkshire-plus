@@ -993,6 +993,7 @@ def _validate_track_outcome(
             )
         sources = company_source_dates.get(row.code, {})
         source = input_fields.get("source")
+        source_names = input_fields.get("sources")
         source_bundle = input_fields.get("source_as_of")
         exact_source = (
             type(source) is str
@@ -1000,14 +1001,21 @@ def _validate_track_outcome(
             and row.as_of == sources[source]
         )
         exact_bundle = (
-            row.rule_id == fallback_id
-            and type(source_bundle) is dict
+            type(source_bundle) is dict
             and bool(source_bundle)
             and all(
                 type(name) is str
                 and type(value) is str
                 and sources.get(name) == value
                 for name, value in source_bundle.items()
+            )
+            and (
+                row.rule_id == fallback_id
+                or (
+                    source is None
+                    and type(source_names) is list
+                    and source_names == list(source_bundle)
+                )
             )
             and row.as_of == min(source_bundle.values())
         )

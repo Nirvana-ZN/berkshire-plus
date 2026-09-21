@@ -517,9 +517,26 @@ def _financial_metrics(
 
     npl_rows = _available(windows.get("bank_npl"), "npl")
     counts["bank_npl"] = len(npl_rows)
-    if len(npl_rows) >= ruler.min_observations["bank_npl"]:
+    npl_window = windows.get("bank_npl")
+    latest_npl_row = (
+        None
+        if npl_window is None
+        else next(
+            (
+                row
+                for row in npl_window.rows
+                if row.year == npl_window.end_year
+            ),
+            None,
+        )
+    )
+    if (
+        len(npl_rows) >= ruler.min_observations["bank_npl"]
+        and latest_npl_row is not None
+        and latest_npl_row.values["npl"] is not None
+    ):
         metrics["npl_change"] = _subtract(
-            npl_rows[-1].values["npl"], npl_rows[0].values["npl"]
+            latest_npl_row.values["npl"], npl_rows[0].values["npl"]
         )
 
     capital_rows = _available(
@@ -528,11 +545,24 @@ def _financial_metrics(
         "core_tier1_capital_adequacy",
     )
     counts["bank_capital"] = len(capital_rows)
-    if capital_rows:
-        metrics["bank_capital_adequacy"] = capital_rows[-1].values[
+    capital_window = windows.get("bank_capital")
+    latest_capital_row = (
+        None
+        if capital_window is None
+        else next(
+            (
+                row
+                for row in capital_window.rows
+                if row.year == capital_window.end_year
+            ),
+            None,
+        )
+    )
+    if latest_capital_row is not None:
+        metrics["bank_capital_adequacy"] = latest_capital_row.values[
             "capital_adequacy"
         ]
-        metrics["bank_core_tier1_capital_adequacy"] = capital_rows[-1].values[
+        metrics["bank_core_tier1_capital_adequacy"] = latest_capital_row.values[
             "core_tier1_capital_adequacy"
         ]
     return metrics, counts
@@ -860,7 +890,16 @@ def classify(company: FrozenCompanyInput, ruler: TrackRuler) -> TrackVerdict:
     assert isinstance(config, Mapping)
     failures: list[tuple[str, str]] = []
     evidence = []
-    risks = []
+    risks = [
+        f"{metric}_worsening"
+        for metric in (
+            "dilution_rate",
+            "revenue_decline",
+            "npl_change",
+        )
+        if calculated[metric] is not None
+        and calculated[metric] > 0
+    ]
     for gate in config["gate_order"]:
         gate_failures = _gate_failures(
             str(gate), ruler, calculated, counts
@@ -868,11 +907,6 @@ def classify(company: FrozenCompanyInput, ruler: TrackRuler) -> TrackVerdict:
         for status, reason in gate_failures:
             failures.append((status, reason))
             evidence.append(f"deep_value.{reason}")
-            if reason in {
-                "revenue_decline_above_max",
-                "npl_change_above_max",
-            }:
-                risks.append(reason)
     if not failures:
         return _verdict(code, "pass", None, metrics, evidence, risks)
     status, reason = failures[0]
