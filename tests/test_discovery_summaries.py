@@ -123,6 +123,27 @@ def _ruler(
     )
 
 
+def _generic_ruler(
+    *,
+    thresholds: dict[str, str] | None = None,
+):
+    from app.models import RulerVersion
+    from discovery.rulers import canonical_payload, payload_digest
+
+    payload = discovery_ruler_payload("garp")
+    if thresholds is not None:
+        payload["thresholds"] = thresholds
+    return RulerVersion(
+        id=7,
+        user_id=1,
+        scope="discovery:garp",
+        digest=payload_digest(payload),
+        reason="通用汇总尺子",
+        payload_json=canonical_payload(payload),
+        activated_at=SNAPSHOT_AT,
+    )
+
+
 def _summary(
     values: list[object],
     *,
@@ -130,10 +151,10 @@ def _summary(
 ):
     from discovery.summaries import build_stage_summary
 
-    ruler = _ruler(thresholds=thresholds)
+    ruler = _generic_ruler(thresholds=thresholds)
     return build_stage_summary(
         _stage(
-            track="deep_value",
+            track="garp",
             stage="track_gate",
             counts=(len(values), len(values), 0, 0),
             ruler_version_id=ruler.id,
@@ -142,7 +163,7 @@ def _summary(
             _result(
                 f"{index:06d}.SZ",
                 {"metric": value},
-                track="deep_value",
+                track="garp",
                 stage="track_gate",
             )
             for index, value in enumerate(values, start=1)
@@ -265,10 +286,10 @@ def test_distributions_use_exact_linear_quartiles(
 def test_empty_null_bool_date_and_text_metrics_stay_visible_unavailable() -> None:
     from discovery.summaries import build_stage_summary
 
-    ruler = _ruler()
+    ruler = _generic_ruler()
     empty = build_stage_summary(
         _stage(
-            track="deep_value",
+            track="garp",
             stage="track_gate",
             status="failed",
             ruler_version_id=ruler.id,
@@ -825,6 +846,8 @@ def _activate(session, track: str, threshold: str, reason: str):
     payload = discovery_ruler_payload(track)
     if track == "quality_discount":
         payload["thresholds"]["roe_mean_min"] = threshold
+    elif track == "deep_value":
+        payload["thresholds"]["normalized_pe_max"] = threshold
     else:
         payload["thresholds"] = {"metric_floor": threshold}
     return activate(session, payload, reason)

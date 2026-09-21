@@ -1,0 +1,592 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import sqlite3
+from dataclasses import replace
+from decimal import DefaultContext, Decimal, getcontext, setcontext
+from pathlib import Path
+from types import MappingProxyType
+
+import pytest
+
+from discovery.builds import BUILD_VERSION
+from discovery.snapshot import FrozenRunInputs, canonical_json
+from tests.test_discovery_tracks_quality import (
+    _annual,
+    _metadata,
+    frozen_company,
+)
+
+
+FIELDS = [
+    "listing_years",
+    "normalized_earnings",
+    "normalized_pe",
+    "cumulative_fcf",
+    "normalized_fcf",
+    "net_debt_to_normalized_fcf",
+    "interest_coverage",
+    "dilution_rate",
+    "revenue_decline",
+    "one_time_profit_share",
+    "impairment_share",
+    "subsidy_disposal_share",
+    "pb_percentile",
+    "pb_median_ratio",
+    "roe_mean",
+    "npl_change",
+    "bank_capital_adequacy",
+    "bank_core_tier1_capital_adequacy",
+    "code",
+]
+
+FORMULAS = {
+    "normalized_earnings": "median(annual.deducted_net_income)",
+    "normalized_pe": "current.price*latest(annual.shares)/normalized_earnings",
+    "cumulative_fcf": "sum(annual.ocf-annual.capex)",
+    "normalized_fcf": "median(annual.ocf-annual.capex)",
+    "net_debt_to_normalized_fcf": (
+        "(latest(annual.interest_debt)-latest(annual.cash))/normalized_fcf"
+    ),
+    "interest_coverage": "latest(annual.ebit)/copy_abs(latest(annual.interest))",
+    "dilution_rate": "latest(annual.shares)/earliest(annual.shares)-1",
+    "revenue_decline": (
+        "max(0,(earliest(annual.revenue)-latest(annual.revenue))/"
+        "earliest(annual.revenue))"
+    ),
+    "one_time_profit_share": (
+        "max(0,latest(annual.net_income)-latest(annual.deducted_net_income))/"
+        "copy_abs(normalized_earnings)"
+    ),
+    "impairment_share": (
+        "copy_abs(latest(annual.impairment_loss))/copy_abs(normalized_earnings)"
+    ),
+    "subsidy_disposal_share": (
+        "(copy_abs(latest(annual.government_grants))+"
+        "copy_abs(latest(annual.asset_disposal_gain)))/"
+        "copy_abs(normalized_earnings)"
+    ),
+    "pb_percentile": "percentile_rank(current.pb,monthly.pb)",
+    "pb_median_ratio": "current.pb/median(monthly.pb)",
+    "roe_mean": "mean(annual.roe)",
+    "npl_change": "latest(annual.npl)-earliest(annual.npl)",
+    "bank_capital_adequacy": "latest(annual.capital_adequacy)",
+    "bank_core_tier1_capital_adequacy": (
+        "latest(annual.core_tier1_capital_adequacy)"
+    ),
+}
+
+
+def deep_value_payload(**threshold_overrides: str) -> dict[str, object]:
+    thresholds = {
+        "listing_years_min": "5",
+        "normalized_earnings_min": "0",
+        "normalized_pe_max": "12",
+        "cumulative_fcf_min": "0",
+        "normalized_fcf_min": "0",
+        "net_debt_to_normalized_fcf_max": "3",
+        "interest_coverage_min": "2",
+        "dilution_rate_max": "0.1",
+        "revenue_decline_max": "0.2",
+        "one_time_profit_share_max": "0.3",
+        "impairment_share_max": "0.3",
+        "subsidy_disposal_share_max": "0.2",
+        "pb_percentile_max": "30",
+        "pb_median_ratio_max": "0.8",
+        "bank_roe_min": "8",
+        "bank_npl_increase_max": "0.2",
+        "bank_capital_adequacy_min": "12",
+        "bank_core_tier1_min": "9",
+        "readiness_min": "0.8",
+    }
+    thresholds.update(threshold_overrides)
+    return {
+        "scope": "weekly-discovery",
+        "track": "deep_value",
+        "fields": FIELDS,
+        "formulas": FORMULAS,
+        "thresholds": thresholds,
+        "min_observations": {
+            "normalized_earnings": 5,
+            "fcf": 5,
+            "net_debt": 1,
+            "interest_coverage": 1,
+            "dilution": 2,
+            "revenue": 2,
+            "one_time_profit": 1,
+            "impairment": 1,
+            "subsidy_disposal": 1,
+            "valuation_pb": 60,
+            "bank_roe": 5,
+            "bank_npl": 2,
+            "bank_capital": 1,
+        },
+        "missing_policy": {field: "insufficient" for field in FIELDS},
+        "sector_branches": {
+            "common": {
+                "valuation_ratio_method": "PE_TTM/PB_MRQ",
+                "field_domain_policy": "deep-value-domain-v1",
+                "lookback_windows": {
+                    "normalized_earnings": 5,
+                    "fcf": 5,
+                    "net_debt": 1,
+                    "interest_coverage": 1,
+                    "dilution": 5,
+                    "revenue": 5,
+                    "one_time_profit": 1,
+                    "impairment": 1,
+                    "subsidy_disposal": 1,
+                    "bank_roe": 5,
+                    "bank_npl": 5,
+                    "bank_capital": 5,
+                },
+                "latest_annual_staleness_years": 1,
+            },
+            "branch_policies": {
+                "bank": "financial",
+                "insurance": "unsupported",
+                "other_financial": "unsupported",
+                "nonfinancial": "nonfinancial",
+                "unknown": "insufficient",
+            },
+            "nonfinancial": {
+                "gate_order": [
+                    "listing_age",
+                    "normalized_earnings",
+                    "normalized_valuation",
+                    "positive_cumulative_fcf",
+                    "net_debt",
+                    "interest_coverage",
+                    "dilution",
+                    "revenue_decline",
+                    "one_time_profit",
+                    "impairment",
+                    "subsidy_disposal",
+                ],
+                "evidence_fields": [
+                    "normalized_pe",
+                    "cumulative_fcf",
+                    "net_debt_to_normalized_fcf",
+                    "interest_coverage",
+                ],
+            },
+            "financial": {
+                "gate_order": [
+                    "listing_age",
+                    "bank_valuation",
+                    "bank_roe",
+                    "bank_npl_trend",
+                    "bank_capital",
+                ],
+                "evidence_fields": [
+                    "pb_percentile",
+                    "roe_mean",
+                    "npl_change",
+                    "bank_capital_adequacy",
+                ],
+            },
+        },
+        "order": [
+            ["normalized_pe", "asc", "nulls_last"],
+            ["pb_percentile", "asc", "nulls_last"],
+            ["net_debt_to_normalized_fcf", "asc", "nulls_last"],
+            ["code", "asc", "nulls_last"],
+        ],
+        "industry_version": "test-industry-v1",
+        "algorithm_version": BUILD_VERSION,
+    }
+
+
+def _deep_annual(
+    year: int,
+    **changes: str | None,
+) -> dict[str, object]:
+    values = {
+        "cash": "20",
+        "capex": "20",
+        "revenue": "200",
+        "impairment_loss": "5",
+        "government_grants": "5",
+        "asset_disposal_gain": "5",
+    }
+    values.update(changes)
+    row = _annual(year)
+    row_values = dict(row["values"])
+    row_values.update(values)
+    row["values"] = row_values
+    row["provenance"] = {
+        field: ("discovery",)
+        for field, value in row_values.items()
+        if value is not None
+    }
+    row["field_sources"] = {
+        field: _metadata(field)
+        for field, value in row_values.items()
+        if value is not None
+    }
+    return row
+
+
+def _company(*, industry: str = "制造业", annual=None):
+    return frozen_company(
+        industry=industry,
+        annual=annual
+        or tuple(_deep_annual(year) for year in range(2021, 2026)),
+    )
+
+
+def _classify(company=None, payload=None):
+    from discovery.rulers import deep_value_ruler
+    from discovery.tracks.deep_value import classify
+
+    return classify(
+        company or _company(),
+        deep_value_ruler(payload or deep_value_payload()),
+    )
+
+
+def test_deep_value_ruler_is_complete_and_semantically_strict() -> None:
+    from discovery.rulers import deep_value_ruler
+
+    assert deep_value_ruler(deep_value_payload()).track == "deep_value"
+    for mutation in (
+        lambda value: value["thresholds"].pop("cumulative_fcf_min"),
+        lambda value: value["min_observations"].pop("fcf"),
+        lambda value: value["missing_policy"].pop("normalized_earnings"),
+        lambda value: value["formulas"].__setitem__(
+            "normalized_earnings", "latest(net_income)"
+        ),
+        lambda value: value["sector_branches"]["financial"][
+            "gate_order"
+        ].append("industrial_fcf"),
+        lambda value: value["sector_branches"]["common"][
+            "lookback_windows"
+        ].pop("fcf"),
+        lambda value: value["order"].pop(1),
+    ):
+        payload = json.loads(json.dumps(deep_value_payload()))
+        mutation(payload)
+        with pytest.raises((TypeError, ValueError)):
+            deep_value_ruler(payload)
+
+
+def test_nonfinancial_normalizes_deducted_profit_and_requires_positive_fcf() -> None:
+    annual = tuple(
+        _deep_annual(
+            year,
+            net_income="1000" if year == 2025 else "100",
+            deducted_net_income="100",
+            ocf="10",
+            capex="20",
+        )
+        for year in range(2021, 2026)
+    )
+    verdict = _classify(_company(annual=annual))
+    assert (verdict.verdict, verdict.primary_reason) == (
+        "drop",
+        "cumulative_fcf_not_positive",
+    )
+    assert verdict.metrics["normalized_earnings"] == "100"
+    assert verdict.metrics["cumulative_fcf"] == "-50"
+    assert verdict.metrics["normalized_fcf"] == "-10"
+
+
+@pytest.mark.parametrize(
+    ("changes", "reason"),
+    [
+        ({"cash": "0", "interest_debt": "400"}, "net_debt_to_normalized_fcf_above_max"),
+        ({"ebit": "5", "interest": "5"}, "interest_coverage_below_min"),
+        ({"shares": "120"}, "dilution_rate_above_max"),
+        ({"revenue": "100"}, "revenue_decline_above_max"),
+        ({"net_income": "200", "deducted_net_income": "100"}, "one_time_profit_share_above_max"),
+        ({"impairment_loss": "40"}, "impairment_share_above_max"),
+        (
+            {"government_grants": "15", "asset_disposal_gain": "15"},
+            "subsidy_disposal_share_above_max",
+        ),
+    ],
+)
+def test_nonfinancial_deep_value_gates(
+    changes: dict[str, str],
+    reason: str,
+) -> None:
+    annual = tuple(
+        _deep_annual(year, **(changes if year == 2025 else {}))
+        for year in range(2021, 2026)
+    )
+    verdict = _classify(_company(annual=annual))
+    assert (verdict.verdict, verdict.primary_reason) == ("drop", reason)
+
+
+def test_missing_required_nonfinancial_field_is_insufficient() -> None:
+    annual = tuple(
+        _deep_annual(year, government_grants=None)
+        for year in range(2021, 2026)
+    )
+    verdict = _classify(_company(annual=annual))
+    assert (verdict.verdict, verdict.primary_reason) == (
+        "insufficient",
+        "subsidy_disposal_insufficient",
+    )
+
+
+def test_financial_branch_uses_pb_roe_npl_and_verified_capital_only() -> None:
+    annual = tuple(
+        _deep_annual(
+            year,
+            ocf="-999",
+            capex="999",
+            cash="0",
+            interest_debt="999999",
+            ebit="1",
+            interest="999",
+            npl=(
+                format(
+                    Decimal("1.4") - Decimal(year - 2021) / Decimal(10),
+                    "f",
+                ).rstrip("0").rstrip(".")
+            ),
+        )
+        for year in range(2021, 2026)
+    )
+    verdict = _classify(_company(industry="银行", annual=annual))
+    assert verdict.verdict == "pass"
+    assert verdict.metrics["branch"] == "financial"
+    assert verdict.metrics["cumulative_fcf"] is None
+    assert verdict.metrics["net_debt_to_normalized_fcf"] is None
+    assert verdict.metrics["pb_percentile"] is not None
+    assert verdict.metrics["roe_mean"] == "15"
+    assert verdict.metrics["npl_change"] == "-0.4"
+    assert verdict.metrics["bank_capital_adequacy"] == "14"
+
+
+def test_financial_missing_capital_is_insufficient() -> None:
+    annual = tuple(
+        _deep_annual(year, capital_adequacy=None)
+        for year in range(2021, 2026)
+    )
+    verdict = _classify(_company(industry="银行", annual=annual))
+    assert (verdict.verdict, verdict.primary_reason) == (
+        "insufficient",
+        "bank_capital_adequacy_insufficient",
+    )
+
+
+@pytest.mark.parametrize(
+    ("industry", "reason"),
+    [
+        ("保险", "industry_branch_insurance_unsupported"),
+        ("证券", "industry_branch_other_financial_unsupported"),
+        ("-", "industry_branch_unknown"),
+    ],
+)
+def test_unsupported_and_unknown_branches_are_insufficient(
+    industry: str,
+    reason: str,
+) -> None:
+    verdict = _classify(_company(industry=industry))
+    assert (verdict.verdict, verdict.primary_reason) == (
+        "insufficient",
+        reason,
+    )
+
+
+def test_exact_calendar_windows_staleness_and_domains_are_enforced() -> None:
+    old = tuple(
+        _deep_annual(year, deducted_net_income="9999" if year == 2020 else "100")
+        for year in range(2020, 2026)
+    )
+    recent = _classify(_company(annual=old))
+    assert recent.metrics["normalized_earnings"] == "100"
+    assert recent.metrics["normalized_earnings_available_years"] == (
+        "2021",
+        "2022",
+        "2023",
+        "2024",
+        "2025",
+    )
+
+    stale = tuple(_deep_annual(year) for year in range(2019, 2024))
+    assert _classify(_company(annual=stale)).primary_reason == (
+        "financial_history_stale"
+    )
+
+    invalid = list(_company().fields["financial_history"])
+    invalid[0] = _deep_annual(2021, capex="-1")
+    assert _classify(_company(annual=tuple(invalid))).primary_reason == (
+        "capex_negative"
+    )
+
+
+def test_ruler_order_controls_primary_reason_and_keeps_structured_metrics() -> None:
+    annual = tuple(
+        _deep_annual(year, ocf="10", capex="20", interest_debt="400", cash="0")
+        for year in range(2021, 2026)
+    )
+    verdict = _classify(_company(annual=annual))
+    assert verdict.primary_reason == "cumulative_fcf_not_positive"
+    assert verdict.evidence_rule_ids[:2] == (
+        "deep_value.cumulative_fcf_not_positive",
+        "deep_value.normalized_fcf_not_positive",
+    )
+    assert verdict.metrics["cumulative_fcf"] == "-50"
+    assert verdict.metrics["net_debt_to_normalized_fcf"] is None
+
+
+def test_deep_value_decimal_arithmetic_is_isolated_and_bounded() -> None:
+    huge = "1" + "0" * 100
+    annual = tuple(
+        _deep_annual(
+            year,
+            ocf=huge,
+            capex="0",
+            deducted_net_income="1",
+            shares=huge,
+        )
+        for year in range(2021, 2026)
+    )
+    saved = getcontext().copy()
+    saved_default = DefaultContext.copy()
+    hostile = saved.copy()
+    hostile.prec = 2
+    hostile.Emax = 9
+    hostile.Emin = -9
+    hostile.clear_flags()
+    expected_flags = hostile.flags.copy()
+    try:
+        setcontext(hostile)
+        DefaultContext.prec = 3
+        verdict = _classify(_company(annual=annual))
+        assert verdict.metrics["normalized_pe"] == "1" + "0" * 101
+        assert verdict.metrics["cumulative_fcf"] == "5" + "0" * 100
+        assert getcontext().flags == expected_flags
+    finally:
+        setcontext(saved)
+        DefaultContext.prec = saved_default.prec
+        DefaultContext.rounding = saved_default.rounding
+        DefaultContext.Emin = saved_default.Emin
+        DefaultContext.Emax = saved_default.Emax
+        DefaultContext.capitals = saved_default.capitals
+        DefaultContext.clamp = saved_default.clamp
+        DefaultContext.traps = saved_default.traps.copy()
+        DefaultContext.flags = saved_default.flags.copy()
+
+
+def test_same_company_can_differ_between_quality_and_deep_value() -> None:
+    from tests.test_discovery_tracks_quality import _classify as quality_classify
+
+    company = _company()
+    assert quality_classify(company).verdict == "pass"
+    assert _classify(
+        company,
+        deep_value_payload(normalized_pe_max="8"),
+    ).verdict == "drop"
+
+
+def test_builtin_dispatches_deep_value_gate_and_competition() -> None:
+    from jobs.discovery import (
+        TrackExecutionCandidate,
+        TrackExecutionContext,
+        builtin_track_executor,
+    )
+
+    company = _company()
+    frozen = FrozenRunInputs(
+        run_id=1,
+        input_fingerprint="run",
+        data_version="data",
+        financial_version="financial",
+        valuation_version="valuation",
+        ruler_version_ids=MappingProxyType(
+            {"quality_discount": None, "deep_value": 2, "garp": None}
+        ),
+        ruler_payloads=MappingProxyType({}),
+        algorithm_version=BUILD_VERSION,
+        trading_dates=MappingProxyType({"SH": ("2026-09-17",)}),
+        snapshot_at=company.snapshot_at,
+        companies=(company,),
+    )
+    candidate = TrackExecutionCandidate(
+        code=company.code,
+        persisted_verdict="pass",
+        effective_verdict="pass",
+        reason=None,
+        metrics_json="{}",
+        rank=None,
+    )
+    gate = TrackExecutionContext(
+        stage_id=1,
+        run_id=1,
+        track="deep_value",
+        stage="track_gate",
+        attempt=1,
+        input_fingerprint="run",
+        ruler_version_id=2,
+        algorithm_version=BUILD_VERSION,
+        common_stage_id=1,
+        predecessor_stage_id=None,
+        predecessor_stage=None,
+        frozen_inputs=frozen,
+        ruler_payload=MappingProxyType(deep_value_payload()),
+        candidates=(candidate,),
+    )
+    outcome = builtin_track_executor(gate)
+    assert outcome.status == "waiting_confirmation"
+    assert outcome.results[0].verdict == "pass"
+
+    competition = replace(
+        gate,
+        stage="competition",
+        common_stage_id=None,
+        predecessor_stage_id=1,
+        predecessor_stage="track_gate",
+        candidates=(
+            replace(
+                candidate,
+                metrics_json=outcome.results[0].metrics_json,
+            ),
+        ),
+    )
+    ranked = builtin_track_executor(competition)
+    assert ranked.status == "waiting_confirmation"
+    assert ranked.results[0].rank == 1
+    assert len(ranked.evidence) >= 3
+    assert all(row.rule_id.startswith("deep_value.") for row in ranked.evidence)
+
+
+def test_calibrator_deep_value_is_deterministic_blocked_and_read_only(
+    tmp_path: Path,
+) -> None:
+    from scripts.calibrate_discovery import calibrate
+
+    db = tmp_path / "empty.db"
+    with sqlite3.connect(db) as connection:
+        connection.execute("CREATE TABLE unrelated (id INTEGER PRIMARY KEY)")
+    before = hashlib.sha256(db.read_bytes()).hexdigest()
+    first = calibrate(db, track="deep_value")
+    second = calibrate(db, track="deep_value")
+    assert first == second
+    assert first["track"] == "deep_value"
+    assert first["status"] == "blocked"
+    assert first["approval_ready"] is False
+    assert first["proposal"] is None
+    assert hashlib.sha256(db.read_bytes()).hexdigest() == before
+
+
+def test_calibrator_blocks_untrusted_production_grants_before_activation(
+    tmp_path: Path,
+) -> None:
+    from scripts.calibrate_discovery import calibrate
+    from tests.test_discovery_tracks_quality import _calibration_preflight_db
+
+    db = tmp_path / "production-contract.db"
+    _calibration_preflight_db(db)
+    before = hashlib.sha256(db.read_bytes()).hexdigest()
+    artifact = calibrate(db, track="deep_value")
+    assert artifact["blocked_reasons"] == [
+        "trusted_government_grants_unavailable"
+    ]
+    assert artifact["approval_ready"] is False
+    assert artifact["proposal"] is None
+    assert hashlib.sha256(db.read_bytes()).hexdigest() == before

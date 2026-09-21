@@ -55,7 +55,8 @@ from discovery.snapshot import (
     canonical_json,
     load_frozen_inputs,
 )
-from discovery.rulers import quality_discount_ruler
+from discovery.rulers import deep_value_ruler, quality_discount_ruler
+from discovery.tracks.deep_value import classify as classify_deep_value
 from discovery.tracks.quality_discount import (
     bounded_ratio,
     classify as classify_quality_discount,
@@ -173,6 +174,10 @@ class TrackExecutionOutcome:
 
 TrackExecutor = Callable[[TrackExecutionContext], TrackExecutionOutcome]
 _UNRANKED_COMPETITION_REASONS = frozenset({"industry_unknown"})
+_TRACK_CLASSIFIERS = {
+    "quality_discount": (quality_discount_ruler, classify_quality_discount),
+    "deep_value": (deep_value_ruler, classify_deep_value),
+}
 
 
 def builtin_track_executor(
@@ -180,7 +185,8 @@ def builtin_track_executor(
 ) -> TrackExecutionOutcome:
     """Dispatch production stages implemented by this build."""
 
-    if context.track != "quality_discount" or context.stage not in {
+    implementation = _TRACK_CLASSIFIERS.get(context.track)
+    if implementation is None or context.stage not in {
         "track_gate",
         "competition",
     }:
@@ -188,12 +194,13 @@ def builtin_track_executor(
             status="ruler_not_ready",
             error="当前构建尚未实现该轨道阶段",
         )
+    load_ruler, classifier = implementation
     try:
-        ruler = quality_discount_ruler(context.ruler_payload)
+        ruler = load_ruler(context.ruler_payload)
     except (TypeError, ValueError):
         return TrackExecutionOutcome(
             status="ruler_not_ready",
-            error="冻结的质量折价尺子不完整或不兼容",
+            error=f"冻结的{context.track}尺子不完整或不兼容",
         )
     if context.stage == "competition":
         companies = {
@@ -282,10 +289,10 @@ def builtin_track_executor(
         or not set(context.candidate_codes) <= set(companies)
     ):
         raise TrackExecutorContractError(
-            "quality gate candidates do not match frozen companies"
+            "track gate candidates do not match frozen companies"
         )
     verdicts = tuple(
-        classify_quality_discount(companies[candidate.code], ruler)
+        classifier(companies[candidate.code], ruler)
         for candidate in context.candidates
     )
     complete = sum(verdict.verdict != "insufficient" for verdict in verdicts)
@@ -297,7 +304,7 @@ def builtin_track_executor(
         return TrackExecutionOutcome(
             status="data_not_ready",
             error=(
-                "quality_discount coverage "
+                f"{context.track} coverage "
                 f"{decimal_string(coverage)} is below approved "
                 f"{ruler.thresholds['readiness_min']}"
             ),

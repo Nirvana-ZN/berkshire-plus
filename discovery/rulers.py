@@ -247,6 +247,201 @@ _QUALITY_GATE_SETS = MappingProxyType({
         }
     ),
 })
+DEEP_VALUE_FIELDS = (
+    "listing_years",
+    "normalized_earnings",
+    "normalized_pe",
+    "cumulative_fcf",
+    "normalized_fcf",
+    "net_debt_to_normalized_fcf",
+    "interest_coverage",
+    "dilution_rate",
+    "revenue_decline",
+    "one_time_profit_share",
+    "impairment_share",
+    "subsidy_disposal_share",
+    "pb_percentile",
+    "pb_median_ratio",
+    "roe_mean",
+    "npl_change",
+    "bank_capital_adequacy",
+    "bank_core_tier1_capital_adequacy",
+    "code",
+)
+DEEP_VALUE_FORMULAS = MappingProxyType(
+    {
+        "normalized_earnings": "median(annual.deducted_net_income)",
+        "normalized_pe": (
+            "current.price*latest(annual.shares)/normalized_earnings"
+        ),
+        "cumulative_fcf": "sum(annual.ocf-annual.capex)",
+        "normalized_fcf": "median(annual.ocf-annual.capex)",
+        "net_debt_to_normalized_fcf": (
+            "(latest(annual.interest_debt)-latest(annual.cash))/"
+            "normalized_fcf"
+        ),
+        "interest_coverage": (
+            "latest(annual.ebit)/copy_abs(latest(annual.interest))"
+        ),
+        "dilution_rate": (
+            "latest(annual.shares)/earliest(annual.shares)-1"
+        ),
+        "revenue_decline": (
+            "max(0,(earliest(annual.revenue)-latest(annual.revenue))/"
+            "earliest(annual.revenue))"
+        ),
+        "one_time_profit_share": (
+            "max(0,latest(annual.net_income)-"
+            "latest(annual.deducted_net_income))/"
+            "copy_abs(normalized_earnings)"
+        ),
+        "impairment_share": (
+            "copy_abs(latest(annual.impairment_loss))/"
+            "copy_abs(normalized_earnings)"
+        ),
+        "subsidy_disposal_share": (
+            "(copy_abs(latest(annual.government_grants))+"
+            "copy_abs(latest(annual.asset_disposal_gain)))/"
+            "copy_abs(normalized_earnings)"
+        ),
+        "pb_percentile": "percentile_rank(current.pb,monthly.pb)",
+        "pb_median_ratio": "current.pb/median(monthly.pb)",
+        "roe_mean": "mean(annual.roe)",
+        "npl_change": "latest(annual.npl)-earliest(annual.npl)",
+        "bank_capital_adequacy": "latest(annual.capital_adequacy)",
+        "bank_core_tier1_capital_adequacy": (
+            "latest(annual.core_tier1_capital_adequacy)"
+        ),
+    }
+)
+DEEP_VALUE_ORDER = (
+    ("normalized_pe", "asc", "nulls_last"),
+    ("pb_percentile", "asc", "nulls_last"),
+    ("net_debt_to_normalized_fcf", "asc", "nulls_last"),
+    ("code", "asc", "nulls_last"),
+)
+DEEP_VALUE_THRESHOLDS = frozenset(
+    {
+        "listing_years_min",
+        "normalized_earnings_min",
+        "normalized_pe_max",
+        "cumulative_fcf_min",
+        "normalized_fcf_min",
+        "net_debt_to_normalized_fcf_max",
+        "interest_coverage_min",
+        "dilution_rate_max",
+        "revenue_decline_max",
+        "one_time_profit_share_max",
+        "impairment_share_max",
+        "subsidy_disposal_share_max",
+        "pb_percentile_max",
+        "pb_median_ratio_max",
+        "bank_roe_min",
+        "bank_npl_increase_max",
+        "bank_capital_adequacy_min",
+        "bank_core_tier1_min",
+        "readiness_min",
+    }
+)
+DEEP_VALUE_MINIMUMS = frozenset(
+    {
+        "normalized_earnings",
+        "fcf",
+        "net_debt",
+        "interest_coverage",
+        "dilution",
+        "revenue",
+        "one_time_profit",
+        "impairment",
+        "subsidy_disposal",
+        "valuation_pb",
+        "bank_roe",
+        "bank_npl",
+        "bank_capital",
+    }
+)
+DEEP_VALUE_FIELD_DOMAIN_POLICY = "deep-value-domain-v1"
+_DEEP_COMMON_KEYS = frozenset(
+    {
+        "valuation_ratio_method",
+        "field_domain_policy",
+        "lookback_windows",
+        "latest_annual_staleness_years",
+    }
+)
+_DEEP_LOOKBACK_KEYS = frozenset(
+    {
+        "normalized_earnings",
+        "fcf",
+        "net_debt",
+        "interest_coverage",
+        "dilution",
+        "revenue",
+        "one_time_profit",
+        "impairment",
+        "subsidy_disposal",
+        "bank_roe",
+        "bank_npl",
+        "bank_capital",
+    }
+)
+_DEEP_BRANCH_POLICIES = MappingProxyType(
+    {
+        "bank": "financial",
+        "insurance": "unsupported",
+        "other_financial": "unsupported",
+        "nonfinancial": "nonfinancial",
+        "unknown": "insufficient",
+    }
+)
+_DEEP_BRANCH_KEYS = frozenset(
+    {"common", "branch_policies", "nonfinancial", "financial"}
+)
+_DEEP_BRANCH_CONFIG_KEYS = frozenset({"gate_order", "evidence_fields"})
+_DEEP_EVIDENCE_FIELDS = MappingProxyType(
+    {
+        "nonfinancial": (
+            "normalized_pe",
+            "cumulative_fcf",
+            "net_debt_to_normalized_fcf",
+            "interest_coverage",
+        ),
+        "financial": (
+            "pb_percentile",
+            "roe_mean",
+            "npl_change",
+            "bank_capital_adequacy",
+        ),
+    }
+)
+_DEEP_GATE_SETS = MappingProxyType(
+    {
+        "nonfinancial": frozenset(
+            {
+                "listing_age",
+                "normalized_earnings",
+                "normalized_valuation",
+                "positive_cumulative_fcf",
+                "net_debt",
+                "interest_coverage",
+                "dilution",
+                "revenue_decline",
+                "one_time_profit",
+                "impairment",
+                "subsidy_disposal",
+            }
+        ),
+        "financial": frozenset(
+            {
+                "listing_age",
+                "bank_valuation",
+                "bank_roe",
+                "bank_npl_trend",
+                "bank_capital",
+            }
+        ),
+    }
+)
 
 
 class RulerNotReadyError(ValueError):
@@ -829,11 +1024,140 @@ def quality_discount_ruler(
     return validate_quality_discount_ruler(parse_payload(value))
 
 
+def validate_deep_value_ruler(ruler: TrackRuler) -> TrackRuler:
+    """Require the complete deep-value schema implemented by this build."""
+
+    if not isinstance(ruler, TrackRuler) or ruler.track != "deep_value":
+        raise ValueError("deep value ruler scope is required")
+    if ruler.fields != DEEP_VALUE_FIELDS:
+        raise ValueError("deep value fields do not match the supported schema")
+    if dict(ruler.formulas) != dict(DEEP_VALUE_FORMULAS):
+        raise ValueError("deep value formulas do not match the supported schema")
+    if ruler.order != DEEP_VALUE_ORDER:
+        raise ValueError("deep value order does not match the supported schema")
+    if set(ruler.thresholds) != DEEP_VALUE_THRESHOLDS:
+        raise ValueError("deep value thresholds must be complete and exact")
+    if set(ruler.min_observations) != DEEP_VALUE_MINIMUMS:
+        raise ValueError(
+            "deep value observation minimums must be complete and exact"
+        )
+    if set(ruler.missing_policy) != set(DEEP_VALUE_FIELDS) or any(
+        policy != "insufficient"
+        for policy in ruler.missing_policy.values()
+    ):
+        raise ValueError("deep value missing policies must all be insufficient")
+
+    branches = ruler.sector_branches
+    if set(branches) != _DEEP_BRANCH_KEYS:
+        raise ValueError("deep value sector branches must be complete and exact")
+    common = branches["common"]
+    if (
+        not isinstance(common, Mapping)
+        or set(common) != _DEEP_COMMON_KEYS
+        or common["field_domain_policy"] != DEEP_VALUE_FIELD_DOMAIN_POLICY
+        or type(common["valuation_ratio_method"]) is not str
+        or not common["valuation_ratio_method"]
+        or common["valuation_ratio_method"]
+        != common["valuation_ratio_method"].strip()
+    ):
+        raise ValueError("deep value common config is invalid")
+    windows = common["lookback_windows"]
+    if (
+        not isinstance(windows, Mapping)
+        or set(windows) != _DEEP_LOOKBACK_KEYS
+        or any(
+            type(value) is not int or value <= 0 or value > 128
+            for value in windows.values()
+        )
+        or type(common["latest_annual_staleness_years"]) is not int
+        or common["latest_annual_staleness_years"] < 0
+        or common["latest_annual_staleness_years"] > 128
+    ):
+        raise ValueError("deep value calendar lookbacks are invalid")
+    if (
+        not isinstance(branches["branch_policies"], Mapping)
+        or dict(branches["branch_policies"]) != dict(_DEEP_BRANCH_POLICIES)
+    ):
+        raise ValueError("deep value branch policies are invalid")
+    for branch in ("nonfinancial", "financial"):
+        config = branches[branch]
+        expected_gates = _DEEP_GATE_SETS[branch]
+        if (
+            not isinstance(config, Mapping)
+            or set(config) != _DEEP_BRANCH_CONFIG_KEYS
+        ):
+            raise ValueError(f"deep value {branch} branch is invalid")
+        gates = config["gate_order"]
+        evidence_fields = config["evidence_fields"]
+        if (
+            isinstance(gates, (str, bytes))
+            or not isinstance(gates, Sequence)
+            or len(gates) != len(expected_gates)
+            or set(gates) != expected_gates
+            or any(type(gate) is not str for gate in gates)
+            or isinstance(evidence_fields, (str, bytes))
+            or not isinstance(evidence_fields, Sequence)
+            or tuple(evidence_fields) != _DEEP_EVIDENCE_FIELDS[branch]
+        ):
+            raise ValueError(f"deep value {branch} policy is invalid")
+
+    thresholds = {
+        key: Decimal(value) for key, value in ruler.thresholds.items()
+    }
+    if any(value < 0 for value in thresholds.values()):
+        raise ValueError("deep value thresholds cannot be negative")
+    if thresholds["readiness_min"] > 1:
+        raise ValueError("deep value readiness threshold exceeds one")
+    if thresholds["pb_percentile_max"] > 100:
+        raise ValueError("deep value percentile threshold exceeds 100")
+    for key in (
+        "normalized_earnings_min",
+        "cumulative_fcf_min",
+        "normalized_fcf_min",
+    ):
+        if thresholds[key] != 0:
+            raise ValueError(f"deep value {key} must be exactly zero")
+    observation_windows = {
+        "normalized_earnings": "normalized_earnings",
+        "fcf": "fcf",
+        "net_debt": "net_debt",
+        "interest_coverage": "interest_coverage",
+        "dilution": "dilution",
+        "revenue": "revenue",
+        "one_time_profit": "one_time_profit",
+        "impairment": "impairment",
+        "subsidy_disposal": "subsidy_disposal",
+        "bank_roe": "bank_roe",
+        "bank_npl": "bank_npl",
+        "bank_capital": "bank_capital",
+    }
+    if any(
+        ruler.min_observations[minimum] > windows[window]
+        for minimum, window in observation_windows.items()
+    ):
+        raise ValueError(
+            "deep value observation minimum exceeds its calendar window"
+        )
+    if ruler.min_observations["valuation_pb"] > 240:
+        raise ValueError("deep value valuation minimum exceeds work bounds")
+    return ruler
+
+
+def deep_value_ruler(
+    value: TrackRuler | Mapping[str, object] | str,
+) -> TrackRuler:
+    """Build and semantically validate one supplied deep-value ruler."""
+
+    return validate_deep_value_ruler(parse_payload(value))
+
+
 def _validate_track_semantics(ruler: TrackRuler) -> TrackRuler:
     """Dispatch only semantics implemented by this build."""
 
     if ruler.track == "quality_discount":
         return validate_quality_discount_ruler(ruler)
+    if ruler.track == "deep_value":
+        return validate_deep_value_ruler(ruler)
     return ruler
 
 

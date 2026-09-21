@@ -1,4 +1,4 @@
-"""Read-only quality-discount calibration evidence.
+"""Read-only discovery-track calibration evidence.
 
 Exit codes: 0 means a ready evidence proposal was emitted, 2 means calibration
 was deterministically blocked by missing/incomplete production prerequisites,
@@ -25,6 +25,7 @@ from discovery.builds import BUILD_VERSION
 from discovery.industry import INDUSTRY_BRANCHES, classify_industry_branch
 from discovery.quality_contract import quality_ruler_branch_policies
 from discovery.rulers import (
+    DEEP_VALUE_FIELD_DOMAIN_POLICY,
     QUALITY_DISCOUNT_FIELDS,
     QUALITY_DISCOUNT_FORMULAS,
     QUALITY_FIELD_DOMAIN_POLICY,
@@ -168,10 +169,13 @@ HYPOTHESIS_BANDS: Mapping[str, Mapping[str, str]] = {
 }
 
 
-def _blocked(*reasons: str) -> dict[str, object]:
+def _blocked(
+    *reasons: str,
+    track: str = "quality_discount",
+) -> dict[str, object]:
     return {
         "schema_version": 1,
-        "track": "quality_discount",
+        "track": track,
         "status": "blocked",
         "approval_ready": False,
         "blocked_reasons": list(reasons),
@@ -182,7 +186,11 @@ def _blocked(*reasons: str) -> dict[str, object]:
         "source_as_of": None,
         "industry_versions": None,
         "algorithm_build": BUILD_VERSION,
-        "field_domain_policy": QUALITY_FIELD_DOMAIN_POLICY,
+        "field_domain_policy": (
+            DEEP_VALUE_FIELD_DOMAIN_POLICY
+            if track == "deep_value"
+            else QUALITY_FIELD_DOMAIN_POLICY
+        ),
         "proposed_readiness_threshold": None,
         "proposal": None,
         "note": (
@@ -740,16 +748,21 @@ def calibrate(
 ) -> dict[str, object]:
     """Return deterministic evidence without initializing or writing the DB."""
 
-    if track != "quality_discount":
-        raise ValueError("only quality_discount calibration is supported")
+    if track not in {"quality_discount", "deep_value"}:
+        raise ValueError("unsupported discovery calibration track")
     path = Path(db_path)
     if not path.is_file():
-        return _blocked("database_missing")
+        return _blocked("database_missing", track=track)
     try:
         with _read_only_connection(path) as connection:
             tables = _tables(connection)
             if not REQUIRED_TABLES <= tables:
-                return _blocked("missing_schema")
+                return _blocked("missing_schema", track=track)
+            if track == "deep_value":
+                return _blocked(
+                    "trusted_government_grants_unavailable",
+                    track=track,
+                )
             preflight = _preflight_latest_fill(connection)
             if preflight is None:
                 return _blocked("no_completed_fill")
@@ -758,7 +771,7 @@ def calibrate(
             if _preflight_incomplete(preflight):
                 return _blocked("snapshot_incomplete_or_corrupt")
     except sqlite3.DatabaseError:
-        return _blocked("database_corrupt")
+        return _blocked("database_corrupt", track=track)
     try:
         return _ready_artifact(path, preflight)
     except (KeyError, TypeError, ValueError, sqlite3.DatabaseError):
@@ -767,7 +780,11 @@ def calibrate(
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--track", required=True, choices=["quality_discount"])
+    parser.add_argument(
+        "--track",
+        required=True,
+        choices=["quality_discount", "deep_value"],
+    )
     parser.add_argument("--db", type=Path, default=DEFAULT_DB)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)

@@ -23,6 +23,10 @@ def discovery_ruler_payload(track: str) -> dict[str, object]:
         from tests.test_discovery_tracks_quality import quality_payload
 
         return quality_payload()
+    if track == "deep_value":
+        from tests.test_discovery_tracks_deep_value import deep_value_payload
+
+        return deep_value_payload()
     return {
         "scope": "weekly-discovery",
         "track": track,
