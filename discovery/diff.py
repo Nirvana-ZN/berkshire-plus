@@ -372,9 +372,11 @@ def _completed_track_rows(
             )
             .order_by(DiscoveryStage.attempt.desc(), DiscoveryStage.id.desc())
         ).first()
-        readable = {"waiting_confirmation", "confirmed"}
-        if stage_name == "adjudication":
-            readable |= TERMINAL_ADJUDICATION
+        readable = (
+            TERMINAL_ADJUDICATION
+            if stage_name == "adjudication"
+            else {"waiting_confirmation", "confirmed"}
+        )
         if stage is None or stage.status not in readable:
             return None
         if stage_name == "track_gate":
@@ -406,6 +408,7 @@ def _completed_track_rows(
         if (
             not valid_parent
             or stage.input_fingerprint != frozen.input_fingerprint
+            or stage.algorithm_version != frozen.algorithm_version
             or type(stage.ruler_version_id) is not int
             or stage.ruler_version_id < 1
             or frozen.ruler_version_ids.get(track) != stage.ruler_version_id
@@ -449,6 +452,31 @@ def _completed_track_rows(
             )
         ):
             raise CorruptDiscoveryHistory("persisted decisions are corrupt")
+        primary_reasons: dict[str, str | None] = {}
+        if stage_name == "adjudication":
+            assert isinstance(parent, DiscoveryStage)
+            competition_results = session.scalars(
+                select(DiscoveryResult)
+                .where(
+                    DiscoveryResult.run_id == run.id,
+                    DiscoveryResult.track == track,
+                    DiscoveryResult.stage == "competition",
+                    DiscoveryResult.attempt == parent.attempt,
+                )
+                .order_by(DiscoveryResult.code, DiscoveryResult.id)
+            ).all()
+            primary_reasons = {
+                row.code: row.reason for row in competition_results
+            }
+            if (
+                len(primary_reasons) != len(competition_results)
+                or not set(result_by_code) <= set(primary_reasons)
+            ):
+                raise CorruptDiscoveryHistory(
+                    "persisted competition reasons are corrupt"
+                )
+            for row in competition_results:
+                _json_value(row.metrics_json)
         rows = []
         for result in results:
             company = companies.get(result.code)
@@ -469,7 +497,11 @@ def _completed_track_rows(
                     frozen_input_fingerprint=company.input_fingerprint,
                     ruler_version_id=stage.ruler_version_id,
                     verdict=result.verdict,
-                    reason=result.reason,
+                    reason=(
+                        primary_reasons[result.code]
+                        if stage_name == "adjudication"
+                        else result.reason
+                    ),
                     decision=None if decision is None else decision.decision,
                     metrics_json=result.metrics_json,
                     rank=result.rank,
@@ -519,6 +551,8 @@ def load_weekly_changes(
     ordered_runs = tuple(
         selected_by_week[key] for key in sorted(selected_by_week)
     )
+    if len(ordered_runs) < 2:
+        return ()
     requested = TRACKS if track is None else (track,)
     changes: list[WeeklyChange] = []
     for selected_track in requested:
@@ -527,13 +561,9 @@ def load_weekly_changes(
         current_loaded = False
         for run in ordered_runs:
             run_order.append((run.week_key, run.id))
-            try:
-                persisted = _completed_track_rows(
-                    session, run, selected_track, stage
-                )
-            except CorruptDiscoveryHistory:
-                rows.clear()
-                break
+            persisted = _completed_track_rows(
+                session, run, selected_track, stage
+            )
             if persisted is not None:
                 rows.extend(persisted)
                 current_loaded = current_loaded or run.id == current.id

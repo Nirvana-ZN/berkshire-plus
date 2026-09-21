@@ -485,10 +485,7 @@ def _compact_changes(session: Session, run: DiscoveryRun) -> list[dict[str, obje
                 row.id,
             ),
         )
-        try:
-            changes = _stage_changes(session, run, track, current.stage)
-        except CorruptDiscoveryResult:
-            continue
+        changes = _stage_changes(session, run, track, current.stage)
         values.extend(
             change.as_dict(compact=True) for change in changes[:10]
         )
@@ -697,10 +694,7 @@ def _track_payload(
     current_overrides = {row.code: row for row in current_override_rows}
     current_rows = by_attempt.get(current.attempt, [])
     current_summary = summaries[current.id]
-    try:
-        changes = _stage_changes(session, run, track, stage)[:100]
-    except CorruptDiscoveryResult:
-        changes = ()
+    changes = _stage_changes(session, run, track, stage)[:100]
     return {
         "run": _run_payload(session, run),
         "current": _track_stage_json(current) | {"summary": current_summary},
