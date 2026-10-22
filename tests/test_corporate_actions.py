@@ -285,3 +285,53 @@ def test_normalized_fixture_is_a_self_contained_reviewed_import():
     window = parse_event_coverage(receipt, rows)
     assert window.complete is True
     assert len(window.evidence_ids) == 4
+
+
+@pytest.mark.parametrize('with_events', [False, True], ids=['zero-events', 'implemented-events'])
+@pytest.mark.parametrize('end,observed,reviewed,complete', [
+    ('2030-12-31', '2026-07-01T00:00:00+00:00', '2026-07-01T00:00:00+00:00', False),
+    ('2026-07-01', '2026-07-01T00:00:00+00:00', '2026-07-01T00:00:00+00:00', False),
+    ('2026-06-30', '2026-06-30T15:59:59.999999+00:00', '2026-06-30T15:59:59.999999+00:00', False),
+    ('2026-06-30', '2026-06-30T16:00:00+00:00', '2026-06-30T15:59:59.999999+00:00', False),
+    ('2026-06-30', '2026-06-30T15:59:59.999999+00:00', '2026-07-01T00:00:00+00:00', False),
+    ('2026-06-30', '2026-06-30T16:00:00+00:00', '2026-07-01T00:00:00+00:00', False),
+    ('2026-06-30', '2026-06-30T16:00:00+00:00', '2026-07-01T00:00:00+08:00', True),
+])
+def test_complete_coverage_requires_observation_and_review_after_entire_shanghai_end_date(
+    with_events, end, observed, reviewed, complete,
+):
+    from market.evidence import parse_event_coverage, parse_source_evidence
+    rows = tuple(parse_source_evidence(payload) for payload in fixture_payloads()['records']) if with_events else ()
+    payload = reviewed_coverage(rows, published_at=observed, observed_at=observed)
+    payload['values']['end'] = end
+    payload['verification']['reviewed_at'] = reviewed
+    receipt = parse_source_evidence(payload)
+    original_id = receipt.evidence_id
+    original_values = dict(receipt.values)
+
+    window = parse_event_coverage(receipt, rows)
+
+    assert window.complete is complete
+    assert window.start == date(2026, 1, 1)
+    assert window.end == date.fromisoformat(end)
+    assert window.evidence_ids[-1] == original_id == evidence_identity(receipt)
+    assert dict(receipt.values) == original_values
+    assert receipt.values['complete'] == 'true'
+
+
+def test_early_zero_event_receipt_stays_incomplete_until_new_reviewed_version():
+    from market.evidence import parse_event_coverage, parse_source_evidence
+    payload = reviewed_coverage(())
+    payload['values']['end'] = '2030-12-31'
+    original = parse_source_evidence(payload)
+    original_window = parse_event_coverage(original, ())
+    assert original_window.complete is False
+
+    later_payload = {**payload, 'observed_at': '2031-01-01T00:00:00+00:00',
+                     'supersedes_id': original.evidence_id,
+                     'verification': {**payload['verification'], 'reviewed_at': '2031-01-01T00:00:00+00:00'}}
+    later = parse_source_evidence(later_payload)
+    assert later.evidence_id != original.evidence_id
+    assert later.supersedes_id == original.evidence_id
+    assert parse_event_coverage(later, ()).complete is True
+    assert parse_event_coverage(original, ()) == original_window

@@ -7,7 +7,7 @@ begin with '_' and carry provenance text, never numeric calculation inputs.
 
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import json
 import re
@@ -157,6 +157,9 @@ def parse_event_coverage(receipt: EvidenceRecord, records: Sequence[EvidenceReco
     IDs. Include the receipt in the window so its observation/review provenance
     is subject to the same repository cutoff as the action evidence. A reviewed
     empty array is an explicit zero-event assertion, never inferred from titles.
+    The entire Shanghai end date must have elapsed before review/observation;
+    a review dated after first observation cannot certify that earlier receipt.
+    Premature assertions remain incomplete with their original identity/interval.
     """
     from market.corporate_actions import parse_capital_events
 
@@ -179,10 +182,20 @@ def parse_event_coverage(receipt: EvidenceRecord, records: Sequence[EvidenceReco
     if any(not start < event.effective_at.astimezone(CHINA_MARKET_TIMEZONE).date() <= end for event in events):
         raise ValueError('capital event lies outside the asserted coverage interval')
     reviewed = receipt.status == 'verified' and receipt.values.get('_verification') is not None
+    timely = False
+    if reviewed:
+        review = json.loads(_text(receipt.values['_verification'], '_verification'))
+        _review({'verification': review})
+        reviewed_at = _time(review['reviewed_at'], 'reviewed_at')
+        interval_closed_at = (datetime.combine(end, time.min, tzinfo=CHINA_MARKET_TIMEZONE)
+                              + timedelta(days=1)).astimezone(timezone.utc)
+        observed_at = receipt.observed_at.astimezone(timezone.utc)
+        timely = interval_closed_at <= reviewed_at <= observed_at
     # A source-only/untrusted notice cannot become a complete action register.
     stages = {'capital_event': {'implemented', 'withdrawn'},
               'capital_plan': {'proposed', 'approved'}, 'buyback_trade': {'traded'}}
     verified = all(row.status == 'verified' and row.values.get('stage') in stages.get(row.kind, set())
                    for row in records)
     return CoverageWindow(receipt.code, 'capital_event', start, end,
-                          complete == 'true' and reviewed and verified, tuple(ids) + (receipt.evidence_id,))
+                          complete == 'true' and reviewed and timely and verified,
+                          tuple(ids) + (receipt.evidence_id,))
