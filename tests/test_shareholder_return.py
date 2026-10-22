@@ -482,3 +482,30 @@ def test_untrusted_applicability_is_distinct_from_missing_classification():
         values={'_industry_branch': 'bank', '_classification_version': 'industry-branch-v1'})
     result = metrics((classification,))['dividend_fcf_ratio']
     assert result.status == 'untrusted'
+
+
+@pytest.mark.parametrize('kind,stage,key', [
+    ('dividend', 'paid', 'dividend_paid'),
+    ('buyback', 'executed', 'buyback_executed'),
+    ('buyback', 'cancelled', 'buyback_cancelled_shares'),
+    ('equity_financing', 'executed', 'equity_financing'),
+])
+@pytest.mark.parametrize('source_status,expected_status', [('untrusted', 'untrusted'), ('verified', 'missing')])
+def test_execution_trust_survives_an_unrelated_complete_reporting_window(kind, stage, key, source_status, expected_status):
+    row = changed(execution(kind, stage, shares='10'), status=source_status)
+    proof, incomplete = receipt((row,), kind=kind, stage=stage, complete='false')
+    before = metrics((row, proof), (incomplete,))[key]
+    assert before.status == expected_status and before.value is None
+    assert row.evidence_id in before.evidence_ids
+
+    unrelated_kind, unrelated_stage, unrelated_key = (
+        ('buyback', 'executed', 'buyback_executed') if kind != 'buyback'
+        else ('dividend', 'paid', 'dividend_paid'))
+    other_proof, other_window = receipt(kind=unrelated_kind, stage=unrelated_stage)
+    result = metrics((row, proof, other_proof), (incomplete, other_window))
+    after = result[key]
+    assert after.status == expected_status and after.value is None
+    assert after.reason == 'execution_coverage_missing'
+    assert {row.evidence_id, proof.evidence_id} <= set(after.evidence_ids)
+    assert other_proof.evidence_id not in after.evidence_ids
+    assert result[unrelated_key].status == 'verified' and result[unrelated_key].value == 0

@@ -76,9 +76,9 @@ def _sum(values, ids=()):
 
 def _ledger(records, coverage, window, kind, stage, field):
     raw = tuple(row for row in records if shareholder_stage(row) == (kind, stage))
+    unavailable_status = 'untrusted' if any(row.status == 'untrusted' for row in raw) else 'missing'
     if window is None:
-        status = 'untrusted' if any(row.status == 'untrusted' for row in raw) else 'missing'
-        return _missing('execution_window_missing', _ids(raw), status=status), ()
+        return _missing('execution_window_missing', _ids(raw), status=unavailable_status), ()
     start, end = window
     matching = tuple(row for row in coverage if row.kind == f'shareholder_{kind}_{stage}'
                      and (row.start, row.end) == window)
@@ -89,7 +89,7 @@ def _ledger(records, coverage, window, kind, stage, field):
         if receipt.complete and verified:
             valid.append(set(ids))
     if not valid:
-        return _missing('execution_coverage_missing', set(_ids(raw)) | proof_ids), ()
+        return _missing('execution_coverage_missing', set(_ids(raw)) | proof_ids, status=unavailable_status), ()
     # Use authoritative versions before selecting dates: a withdrawn payment
     # must not survive in a separate stage bucket.
     try:
