@@ -50,10 +50,25 @@ class FundamentalCoverage(Base):
     digest: Mapped[str] = mapped_column(String, unique=True, nullable=False)
 
 
+class ResearchAssumption(Base):
+    __tablename__ = 'selection_research_assumptions'
+    __table_args__ = (Index('ix_research_assumption_owner_company', 'user_id', 'code', 'id'),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey('users.id', ondelete='RESTRICT'), nullable=False)
+    code: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+    method: Mapped[str] = mapped_column(String, nullable=False)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    evidence_ids_json: Mapped[str] = mapped_column(Text, nullable=False)
+    digest: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+
+
 # Triggers also protect direct SQL and INSERT OR REPLACE (which otherwise may
 # bypass delete triggers under SQLite's default recursive_triggers setting).
 for _table, _key in ((FundamentalEvidence.__table__, 'evidence_id'),
-                     (FundamentalCoverage.__table__, 'digest')):
+                     (FundamentalCoverage.__table__, 'digest'),
+                     (ResearchAssumption.__table__, 'digest')):
     for _action in ('UPDATE', 'DELETE'):
         event.listen(_table, 'after_create', DDL(
             f'CREATE TRIGGER IF NOT EXISTS trg_{_table.name}_{_action.lower()} '

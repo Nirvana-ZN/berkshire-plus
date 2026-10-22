@@ -260,6 +260,9 @@ def band_bounds(
 
 
 def _band_prices(bands: dict, ref_price: Decimal | None) -> list[list[Decimal]]:
+    computed = _computed_bands(bands)
+    if computed is not None:
+        return [[value] for value in computed]
     rows = []
     for key in _BAND_KEYS:
         numbers = _price_numbers(str(bands.get(key) or ""))
@@ -269,6 +272,16 @@ def _band_prices(bands: dict, ref_price: Decimal | None) -> list[list[Decimal]]:
         if numbers:
             rows.append(numbers)
     return rows
+
+
+def _computed_bands(bands):
+    """Exact deterministic v1 prices bypass legacy prose/quote heuristics."""
+    if not isinstance(bands, Mapping) or bands.get('computed_version') != 'valuation-scenarios-v1':
+        return None
+    values = tuple(_as_decimal(bands.get(key)) for key in _BAND_KEYS)
+    if all(value is not None and value > 0 for value in values) and values[0] < values[1] < values[2]:
+        return values
+    return None
 
 
 def _price_check(
@@ -292,7 +305,7 @@ def _price_check(
     if ceiling is None:
         return None
     # 立论现价已高于解析上沿：带子是「更便宜才加仓」或最后一个数字是 PE/PB，上沿不可信
-    if as_of_price is not None and as_of_price > ceiling:
+    if _computed_bands(bands) is None and as_of_price is not None and as_of_price > ceiling:
         return None
     return price > ceiling
 
@@ -311,6 +324,9 @@ def is_overvalued(
 def expensive_line(bands: object, ref_price: Decimal | None) -> Decimal | None:
     if not isinstance(bands, dict):
         return None
+    computed = _computed_bands(bands)
+    if computed is not None:
+        return computed[2]
     over = conservative_ceiling(str(bands.get("overvalued") or ""), ref_price)
     if over is not None:
         return over

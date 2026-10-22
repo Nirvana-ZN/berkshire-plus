@@ -322,15 +322,18 @@ def _apply_evidence_contract(structured, raw, payload):
     critical_complete = not any(critical_errors.intersection(audit['errors']) for audit in audits)
     inputs_complete = context is not None and financial_complete(records, context['sources'])
     complete = inputs_complete and critical_complete
-    # Positive IDs and model valuation_complete fields cannot change this boundary.
-    valuation_complete = False
+    from research.valuation import validate_frozen_assumptions
+    validated = validate_frozen_assumptions(context.get('valuation') if context else None,
+        context, code=payload.code)
+    valuation_complete = validated['complete']
+    structured['valuation_scenarios'] = validated['report']
     coverage = [not audit['errors'] for audit in audits[:6]]
     structured['data_grade'] = research_grade(financial_complete=complete,
         valuation_complete=valuation_complete, claim_coverage=coverage)
     structured['evidence_contract'] = {'version': EVIDENCE_CONTRACT_VERSION,
         'financial_inputs_complete': inputs_complete, 'financial_complete': complete,
         'critical_claims_complete': critical_complete, 'valuation_complete': valuation_complete,
-        'valuation_reason': 'validated_valuation_unavailable', 'claim_coverage': coverage,
+        'valuation_reason': validated['reason'], 'claim_coverage': coverage,
         'cutoff_at': context['cutoff_at'] if context else None,
         'context_fingerprint': context['fingerprint'] if context else None,
         'frozen_input_fingerprint': payload.frozen_input_fingerprint,
@@ -345,6 +348,11 @@ def _apply_evidence_contract(structured, raw, payload):
     if not valuation_complete:
         structured['price_bands'] = dict.fromkeys(('aggressive', 'steady', 'conservative', 'overvalued'), '')
         structured['price_bands']['mode'] = 'watch'
+    else:
+        prices = validated['report']['computed_prices']
+        structured['price_bands'] = {'mode': 'steady', 'aggressive': prices['low'],
+            'steady': prices['base'], 'conservative': prices['high'], 'overvalued': prices['high'],
+            'computed_version': validated['report']['version']}
 
 
 def _shareholder_audit(payload: EvalInput) -> dict[str, Any]:
@@ -472,6 +480,8 @@ def render_markdown(name: str, structured: dict[str, Any], *, web_search: bool) 
     fit = structured.get("portfolio_fit") if isinstance(structured.get("portfolio_fit"), dict) else {}
     as_of = structured.get("as_of") if isinstance(structured.get("as_of"), dict) else {}
     hits = structured.get("search_hits") if isinstance(structured.get("search_hits"), list) else []
+    band_labels = (('积极买入价', '常规买入价', '停止加仓价')
+        if isinstance(structured.get('evidence_contract'), dict) else ('激进', '稳健', '保守'))
     if not web_search:
         search_note = "未开启网页搜索。已抓取财务仅作线索，财务判断以冻结证据为准。"
     elif hits:
@@ -496,9 +506,10 @@ def render_markdown(name: str, structured: dict[str, Any], *, web_search: bool) 
         "## 价格带",
         "",
         f"策略：{_band_zh(str(bands.get('mode')))}",
-        f"激进：{bands.get('aggressive') or '—'}",
-        f"稳健：{bands.get('steady') or '—'}",
-        f"保守：{bands.get('conservative') or '—'}",
+        f"{band_labels[0]}：{bands.get('aggressive') or '—'}",
+        f"{band_labels[1]}：{bands.get('steady') or '—'}",
+        f"{band_labels[2]}：{bands.get('conservative') or '—'}",
+        _valuation_scenario_markdown(structured),
         "",
         "## 备忘",
         "",
@@ -523,6 +534,34 @@ def render_markdown(name: str, structured: dict[str, Any], *, web_search: bool) 
         "",
     ]
     return "\n".join(lines)
+
+
+def _valuation_scenario_markdown(structured):
+    report = structured.get('valuation_scenarios')
+    if not isinstance(report, dict):
+        return ''
+    facts, declared = report['source_facts'], report['declared_assumptions']
+    spread = report['valuation_spread']
+    lines = ['', '### 可复算估值情景', '',
+        f"假设版本：{report['assumption_id']} / {report['assumption_digest']}；计算版本：{report['version']}。",
+        f"已核验来源事实：{facts['period']} 的{facts['metric_basis']}分子 {facts['numerator']} 元；"
+        f"当前总股数 {facts['current_shares']} 股；可比口径 {facts['basis_id']}。",
+        f"核验现价：{report['current_price'] or '缺失'}；当前股数来源：{facts['shares_evidence_id']}。",
+        '情景假设由研究者明确声明，不是已验证的未来盈利事实，也不承诺精确公允价值。',
+        f"情景假设：每股基数 {declared['metric_per_share']}；增长率 {declared['growth']}；"
+        f"倍数 {', '.join(declared['multiples'])}；折扣 {', '.join(declared['haircuts'])}；"
+        f"期限 {declared['horizon_years']} 年。",
+        f"公式：`{report['formula']}`。",
+        f"悲观情景价：{report['pessimistic']['price']}；低倍数 {report['pessimistic']['multiple']}；"
+        f"折扣 {report['pessimistic']['haircut']}。", '',
+        '敏感性（增长率为小数，固定常规折扣）：', '',
+        '| 增长率 | 倍数 | 情景价格（元） |', '| --- | --- | --- |']
+    lines.extend(f"| {row['growth']} | {row['multiple']} | {row['price'] or '不适用'} |"
+                 for row in report['sensitivity'])
+    lines.extend(['', f"估值利差：{spread['value'] if spread['status'] == 'available' else '待核'}；"
+        f"国债来源：{spread['treasury_source'] or '缺失'}；日期：{spread['treasury_date'] or '缺失'}；"
+        f"状态：{spread['reason'] or '可比较'}。仅为估值比较，不是预期收益。"])
+    return '\n'.join(lines)
 
 
 def _evidence_markdown(structured: dict[str, Any]) -> str:
@@ -984,8 +1023,9 @@ def _build_prompt(payload: EvalInput) -> str:
         f"gates 必须是数组（不能是对象），六项且每项含 name/status/reason，"
         f"name 覆盖：{'、'.join(GATE_NAMES)}，status 为 pass/fail/gray。"
         f"mirror_test 必须是五句。"
-        "当前缺少已验证的持久化估值假设，price_bands.mode 必须为 watch，"
-        "aggressive、steady、conservative 留空；禁止模型自行生成价格数字。"
+        "价格由代码依冻结的已审阅假设计算；假设是情景输入，不是已验证的未来盈利事实。"
+        "模型 price_bands.mode 必须为 watch，aggressive、steady、conservative 留空；禁止模型自行生成价格数字。"
+        "冻结估值中的 source_facts、reviewed_assumptions 与计算结果必须区分；不得将计算价格冒充来源事实。"
         f"memo 为对象，含 essence、risks、role；role 只能是 core/satellite/skip。"
         f"portfolio_fit 必须对照当前仓回答 should_enter、funding、overlap；"
         f"若当前仓 cash.target 为 null（无现金目标），说明现金是可随时动用的机动资金，不设强制保留比例底线；"

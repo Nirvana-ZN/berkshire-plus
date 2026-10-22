@@ -2141,7 +2141,15 @@ def create_app(
                     code="INVALID_RESEARCH",
                     detail=str(exc),
                 )
-            job = create_research_job(session, screen_run_id=screen_run_id, name=name, code=code)
+            assumption_id = payload.get('assumption_id')
+            if assumption_id is not None and (type(assumption_id) is not int or assumption_id <= 0):
+                return _error_json(400, error='请求无效', code='INVALID_RESEARCH',
+                    detail='assumption_id 必须是所选公司已审阅假设的正整数版本 ID')
+            try:
+                job = create_research_job(session, screen_run_id=screen_run_id, name=name, code=code,
+                    assumption_id=assumption_id)
+            except ValueError as exc:
+                return _error_json(400, error='请求无效', code='INVALID_RESEARCH', detail=str(exc))
             session.flush()
             if not try_acquire(session, job.id, JOB_TYPE_RESEARCH):
                 session.rollback()

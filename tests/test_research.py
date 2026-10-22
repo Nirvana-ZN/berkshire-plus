@@ -668,7 +668,7 @@ def test_research_prompt_includes_valuation_snapshot(tmp_path: Path) -> None:
         )
         assert created.status_code == 200
         body = client.get(f"/api/research/{created.json()['id']}").json()
-        assert body.get("valuation", {}).get("bps") == 45.4
+        assert body.get("valuation", {}).get("bps") == "45.4"
         assert llm.prompts
         prompt = llm.prompts[0]
         assert "估值快照" in prompt

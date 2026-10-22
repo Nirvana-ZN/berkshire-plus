@@ -67,6 +67,7 @@ def create_research_job(
     screen_run_id: int | None = None,
     discovery_run_id: int | None = None,
     discovery_track: str | None = None,
+    assumption_id: int | None = None,
 ) -> ResearchJob:
     now = _now()
     job = ResearchJob(
@@ -79,7 +80,7 @@ def create_research_job(
         status="queued",
         error=None,
         evidence_context_json=json.dumps(_capture_evidence_context(
-            session, code=code, cutoff=now, discovery_run_id=discovery_run_id),
+            session, code=code, cutoff=now, discovery_run_id=discovery_run_id, assumption_id=assumption_id),
             ensure_ascii=False, sort_keys=True, separators=(',', ':'), allow_nan=False),
         created_at=now,
         updated_at=now,
@@ -89,7 +90,7 @@ def create_research_job(
 
 
 def _capture_evidence_context(session: Session, *, code: str, cutoff: datetime,
-                              discovery_run_id: int | None) -> dict[str, object]:
+                              discovery_run_id: int | None, assumption_id: int | None = None) -> dict[str, object]:
     """Creation-time capture only. A discovery run keeps its original cutoff."""
     from discovery.evidence_store import load_coverage, load_coverage_references, load_evidence_as_of
     from discovery.fundamentals import freeze_fundamentals, fundamentals_from_payload, snapshot_payload
@@ -119,6 +120,12 @@ def _capture_evidence_context(session: Session, *, code: str, cutoff: datetime,
         origin = 'evidence_repository_at_job_creation'
     records = () if snapshot is None else snapshot.annuals + snapshot.interims + snapshot.extensions
     context = freeze_research_context(records, None, cutoff)
+    if assumption_id is not None:
+        from research.valuation import freeze_assumptions
+        from research.evidence import with_frozen_valuation
+        valuation = freeze_assumptions(session, assumption_id=assumption_id,
+            user_id=LOCAL_USER_ID, code=code, context=context)
+        context = with_frozen_valuation(context, valuation)
     frozen = {'version': 'research-job-context-v1', 'code': code, 'origin': origin, 'reason': reason,
         'fundamentals': snapshot_payload(snapshot) if snapshot else None,
         'operating_policy': policy, 'research': context}

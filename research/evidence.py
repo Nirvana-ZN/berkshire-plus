@@ -161,6 +161,20 @@ def freeze_research_context(records: Sequence[EvidenceRecord], assumption_id: in
     return {**context, 'fingerprint': _digest(context)}
 
 
+def with_frozen_valuation(context: Mapping[str, object], valuation: Mapping[str, object]) -> Mapping[str, object]:
+    """Creation-only additive codec. Existing frozen contexts are never mutated."""
+    read_research_context(context)
+    if context.get('valuation') is not None:
+        raise ValueError('valuation context already frozen')
+    result = {key: value for key, value in context.items() if key != 'fingerprint'}
+    result['assumption_id'] = valuation['assumption_id']
+    result['valuation'] = valuation
+    result['valuation_complete'] = valuation['validation']['complete']
+    result['valuation_reason'] = valuation['validation']['reason']
+    result['model_context'] = {**context['model_context'], 'valuation': valuation}
+    return {**result, 'fingerprint': _digest(result)}
+
+
 def read_research_context(context: Mapping[str, object]) -> tuple[EvidenceRecord, ...]:
     """Check the retained context without re-reading files or live source tables."""
     if (context.get('contract_version') != CONTRACT_VERSION
