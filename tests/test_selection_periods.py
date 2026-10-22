@@ -13,6 +13,7 @@ POLICY = {
     'calendar_version': 'synthetic-reviewed-2026',
     'calendar_source_url': 'https://example.invalid/official-calendar',
     'calendar_document_sha256': 'a' * 64, 'calendar_status': 'verified',
+    'calendar_complete': True, 'calendar_coverage_end': '2026-10-31',
     'period_due_dates': {'2025': '2026-04-30', '2026H1': '2026-08-31'},
 }
 
@@ -112,3 +113,31 @@ def test_due_calendar_is_required_and_frozen_cutoff_driven():
     policy = {**POLICY, 'period_due_dates': {'2026Q3': '2026-10-21'}}
     assert 'report_overdue' in operating_state(snap, policy).reasons
     assert operating_state(snap, {**policy, 'period_due_dates': {'2026Q3': '2026-10-31'}}).state == 'stable'
+
+
+@pytest.mark.parametrize('changes,reason', [
+    ({'calendar_complete': None}, 'operating_calendar_incomplete'),
+    ({'calendar_complete': False}, 'operating_calendar_incomplete'),
+    ({'calendar_complete': 'true'}, 'operating_calendar_incomplete'),
+    ({'calendar_complete': 1}, 'operating_calendar_incomplete'),
+    ({'calendar_coverage_end': None}, 'operating_calendar_coverage_unavailable'),
+    ({'calendar_coverage_end': '2026-10-21'}, 'operating_calendar_expired'),
+    ({'calendar_coverage_end': '20261022'}, 'operating_calendar_coverage_unavailable'),
+    ({'calendar_coverage_end': 'invalid'}, 'operating_calendar_coverage_unavailable'),
+])
+def test_stale_or_incomplete_calendar_cannot_certify_stable(changes, reason):
+    rows = (evidence('2024', deducted_net_income='100', ocf='10'),
+            evidence('2025', deducted_net_income='110', ocf='20'))
+    policy = {**POLICY, 'period_due_dates': {'2025': '2026-04-30'}, **changes}
+    policy = {key: value for key, value in policy.items() if value is not None}
+    result = operating_state(snapshot(rows), policy)
+    assert result.state == 'unknown'
+    assert result.reasons == (reason,)
+
+
+def test_calendar_coverage_uses_cutoff_shanghai_date_and_preserves_due_check():
+    snap = replace(snapshot(stable_rows()), cutoff_at=datetime(2026, 10, 21, 16, tzinfo=timezone.utc))
+    assert operating_state(snap, {**POLICY, 'calendar_coverage_end': '2026-10-21'}).state == 'unknown'
+    assert operating_state(snap, {**POLICY, 'calendar_coverage_end': '2026-10-22'}).state == 'stable'
+    due_policy = {**POLICY, 'calendar_coverage_end': '2026-10-22', 'period_due_dates': {'2026Q3': '2026-10-21'}}
+    assert operating_state(snap, due_policy).reasons == ('report_overdue',)

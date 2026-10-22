@@ -796,7 +796,7 @@ def _persist_company(
     for record in result.evidence_records:
         append_evidence(session, record)
     for window in result.coverage:
-        append_coverage(session, window)
+        append_coverage(session, window, captured_at=now)
     result = replace(result, evidence_records=load_evidence_as_of(session, result.code, now),
                      coverage=load_coverage(session, result.code, cutoff=now))
     payload_json = serialize_company_payload(result, captured_at=now)

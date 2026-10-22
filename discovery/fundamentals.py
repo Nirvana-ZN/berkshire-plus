@@ -126,6 +126,7 @@ def _yoy(current: MetricResult, prior: MetricResult) -> MetricResult:
 def operating_state(snapshot: FundamentalSnapshot, policy: Mapping[str, object]) -> OperatingResult:
     """Use a supplied reviewed calendar; never infer disclosure from today's month.
 
+    Reviewed completeness must cover the cutoff's Shanghai business date.
     Calendar date deadlines expire after the complete Shanghai civil day.
     Nonpositive prior profit has no meaningful conventional growth rate.
     """
@@ -138,6 +139,17 @@ def operating_state(snapshot: FundamentalSnapshot, policy: Mapping[str, object])
                 or not policy.get('calendar_version') or not str(policy.get('calendar_source_url', '')).startswith('https://')
                 or not re.fullmatch('[0-9a-f]{64}', str(policy.get('calendar_document_sha256', '')))):
             return unknown('operating_policy_unavailable')
+        if policy.get('calendar_complete') is not True:
+            return unknown('operating_calendar_incomplete')
+        coverage_end = policy.get('calendar_coverage_end')
+        try:
+            covered_through = date.fromisoformat(coverage_end)
+            if covered_through.isoformat() != coverage_end:
+                raise ValueError('calendar coverage requires an ISO date')
+        except (TypeError, ValueError):
+            return unknown('operating_calendar_coverage_unavailable')
+        if covered_through < snapshot.cutoff_at.astimezone(CHINA_MARKET_TIMEZONE).date():
+            return unknown('operating_calendar_expired')
         drop = policy['profit_drop']
         if not isinstance(drop, (str, Decimal)):
             raise ValueError('profit_drop requires decimal text')

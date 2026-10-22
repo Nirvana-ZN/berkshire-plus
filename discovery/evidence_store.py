@@ -135,7 +135,17 @@ def select_evidence_as_of(records: Sequence[EvidenceRecord], *, code: str,
                         key=lambda row: (row.kind, row.period, available_at(row, historical=historical), row.evidence_id)))
 
 
-def append_coverage(session: Session, window: CoverageWindow) -> str:
+def append_coverage(session: Session, window: CoverageWindow, *,
+                    captured_at: datetime | None = None) -> str:
+    """Append coverage using the trusted service capture clock, never archival time.
+
+    An existing digest retains its original creation time even when a retry
+    supplies a different capture timestamp. This keyword is an internal clock
+    injection boundary; normalized evidence imports do not expose it.
+    """
+    created_at = datetime.now(timezone.utc) if captured_at is None else captured_at
+    _aware(created_at)
+    created_at = created_at.astimezone(timezone.utc)
     payload = dict(code=window.code, kind=window.kind, start=window.start.isoformat(),
                    end=window.end.isoformat(), complete=window.complete, evidence_ids=list(window.evidence_ids))
     digest = sha256(_json(payload).encode('utf-8')).hexdigest()
@@ -149,7 +159,7 @@ def append_coverage(session: Session, window: CoverageWindow) -> str:
         code=window.code, kind=window.kind, start_date=window.start,
         end_date=window.end, complete=window.complete,
         evidence_ids_json=_json(list(window.evidence_ids)),
-        created_at=datetime.now(timezone.utc), digest=digest,
+        created_at=created_at, digest=digest,
     ))
     session.flush()
     return digest

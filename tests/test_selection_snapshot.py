@@ -390,3 +390,35 @@ def test_freeze_reuses_trusted_action_supersession_and_coverage_references():
     restored = fundamentals_from_payload(snapshot_payload(snapshot), code=original.code)
     assert restored == snapshot
     assert restored.actions[0].shares_after == Decimal('80')
+
+
+def test_supplied_fill_coverage_survives_its_checkpoint_capture(tmp_path):
+    from app.db import init_db
+    from app.models import DiscoveryDataCheckpoint
+    from app.selection_models import FundamentalCoverage
+    from sqlalchemy import select
+    from sqlalchemy.orm import Session
+    from discovery.fundamental_types import CoverageWindow
+    from discovery.company_payload import parse_company_payload
+    from discovery.fundamentals import fundamentals_from_payload
+    from jobs.discovery_data import _persist_company
+    from tests.test_discovery_data import _fill
+    from datetime import date
+    bundle = bundle_with_evidence()
+    receipt = identified(replace(evidence('2026'), kind='capital_event_coverage',
+                                  values={'scope': 'all_capital_actions', 'complete': 'true'}))
+    window = CoverageWindow(bundle.code, 'capital_event', date(2025, 1, 1), date(2026, 9, 30), True, (receipt.evidence_id,))
+    bundle = replace(bundle, evidence_records=bundle.evidence_records + (receipt,), coverage=(window,))
+    engine = init_db(tmp_path / 'supplied-coverage.db')
+    with Session(engine) as session:
+        fill = _fill(session, [bundle.code], now=CUTOFF)
+        checkpoint = session.get(DiscoveryDataCheckpoint, (fill.id, bundle.code))
+        _persist_company(session, checkpoint, bundle, CUTOFF)
+        payload = parse_company_payload(checkpoint.payload_json)
+        assert fundamentals_from_payload(payload, code=bundle.code).coverage == (window,)
+        stored = session.scalar(select(FundamentalCoverage))
+        assert stored.created_at == CUTOFF
+        assert checkpoint.updated_at == CUTOFF
+        assert payload['operating_policy']['calendar_complete'] is True
+        assert payload['operating_policy']['calendar_coverage_end'] == '2026-10-31'
+    engine.dispose()

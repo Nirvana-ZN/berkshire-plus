@@ -196,6 +196,35 @@ def test_coverage_cutoff_requires_timezone(store):
         load_coverage(session, '000001.SZ', cutoff=datetime(2026, 10, 1))
 
 
+def test_trusted_capture_time_preserves_coverage_cutoff_and_duplicate_creation(store):
+    from discovery.evidence_store import append_coverage, append_evidence, load_coverage
+    from app.selection_models import FundamentalCoverage
+    from sqlalchemy import select
+    from datetime import timedelta
+    row = evidence('2025', inventory='10')
+    cutoff = row.observed_at + timedelta(days=1)
+    first = CoverageWindow(row.code, 'financial', date(2025, 1, 1), date(2025, 12, 31), True, (row.evidence_id,))
+    later = replace(first, end=date(2026, 1, 1))
+    with Session(store) as session:
+        append_evidence(session, row)
+        digest = append_coverage(session, first, captured_at=cutoff.astimezone(timezone(timedelta(hours=8))))
+        assert append_coverage(session, first, captured_at=cutoff - timedelta(days=10)) == digest
+        assert append_coverage(session, first, captured_at=cutoff + timedelta(days=10)) == digest
+        stored = session.scalar(select(FundamentalCoverage).where(FundamentalCoverage.digest == digest))
+        assert stored.created_at == cutoff
+        assert stored.created_at.utcoffset() == timedelta(0)
+        append_coverage(session, later, captured_at=cutoff + timedelta(microseconds=1))
+        assert load_coverage(session, row.code, cutoff=cutoff) == (first,)
+        assert load_coverage(session, row.code, cutoff=cutoff + timedelta(microseconds=1)) == (first, later)
+
+
+def test_coverage_capture_rejects_naive_timestamp(store):
+    from discovery.evidence_store import append_coverage
+    window = CoverageWindow('000001.SZ', 'financial', date(2025, 1, 1), date(2025, 12, 31), False, ())
+    with Session(store) as session, pytest.raises(ValueError, match='timezone'):
+        append_coverage(session, window, captured_at=datetime(2026, 10, 1))
+
+
 @pytest.mark.parametrize(('field', 'value'), [
     ('inventory', 'NaN'),
     ('inventory', 'sNaN'),
