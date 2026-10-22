@@ -1,7 +1,12 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from collections.abc import Callable
+from dataclasses import replace
+from datetime import date, datetime, timedelta, timezone
+from hashlib import sha256
 from typing import Any
+
+from discovery.fundamental_types import CoverageWindow, EvidenceRecord, evidence_identity
 
 LOOKUP_URL = "https://www.cninfo.com.cn/new/information/topSearch/query"
 QUERY_URL = "https://www.cninfo.com.cn/new/hisAnnouncement/query"
@@ -147,3 +152,86 @@ def _notice_date(raw: object) -> str:
     if stamp <= 0:
         return ""
     return datetime.fromtimestamp(stamp, tz=timezone(timedelta(hours=8))).date().isoformat()
+
+
+def fetch_event_evidence(
+    code: str, start: date, end: date, *, before_request: Callable[[], None],
+) -> tuple[tuple[EvidenceRecord, ...], CoverageWindow]:
+    """Locate all interval notices, without certifying structured action details.
+
+    Unlike fetch_notices this has no latest-eight cap and preserves page/total
+    metadata. Every lookup/page passes the caller's RequestPolicy hook; its
+    cancellation/budget exceptions propagate. Transport failures retain partial
+    sources with incomplete coverage. A fully retrieved listing still remains
+    incomplete until independently reviewed normalized details/coverage exist.
+    No document-title extraction is promoted to a verified capital event.
+    """
+    window = CoverageWindow(code, 'capital_event', start, end, False, ())
+    code6 = _code6(code)
+    if not code6:
+        return (), window
+    import httpx2
+
+    rows: dict[str, EvidenceRecord] = {}
+    with httpx2.Client(timeout=20.0) as client:
+        before_request()
+        try:
+            org = _lookup_org(client, code6)
+        except Exception:
+            return (), window
+        if org is None:
+            return (), window
+        page = 1
+        expected: tuple[int, int] | None = None
+        while True:
+            before_request()
+            try:
+                response = client.post(QUERY_URL, data={
+                    'pageNum': str(page), 'pageSize': '30', 'column': _column(code),
+                    'tabName': 'fulltext', 'plate': '', 'stock': f"{code6},{org['orgId']}",
+                    'searchkey': '', 'secid': '', 'category': '', 'trade': '',
+                    'seDate': f'{start.isoformat()}~{end.isoformat()}',
+                    'sortName': '', 'sortType': '', 'isHLtitle': 'true',
+                }, headers=_HTTP_HEADERS)
+                if response.status_code >= 400:
+                    break
+                body = response.json()
+                document_hash = sha256(response.content).hexdigest()
+            except Exception:
+                break
+            if not isinstance(body, dict) or not isinstance(body.get('announcements'), list):
+                break
+            notices = body['announcements']
+            observed = datetime.now(timezone.utc)
+            for notice in notices:
+                if not isinstance(notice, dict):
+                    continue
+                notice_id = str(notice.get('announcementId') or '').strip()
+                title = _plain_title(notice.get('announcementTitle'))
+                published_date = _notice_date(notice.get('announcementTime'))
+                if not notice_id or notice_id in rows or not published_date or not title:
+                    continue
+                # CNINFO dates do not certify publication-time precision.
+                published = datetime.fromisoformat(published_date).replace(tzinfo=timezone(timedelta(hours=8)))
+                record = EvidenceRecord(
+                    evidence_id='pending', code=code, kind='capital_notice',
+                    period=published_date[:4], published_at=published, observed_at=observed,
+                    source_updated_at=None, source_url=QUERY_URL, document_sha256=document_hash,
+                    values={'_announcement_id': notice_id, '_title': title, '_listing_page': str(page),
+                            '_total_announcements': str(body.get('totalAnnouncement')),
+                            '_total_pages': str(body.get('totalpages')),
+                            '_notice_url': f"{DETAIL_URL}?stockCode={code6}&announcementId={notice_id}&orgId={org['orgId']}"},
+                    status='untrusted', basis_id='cninfo-announcement-listing', date_only=True,
+                )
+                rows[notice_id] = replace(record, evidence_id=evidence_identity(record))
+            total, pages = body.get('totalAnnouncement'), body.get('totalpages')
+            if (type(total) is not int or type(pages) is not int or total < 0 or pages < 0
+                    or (total > 0 and pages != (total + 29) // 30)):
+                break
+            if expected is None:
+                expected = (total, pages)
+            if expected != (total, pages) or not notices or page >= pages:
+                break
+            page += 1
+    result = tuple(rows.values())
+    return result, replace(window, evidence_ids=tuple(row.evidence_id for row in result))

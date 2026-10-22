@@ -5,9 +5,9 @@ archive. Standalone imports cannot grant archival trust. Reserved values keys
 begin with '_' and carry provenance text, never numeric calculation inputs.
 """
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 import json
 import re
@@ -15,7 +15,12 @@ from urllib.parse import urlparse
 
 from discovery.constants import CHINA_MARKET_TIMEZONE
 from discovery.field_dictionary import SELECTION_FIELD_DICTIONARY
-from discovery.fundamental_types import EvidenceRecord, evidence_identity
+from discovery.fundamental_types import CoverageWindow, EvidenceRecord, evidence_identity
+
+CAPITAL_TEXT_FIELDS = frozenset({
+    'economic_event_id', 'action', 'stage', 'effective_at',
+    'start', 'end', 'complete', 'scope', 'evidence_ids',
+})
 
 SELECTION_EXTENSION_FIELDS = (
     'accounts_receivable', 'contract_assets', 'inventory',
@@ -111,7 +116,12 @@ def parse_source_evidence(payload: Mapping[str, object]) -> EvidenceRecord:
             _text(key, 'values key')
             if key.startswith('_'):
                 raise ValueError('reserved provenance keys must be supplied through explicit metadata fields')
-            values[key] = _decimal(value)
+            # Action descriptors are text, never decimal amounts or provenance.
+            # All other normalized values retain the financial numeric boundary.
+            if key in CAPITAL_TEXT_FIELDS and str(payload.get('kind', '')).startswith(('capital_', 'buyback_')):
+                values[key] = _text(value, key) if value is not None else None
+            else:
+                values[key] = _decimal(value)
         published = _time(payload.get('published_at'), 'published_at')
         updated = _time(payload['source_updated_at'], 'source_updated_at') if payload.get('source_updated_at') is not None else None
         status = payload.get('status', 'untrusted')
@@ -136,3 +146,43 @@ def parse_source_evidence(payload: Mapping[str, object]) -> EvidenceRecord:
     if payload.get('evidence_id') is not None and payload['evidence_id'] != identity:
         raise ValueError('evidence identity conflicts with canonical content')
     return replace(row, evidence_id=identity)
+
+
+def parse_event_coverage(receipt: EvidenceRecord, records: Sequence[EvidenceRecord]) -> CoverageWindow:
+    """Read an independently reviewed, explicit (start, end] coverage assertion.
+
+    Import the receipt through parse_source_evidence just like event evidence.
+    Its values contain ISO start/end, complete='true'/'false',
+    scope='all_capital_actions' and a JSON array of exactly the supplied evidence
+    IDs. Include the receipt in the window so its observation/review provenance
+    is subject to the same repository cutoff as the action evidence. A reviewed
+    empty array is an explicit zero-event assertion, never inferred from titles.
+    """
+    from market.corporate_actions import parse_capital_events
+
+    if receipt.kind != 'capital_event_coverage':
+        raise ValueError('capital coverage requires a separate coverage receipt')
+    if receipt.values.get('scope') != 'all_capital_actions':
+        raise ValueError('capital coverage requires an explicit all_capital_actions scope')
+    start = date.fromisoformat(_text(receipt.values.get('start'), 'start'))
+    end = date.fromisoformat(_text(receipt.values.get('end'), 'end'))
+    complete = receipt.values.get('complete')
+    if complete not in {'true', 'false'}:
+        raise ValueError('coverage complete must be true or false text')
+    ids = json.loads(_text(receipt.values.get('evidence_ids'), 'evidence_ids'))
+    if not isinstance(ids, list) or any(not isinstance(item, str) for item in ids) or len(set(ids)) != len(ids):
+        raise ValueError('coverage evidence_ids must be a unique JSON array of text')
+    supplied = {row.evidence_id: row for row in records}
+    if set(ids) != set(supplied) or any(row.code != receipt.code for row in records):
+        raise ValueError('coverage must reference exactly the supplied same-company evidence')
+    events = parse_capital_events(records)
+    if any(not start < event.effective_at.astimezone(CHINA_MARKET_TIMEZONE).date() <= end for event in events):
+        raise ValueError('capital event lies outside the asserted coverage interval')
+    reviewed = receipt.status == 'verified' and receipt.values.get('_verification') is not None
+    # A source-only/untrusted notice cannot become a complete action register.
+    stages = {'capital_event': {'implemented', 'withdrawn'},
+              'capital_plan': {'proposed', 'approved'}, 'buyback_trade': {'traded'}}
+    verified = all(row.status == 'verified' and row.values.get('stage') in stages.get(row.kind, set())
+                   for row in records)
+    return CoverageWindow(receipt.code, 'capital_event', start, end,
+                          complete == 'true' and reviewed and verified, tuple(ids) + (receipt.evidence_id,))

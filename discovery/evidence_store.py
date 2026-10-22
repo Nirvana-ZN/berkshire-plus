@@ -53,7 +53,9 @@ def _validate_numeric_values(record: EvidenceRecord) -> None:
     market-layer parser, including for trusted internal callers.
     """
     for field, value in record.values.items():
-        if value is None or (field not in FIELD_DICTIONARY and field not in SELECTION_FIELD_DICTIONARY):
+        action_number = (record.kind in {'capital_event', 'capital_plan', 'buyback_trade'}
+                         and field in {'shares_before', 'shares_after', 'factor', 'sequence'})
+        if value is None or (field not in FIELD_DICTIONARY and field not in SELECTION_FIELD_DICTIONARY and not action_number):
             continue
         try:
             amount = Decimal(value)
@@ -78,6 +80,10 @@ def append_evidence(session: Session, record: EvidenceRecord) -> str:
             raise ValueError('supersedes_id must reference the same company, kind and period')
         if record.observed_at < parent.observed_at:
             raise ValueError('superseding evidence cannot precede first observation')
+        if record.kind == 'capital_event':
+            economic_id = record.values.get('economic_event_id')
+            if not economic_id or economic_id != json.loads(parent.values_json).get('economic_event_id'):
+                raise ValueError('capital supersession must retain the same economic_event_id')
     session.add(FundamentalEvidence(
         evidence_id=record.evidence_id, code=record.code, kind=record.kind, period=record.period,
         published_at=record.published_at, observed_at=record.observed_at,
@@ -101,7 +107,20 @@ def load_evidence_as_of(session: Session, code: str, cutoff: datetime, *, histor
         record = _record(item)
         if available_at(record, historical=historical) <= cutoff:
             visible.append(record)
-    superseded = {row.supersedes_id for row in visible}
+    # Unreviewed action corrections/withdrawals remain visible as raw evidence,
+    # but cannot hide the verified fact that the action parser still needs.
+    superseded = {row.supersedes_id for row in visible
+                  if row.kind != 'capital_event' or (row.status == 'verified'
+                      and row.values.get('stage') in {'implemented', 'withdrawn'})}
+    by_id = {row.evidence_id: row for row in visible}
+    for row in visible:
+        if row.kind == 'capital_event' and row.status == 'verified' and row.values.get('stage') in {'implemented', 'withdrawn'}:
+            parent_id = row.supersedes_id
+            seen = set()
+            while parent_id in by_id and parent_id not in seen:
+                seen.add(parent_id)
+                superseded.add(parent_id)
+                parent_id = by_id[parent_id].supersedes_id
     return tuple(sorted((row for row in visible if row.evidence_id not in superseded),
                         key=lambda row: (row.kind, row.period, available_at(row, historical=historical), row.evidence_id)))
 
