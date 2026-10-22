@@ -50,7 +50,8 @@ def test_normalize_accepts_gates_object_map(tmp_path: Path) -> None:
     }
     got = normalize_structured(raw, _input(tmp_path))
     assert [row["name"] for row in got["gates"]] == list(GATE_NAMES)
-    assert all(row["status"] == "pass" for row in got["gates"])
+    assert all(row["status"] == "gray" for row in got["gates"])
+    assert got['data_grade'] == 'C'  # No frozen sources in this syntax fixture.
 
 
 def test_normalize_accepts_chinese_keys_and_statuses(tmp_path: Path) -> None:
@@ -117,8 +118,8 @@ def test_normalize_accepts_hold_role_and_band_and_verdict_phrases(tmp_path: Path
     raw["price_bands"] = {"mode": "稳健持有", "aggressive": "", "steady": "", "conservative": ""}
     raw["memo"] = {"essence": "锂盐与资源。", "risks": "周期与锂价。", "role": "继续持有"}
     got = normalize_structured(raw, _input(tmp_path))
-    assert got["verdict"] == "pass"
-    assert got["price_bands"]["mode"] == "steady"
+    assert got["verdict"] == "gray"
+    assert got["price_bands"]["mode"] == "watch"
     assert got["memo"]["role"] == "satellite"
     parsed = _parse_model_json('前言\n{"verdict":"gray"}\n以上。')
     assert parsed == {"verdict": "gray"}
@@ -134,12 +135,12 @@ def test_normalize_accepts_hold_role_and_band_and_verdict_phrases(tmp_path: Path
         "明显高估": "16",
     }
     got = normalize_structured(raw, _input(tmp_path))
-    assert got["verdict"] == "fail"
-    assert got["price_bands"]["aggressive"] == "8"
-    assert got["price_bands"]["overvalued"] == "16"
+    assert got["verdict"] == "gray"
+    assert got["price_bands"]["aggressive"] == ""
+    assert got["price_bands"]["overvalued"] == ""
 
 
-def test_price_between_stop_add_and_overvalued_stays_pass(tmp_path: Path) -> None:
+def test_model_price_between_bands_requires_validated_valuation(tmp_path: Path) -> None:
     payload = EvalInput(
         name="招商银行",
         code="600036.SH",
@@ -166,7 +167,8 @@ def test_price_between_stop_add_and_overvalued_stays_pass(tmp_path: Path) -> Non
         "overvalued": "48",
     }
     got = normalize_structured(raw, payload)
-    assert got["verdict"] == "pass"
+    assert got["verdict"] == "gray"
+    assert got['price_bands']['mode'] == 'watch'
 
 
 def test_inverted_bands_do_not_flip_pass_to_fail(tmp_path: Path) -> None:
@@ -196,9 +198,9 @@ def test_inverted_bands_do_not_flip_pass_to_fail(tmp_path: Path) -> None:
         "overvalued": "",
     }
     got = normalize_structured(raw, payload)
-    assert got["verdict"] == "pass"
-    assert got["price_bands"]["aggressive"] == "21.0"
-    assert got["price_bands"]["conservative"] == "26.5"
+    assert got["verdict"] == "gray"
+    assert got["price_bands"]["aggressive"] == ""
+    assert got["price_bands"]["conservative"] == ""
 
 
 def test_normalize_accepts_colloquial_memo_role(tmp_path: Path) -> None:
@@ -271,8 +273,8 @@ def test_valuation_snapshot_derives_pb_and_stays_sufficient(tmp_path: Path) -> N
     assert "估值快照" in prompt
     assert "每股净资产" in prompt
     assert "45.4" in prompt
-    assert "给出价格带：激进 / 稳健 / 保守，或观望。" in prompt
-    assert "不要空着" in prompt
+    assert "price_bands.mode 必须为 watch" in prompt
+    assert "禁止模型自行生成价格数字" in prompt
     assert "任一关失败则 verdict 必须是 fail" in prompt
     assert "好生意或护城河可以为 gray" in prompt
     assert "不要用灰色地带回避判断" not in prompt
@@ -317,7 +319,7 @@ def test_pe_uses_annual_eps_not_quarterly(tmp_path: Path) -> None:
     assert "静态市盈率" in prompt
     assert "禁止改用动态" in prompt
     assert "中报与季报只用于看趋势" in prompt
-    assert "给出价格带：激进 / 稳健 / 保守，或观望。" in prompt
+    assert "price_bands.mode 必须为 watch" in prompt
     assert "pe_mid" not in snap
     assert "中周期对照" not in prompt
 

@@ -274,7 +274,10 @@ def test_realization_references_must_be_current_frozen_verified_sources(tmp_path
     path = dict(path='dividend', evidence_ids=[cash.evidence_id], falsification_condition='Paid dividends cease.')
     result = normalize_structured({**raw, 'realization_path': path}, payload)
     assert result['realization_path']['status'] == 'verified'
-    assert result['verdict'] == 'pass'
+    assert result['verdict'] == 'gray'
+    assert result['data_grade'] == 'C'
+    assert result['price_bands']['mode'] == 'watch'
+    assert normalize_structured({**raw, 'verdict': 'fail', 'realization_path': path}, payload)['verdict'] == 'fail'
     assert normalize_structured({**raw, 'realization_path': {**path, 'evidence_ids': ['invented']}}, payload)['verdict'] == 'gray'
     assert normalize_structured({**raw, 'realization_path': {**path, 'falsification_condition': ''}}, payload)['verdict'] == 'gray'
 

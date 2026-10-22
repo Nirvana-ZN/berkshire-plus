@@ -100,6 +100,7 @@ const shouldEnter = ref('')
 const funding = ref('')
 const overlap = ref('')
 const dataGrade = ref('')
+const legacyEvidenceContract = ref(false)
 const asOfDate = ref('')
 const asOfPrice = ref<string | number | null>(null)
 const valuation = ref<Record<string, string | number>>({})
@@ -211,6 +212,7 @@ function applyResearch(data: Record<string, unknown>) {
     overlap.value = typeof row.overlap === 'string' ? row.overlap : ''
   }
   dataGrade.value = typeof data.data_grade === 'string' ? data.data_grade : ''
+  legacyEvidenceContract.value = data.legacy_evidence_contract === true
   const asOf = data.as_of
   if (asOf && typeof asOf === 'object') {
     const row = asOf as Record<string, unknown>
@@ -384,6 +386,7 @@ onBeforeUnmount(stopPoll)
             <p class="stat-label">价格带模式</p>
             <p class="stat-value">{{ BAND_ZH[bandMode] || bandMode || '—' }}</p>
             <p class="stat-sub">信息丰富度：{{ dataGrade || '—' }}</p>
+            <p v-if="legacyEvidenceContract" class="stat-sub">旧版研究（legacy_evidence_contract）：原文与原等级保留，未按冻结证据合同核验。</p>
           </div>
         </div>
 

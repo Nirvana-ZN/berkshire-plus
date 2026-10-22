@@ -18,6 +18,7 @@ from app.models import (
 )
 from jobs.lock import JOB_TYPE_REVIEW, release
 from jobs.research import (
+    create_research_job,
     _run_one as run_research_one,
     load_book_dict,
     load_financials,
@@ -262,17 +263,7 @@ def _evaluate_missing_theses(
         code = mapping.get(name)
         if not code or not is_a_share_code(code):
             continue
-        job = ResearchJob(
-            user_id=LOCAL_USER_ID,
-            screen_run_id=None,
-            name=name,
-            code=code,
-            status="queued",
-            error=None,
-            created_at=_now(),
-            updated_at=_now(),
-        )
-        session.add(job)
+        job = create_research_job(session, name=name, code=code)
         session.commit()
         run_research_one(
             session,

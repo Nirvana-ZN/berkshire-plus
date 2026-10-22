@@ -543,6 +543,45 @@ def _ensure_research_columns(engine: Engine) -> None:
             row[1]
             for row in conn.execute(text("PRAGMA table_info(research_jobs)")).all()
         }
+        if "evidence_context_json" not in names:
+            conn.execute(text("ALTER TABLE research_jobs ADD COLUMN evidence_context_json TEXT"))
+        if "model_input_json" not in names:
+            conn.execute(text("ALTER TABLE research_jobs ADD COLUMN model_input_json TEXT"))
+        conn.execute(text(
+            "CREATE TRIGGER IF NOT EXISTS trg_research_model_input_immutable "
+            "BEFORE UPDATE OF model_input_json ON research_jobs "
+            "WHEN OLD.model_input_json IS NOT NULL AND NEW.model_input_json IS NOT OLD.model_input_json "
+            "BEGIN SELECT RAISE(ABORT, 'research model input is immutable'); END"
+        ))
+        conn.execute(text(
+            "CREATE TRIGGER IF NOT EXISTS trg_research_model_input_replace_immutable "
+            "BEFORE INSERT ON research_jobs WHEN EXISTS (SELECT 1 FROM research_jobs "
+            "WHERE id = NEW.id AND model_input_json IS NOT NULL) "
+            "BEGIN SELECT RAISE(ABORT, 'research model input is immutable'); END"
+        ))
+        conn.execute(text(
+            "CREATE TRIGGER IF NOT EXISTS trg_research_model_input_delete_immutable "
+            "BEFORE DELETE ON research_jobs WHEN OLD.model_input_json IS NOT NULL "
+            "BEGIN SELECT RAISE(ABORT, 'research model input is immutable'); END"
+        ))
+        conn.execute(text(
+            "CREATE TRIGGER IF NOT EXISTS trg_research_context_immutable "
+            "BEFORE UPDATE OF evidence_context_json ON research_jobs "
+            "WHEN OLD.evidence_context_json IS NOT NULL "
+            "AND NEW.evidence_context_json IS NOT OLD.evidence_context_json "
+            "BEGIN SELECT RAISE(ABORT, 'research evidence context is immutable'); END"
+        ))
+        conn.execute(text(
+            "CREATE TRIGGER IF NOT EXISTS trg_research_context_replace_immutable "
+            "BEFORE INSERT ON research_jobs WHEN EXISTS (SELECT 1 FROM research_jobs "
+            "WHERE id = NEW.id AND evidence_context_json IS NOT NULL) "
+            "BEGIN SELECT RAISE(ABORT, 'research evidence context is immutable'); END"
+        ))
+        conn.execute(text(
+            "CREATE TRIGGER IF NOT EXISTS trg_research_context_delete_immutable "
+            "BEFORE DELETE ON research_jobs WHEN OLD.evidence_context_json IS NOT NULL "
+            "BEGIN SELECT RAISE(ABORT, 'research evidence context is immutable'); END"
+        ))
         if "discovery_run_id" not in names:
             conn.execute(
                 text(

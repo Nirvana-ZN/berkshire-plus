@@ -463,6 +463,8 @@ class ResearchJob(Base):
     code: Mapped[str] = mapped_column(String, nullable=False)
     status: Mapped[str] = mapped_column(String, nullable=False)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    evidence_context_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    model_input_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 

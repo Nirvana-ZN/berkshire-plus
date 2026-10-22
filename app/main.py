@@ -75,7 +75,7 @@ from jobs.lock import (
     release,
     try_acquire,
 )
-from jobs.research import execute_research, load_financials
+from jobs.research import create_research_job, execute_research, load_financials
 from jobs.review import execute_review
 from ledger.positions import LOCAL_USER_ID, load_positions
 from ledger.quotes import (
@@ -627,6 +627,7 @@ def _artifact_payload(session, job: ResearchJob) -> dict[str, object]:
         "structured": structured,
         "markdown": markdown,
         "report_path": report_path,
+        "legacy_evidence_contract": bool(artifact is not None and not isinstance(structured.get("evidence_contract"), dict)),
     }
     if structured:
         body["verdict"] = structured.get("verdict")
@@ -638,7 +639,7 @@ def _artifact_payload(session, job: ResearchJob) -> dict[str, object]:
         body["as_of"] = structured.get("as_of")
         body["portfolio_fit"] = structured.get("portfolio_fit")
         val = dict(structured.get("valuation") or {}) if isinstance(structured.get("valuation"), dict) else {}
-        if ("pe_ttm" not in val or "pe_deducted_ttm" not in val) and job.code:
+        if body['legacy_evidence_contract'] and ("pe_ttm" not in val or "pe_deducted_ttm" not in val) and job.code:
             as_of_dict = structured.get("as_of") if isinstance(structured.get("as_of"), dict) else {}
             raw_price = as_of_dict.get("price") if as_of_dict else None
             if raw_price is None:
@@ -662,7 +663,7 @@ def _artifact_payload(session, job: ResearchJob) -> dict[str, object]:
                         val["pe_deducted_ttm"] = _json_optional(dec_price / ded_eps)
                         val["pe_deducted_ttm_basis"] = ded_basis
                 _enrich_balance_sheet_traps(val, fins)
-        elif job.code and ("goodwill_pct" not in val and "net_cash_yi" not in val):
+        elif body['legacy_evidence_contract'] and job.code and ("goodwill_pct" not in val and "net_cash_yi" not in val):
             _enrich_balance_sheet_traps(val, load_financials(session, job.code))
         body["valuation"] = val
     thesis = session.scalars(
@@ -2140,18 +2141,7 @@ def create_app(
                     code="INVALID_RESEARCH",
                     detail=str(exc),
                 )
-            now = datetime.now(timezone.utc)
-            job = ResearchJob(
-                user_id=LOCAL_USER_ID,
-                screen_run_id=screen_run_id,
-                name=name,
-                code=code,
-                status="queued",
-                error=None,
-                created_at=now,
-                updated_at=now,
-            )
-            session.add(job)
+            job = create_research_job(session, screen_run_id=screen_run_id, name=name, code=code)
             session.flush()
             if not try_acquire(session, job.id, JOB_TYPE_RESEARCH):
                 session.rollback()

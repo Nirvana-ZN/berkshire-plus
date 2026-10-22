@@ -9,7 +9,9 @@ from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+from hashlib import sha256
 import json
+from pathlib import Path
 import re
 from urllib.parse import urlparse
 
@@ -89,6 +91,48 @@ def _review(payload: Mapping[str, object]) -> str:
     return json.dumps(dict(review), ensure_ascii=False, sort_keys=True, allow_nan=False, separators=(',', ':'))
 
 
+def _retained_excerpt(payload: Mapping[str, object], *, document_sha256: str,
+                      location: str, observed_at: datetime) -> dict[str, str]:
+    """Explicit retained-document receipt; never derive trust from a search hit.
+
+    human_review supports PDF/binary documents and records a human assertion,
+    not automated PDF extraction. literal_utf8 additionally checks exact text.
+    """
+    fields = ('source_document_path', 'source_excerpt', 'excerpt_verification')
+    if not any(key in payload for key in fields):
+        return {}
+    if payload.get('source', 'normalized') != 'normalized' or payload.get('status') != 'verified':
+        raise ValueError('retained source excerpts require verified manual evidence')
+    path = Path(_text(payload.get('source_document_path'), 'source_document_path'))
+    if not path.is_absolute():
+        raise ValueError('source_document_path must be absolute')
+    excerpt = _text(payload.get('source_excerpt'), 'source_excerpt')
+    receipt = payload.get('excerpt_verification')
+    if not isinstance(receipt, Mapping) or receipt.get('method') not in {'literal_utf8', 'human_review'}:
+        raise ValueError('excerpt_verification requires literal_utf8 or human_review receipt')
+    if (receipt.get('document_sha256') != document_sha256
+            or receipt.get('excerpt_sha256') != sha256(excerpt.encode('utf-8')).hexdigest()
+            or receipt.get('report_location') != location):
+        raise ValueError('excerpt verification document/hash/location binding mismatch')
+    _text(receipt.get('reviewer'), 'excerpt reviewer')
+    reviewed_at = _time(receipt.get('reviewed_at'), 'excerpt reviewed_at')
+    source_reviewed = _time(payload['verification'].get('reviewed_at'), 'source reviewed_at')
+    if max(reviewed_at, source_reviewed) > observed_at:
+        raise ValueError('source and excerpt review cannot follow verified observation')
+    raw = path.read_bytes()
+    if sha256(raw).hexdigest() != document_sha256:
+        raise ValueError('retained source document hash mismatch')
+    if receipt['method'] == 'literal_utf8':
+        try:
+            if excerpt not in raw.decode('utf-8'):
+                raise ValueError('source excerpt must be an exact UTF-8 document substring')
+        except UnicodeError as error:
+            raise ValueError('nontext documents require a human_review excerpt receipt') from error
+    return {'_source_document_path': str(path.resolve()), '_source_excerpt': excerpt,
+            '_excerpt_verification': json.dumps(dict(receipt), ensure_ascii=False,
+                sort_keys=True, allow_nan=False, separators=(',', ':'))}
+
+
 def parse_source_evidence(payload: Mapping[str, object]) -> EvidenceRecord:
     """Normalize without inferring trust, publication dates or absent zeros.
 
@@ -155,10 +199,13 @@ def parse_source_evidence(payload: Mapping[str, object]) -> EvidenceRecord:
     # Archive provenance text may be retained, but never grants archive trust.
     if payload.get('archive_verification_source') is not None:
         values['_archive_verification_source'] = _text(payload['archive_verification_source'], 'archive_verification_source')
+    observed_at = _time(payload.get('observed_at'), 'observed_at')
+    values.update(_retained_excerpt(payload, document_sha256=document_sha256,
+                                   location=location, observed_at=observed_at))
     row = EvidenceRecord(
         evidence_id='pending', code=payload.get('code'), kind=payload.get('kind'),
         period=payload.get('period'), published_at=published,
-        observed_at=_time(payload.get('observed_at'), 'observed_at'),
+        observed_at=observed_at,
         source_updated_at=updated, source_url=source_url, document_sha256=document_sha256,
         values=values, status=status, basis_id=payload.get('basis_id'),
         supersedes_id=payload.get('supersedes_id'), date_only=date_only, archive_verified=False,
