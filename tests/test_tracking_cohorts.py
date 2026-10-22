@@ -147,6 +147,62 @@ def test_import_is_retrospective_even_with_backdated_registration(store):
         manifest_for(store, run.id, 'no_operating_selected')
 
 
+def legacy_overridden_run(session):
+    from app.discovery_models import DiscoveryOverride
+    run = persisted_run(session, legacy=True)
+    publish_waiting(session, run)
+    overrides = [DiscoveryOverride(run_id=run.id, track='garp', stage='competition', attempt=1,
+        code=code, action=action, reason=reason, created_at=PUBLISHED)
+        for code, action, reason in (
+            ('600001.SH', 'forced_pass', 'retained review admitted'),
+            ('600003.SH', 'forced_drop', 'retained review excluded'),
+        )]
+    session.add_all(overrides)
+    session.commit()
+    return run, overrides
+
+
+def test_legacy_full_selection_uses_retained_competition_overrides(store):
+    run, overrides = legacy_overridden_run(store)
+    _, full = manifest_for(store, run.id)
+    assert [member['code'] for member in full['members']] == ['600001.SH', '600004.SH']
+    assert {member['weight'] for member in full['members']} == {'0.5'}
+    assert full['kind'] == 'retrospective_observation'
+    assert full['competition_override_audit'] == [
+        {'id': overrides[0].id, 'run_id': run.id, 'track': 'garp', 'stage': 'competition',
+         'attempt': 1, 'code': '600001.SH', 'action': 'forced_pass',
+         'reason': 'retained review admitted', 'created_at': PUBLISHED.isoformat()},
+        {'id': overrides[1].id, 'run_id': run.id, 'track': 'garp', 'stage': 'competition',
+         'attempt': 1, 'code': '600003.SH', 'action': 'forced_drop',
+         'reason': 'retained review excluded', 'created_at': PUBLISHED.isoformat()},
+    ]
+    _, all_passed = manifest_for(store, run.id, 'all_passed')
+    assert [member['code'] for member in all_passed['members']] == [f'60000{i}.SH' for i in range(1, 5)]
+    assert all_passed['source_selection_hash'] == full['source_selection_hash']
+
+
+@pytest.mark.parametrize(('field', 'value'), [
+    ('action', 'forced_drop'), ('reason', 'subsequently changed review text'),
+])
+def test_competition_override_hash_is_bound_and_registration_retries_remain_frozen(store, field, value):
+    from tracking.contracts import default_tracking_config
+    run, overrides = legacy_overridden_run(store)
+    first_id, original = manifest_for(store, run.id)
+    store.commit()
+    # Change only a synthetic retained source record. Previously registered
+    # cohorts must remain byte-identical; a fresh import must bind the change.
+    setattr(overrides[0], field, value)
+    store.commit()
+    _, fresh = manifest_for(store, run.id, 'all_passed')
+    assert fresh['source_selection_hash'] != original['source_selection_hash']
+    assert manifest_for(store, run.id) == (first_id, original)
+    _, other_cost = manifest_for(store, run.id,
+        config={**default_tracking_config(), 'cost_bps_each_side': '30'})
+    assert other_cost['members'] == original['members']
+    assert other_cost['source_selection_hash'] == original['source_selection_hash']
+    assert other_cost['competition_override_audit'] == original['competition_override_audit']
+
+
 def test_registration_retry_reuses_id_and_new_cost_has_distinct_experiment(store):
     from app.selection_models import StrategyCohort
     from tracking.contracts import default_tracking_config

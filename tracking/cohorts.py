@@ -19,6 +19,7 @@ from app.selection_models import StrategyCohort, StrategyExperiment, StrategyMem
 from discovery.builds import CANDIDATE_BUILD_VERSION
 from discovery.competition import CompetitionCandidate
 from discovery.constants import TRACKS
+from discovery.overrides import StageOverride, StageResult, effective_verdict
 from discovery.ranking import rank_candidates, ranking_audit
 from discovery.rulers import parse_payload
 from discovery.selection_contract import rank_inputs
@@ -43,6 +44,21 @@ def _rows(session, stage):
     ).order_by(DiscoveryResult.code)).all()
 
 
+def _overrides(session, stage):
+    return {row.code: row for row in session.scalars(select(DiscoveryOverride).where(
+        DiscoveryOverride.run_id == stage.run_id, DiscoveryOverride.track == stage.track,
+        DiscoveryOverride.stage == stage.stage, DiscoveryOverride.attempt == stage.attempt))}
+
+
+def _effective_pass(row, overrides):
+    override = overrides.get(row.code)
+    return effective_verdict(
+        StageResult(row.track, row.stage, row.code, row.verdict),
+        StageOverride(override.track, override.stage, override.code, override.action, override.reason)
+        if override is not None else None,
+    ) == 'pass'
+
+
 def _source(session, stage):
     """Use exact persisted lineage, overrides and competition entrants, never live facts."""
     run = session.get(DiscoveryRun, stage.run_id)
@@ -56,12 +72,17 @@ def _source(session, stage):
         raise ValueError('cohort source has invalid frozen stage lineage')
     frozen = load_frozen_inputs(session, run.id)
     companies = {company.code: company for company in frozen.companies}
-    overrides = {row.code: row for row in session.scalars(select(DiscoveryOverride).where(
-        DiscoveryOverride.run_id == run.id, DiscoveryOverride.track == stage.track,
-        DiscoveryOverride.stage == gate.stage, DiscoveryOverride.attempt == gate.attempt))}
-    gates = {row.code: row for row in _rows(session, gate) if
-             (row.verdict == 'pass' if row.code not in overrides else overrides[row.code].action == 'forced_pass')}
+    overrides = _overrides(session, gate)
+    gates = {row.code: row for row in _rows(session, gate) if _effective_pass(row, overrides)}
     rows = _rows(session, stage)
+    competition_overrides = _overrides(session, stage)
+    selected = [row.code for row in rows if _effective_pass(row, competition_overrides)]
+    competition_override_audit = [
+        {'id': row.id, 'run_id': row.run_id, 'track': row.track, 'stage': row.stage,
+         'attempt': row.attempt, 'code': row.code, 'action': row.action, 'reason': row.reason,
+         'created_at': utc_timestamp(row.created_at).isoformat()}
+        for _, row in sorted(competition_overrides.items())
+    ]
     if {row.code for row in rows} != set(gates) or not set(gates) <= set(companies):
         raise ValueError('competition results differ from frozen gate-pass set')
     ruler_entry = frozen.ruler_payloads.get(stage.track)
@@ -80,6 +101,7 @@ def _source(session, stage):
         'gate_stage_id': gate.id, 'competition_stage_id': stage.id,
         'universe': sorted(companies), 'eligible_codes': sorted(gates),
         'market_as_of': {code: companies[code].as_of.get('price') for code in sorted(companies)},
+        'competition_override_audit': competition_override_audit,
         'source_selection_hash': digest({
             'gate': [{'id': row.id, 'code': row.code, 'verdict': row.verdict,
                       'reason': row.reason, 'metrics_json': row.metrics_json} for row in gates.values()],
@@ -87,9 +109,10 @@ def _source(session, stage):
                              'rank': row.rank, 'reason': row.reason, 'metrics_json': row.metrics_json} for row in rows],
             'gate_overrides': [{'id': row.id, 'code': row.code, 'action': row.action, 'reason': row.reason}
                                for _, row in sorted(overrides.items())],
+            'competition_overrides': competition_override_audit,
         }),
     }
-    return source, gates, rows, companies, ruler_entry
+    return source, gates, rows, companies, ruler_entry, selected
 
 
 def _members(gates, selected, reason):
@@ -161,7 +184,7 @@ def publish_track_cohorts(session: Session, *, stage_id: int, published_at: date
                                  and cohort_manifest(session, row.id)['kind'] == 'prospective' for row in existing):
             return tuple(row.id for row in existing)
         raise ValueError('cohort publication cannot replace an existing registration')
-    source, gates, rows, companies, ruler_entry = _source(session, stage)
+    source, gates, rows, companies, ruler_entry, selected = _source(session, stage)
     if at < utc_timestamp(datetime.fromisoformat(source['decision_cutoff_at'])):
         raise ValueError('publication precedes decision cutoff')
     ruler = parse_payload(ruler_entry['payload'])
@@ -177,7 +200,7 @@ def publish_track_cohorts(session: Session, *, stage_id: int, published_at: date
     ranked = rank_candidates(entrants, ruler.ranking_contract)
     audit = ranking_audit(entrants, ruler.ranking_contract)
     lists = {
-        'full_selected': _members(gates, [row.code for row in rows if row.verdict == 'pass'], 'persisted_competition_pass'),
+        'full_selected': _members(gates, selected, 'persisted_effective_competition_pass'),
         'no_operating_selected': _members(gates, [row.code for row in ranked if row.verdict == 'pass'], 'operating_layer_removed'),
         'all_passed': _members(gates, gates, 'persisted_gate_pass'),
     }
@@ -210,7 +233,12 @@ def register_cohort(session: Session, *, run_id: int, track: str, variant_id: st
         source_keys = ('run_id', 'track', 'source_run_hash', 'input_hash', 'algorithm_version',
                        'ruler_hash', 'decision_cutoff_at', 'gate_stage_id', 'competition_stage_id',
                        'universe', 'eligible_codes', 'market_as_of', 'source_selection_hash')
-        return _write(session, {key: old[key] for key in source_keys}, old['members'],
+        source = {key: old[key] for key in source_keys}
+        # Old immutable receipts remain readable; do not invent an empty audit
+        # when the registration predates retained competition-override auditing.
+        if 'competition_override_audit' in old:
+            source['competition_override_audit'] = old['competition_override_audit']
+        return _write(session, source, old['members'],
             variant_id=variant_id, config=config, kind='retrospective_observation',
             registered_at=at, published_at=original.published_run_at,
             ablation_audit=old['ablation_audit'], source_registration_hash=old['manifest_hash'])
@@ -222,9 +250,10 @@ def register_cohort(session: Session, *, run_id: int, track: str, variant_id: st
         DiscoveryStage.superseded_at.is_(None)).order_by(DiscoveryStage.attempt.desc(), DiscoveryStage.id.desc()))
     if stage is None:
         raise ValueError('cohort requires persisted confirmed competition results')
-    source, gates, rows, _, _ = _source(session, stage)
-    selected = gates if variant_id == 'all_passed' else [row.code for row in rows if row.verdict == 'pass']
-    members = _members(gates, selected, 'persisted_gate_pass' if variant_id == 'all_passed' else 'persisted_competition_pass')
+    source, gates, _, _, _, selected = _source(session, stage)
+    selected = gates if variant_id == 'all_passed' else selected
+    members = _members(gates, selected,
+                       'persisted_gate_pass' if variant_id == 'all_passed' else 'persisted_effective_competition_pass')
     return _write(session, source, members, variant_id=variant_id, config=config,
                   kind='retrospective_observation', registered_at=at, published_at=None)
 
