@@ -9,6 +9,11 @@ from pathlib import Path
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.selection_models import ReviewExposureCapture
+from discovery.constants import CHINA_MARKET_TIMEZONE
+from ledger.exposure import (capture_review_input, exact_book_weights,
+    freeze_selected_exposure, read_review_capture)
+
 from app.models import (
     PortfolioReview,
     ResearchArtifact,
@@ -81,6 +86,9 @@ def snapshot_to_dict(book: BookSnapshot) -> dict[str, object]:
                 "rule_light": row.rule_light,
                 "code": row.code,
                 "deviation": _json_optional(row.deviation),
+                "exposure_weight": str(row.weight) if row.weight is not None else None,
+                "exposure_target": str(row.target) if row.target is not None else None,
+                "exposure_price": str(row.price) if row.price is not None else None,
             }
             for row in book.positions
         ],
@@ -287,51 +295,52 @@ def _run_one(
     reports_dir: Path,
     market=None,
 ) -> None:
+    if row.status == 'done':
+        return  # Published old or new recommendations are never retrofitted.
     row.status = "running"
     row.updated_at = _now()
     session.commit()
     setting = session.get(Setting, LLM_MODEL_KEY)
-    model = (setting.value or "").strip() if setting is not None else ""
+    model = ((setting.value or '').strip() if setting is not None else '') or getattr(llm, 'model', '')
     if model and hasattr(llm, "model"):
         llm.model = model
     try:
-        refresh_held_quotes(session, quote_client)
-        positions, cash = load_positions(session)
-        snapshot = snapshot_to_dict(project_book(session, positions, cash))
-        names = [
-            str(item.get("name"))
-            for item in snapshot.get("positions", [])
-            if isinstance(item, dict) and item.get("name")
-        ]
-        if _review_depth(row) == "eval_first":
-            _evaluate_missing_theses(
-                session,
-                names,
-                llm=llm,
-                quote_client=quote_client,
-                reports_dir=reports_dir,
-                market=market,
-            )
-        evaluations = load_current_theses(
-            session,
-            names,
-            [
-                item
-                for item in snapshot.get("positions", [])
-                if isinstance(item, dict)
-            ],
-        )
-        funnel_names = tuple(load_funnel_candidates(session))
+        captured = session.scalar(select(ReviewExposureCapture).where(ReviewExposureCapture.review_id == row.id))
+        if captured is not None:
+            inputs = read_review_capture(captured, user_id=row.user_id)
+        else:
+            refresh_held_quotes(session, quote_client)
+            positions, cash = load_positions(session)
+            book = project_book(session, positions, cash)
+            snapshot = snapshot_to_dict(book)
+            names = [str(item['name']) for item in snapshot['positions'] if item.get('name')]
+            if _review_depth(row) == 'eval_first':
+                _evaluate_missing_theses(session, names, llm=llm, quote_client=quote_client,
+                    reports_dir=reports_dir, market=market)
+            evaluations = load_current_theses(session, names, snapshot['positions'])
+            cutoff = _now()
+            inputs = capture_review_input(session, review_id=row.id, user_id=row.user_id, payload={
+                'snapshot': snapshot, 'evaluations': evaluations,
+                'funnel_names': list(load_funnel_candidates(session)), 'model': model,
+                'as_of_date': cutoff.astimezone(CHINA_MARKET_TIMEZONE).date().isoformat(),
+                'exposure_context': freeze_selected_exposure(session, user_id=row.user_id,
+                    cutoff_at=cutoff, weights=exact_book_weights(book)),
+            })
+            # The durable boundary precedes any review model call/report write.
+            session.commit()
+        if inputs.get('model') and hasattr(llm, 'model'):
+            llm.model = inputs['model']
         output = run_review(
             llm,
             ReviewInput(
-                snapshot=snapshot,
-                evaluations=evaluations,
-                funnel_names=funnel_names,
-                as_of_date=_now().date().isoformat(),
+                snapshot=inputs['snapshot'],
+                evaluations=inputs['evaluations'],
+                funnel_names=tuple(inputs['funnel_names']),
+                as_of_date=inputs['as_of_date'],
+                exposure_context=inputs['exposure_context'],
                 review_id=row.id,
                 reports_dir=Path(reports_dir),
-            ),
+            )
         )
         row.structured_json = json.dumps(output.structured, ensure_ascii=False)
         row.markdown = output.markdown

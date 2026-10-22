@@ -81,6 +81,20 @@ interface ReviewRow {
   portfolio_actions?: ReviewAction[]
   markdown?: string
   has_stale?: boolean
+  common_exposure?: ExposureSummary | null
+}
+
+interface ExposureSummary {
+  version_id: number | null
+  label_names: Record<string, string>
+  current_totals: Record<string, string>
+  proposed_totals: Record<string, string>
+  breaches: Record<string, string>
+  policy: { limits: Record<string, string>; unknown_limit: string | null }
+  configured: boolean
+  complete: boolean
+  unpriced_codes: string[]
+  allowed: boolean
 }
 
 interface OptItem {
@@ -117,6 +131,21 @@ const route = useRoute()
 const router = useRouter()
 const positions = ref<PositionRow[]>([])
 const optimization = ref<OptimizationData>({ reduce: [], add: [], build: [] })
+const commonExposure = ref<ExposureSummary | null>(null)
+const exposureLabels = computed(() => [...new Set([
+  ...Object.keys(commonExposure.value?.current_totals ?? {}),
+  ...Object.keys(commonExposure.value?.proposed_totals ?? {}),
+])])
+
+function exposurePercent(value: string | undefined | null): string {
+  if (value == null) return '未设置'
+  const [whole = '0', fraction = ''] = value.split('.')
+  const digits = whole + fraction.padEnd(2, '0')
+  const point = whole.length + 2
+  const integer = digits.slice(0, point).replace(/^0+(?=\d)/, '')
+  const tail = digits.slice(point).replace(/0+$/, '')
+  return `${integer}${tail ? '.' + tail : ''}%`
+}
 const cash = ref<number | null>(null)
 const cashWeight = ref<number | null>(null)
 const cashTarget = ref<number | null>(null)
@@ -252,8 +281,10 @@ function applyBook(data: {
   errors?: RefreshError[]
   rebalance?: string[]
   optimization?: OptimizationData
+  common_exposure?: ExposureSummary
 }) {
   positions.value = data.positions ?? []
+  commonExposure.value = data.common_exposure ?? null
   if (data.optimization) {
     optimization.value = data.optimization
   }
@@ -1117,6 +1148,31 @@ onBeforeUnmount(stopReviewPoll)
         <p v-if="targetError" class="alert-error">{{ targetError }}</p>
       </form>
 
+      <section v-if="commonExposure" class="panel exposure-section" aria-label="共同经济风险">
+        <h2>共同经济风险</h2>
+        <p class="muted">
+          同一需求可能影响不同行业。每个标签计入完整持仓权重，多标签合计可能超过 100%。
+          {{ commonExposure.version_id == null ? '尚未选择证据映射，持仓计入未知暴露。' : `使用映射版本 ${commonExposure.version_id}。` }}
+        </p>
+        <p v-if="!commonExposure.configured" class="hint">未设置共同风险上限；仅展示分布，不判断超限。</p>
+        <p v-if="!commonExposure.complete" class="alert-error">
+          部分持仓权重缺失，以下仅为已知部分，暂停新增建议：{{ commonExposure.unpriced_codes.join('、') }}
+        </p>
+        <div class="exposure-grid">
+          <article v-for="label in exposureLabels" :key="label" class="exposure-card">
+            <strong>{{ commonExposure.label_names[label] || label }}</strong>
+            <span>当前 {{ exposurePercent(commonExposure.current_totals[label] ?? '0') }}</span>
+            <span>建议新增后 {{ exposurePercent(commonExposure.proposed_totals[label] ?? '0') }}</span>
+            <small class="muted">上限 {{ exposurePercent(label === 'unknown' ? commonExposure.policy.unknown_limit : commonExposure.policy.limits[label]) }}</small>
+          </article>
+        </div>
+        <p v-if="!commonExposure.allowed" class="alert-error">
+          暂停新增建议：{{ Object.keys(commonExposure.breaches).map((key) => commonExposure!.label_names[key] || key).join('、') || '权重尚不完整' }}。
+          减仓与退出审视仍可进行。
+        </p>
+        <p class="hint">标签来自已复核的主营、客户、地区收入或 ETF 持仓证据；没有映射的部分保留为未知。所有建议仅供研究，不生成交易指令。</p>
+      </section>
+
       <section
         v-if="optimization.reduce.length || optimization.add.length || optimization.build.length"
         class="panel opt-section"
@@ -1125,7 +1181,7 @@ onBeforeUnmount(stopReviewPoll)
           <div>
             <h2>持仓优化建议</h2>
             <p class="muted sub-desc">
-              基于角色上限（核心仓 10%~15% / 卫星仓 5%~8%）、三档价格带（激进 / 稳健 / 保守）、最新财报漂移与市场情绪自动生成。
+              基于角色上限（核心仓 10%~15% / 卫星仓 5%~8%）、三档价格带、信息等级、经营状态和共同经济风险生成纸面研究建议。
             </p>
             <p v-if="optimization.sentiment_regime?.note" class="muted sub-desc">
               {{ optimization.sentiment_regime.note }}
@@ -1414,6 +1470,10 @@ onBeforeUnmount(stopReviewPoll)
       </div>
 
       <section v-if="review" class="panel review-section">
+        <p v-if="review.common_exposure" class="hint">
+          本次审视冻结映射版本：{{ review.common_exposure.version_id ?? '未选择（未知暴露）' }}。
+          后续映射修订不会改写本次审视。宽基 ETF 同日期假设对照见审视备忘录。
+        </p>
         <div class="toolbar">
           <h2>最近审视</h2>
           <span
@@ -1562,5 +1622,21 @@ onBeforeUnmount(stopReviewPoll)
 
 .memo-fold {
   margin-top: 0.75rem;
+}
+
+.exposure-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 12rem), 1fr));
+  gap: 0.75rem;
+  margin: 1rem 0;
+}
+
+.exposure-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  padding: 0.8rem;
+  border: 1px solid #e4ddd0;
+  overflow-wrap: anywhere;
 }
 </style>

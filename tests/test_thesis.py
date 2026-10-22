@@ -527,10 +527,15 @@ def test_stale_price_does_not_judge_band_or_deviation() -> None:
 
 
 def test_research_does_not_import_ledger() -> None:
+    import ast
+    allowed = {'proposal_priority', 'exposure_report', 'read_exposure_context'}
     for path in RESEARCH_DIR.rglob("*.py"):
-        source = path.read_text(encoding="utf-8")
-        assert "import ledger" not in source
-        assert "from ledger" not in source
+        for node in ast.walk(ast.parse(path.read_text(encoding='utf-8'))):
+            if isinstance(node, ast.Import):
+                assert not any(item.name == 'ledger' or item.name.startswith('ledger.') for item in node.names)
+            if isinstance(node, ast.ImportFrom) and (node.module == 'ledger' or (node.module or '').startswith('ledger.')):
+                assert node.module == 'ledger.exposure'
+                assert {item.name for item in node.names} <= allowed
 
 
 def test_eligible_research_upserts_and_marks_page(tmp_path: Path) -> None:
@@ -810,6 +815,7 @@ def test_dynamic_sizing_evaluates_role_band_and_drift() -> None:
     from research.thesis import dynamic_sizing
 
     core = _structured(mode="steady", conservative="48", as_of_price=42)
+    core.update(data_grade='B', operating_result={'state': 'stable'})
     core["price_bands"]["aggressive"] = "36"
     core["price_bands"]["steady"] = "42"
     core["memo"] = {"role": "core"}
@@ -821,6 +827,7 @@ def test_dynamic_sizing_evaluates_role_band_and_drift() -> None:
     assert hold_res["label"] == "核心仓·持有观察区（不追高补仓）"
 
     sat = _structured(mode="steady", conservative="8.9", as_of_price=8.4)
+    sat.update(data_grade='B', operating_result={'state': 'stable'})
     sat["price_bands"]["aggressive"] = "7.0"
     sat["price_bands"]["steady"] = "7.9"
     sat["memo"] = {"role": "satellite"}

@@ -267,6 +267,9 @@ def _positions_payload(
     session, rows, cash: Decimal
 ) -> dict[str, object]:
     book = project_book(session, rows, cash)
+    from ledger.exposure import exact_book_weights, freeze_selected_exposure
+    exposure_context = freeze_selected_exposure(session, user_id=LOCAL_USER_ID,
+        cutoff_at=datetime.now(timezone.utc), weights=exact_book_weights(book))
     held_names = [row.name for row in book.positions]
     theses = load_by_names(session, LOCAL_USER_ID, held_names)
     pos_jsons = [
@@ -309,6 +312,8 @@ def _positions_payload(
                 sent_payload = parsed_sent
         except json.JSONDecodeError:
             sent_payload = None
+    optimization = portfolio_optimization(pos_jsons, unheld_candidates, sentiment=sent_payload,
+                                          exposure_context=exposure_context)
     return {
         "positions": pos_jsons,
         "cash": {
@@ -320,9 +325,8 @@ def _positions_payload(
             "deviation": _json_optional(book.cash.deviation),
         },
         "rebalance": rebalance_alerts(book.positions, book.cash),
-        "optimization": portfolio_optimization(
-            pos_jsons, unheld_candidates, sentiment=sent_payload
-        ),
+        "optimization": optimization,
+        'common_exposure': optimization['common_exposure'],
     }
 
 
@@ -903,6 +907,8 @@ def _review_payload(row: PortfolioReview) -> dict[str, object]:
         "markdown": row.markdown or "",
         "report_path": row.report_path,
         "has_stale": bool(row.has_stale or structured.get("has_stale")),
+        'common_exposure': structured.get('common_exposure'),
+        'opportunity_cost': structured.get('opportunity_cost'),
     }
 
 

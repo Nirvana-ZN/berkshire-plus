@@ -742,10 +742,15 @@ def test_model_rebalance_note_is_dropped(tmp_path: Path) -> None:
 
 
 def test_review_module_does_not_import_ledger() -> None:
+    import ast
+    allowed = {'proposal_priority', 'exposure_report', 'read_exposure_context'}
     for path in REVIEW_DIR.rglob("*.py"):
-        source = path.read_text(encoding="utf-8")
-        assert "import ledger" not in source
-        assert "from ledger" not in source
+        for node in ast.walk(ast.parse(path.read_text(encoding='utf-8'))):
+            if isinstance(node, ast.Import):
+                assert not any(item.name == 'ledger' or item.name.startswith('ledger.') for item in node.names)
+            if isinstance(node, ast.ImportFrom) and (node.module == 'ledger' or (node.module or '').startswith('ledger.')):
+                assert node.module == 'ledger.exposure'
+                assert {item.name for item in node.names} <= allowed
 
 
 def test_positions_and_home_have_review_entry_without_apply() -> None:

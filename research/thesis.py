@@ -11,6 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models import Financial, ResearchArtifact, ResearchJob, Thesis
+from ledger.exposure import exposure_report, proposal_priority, read_exposure_context
 
 STALE_DAYS = 90
 WATCH_DEVIATION = Decimal("0.15")
@@ -575,7 +576,11 @@ def dynamic_sizing(
     price = _as_decimal(current_price) if price_usable else None
     over_cap = bool(weight is not None and max_w > 0 and weight > max_w)
     drift = financial_drift(structured, financials, since_baseline=False)
-    if drift is not None:
+    operating = structured.get('operating_result')
+    state = operating.get('state', 'unknown') if isinstance(operating, Mapping) else 'unknown'
+    priority = proposal_priority('skip' if role == 'skip' else verdict,
+                                'deteriorating' if drift else state, structured.get('data_grade', 'C'))
+    if drift is not None and priority != 'exit_review':
         cap = min(weight, max_w) if weight is not None else Decimal("0")
         return {
             "role": role or "satellite",
@@ -591,7 +596,7 @@ def dynamic_sizing(
             "label": f"{role_zh}·冻结加仓（{drift['period']}同比恶化）",
         }
 
-    if verdict == "fail" or role == "skip":
+    if priority == 'exit_review':
         zone, action, s_min, s_max = "exit", "trim_or_exit", Decimal("0"), Decimal("0")
         label = f"{role_zh}·建议退出"
     elif price is not None and price > 0 and is_overvalued(
@@ -603,6 +608,10 @@ def dynamic_sizing(
         zone, action = "gray_hold", "hold_no_add"
         s_min, s_max = Decimal("0"), std_w
         label = f"{role_zh}·灰区观察（禁加仓）"
+    elif priority == 'freeze_add':
+        zone, action, s_min = 'evidence_freeze', 'hold_no_add', Decimal('0')
+        s_max = min(weight, max_w) if weight is not None else Decimal('0')
+        label = f'{role_zh}·信息等级或经营状态不支持新增'
     elif price is not None and cheap is not None and price <= cheap:
         zone, action, s_min, s_max = "aggressive", "add_to_cap", std_w, max_w
         label = f"{role_zh}·击球加仓区（{int(std_w * 100)}%-{int(max_w * 100)}%）"
@@ -651,6 +660,7 @@ def portfolio_optimization(
     unheld_candidates: Sequence[Mapping[str, Any]] = (),
     *,
     sentiment: Mapping[str, Any] | None = None,
+    exposure_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build actionable reduce, add, and build recommendations across holdings, pass theses, and market sentiment."""
 
@@ -705,6 +715,7 @@ def portfolio_optimization(
             "cheap_bound": _json_bound(cheap),
             "steady_bound": _json_bound(steady),
             "rich_bound": _json_bound(rich),
+            '_proposed_weight': role_cap if is_fear else s_max,
         }
         if zone == "exit":
             reduce_list.append({
@@ -830,7 +841,8 @@ def portfolio_optimization(
             "cheap_bound": _json_bound(cheap),
             "steady_bound": _json_bound(steady),
             "rich_bound": _json_bound(rich),
-            "_sort_key": (0 if zone in ("aggressive", "steady") else 1, 0 if role == "core" else 1, -float(gap)),
+            '_proposed_weight': role_cap if is_fear else _as_decimal(ds.get('suggested_max')),
+            "_sort_key": (0 if zone in ("aggressive", "steady") else 1, 0 if role == "core" else 1, -gap),
         }
         if zone in ("aggressive", "steady"):
             if is_greed and zone == "steady":
@@ -870,11 +882,33 @@ def portfolio_optimization(
             })
 
     build_list.sort(key=lambda item: item.pop("_sort_key", (9, 9, 999)))
+    common_exposure = None
+    if exposure_context is not None:
+        weights, _labels, _policy = read_exposure_context(exposure_context)
+        deltas = {}
+        for item in add_list + build_list:
+            code = item.get('code') or f"name:{item['name']}"
+            proposed = item['_proposed_weight']
+            if item.get('ready') and proposed is not None:
+                delta = proposed - weights.get(code, Decimal('0'))
+                if delta > 0:
+                    deltas[code] = max(deltas.get(code, Decimal('0')), delta)
+        common_exposure = exposure_report(exposure_context, deltas)
+        if not common_exposure['allowed']:
+            for item in add_list + build_list:
+                if item.get('ready'):
+                    item.update(ready=False, restriction='shared_exposure_limit', severity='warn', tag='共同风险约束·暂停新增')
+                    item['reason'] = '组合同时新增后的共同风险超限或部分权重缺失。' + str(item['reason'])
+    for item in reduce_list + add_list + build_list:
+        proposed = item.pop('_proposed_weight', None)
+        if item in add_list + build_list:
+            item['proposed_weight'] = str(proposed) if proposed is not None else None
     return {
         "reduce": reduce_list,
         "add": add_list,
         "build": build_list,
         "sentiment_regime": sentiment_regime,
+        'common_exposure': common_exposure,
     }
 
 

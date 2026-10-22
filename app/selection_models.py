@@ -64,6 +64,39 @@ class ResearchAssumption(Base):
     digest: Mapped[str] = mapped_column(String, unique=True, nullable=False)
 
 
+class ExposureVersion(Base):
+    __tablename__ = 'portfolio_exposure_versions'
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey('users.id', ondelete='RESTRICT'), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+    supersedes_id: Mapped[int | None] = mapped_column(ForeignKey('portfolio_exposure_versions.id', ondelete='RESTRICT'))
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    digest: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+
+
+class ExposureSelection(Base):
+    __tablename__ = 'portfolio_exposure_selections'
+    __table_args__ = (Index('ix_exposure_selection_owner', 'user_id', 'id'),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey('users.id', ondelete='RESTRICT'), nullable=False)
+    version_id: Mapped[int] = mapped_column(ForeignKey('portfolio_exposure_versions.id', ondelete='RESTRICT'), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+    digest: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+
+
+class ReviewExposureCapture(Base):
+    __tablename__ = 'portfolio_review_exposure_captures'
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    review_id: Mapped[int] = mapped_column(ForeignKey('portfolio_reviews.id', ondelete='RESTRICT'), unique=True, nullable=False)
+    user_id: Mapped[int] = mapped_column(ForeignKey('users.id', ondelete='RESTRICT'), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    digest: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+
+
 class StrategyExperiment(Base):
     __tablename__ = 'strategy_experiments'
     __table_args__ = (CheckConstraint("kind IN ('prospective','retrospective_observation')"),)
@@ -252,7 +285,10 @@ for _statement in strategy_guard_statements():
 # bypass delete triggers under SQLite's default recursive_triggers setting).
 for _table, _key in ((FundamentalEvidence.__table__, 'evidence_id'),
                      (FundamentalCoverage.__table__, 'digest'),
-                     (ResearchAssumption.__table__, 'digest')):
+                     (ResearchAssumption.__table__, 'digest'),
+                     (ExposureVersion.__table__, 'digest'),
+                     (ExposureSelection.__table__, 'digest'),
+                     (ReviewExposureCapture.__table__, 'digest')):
     for _action in ('UPDATE', 'DELETE'):
         event.listen(_table, 'after_create', DDL(
             f'CREATE TRIGGER IF NOT EXISTS trg_{_table.name}_{_action.lower()} '
@@ -262,6 +298,8 @@ for _table, _key in ((FundamentalEvidence.__table__, 'evidence_id'),
     _duplicate = f'{_key} = NEW.{_key}'
     if _key == 'digest':
         _duplicate += ' OR id = NEW.id'
+    if _table is ReviewExposureCapture.__table__:
+        _duplicate += ' OR review_id = NEW.review_id'
     event.listen(_table, 'after_create', DDL(
         f'CREATE TRIGGER IF NOT EXISTS trg_{_table.name}_replace '
         f'BEFORE INSERT ON {_table.name} '
