@@ -4,6 +4,7 @@ import PositionsView from '../views/PositionsView.vue'
 import ScreenView from '../views/ScreenView.vue'
 import ResearchView from '../views/ResearchView.vue'
 import DiscoveryView from '../views/DiscoveryView.vue'
+import TrackingView from '../views/TrackingView.vue'
 import IndexFundsView from '../views/IndexFundsView.vue'
 import SettingsView from '../views/SettingsView.vue'
 import NotFoundView from '../views/NotFoundView.vue'
@@ -11,6 +12,7 @@ import NotFoundView from '../views/NotFoundView.vue'
 const router = createRouter({
   history: createWebHistory(import.meta.env.BASE_URL),
   routes: [
+    { path: '/tracking', name: 'tracking', component: TrackingView },
     {
       path: '/',
       name: 'home',

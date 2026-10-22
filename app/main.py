@@ -17,6 +17,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.db import PROJECT_ROOT, create_session_factory, init_db
 from app.discovery_models import DiscoveryRun
+from app.tracking_routes import create_tracking_router
 from app.discovery_routes import (
     cancel_discovery_research_worker,
     create_discovery_router,
@@ -934,6 +935,8 @@ def create_app(
     discovery_snapshot_provider=None,
     discovery_clock=None,
     fund_client=None,
+    tracking_provider=None,
+    tracking_clock=None,
 ) -> FastAPI:
     resolved_dist = dist_path if dist_path is not None else DEFAULT_DIST_PATH
     resolved_fund_client = fund_client if fund_client is not None else FundClient()
@@ -954,6 +957,8 @@ def create_app(
         session_factory = create_session_factory(engine)
         app.state.engine = engine
         app.state.session_factory = session_factory
+        app.state.tracking_provider = tracking_provider
+        app.state.tracking_clock = tracking_clock or (lambda: datetime.now(timezone.utc))
         app.state.quote_client = resolved_quote_client
         app.state.market_client = resolved_market_client
         app.state.fund_client = resolved_fund_client
@@ -1074,6 +1079,7 @@ def create_app(
 
     app = FastAPI(title="本机工作台", lifespan=lifespan)
     app.include_router(create_discovery_router())
+    app.include_router(create_tracking_router())
 
     @app.get("/api/health")
     def health(request: Request) -> dict[str, object]:

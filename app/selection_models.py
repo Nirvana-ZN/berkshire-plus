@@ -161,8 +161,41 @@ class StrategyObservation(Base):
     calculation_version: Mapped[str] = mapped_column(Text, nullable=False)
 
 
+class TrackingRequest(Base):
+    """Recoverable HTTP claim with immutable identity and terminal receipt."""
+    __tablename__ = 'tracking_requests'
+    __table_args__ = (CheckConstraint("status IN ('pending','completed')"),
+        CheckConstraint("(status='pending' AND http_status IS NULL AND response_json IS NULL) OR "
+                        "(status='completed' AND http_status BETWEEN 100 AND 599 AND response_json IS NOT NULL)"))
+
+    key: Mapped[str] = mapped_column(String, primary_key=True)
+    fingerprint: Mapped[str] = mapped_column(String, nullable=False)
+    scope_json: Mapped[str] = mapped_column(Text, nullable=False)
+    as_of: Mapped[date] = mapped_column(Date, nullable=False)
+    token: Mapped[str] = mapped_column(String, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False)
+    http_status: Mapped[int | None] = mapped_column()
+    response_json: Mapped[str | None] = mapped_column(Text)
+
+
+def tracking_request_guard_statements():
+    return (
+        "CREATE TRIGGER IF NOT EXISTS tracking_request_identity BEFORE UPDATE ON tracking_requests "
+        "WHEN NEW.key IS NOT OLD.key OR NEW.fingerprint IS NOT OLD.fingerprint OR "
+        "NEW.scope_json IS NOT OLD.scope_json OR NEW.as_of IS NOT OLD.as_of OR OLD.status != 'pending' "
+        "BEGIN SELECT RAISE(ABORT, 'immutable tracking request'); END",
+        "CREATE TRIGGER IF NOT EXISTS tracking_request_delete BEFORE DELETE ON tracking_requests "
+        "BEGIN SELECT RAISE(ABORT, 'immutable tracking request'); END",
+        "CREATE TRIGGER IF NOT EXISTS tracking_request_replace BEFORE INSERT ON tracking_requests "
+        "WHEN EXISTS (SELECT 1 FROM tracking_requests WHERE key=NEW.key) "
+        "BEGIN SELECT RAISE(ABORT, 'immutable tracking request'); END",
+    )
+
+
 def strategy_guard_statements():
     """Shared by metadata creation and idempotent initialization of existing DBs."""
+    yield from tracking_request_guard_statements()
     for model in (StrategyExperiment, StrategyCohort, StrategyMember):
         table = model.__table__
         changed = ' OR '.join(f'NEW.{column.name} IS NOT OLD.{column.name}'

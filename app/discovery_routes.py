@@ -673,7 +673,8 @@ def _result_json(
     )
     # Full-market drop/insufficient rows are thousands of metric blobs.
     # The summary still reads every metric. The table only needs them for passes.
-    metrics = dict(_metrics(row.metrics_json)) if include_metrics else {}
+    stored_metrics = _metrics(row.metrics_json)
+    metrics = dict(stored_metrics) if include_metrics else {}
     return {
         "code": row.code,
         "name": name,
@@ -681,6 +682,13 @@ def _result_json(
         "original_verdict": row.verdict,
         "reason": row.reason,
         "metrics": metrics,
+        "selection_audit": {
+            "operating_state": stored_metrics.get("operating_state"),
+            "ranking_audit": stored_metrics.get("ranking_audit"),
+            "missing": [f"{key}: {item.get('reason') or item.get('status')}"
+                        for key, item in stored_metrics.get("metric_results", {}).items()
+                        if isinstance(item, Mapping) and item.get("status") not in ("verified", "not_applicable")],
+        } if "metric_results" in stored_metrics or "ranking_audit" in stored_metrics else None,
         "override": None if override is None else _override_json(override),
         **({"rank": row.rank} if isinstance(row, DiscoveryResult) else {}),
         "created_at": _iso(row.created_at),
@@ -713,6 +721,49 @@ def _stage_changes(
         raise CorruptDiscoveryResult(
             "persisted discovery history is corrupt"
         ) from error
+
+
+def _selection_change_labels(before, after, change):
+    valuation = {'pe_deducted_ttm', 'deducted_peg', 'earnings_yield', 'normalized_pe',
+                 'usable_net_cash_to_mcap', 'fcf_yield'}
+    left, right = before.get('metric_results', {}), after.get('metric_results', {})
+    changed = {key for key in left.keys() | right.keys() if left.get(key) != right.get(key)}
+    # Existing bank metrics remain persisted top-level proxies, outside the
+    # nonfinancial metric-results registry; compare those saved values too.
+    bank_valuation = any(before.get(key) != after.get(key) for key in ('pb_percentile', 'pb', 'pb_tangible'))
+    bank_fundamentals = any(before.get(key) != after.get(key) for key in
+        ('roe_mean', 'bank_core_tier1_capital_adequacy', 'npl_change'))
+    return [label for label, applies in (
+        ('fundamental_changed', bool(changed - valuation) or bank_fundamentals
+         or before.get('operating_state') != after.get('operating_state')),
+        ('valuation_changed', bool(changed & valuation) or bank_valuation),
+        ('rule_changed', change.cause in ('rule_changed', 'both_changed')),
+        ('cap_excluded', change.current_reason in ('industry_cap', 'total_cap')),
+    ) if applies]
+
+
+def _change_json(session, change):
+    value = change.as_dict()
+    metrics = []
+    for identity in (change.previous_run_id, change.current_run_id):
+        if identity is None:
+            return value
+        run = session.get(DiscoveryRun, identity)
+        if run is None or run.algorithm_version != 'discovery-v8':
+            return value
+        stage = session.scalar(select(DiscoveryStage).where(DiscoveryStage.run_id == identity,
+            DiscoveryStage.track == change.track, DiscoveryStage.stage == change.stage,
+            DiscoveryStage.superseded_at.is_(None)).order_by(DiscoveryStage.attempt.desc()))
+        if stage is None:
+            return value
+        row = session.scalar(select(DiscoveryResult).where(DiscoveryResult.run_id == identity,
+            DiscoveryResult.track == change.track, DiscoveryResult.stage == change.stage,
+            DiscoveryResult.attempt == stage.attempt, DiscoveryResult.code == change.code))
+        if row is None:
+            return value
+        metrics.append(_metrics(row.metrics_json))
+    value['selection_changes'] = _selection_change_labels(*metrics, change)
+    return value
 
 
 def _compact_changes(session: Session, run: DiscoveryRun) -> list[dict[str, object]]:
@@ -781,6 +832,45 @@ def _partition(
         ]
         for verdict in ("pass", "drop", "insufficient")
     }
+
+
+def _selection_partition(session, run, stage, rows, names, overrides):
+    """Attach only already persisted gate verdicts and frozen evidence cutoff."""
+    partition = _partition(rows, names, overrides)
+    if run.algorithm_version != 'discovery-v8':
+        for group in partition.values():
+            for item in group:
+                item['selection_audit'] = None
+        return partition
+    snapshots = {row.code: row for row in session.scalars(select(DiscoveryInputSnapshot).where(
+        DiscoveryInputSnapshot.run_id == run.id))}
+    gate = stage if stage.stage == 'track_gate' else (
+        session.get(DiscoveryStage, stage.predecessor_stage_id) if stage.predecessor_stage_id else None)
+    if gate is not None and gate.stage == 'competition':
+        gate = session.get(DiscoveryStage, gate.predecessor_stage_id)
+    gate_rows = {} if gate is None else {row.code: row for row in session.scalars(
+        select(DiscoveryResult).where(DiscoveryResult.run_id == run.id, DiscoveryResult.track == stage.track,
+            DiscoveryResult.stage == 'track_gate', DiscoveryResult.attempt == gate.attempt))}
+    gate_overrides = {} if gate is None else {row.code: row for row in session.scalars(
+        select(DiscoveryOverride).where(DiscoveryOverride.run_id == run.id, DiscoveryOverride.track == stage.track,
+            DiscoveryOverride.stage == 'track_gate', DiscoveryOverride.attempt == gate.attempt))}
+    labels = {'pass': '通过', 'drop': '未通过', 'insufficient': '证据不足'}
+    for group in partition.values():
+        for item in group:
+            audit = item['selection_audit']
+            if audit is None:
+                audit = item['selection_audit'] = {'missing': ['selection_audit_unavailable']}
+            code = item['code']
+            original = gate_rows.get(code)
+            override = gate_overrides.get(code)
+            verdict = original.verdict if original is not None else None
+            if override is not None:
+                verdict = 'pass' if override.action == 'forced_pass' else 'drop'
+            audit['long_term_eligibility'] = labels.get(verdict, '不可用')
+            snapshot = snapshots.get(code)
+            dates = _persisted_json(snapshot.as_of_json) if snapshot is not None else {}
+            audit['evidence_at'] = dates.get('decision_cutoff_at')
+    return partition
 
 
 # A finished stage's results never change (a retry is a new stage row), but
@@ -1015,7 +1105,7 @@ def _track_payload(
         attempts.append(
             _track_stage_json(attempt)
             | _stage_token_json(session, attempt)
-            | _partition(rows, names, attempt_overrides)
+            | _selection_partition(session, run, attempt, rows, names, attempt_overrides)
             | {
                 "overrides": [
                     _override_json(row) for row in attempt_override_rows
@@ -1034,14 +1124,14 @@ def _track_payload(
         | _stage_token_json(session, current)
         | {"summary": current_summary},
         "attempts": attempts,
-        **_partition(current_rows, names, current_overrides),
+        **_selection_partition(session, run, current, current_rows, names, current_overrides),
         "overrides": [
             _override_json(row) for row in current_override_rows
         ],
         "decisions": [_decision_json(row) for row in decision_rows],
         "evidence": [_evidence_json(row) for row in evidence_rows],
         "summary": current_summary,
-        "changes": [change.as_dict() for change in changes],
+        "changes": [_change_json(session, change) for change in changes],
     }
 
 

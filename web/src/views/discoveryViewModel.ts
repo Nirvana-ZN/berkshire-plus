@@ -33,6 +33,7 @@ export interface ParsedDiscoveryRow {
   metrics: Record<string, MetricValue>
   metrics_unavailable_reason: string | null
   override: ParsedDiscoveryOverride | null
+  selection_audit?: Record<string, unknown> | null
 }
 
 export interface ParsedDiscoveryDecision {
@@ -74,6 +75,7 @@ export interface ParsedDiscoveryChange {
   current_state: DiscoveryResultState
   previous_reason: string | null
   current_reason: string | null
+  selection_changes?: string[]
 }
 
 type DiscoveryMembership = 'new' | 'dropped' | 'reentered' | 'continuous'
@@ -243,11 +245,12 @@ export function keeperRange(
 }
 
 export function discoveryChangeLabels(
-  change: Pick<ParsedDiscoveryChange, 'classifications'>,
+  change: Pick<ParsedDiscoveryChange, 'classifications' | 'selection_changes'>,
 ): string {
-  return change.classifications
-    .map((classification) => DISCOVERY_CHANGE_ZH[classification])
-    .join('；')
+  const details: Record<string, string> = {fundamental_changed: '基本面指标变化', valuation_changed: '估值指标变化',
+    rule_changed: '规则变化', cap_excluded: '名额挤出（不代表卖出）'}
+  return [...change.classifications.map((classification) => DISCOVERY_CHANGE_ZH[classification]),
+    ...(change.selection_changes || []).map((key) => details[key] || '变化待核验')].join('；')
 }
 
 export function candidateSurfacedReason(
@@ -659,7 +662,11 @@ function parseRow(value: unknown): ParsedDiscoveryRow | null {
     || (value.reason !== null && typeof value.reason !== 'string')
     || (value.rank !== undefined && value.rank !== null && nonNegativeInteger(value.rank) === null)
   ) return null
-  const metrics = parseMetricRecord(value.metrics)
+  const audit = isRecord(value.selection_audit) ? value.selection_audit : null
+  const flatMetrics = audit && isRecord(value.metrics)
+    ? Object.fromEntries(Object.entries(value.metrics).filter(([, metric]) => !isRecord(metric)))
+    : value.metrics
+  const metrics = parseMetricRecord(flatMetrics)
   const override = value.override == null ? null : parseOverride(value.override)
   if (value.override != null && override === null) return null
   return {
@@ -674,7 +681,37 @@ function parseRow(value: unknown): ParsedDiscoveryRow | null {
       ? '指标值超出安全展示契约，已隐藏本行指标'
       : null,
     override,
+    selection_audit: audit,
   }
+}
+
+export function selectionExclusionLabel(reason: string | null): string {
+  if (reason === 'industry_cap' || reason === 'total_cap') return '名额排除（不代表卖出）'
+  if (reason === null) return '入选'
+  return '门槛或证据未满足'
+}
+
+export function selectionAuditLines(value: unknown): string[] {
+  if (!isRecord(value)) return ['历史版本，无新增指标']
+  const rank = isRecord(value.ranking_audit) ? value.ranking_audit : {}
+  const states: Record<string, string> = {stable: '稳定', improving: '改善', deteriorating: '恶化', unknown: '未知'}
+  const risks: Record<string, string> = {clear: '未发现已验证风险', watch: '关注', deteriorating: '恶化', unknown: '证据未知'}
+  const missing = Array.isArray(rank.risk_evidence_missing) ? rank.risk_evidence_missing.map(String) : []
+  const lines = [
+    `长期准入：${typeof value.long_term_eligibility === 'string' ? value.long_term_eligibility : '见长期门槛记录'}`,
+    `当期状态：${states[String(value.operating_state)] || '未知'}；风险：${risks[String(rank.risk_state)] || '证据未知'}`,
+    `排名分数（组内越低越靠前）：${typeof rank.rank_score === 'string' ? rank.rank_score : '不可用'}`,
+    `已验证风险类型：${Array.isArray(rank.verified_risk_types) ? (rank.verified_risk_types.join('；') || '未列出已验证风险') : '证据缺失'}`,
+    `证据截止：${typeof value.evidence_at === 'string' ? value.evidence_at : '不可用'}`,
+  ]
+  if (isRecord(rank.dimensions)) {
+    for (const [name, raw] of Object.entries(rank.dimensions)) {
+      if (isRecord(raw)) lines.push(`${EVIDENCE_FIELDS[name]?.[0] || name}：值 ${raw.value ?? '缺失'}，排名贡献 ${raw.contribution ?? '不可用'}${raw.missing_reason ? `，缺口 ${raw.missing_reason}` : ''}`)
+    }
+  }
+  if (Array.isArray(value.missing)) missing.push(...value.missing.map(String))
+  lines.push(`缺失项：${missing.length ? missing.join('；') : '记录未列出缺失项'}`)
+  return lines
 }
 
 function parseRows(value: unknown): ParsedDiscoveryRow[] | null {
@@ -792,6 +829,8 @@ function parseChange(value: unknown): ParsedDiscoveryChange | null {
     current_state: value.current_state as DiscoveryResultState,
     previous_reason: value.previous_reason as string | null,
     current_reason: value.current_reason as string | null,
+    ...(Array.isArray(value.selection_changes) && value.selection_changes.every((key) => typeof key === 'string')
+      ? {selection_changes: value.selection_changes as string[]} : {}),
   }
 }
 
