@@ -38,40 +38,18 @@ from scripts.evolve_rulers import evolve, main
 
 
 def _seed_evolution_db(db_path: Path) -> None:
-    engine = create_engine(f"sqlite:///{db_path}")
-    Base.metadata.create_all(engine)
+    from tests.test_selection_release import seed_published_release
+    from app.db import create_db_engine
+    from discovery.rulers import require_ready
+    seed_published_release(db_path)
+    engine = create_db_engine(db_path)
     now = datetime(2026, 10, 20, 8, 0, tzinfo=timezone.utc)
     industries = ["医药生物", "银行Ⅱ", "煤炭开采"]
 
     with Session(engine) as session:
-        q_row = activate(
-            session,
-            _quality_payload(
-                HYPOTHESIS_BANDS["base"],
-                industry_version="sw-2021",
-                industries=industries,
-                valuation_ratio_method="PE_TTM/PB_MRQ",
-            ),
-            "base quality",
-        )
-        d_row = activate(
-            session,
-            _deep_value_payload(
-                DEEP_VALUE_BANDS["base"],
-                industry_version="sw-2021",
-                valuation_ratio_method="PE_TTM/PB_MRQ",
-            ),
-            "base deep value",
-        )
-        g_row = activate(
-            session,
-            _garp_payload(
-                GARP_BANDS["base"],
-                industry_version="sw-2021",
-                valuation_ratio_method="PE_TTM/PB_MRQ",
-            ),
-            "base garp",
-        )
+        q_row = require_ready(session, 'quality_discount')[0]
+        d_row = require_ready(session, 'deep_value')[0]
+        g_row = require_ready(session, 'garp')[0]
         run = DiscoveryRun(
             user_id=LOCAL_USER_ID,
             week_key="2026-W43",
@@ -89,6 +67,18 @@ def _seed_evolution_db(db_path: Path) -> None:
             updated_at=now,
         )
         session.add(run)
+        session.flush()
+        from app.discovery_models import DiscoveryCommonStage, DiscoveryStage
+        common = DiscoveryCommonStage(run_id=run.id, attempt=1, status='confirmed',
+            input_fingerprint=run.input_fingerprint, algorithm_version=BUILD_VERSION,
+            created_at=now, updated_at=now, confirmed_at=now)
+        session.add(common)
+        session.flush()
+        for track, ruler in (('quality_discount', q_row), ('deep_value', d_row), ('garp', g_row)):
+            session.add(DiscoveryStage(run_id=run.id, track=track, stage='track_gate', attempt=1,
+                status='confirmed', common_stage_id=common.id, ruler_version_id=ruler.id,
+                input_fingerprint=run.input_fingerprint, algorithm_version=BUILD_VERSION,
+                created_at=now, updated_at=now, confirmed_at=now))
         session.flush()
 
         for code, name in (

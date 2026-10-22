@@ -17,7 +17,9 @@ FIXTURES = ROOT / "tests" / "fixtures" / "portfolio"
 
 
 def _engine(db_path: Path):
-    return create_engine(f"sqlite:///{db_path.resolve().as_posix()}")
+    from app.db import create_db_engine
+    return create_db_engine(db_path)
+
 
 
 def _scalar(db_path: Path, sql: str, params: dict | None = None):
@@ -742,15 +744,9 @@ def test_model_rebalance_note_is_dropped(tmp_path: Path) -> None:
 
 
 def test_review_module_does_not_import_ledger() -> None:
-    import ast
-    allowed = {'proposal_priority', 'exposure_report', 'read_exposure_context'}
+    from tests.dependency_guards import assert_no_ledger_writes
     for path in REVIEW_DIR.rglob("*.py"):
-        for node in ast.walk(ast.parse(path.read_text(encoding='utf-8'))):
-            if isinstance(node, ast.Import):
-                assert not any(item.name == 'ledger' or item.name.startswith('ledger.') for item in node.names)
-            if isinstance(node, ast.ImportFrom) and (node.module == 'ledger' or (node.module or '').startswith('ledger.')):
-                assert node.module == 'ledger.exposure'
-                assert {item.name for item in node.names} <= allowed
+        assert_no_ledger_writes(path.read_text(encoding='utf-8'))
 
 
 def test_positions_and_home_have_review_entry_without_apply() -> None:

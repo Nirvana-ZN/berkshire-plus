@@ -10,6 +10,7 @@ from sqlalchemy import text
 
 from app.envfile import OPENAI_API_KEY, write_env_value
 from app.main import create_app
+from app.db import create_db_engine
 from app.models import ScreenResult, ScreenRun, Setting
 from ledger.positions import LOCAL_USER_ID
 from market.eastmoney import FakeMarketClient
@@ -132,7 +133,7 @@ def test_data_flips_do_not_open_gate(tmp_path: Path) -> None:
             _seed_run(session, digest=None, verdict="keep")
         from sqlalchemy import create_engine
 
-        engine = create_engine(f"sqlite:///{db_path.resolve().as_posix()}")
+        engine = create_db_engine(db_path)
         with engine.begin() as conn:
             conn.execute(text("UPDATE financials SET roe = 1"))
         body = client.get("/api/ruler").json()

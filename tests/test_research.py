@@ -33,7 +33,9 @@ REQUIRED = {
 
 
 def _engine(db_path: Path):
-    return create_engine(f"sqlite:///{db_path.resolve().as_posix()}")
+    from app.db import create_db_engine
+    return create_db_engine(db_path)
+
 
 
 def _scalar(db_path: Path, sql: str, params: dict | None = None):
@@ -437,14 +439,28 @@ def test_standalone_research_uses_same_lock(tmp_path: Path) -> None:
 
 
 def test_research_does_not_import_ledger_and_screen_has_no_http() -> None:
+    from tests.dependency_guards import assert_no_direct_http_or_llm, assert_no_ledger_writes
     for path in RESEARCH_DIR.rglob("*.py"):
-        source = path.read_text(encoding="utf-8")
-        assert "import ledger" not in source
-        assert "from ledger" not in source
+        assert_no_ledger_writes(path.read_text(encoding="utf-8"))
     for path in SCREEN_DIR.rglob("*.py"):
-        source = path.read_text(encoding="utf-8")
-        assert "httpx" not in source
-        assert "openai" not in source.lower()
+        assert_no_direct_http_or_llm(path.read_text(encoding="utf-8"))
+
+
+def test_ledger_dependency_guard_allows_only_named_exposure_reads() -> None:
+    import pytest
+    from tests.dependency_guards import assert_no_ledger_writes
+    assert_no_ledger_writes(
+        'from ledger.exposure import proposal_priority, exposure_report, read_exposure_context'
+    )
+    for source in (
+        'import ledger', 'import ledger.exposure as exposure', 'from ledger import exposure',
+        'from ledger.exposure import *', 'from ledger.exposure import append_exposure_version',
+        'from ledger.trades import buy', '__import__("ledger.exposure")',
+        'import importlib; importlib.import_module("ledger.trades")',
+        'from importlib import import_module as load; load(name="ledger")',
+    ):
+        with pytest.raises(AssertionError):
+            assert_no_ledger_writes(source)
 
 
 def test_screen_and_research_views_are_not_json() -> None:

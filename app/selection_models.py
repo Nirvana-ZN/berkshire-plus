@@ -212,6 +212,23 @@ class TrackingRequest(Base):
     response_json: Mapped[str | None] = mapped_column(Text)
 
 
+class SelectionRelease(Base):
+    """One immutable publication/rollback receipt, committed with its rulers."""
+    __tablename__ = 'selection_releases'
+    __table_args__ = (CheckConstraint("action IN ('publish','read_only')"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey('users.id', ondelete='RESTRICT'), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+    action: Mapped[str] = mapped_column(String, nullable=False)
+    build: Mapped[str] = mapped_column(String, nullable=False)
+    fill_id: Mapped[int] = mapped_column(ForeignKey('discovery_data_fills.id', ondelete='RESTRICT'), nullable=False)
+    previous_id: Mapped[int | None] = mapped_column(ForeignKey('selection_releases.id', ondelete='RESTRICT'))
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    digest: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+
+
 def tracking_request_guard_statements():
     return (
         "CREATE TRIGGER IF NOT EXISTS tracking_request_identity BEFORE UPDATE ON tracking_requests "
@@ -266,6 +283,7 @@ def strategy_guard_statements():
         (StrategyObservation, 'id = NEW.id OR (cohort_id = NEW.cohort_id AND '
          'horizon_months = NEW.horizon_months AND as_of = NEW.as_of AND '
          'calculation_version = NEW.calculation_version AND event_digest = NEW.event_digest)'),
+        (SelectionRelease, 'id = NEW.id OR digest = NEW.digest'),
     ):
         table = model.__tablename__
         for action in ('UPDATE', 'DELETE'):

@@ -21,7 +21,8 @@ ROOT = Path(__file__).resolve().parents[1]
 TRACKS = ("quality_discount", "deep_value", "garp")
 
 
-def test_production_v2_classifiers_and_dispatch_diverge_by_track() -> None:
+def test_production_v8_classifiers_and_dispatch_diverge_by_track() -> None:
+    from dataclasses import replace
     from discovery.rulers import (
         deep_value_ruler,
         garp_ruler,
@@ -44,12 +45,18 @@ def test_production_v2_classifiers_and_dispatch_diverge_by_track() -> None:
     )
     from tests.test_discovery_tracks_quality import quality_payload
 
-    company = _company()
-    payloads = {
-        "quality_discount": quality_payload(),
-        "deep_value": deep_value_payload(normalized_pe_max="8"),
-        "garp": garp_payload(),
-    }
+    from tests.test_selection_v8 import company as current_company, candidate
+    base = _company()
+    fields = dict(base.fields)
+    fields["financial_history"] = tuple(
+        {**row, "values": {**row["values"], "capex": "10"}}
+        for row in fields["financial_history"]
+    )
+    company = current_company(replace(base, fields=fields), cap="200")
+    payloads = {track: candidate(track).payload() for track in TRACKS}
+    payloads["deep_value"] = candidate(
+        "deep_value", payload=deep_value_payload(normalized_pe_max="0.5")
+    ).payload()
     classifiers = {
         "quality_discount": (
             quality_discount_ruler,
@@ -158,7 +165,7 @@ def test_seeded_weekly_discovery_full_flow_survives_reload(
         created = client.post("/api/discoveries", json={"sync": True})
         assert created.status_code == 200
         run_id = created.json()["id"]
-        assert created.json()["algorithm_version"] == "discovery-v7"
+        assert created.json()["algorithm_version"] == BUILD_VERSION
         assert all(
             value == "ready"
             for value in created.json()["ruler_readiness"].values()

@@ -253,6 +253,32 @@ function competitionPayload() {
   }
 }
 
+test('competition accepts only the exact canonical selection v8 risk record', () => {
+  const payload = competitionPayload()
+  const risk = payload.evidence[3]!
+  risk.rule_id = 'garp.risk.selection_v8'
+  risk.display_text = 'Frozen selection risk audit'
+  risk.input_fields = { source_as_of: { financial: '2026-09-17' }, rank_audit: { score: '42' } }
+  assert.ok(parseStageResponse(payload))
+
+  for (const ruleId of [
+    'garp.risk.selection_v8.extra', 'garp.risk.selection_v80',
+    'garp.risk.selection_v', 'garp.risk.unknown', 'quality.risk.selection_v8',
+  ]) {
+    assert.equal(parseStageResponse({
+      ...payload, evidence: [...payload.evidence.slice(0, 3), { ...risk, rule_id: ruleId }],
+    }), null, ruleId)
+  }
+  for (const invalid of [
+    { kind: 'fact' }, { rule_version: 'deterministic-evidence-v1' },
+    { input_fields: {} }, { data_completeness: 'unknown' },
+  ]) {
+    assert.equal(parseStageResponse({
+      ...payload, evidence: [...payload.evidence.slice(0, 3), { ...risk, ...invalid }],
+    }), null)
+  }
+})
+
 test('competition schema requires exact card arrays and reliable evidence', () => {
   const payload = competitionPayload()
   payload.changes = [{

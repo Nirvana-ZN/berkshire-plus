@@ -803,9 +803,12 @@ def build_production_snapshot(
     expected_lock_job_id: int | None = None,
     snapshot_at: datetime | None = None,
     operating_policy: Mapping[str, object] | None = None,
+    fill_id: int | None = None,
 ) -> ProductionSnapshot:
     """Bulk-read the latest completed discovery fill without hiding gaps."""
 
+    if fill_id is not None and (type(fill_id) is not int or fill_id <= 0):
+        raise ValueError('fill_id must be a positive integer')
     lock = session.get(JobLock, 1)
     if lock is not None and lock.job_id is not None:
         adopted = (
@@ -815,8 +818,11 @@ def build_production_snapshot(
         )
         if not adopted:
             raise ValueError("discovery data is being mutated")
+    fill_query = select(DiscoveryDataFill)
+    if fill_id is not None:
+        fill_query = fill_query.where(DiscoveryDataFill.id == fill_id)
     fill = session.scalars(
-        select(DiscoveryDataFill)
+        fill_query
         .order_by(DiscoveryDataFill.id.desc())
         .limit(1)
     ).first()

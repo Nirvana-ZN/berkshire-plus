@@ -5,7 +5,7 @@ from copy import deepcopy
 from math import isfinite
 from typing import TypeVar
 
-BUILD_VERSION = "discovery-v7"
+BUILD_VERSION = "discovery-v8"
 AVAILABLE_BUILDS = frozenset({BUILD_VERSION})
 CANDIDATE_BUILD_VERSION = "discovery-v8"
 # Callable validation is deliberately separate from production publication.
@@ -17,6 +17,7 @@ RETIRED_BUILDS = frozenset(
         "discovery-v4",
         "discovery-v5",
         "discovery-v6",
+        "discovery-v7",
     }
 )
 

@@ -50,6 +50,7 @@ from discovery.rulers import (
     deep_value_ruler,
     garp_ruler,
     quality_discount_ruler,
+    TrackRuler, _validate_track_semantics, _canonical_ruler_payload,
 )
 from discovery.snapshot import (
     FrozenCompanyInput,
@@ -685,6 +686,13 @@ def _branch_counts(
     return {branch: counts[branch] for branch in INDUSTRY_BRANCHES}
 
 
+def _historical_hypothesis(payload):
+    """Validate a v7 hypothesis structurally without making it executable."""
+    payload['algorithm_version'] = 'discovery-v7'
+    return json.loads(_canonical_ruler_payload(_validate_track_semantics(
+        TrackRuler.from_payload(payload, allow_retired_algorithm=True))))
+
+
 def _quality_payload(
     thresholds: Mapping[str, str],
     *,
@@ -781,8 +789,7 @@ def _quality_payload(
         "industry_version": industry_version,
         "algorithm_version": BUILD_VERSION,
     }
-    ruler = quality_discount_ruler(payload)
-    return json.loads(canonical_payload(ruler))
+    return _historical_hypothesis(payload)
 
 
 def _deep_value_payload(
@@ -860,7 +867,7 @@ def _deep_value_payload(
         "industry_version": industry_version,
         "algorithm_version": BUILD_VERSION,
     }
-    return json.loads(canonical_payload(deep_value_ruler(payload)))
+    return _historical_hypothesis(payload)
 
 
 def _garp_payload(
@@ -932,7 +939,7 @@ def _garp_payload(
         "industry_version": industry_version,
         "algorithm_version": BUILD_VERSION,
     }
-    return json.loads(canonical_payload(garp_ruler(payload)))
+    return _historical_hypothesis(payload)
 
 
 def _quantiles(values: Sequence[Decimal]) -> dict[str, str] | None:

@@ -10,7 +10,7 @@ from types import MappingProxyType
 
 import pytest
 
-from discovery.builds import BUILD_VERSION
+HISTORICAL_BUILD_VERSION = 'discovery-v7'
 from discovery.snapshot import FrozenRunInputs, canonical_json
 from tests.test_discovery_tracks_quality import (
     _annual,
@@ -92,7 +92,7 @@ FORMULAS = {
 }
 
 
-def deep_value_payload(**threshold_overrides: str) -> dict[str, object]:
+def deep_value_payload(*, build_version=HISTORICAL_BUILD_VERSION, **threshold_overrides: str) -> dict[str, object]:
     thresholds = {
         "listing_years_min": "5",
         "normalized_earnings_min": "0",
@@ -214,7 +214,7 @@ def deep_value_payload(**threshold_overrides: str) -> dict[str, object]:
             ["code", "asc", "nulls_last"],
         ],
         "industry_version": "test-industry-v1",
-        "algorithm_version": BUILD_VERSION,
+        "algorithm_version": build_version,
     }
 
 
@@ -266,6 +266,7 @@ def _classify(company=None, payload=None):
     )
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_deep_value_ruler_is_complete_and_semantically_strict() -> None:
     from discovery.rulers import deep_value_ruler
 
@@ -299,6 +300,7 @@ def test_deep_value_ruler_is_complete_and_semantically_strict() -> None:
     ("shares", "deducted", "bucket"),
     [("100", "200", "1"), ("100", "100", "3"), ("120", "100", "3")],
 )
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_normalized_pe_bucket_quarters_the_ceiling(
     shares: str, deducted: str, bucket: str
 ) -> None:
@@ -311,6 +313,7 @@ def test_normalized_pe_bucket_quarters_the_ceiling(
     assert verdict.metrics["normalized_pe_bucket"] == bucket
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_deep_value_cash_debt_double_high_drops() -> None:
     def verdict_for(debt: str):
         annual = tuple(
@@ -329,6 +332,7 @@ def test_deep_value_cash_debt_double_high_drops() -> None:
     assert _classify().verdict == "pass"
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_deep_value_zero_interest_debt_skips_interest_coverage() -> None:
     def verdict_for(debt: str):
         annual = tuple(
@@ -343,6 +347,7 @@ def test_deep_value_zero_interest_debt_skips_interest_coverage() -> None:
     assert verdict_for("0").verdict == "pass"
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_nonfinancial_normalizes_deducted_profit_and_requires_positive_fcf() -> None:
     annual = tuple(
         _deep_annual(
@@ -383,6 +388,7 @@ def test_nonfinancial_normalizes_deducted_profit_and_requires_positive_fcf() -> 
         ),
     ],
 )
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_nonfinancial_deep_value_gates(
     changes: dict[str, str],
     reason: str,
@@ -395,6 +401,7 @@ def test_nonfinancial_deep_value_gates(
     assert (verdict.verdict, verdict.primary_reason) == ("drop", reason)
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_purity_shares_average_the_configured_window() -> None:
     payload = deep_value_payload()
     for key in ("one_time_profit", "impairment", "non_core_income_proxy"):
@@ -419,6 +426,7 @@ def test_purity_shares_average_the_configured_window() -> None:
     assert verdict_for({2023: None}).primary_reason == "impairment_insufficient"
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_missing_required_nonfinancial_field_is_insufficient() -> None:
     annual = tuple(
         _deep_annual(year, other_income=None)
@@ -459,6 +467,7 @@ def test_missing_required_nonfinancial_field_is_insufficient() -> None:
         ),
     ],
 )
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_nonfinancial_current_gates_require_latest_fiscal_endpoint(
     missing: str,
     reason: str,
@@ -476,6 +485,7 @@ def test_nonfinancial_current_gates_require_latest_fiscal_endpoint(
     assert verdict.metrics[metric] is None
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_financial_branch_uses_pb_roe_npl_and_verified_capital_only() -> None:
     annual = tuple(
         _deep_annual(
@@ -505,6 +515,7 @@ def test_financial_branch_uses_pb_roe_npl_and_verified_capital_only() -> None:
     assert verdict.metrics["bank_capital_adequacy"] == "14"
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_branch_selection_precedes_branch_specific_domain_validation() -> None:
     bank = tuple(
         _deep_annual(
@@ -532,6 +543,7 @@ def test_branch_selection_precedes_branch_specific_domain_validation() -> None:
     assert unsupported.primary_reason == "industry_branch_insurance_unsupported"
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_financial_missing_capital_is_insufficient() -> None:
     annual = tuple(
         _deep_annual(year, capital_adequacy=None)
@@ -560,6 +572,7 @@ def test_financial_missing_capital_is_insufficient() -> None:
         ),
     ],
 )
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_bank_latest_required_year_never_falls_back_to_stale_fields(
     missing: str,
     reason: str,
@@ -577,6 +590,7 @@ def test_bank_latest_required_year_never_falls_back_to_stale_fields(
     assert verdict.metrics[metric] is None
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_bank_latest_accepted_stale_year_is_used_when_ruler_allows_it() -> None:
     annual = tuple(_deep_annual(year) for year in range(2020, 2025))
     verdict = _classify(_company(industry="银行", annual=annual))
@@ -594,6 +608,7 @@ def test_bank_latest_accepted_stale_year_is_used_when_ruler_allows_it() -> None:
         ("-", "industry_branch_unknown"),
     ],
 )
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_unsupported_and_unknown_branches_are_insufficient(
     industry: str,
     reason: str,
@@ -605,6 +620,7 @@ def test_unsupported_and_unknown_branches_are_insufficient(
     )
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_exact_calendar_windows_staleness_and_domains_are_enforced() -> None:
     old = tuple(
         _deep_annual(year, deducted_net_income="9999" if year == 2020 else "100")
@@ -632,6 +648,7 @@ def test_exact_calendar_windows_staleness_and_domains_are_enforced() -> None:
     )
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_ruler_order_controls_primary_reason_and_keeps_structured_metrics() -> None:
     annual = tuple(
         _deep_annual(year, ocf="10", capex="20", interest_debt="400", cash="0")
@@ -647,6 +664,7 @@ def test_ruler_order_controls_primary_reason_and_keeps_structured_metrics() -> N
     assert verdict.metrics["net_debt_to_normalized_fcf"] is None
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_deep_value_decimal_arithmetic_is_isolated_and_bounded() -> None:
     huge = "1" + "0" * 100
     annual = tuple(
@@ -686,6 +704,7 @@ def test_deep_value_decimal_arithmetic_is_isolated_and_bounded() -> None:
         DefaultContext.flags = saved_default.flags.copy()
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_same_company_can_differ_between_quality_and_deep_value() -> None:
     from tests.test_discovery_tracks_quality import _classify as quality_classify
 
@@ -697,6 +716,7 @@ def test_same_company_can_differ_between_quality_and_deep_value() -> None:
     ).verdict == "drop"
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_builtin_dispatches_deep_value_gate_and_competition() -> None:
     from jobs.discovery import (
         TrackExecutionCandidate,
@@ -717,7 +737,7 @@ def test_builtin_dispatches_deep_value_gate_and_competition() -> None:
             {"quality_discount": None, "deep_value": 2, "garp": None}
         ),
         ruler_payloads=MappingProxyType({}),
-        algorithm_version=BUILD_VERSION,
+        algorithm_version=HISTORICAL_BUILD_VERSION,
         trading_dates=MappingProxyType({"SH": ("2026-09-17",)}),
         snapshot_at=company.snapshot_at,
         companies=(company,),
@@ -738,7 +758,7 @@ def test_builtin_dispatches_deep_value_gate_and_competition() -> None:
         attempt=1,
         input_fingerprint="run",
         ruler_version_id=2,
-        algorithm_version=BUILD_VERSION,
+        algorithm_version=HISTORICAL_BUILD_VERSION,
         common_stage_id=1,
         predecessor_stage_id=None,
         predecessor_stage=None,
@@ -839,6 +859,7 @@ def test_builtin_dispatches_deep_value_gate_and_competition() -> None:
         ),
     ],
 )
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_passing_nonfinancial_competition_emits_threshold_risk(
     latest: dict[str, str],
     expected_rule: str,
@@ -874,6 +895,7 @@ def test_passing_nonfinancial_competition_emits_threshold_risk(
     assert risk.input_fields[threshold[0]] == threshold[1]
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_passing_bank_npl_worsening_emits_frozen_threshold_trend_risk() -> None:
     from discovery.evidence import build_evidence_card
 
@@ -910,6 +932,7 @@ def test_passing_bank_npl_worsening_emits_frozen_threshold_trend_risk() -> None:
     )
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_boom_median_with_collapsed_latest_earnings_drops_while_moderate_dip_passes() -> None:
     from discovery.evidence import build_evidence_card
 
@@ -974,6 +997,7 @@ def test_boom_median_with_collapsed_latest_earnings_drops_while_moderate_dip_pas
     )
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_bank_roe_fact_and_near_threshold_use_bank_observations() -> None:
     from discovery.evidence import build_evidence_card
 
@@ -1012,6 +1036,7 @@ def test_bank_roe_fact_and_near_threshold_use_bank_observations() -> None:
     )
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_evidence_threshold_arithmetic_is_bounded_and_context_isolated() -> None:
     from discovery.evidence import FALLBACK_RISK_TEXT, build_evidence_card
 
@@ -1043,6 +1068,7 @@ def test_evidence_threshold_arithmetic_is_bounded_and_context_isolated() -> None
         setcontext(saved)
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_calibrator_deep_value_is_deterministic_blocked_and_read_only(
     tmp_path: Path,
 ) -> None:
@@ -1062,6 +1088,7 @@ def test_calibrator_deep_value_is_deterministic_blocked_and_read_only(
     assert hashlib.sha256(db.read_bytes()).hexdigest() == before
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_calibrator_deep_value_emits_approval_ready_proxy_evidence(
     tmp_path: Path,
     monkeypatch,
@@ -1117,7 +1144,7 @@ def test_calibrator_deep_value_emits_approval_ready_proxy_evidence(
             ruler_version_ids=MappingProxyType(
                 {"quality_discount": None, "deep_value": None, "garp": None}
             ),
-            algorithm_version=BUILD_VERSION,
+            algorithm_version=HISTORICAL_BUILD_VERSION,
         ),
         trading_dates=MappingProxyType({"SH": ("2026-09-15",)}),
         snapshot_at=_company().snapshot_at,
@@ -1152,6 +1179,7 @@ def test_calibrator_deep_value_emits_approval_ready_proxy_evidence(
     assert hashlib.sha256(db.read_bytes()).hexdigest() == before
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_calibrator_deep_value_blocks_missing_trusted_proxy_source(
     tmp_path: Path,
     monkeypatch,
@@ -1197,7 +1225,7 @@ def test_calibrator_deep_value_blocks_missing_trusted_proxy_source(
             ruler_version_ids=MappingProxyType(
                 {"quality_discount": None, "deep_value": None, "garp": None}
             ),
-            algorithm_version=BUILD_VERSION,
+            algorithm_version=HISTORICAL_BUILD_VERSION,
         ),
         trading_dates=MappingProxyType({"SH": ("2026-09-15",)}),
         snapshot_at=company.snapshot_at,
@@ -1229,6 +1257,7 @@ def test_calibrator_deep_value_blocks_missing_trusted_proxy_source(
     ] == 1
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_calibrator_rejects_duplicate_canonical_annual_year_before_overwrite() -> None:
     from scripts.calibrate_discovery import _annual_rows
 
@@ -1240,6 +1269,7 @@ def test_calibrator_rejects_duplicate_canonical_annual_year_before_overwrite() -
         _annual_rows(company)
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_calibrator_requires_exact_field_dictionary_source_metadata() -> None:
     from scripts.calibrate_discovery import _trusted_decimal
 

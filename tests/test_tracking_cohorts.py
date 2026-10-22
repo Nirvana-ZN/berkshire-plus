@@ -33,7 +33,15 @@ def persisted_run(session, *, legacy=False, week='2026-W38'):
     run = add_unfrozen_run(session, week_key=week)
     run.current = True
     run.status = 'running'
-    if not legacy:
+    if legacy:
+        run.algorithm_version = 'discovery-v7'
+        retained = json.loads(run.ruler_payloads_json)
+        for entry in retained.values():
+            entry['payload']['algorithm_version'] = 'discovery-v7'
+            from tracking.contracts import digest
+            entry['sha256'] = digest(entry['payload'])
+        run.ruler_payloads_json = canonical_json(retained)
+    else:
         run.algorithm_version = 'discovery-v8'
         run.ruler_payloads_json = canonical_json({track: {
             'id': 1, 'payload': json.loads(canonical_payload(candidate(track))),
@@ -94,9 +102,10 @@ def manifest_for(session, run_id, variant='full_selected', track='garp', config=
 
 
 def publish_waiting(session, run):
-    from jobs.discovery import _commit_if_current, confirm_waiting_layers
+    # Registration-only fixture: caller owns this transaction; no queue executes.
+    from jobs.discovery import confirm_waiting_layers
     confirm_waiting_layers(session, run, PUBLISHED)
-    assert _commit_if_current(session, run.id, lambda: PUBLISHED)
+    session.commit()
 
 
 def test_default_experiment_declares_execution_and_maturity():
@@ -293,7 +302,7 @@ def test_partial_publication_retry_preserves_first_track_receipt(store):
     from jobs.discovery import confirm_waiting_layers, _commit_if_current
     later = PUBLISHED + timedelta(minutes=1)
     confirm_waiting_layers(store, run, later)
-    assert _commit_if_current(store, run.id, lambda: later)
+    store.commit()  # Registration-only caller transaction.
     assert len(store.scalars(select(StrategyCohort)).all()) == 9
     assert manifest_for(store, run.id) == (first, original)
     assert manifest_for(store, run.id, track='deep_value')[1]['published_run_at'] == later.isoformat()
@@ -320,9 +329,8 @@ def test_executor_publication_and_three_cohorts_commit_or_rollback_together(stor
     from app.selection_models import StrategyCohort, StrategyExperiment
     from jobs import discovery as worker
     run, stage = empty_queued_competition(store)
-    # Candidate remains inactive globally; this controlled executor test supplies
-    # its local availability boundary and never activates a persisted ruler.
-    monkeypatch.setattr(worker, 'AVAILABLE_BUILDS', {'discovery-v8'})
+    # Isolate registration atomicity; T19 exercises real publication authority.
+    monkeypatch.setattr(worker, 'execution_authorized', lambda session, run: True)
     if registration_fails:
         store.execute(text("CREATE TRIGGER reject_second_variant BEFORE INSERT ON strategy_cohorts "
                            "WHEN NEW.variant_id='no_operating_selected' "
@@ -407,7 +415,7 @@ def test_protocol_retains_identity_and_rules_without_inventing_future_data(store
     for key in ('protocol_hash', 'registration_hash', 'source_selection_hash', 'manifest_hash'):
         assert len(manifest[key]) == 64
     from discovery.builds import AVAILABLE_BUILDS, BUILD_VERSION
-    assert BUILD_VERSION == 'discovery-v7' and 'discovery-v8' not in AVAILABLE_BUILDS
+    assert BUILD_VERSION == 'discovery-v8' and AVAILABLE_BUILDS == {'discovery-v8'}
 
 
 def test_append_members_and_delete_source_are_rejected(store):

@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 
 from app.envfile import OPENAI_API_KEY, write_env_value
 from app.main import create_app
+from app.db import create_db_engine
 from market.eastmoney import FakeMarketClient
 from market.quotes import FakeQuoteClient
 from market.sentiment import (
@@ -185,7 +186,7 @@ def test_weekend_loads_share_one_hist_row(tmp_path: Path) -> None:
     db = tmp_path / "app.db"
     with _client(tmp_path, market=market) as client:
         assert client.get("/api/sentiment").status_code == 200
-    engine = create_engine(f"sqlite:///{db.resolve().as_posix()}")
+    engine = create_db_engine(db)
     with engine.begin() as conn:
         conn.execute(text("DELETE FROM settings WHERE key = 'sentiment'"))
     with _client(tmp_path, market=market) as client:

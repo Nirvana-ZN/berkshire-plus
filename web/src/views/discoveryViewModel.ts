@@ -742,6 +742,7 @@ function parseEvidence(value: unknown): ParsedDiscoveryEvidence | null {
   const riskCategory = typeof value.rule_id === 'string' && value.rule_id.startsWith(riskPrefix)
     ? value.rule_id.slice(riskPrefix.length).split('.', 1)[0] ?? ''
     : ''
+  const isSelectionV8Risk = value.rule_id === `${String(value.track)}.risk.selection_v8`
   if (
     nonNegativeInteger(value.id) === null
     || !isTrack(value.track)
@@ -764,6 +765,7 @@ function parseEvidence(value: unknown): ParsedDiscoveryEvidence | null {
     || (value.kind === 'fact' && value.data_completeness !== 'complete')
     || (
       value.kind === 'risk'
+      && !isSelectionV8Risk
       && (
         (riskCategory !== 'none' && !RISK_CATEGORIES.has(riskCategory))
         || (

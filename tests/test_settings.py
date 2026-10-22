@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import subprocess
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
@@ -20,7 +21,9 @@ ROOT = Path(__file__).resolve().parents[1]
 SECRET = "sk-test-do-not-leak-xyz"
 
 def _engine(db_path: Path):
-    return create_engine(f"sqlite:///{db_path.resolve().as_posix()}")
+    from app.db import create_db_engine
+    return create_db_engine(db_path)
+
 
 
 def _rows(db_path: Path, sql: str):
@@ -168,10 +171,13 @@ def test_model_only_does_not_touch_env(tmp_path: Path) -> None:
 
 
 def test_gitignore_ignores_env_and_db() -> None:
-    text = (ROOT / ".gitignore").read_text(encoding="utf-8")
-    lines = {line.strip() for line in text.splitlines() if line.strip()}
-    assert ".env" in lines
-    assert "data/app.db" in lines
+    protected = ('.env', 'data/app.db', 'data/app.db-wal', 'data/app.db-shm', 'data/app.db-journal')
+    result = subprocess.run(
+        ['git', 'check-ignore', '--no-index', '--', *protected], cwd=ROOT,
+        text=True, capture_output=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert set(result.stdout.splitlines()) == set(protected)
 
 
 def test_does_not_write_repo_env(tmp_path: Path) -> None:

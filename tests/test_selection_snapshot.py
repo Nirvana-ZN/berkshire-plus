@@ -249,10 +249,12 @@ def test_actual_case_card_contains_frozen_policy_triggers_and_provenance(state, 
     from discovery.evidence import build_evidence_card
     from tests.test_discovery_evidence import metrics, ruler_payload, SOURCE_AS_OF
     from tests.test_selection_periods import POLICY
+    from tests.test_selection_v8 import candidate
     result = {'state': state, 'period': '2026H1', 'reasons': ['required_gap' if state == 'unknown' else 'deducted_profit_drop'],
               'metrics': {'deducted_profit_yoy': {'value': '-0.5', 'evidence_ids': ['fixture-source']}}}
     card = build_evidence_card('000001.SZ', metrics(operating_result=result, operating_policy=POLICY,
-                                                    fundamental_fingerprint='frozen-hash'), ruler_payload(), source_as_of=SOURCE_AS_OF)
+                                                    fundamental_fingerprint='frozen-hash', ranking_branch='nonfinancial'),
+                               ruler_payload(), source_as_of=SOURCE_AS_OF)
     item = next(item for item in card.items if '.risk.operating.' in item.rule_id)
     assert item.data_completeness == completeness
     assert item.input_fields['operating_result'] == result
@@ -297,79 +299,31 @@ def test_real_schema4_fill_snapshot_ignores_mutable_financial_and_late_evidence(
     engine.dispose()
 
 
-def test_competition_candidate_and_audit_ignore_live_financial_mutation(tmp_path):
-    from app.db import init_db
-    from app.models import Financial
-    from app.discovery_models import DiscoveryStage, DiscoveryResult, DiscoveryEvidence
+def test_competition_candidate_and_audit_ignore_live_financial_mutation(tmp_path, monkeypatch):
     from sqlalchemy import select
     from sqlalchemy.orm import Session
-    from tests.discovery_helpers import add_unfrozen_run, versions, company
-    from tests.test_discovery_common import _add_track_stage, _add_track_result
-    from tests.test_discovery_evidence import metrics
-    from tests.test_discovery_tracks_quality import quality_payload
-    from discovery.snapshot import freeze_inputs, load_frozen_inputs, canonical_json, _sha256
-    from discovery.evidence_store import append_evidence
-    from discovery.fundamentals import snapshot_payload, operating_state, plain
-    from tests.test_selection_periods import POLICY
-    from jobs.discovery import _track_candidates, builtin_track_executor, TrackExecutionContext, _validate_track_outcome, _execute_track_stage
-    from discovery.builds import BUILD_VERSION
-    engine = init_db(tmp_path / 'competition.db')
-    records = tuple(identified(replace(row, code='600000.SH')) for row in bundle_with_evidence().evidence_records)
-    snap = freeze_fundamentals(records, (), (), code='600000.SH', cutoff_at=CUTOFF, current_mcap=None)
-    fields = {**snapshot_payload(snap), 'operating_policy': POLICY, 'operating_result': plain(operating_state(snap, POLICY))}
-    item = replace(company('600000.SH'), fields=fields,
-                   as_of={'financial': '2026-08-31', 'security': '2026-10-21', 'valuation': '2026-10-21'})
+    from app.models import Financial
+    from app.discovery_models import DiscoveryResult
+    from tests.test_selection_release import retained_release_fill
+    from tests.test_selection_acceptance import _selection_run
+    from scripts.release_selection_v8 import publish_release
+    from discovery.snapshot import build_production_snapshot, load_frozen_inputs
+    engine, fill_id = retained_release_fill(tmp_path, monkeypatch)
+    publish_release(tmp_path / 'release.db', fill_id=fill_id, reason='synthetic frozen audit', backup_dir=tmp_path / 'backups')
     with Session(engine) as session:
-        run = add_unfrozen_run(session, week_key='2026-W43')
-        rulers = json.loads(run.ruler_payloads_json)
-        rulers['quality_discount']['payload'] = quality_payload()
-        rulers['quality_discount']['sha256'] = _sha256(quality_payload())
-        run.ruler_payloads_json = canonical_json(rulers)
-        run.current = True
-        for record in records:
-            append_evidence(session, record)
-        freeze_inputs(session, run, (item,), versions(), {'SH': ['2026-10-21']}, snapshot_at=CUTOFF)
-        gate = _add_track_stage(session, run, track='quality_discount', created_at=CUTOFF, status='confirmed')
-        result = _add_track_result(session, gate)
-        result.metrics_json = canonical_json(metrics(code='600000.SH', branch='nonfinancial', quality_branch='nonfinancial'))
-        stage = DiscoveryStage(run_id=run.id, track='quality_discount', stage='competition', attempt=1, status='queued',
-                               input_fingerprint=run.input_fingerprint, algorithm_version=BUILD_VERSION,
-                               ruler_version_id=1, common_stage_id=None, predecessor_stage_id=gate.id,
-                               predecessor_stage='track_gate', created_at=CUTOFF, updated_at=CUTOFF)
-        session.add(stage)
-        session.flush()
-        def outcome():
-            frozen = load_frozen_inputs(session, run.id)
-            context = TrackExecutionContext(stage.id, run.id, 'quality_discount', 'competition', 1,
-                                             run.input_fingerprint, 1, BUILD_VERSION, None, gate.id, 'track_gate',
-                                             frozen, quality_payload(), _track_candidates(session, stage))
-            return frozen.input_fingerprint, _validate_track_outcome(context, builtin_track_executor(context))
-        before = outcome()
-        session.add(Financial(code='600000.SH', period='2026H1', period_type='interim',
-                              deducted_net_income=Decimal('99999999'), ocf=Decimal('9999999')))
-        session.commit()
-        assert outcome() == before
-        audit = json.loads(before[1].results[0].metrics_json)
+        snapshot = build_production_snapshot(session, fill_id=fill_id)
+        run_id, frozen, outcomes, _ = _selection_run(session, snapshot)
+        audit = json.loads(outcomes['quality_discount'].results[0].metrics_json)
         assert audit['operating_result']['state'] == 'deteriorating'
         assert audit['freeze_new_positions'] is True
-        assert 'interim_deterioration' in audit['risk_flags']
-        assert any('operating.deteriorating' in row.rule_id for row in before[1].evidence)
-        session.commit()
-        assert _execute_track_stage(session, stage.id, builtin_track_executor, lambda: CUTOFF)
-        def persisted():
-            return ([(row.rank, row.metrics_json) for row in session.scalars(select(DiscoveryResult).where(DiscoveryResult.stage == 'competition'))],
-                    [(row.rule_id, row.input_fields_json) for row in session.scalars(select(DiscoveryEvidence).order_by(DiscoveryEvidence.id))],
-                    load_frozen_inputs(session, run.id).input_fingerprint)
-        persisted_before = persisted()
-        assert json.loads(persisted_before[0][0][1])['operating_result'] == audit['operating_result']
-        late = identified(replace(records[-1], values={'deducted_net_income': '1', 'ocf': '-100'},
-                                  observed_at=CUTOFF + timedelta(days=1), supersedes_id=records[-1].evidence_id))
-        append_evidence(session, late)
-        live = session.get(Financial, ('600000.SH', '2026H1', 'interim'))
+        assert audit['ranking_audit']['risk_state'] == 'deteriorating'
+        before = [(row.id, row.metrics_json) for row in session.scalars(select(DiscoveryResult))]
+        live = session.get(Financial, ('600000.SH', '2025', 'annual'))
         live.deducted_net_income = Decimal('-99999999')
         session.commit()
-        assert persisted() == persisted_before
-        assert outcome() == before
+        assert load_frozen_inputs(session, run_id) == frozen
+        assert build_production_snapshot(session, fill_id=fill_id) == snapshot
+        assert [(row.id, row.metrics_json) for row in session.scalars(select(DiscoveryResult))] == before
     engine.dispose()
 
 

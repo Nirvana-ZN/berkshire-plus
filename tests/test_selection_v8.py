@@ -20,7 +20,7 @@ def candidate(track='garp', payload=None):
         from tests.test_discovery_tracks_deep_value import deep_value_payload
         payload = {'garp': garp_payload, 'quality_discount': quality_payload,
                    'deep_value': deep_value_payload}[track]()
-    return candidate_ruler(payload, operating_policy={}, band='base')
+    return candidate_ruler({**payload, 'algorithm_version': 'discovery-v7'}, operating_policy={}, band='base')
 
 
 def company(base=None, *, cap='1000', ebit='20', restricted='0', coverage=True, tax='4'):
@@ -89,7 +89,7 @@ def test_nonpositive_peg_is_explicitly_unavailable(field, value):
     assert result.value is None and result.reason and result.status != 'verified'
 
 
-def test_garp_uses_deducted_value_but_keeps_ordinary_history():
+def test_garp_uses_deducted_value_but_keeps_ordinary_history(monkeypatch):
     from discovery.tracks.garp import classify
     from tests.test_discovery_tracks_quality import _valuations
     from tests.test_discovery_tracks_garp import _garp_annual
@@ -97,7 +97,10 @@ def test_garp_uses_deducted_value_but_keeps_ordinary_history():
     original = _company(valuations=_valuations(latest_pe='10'), annual=tuple(
         _garp_annual(year, deducted_net_income=decimal_string(D('20') * D('1.2') ** (year - 2021)))
         for year in range(2021, 2026)))
-    legacy = classify(original, garp_payload())
+    # Historical algorithm comparison only; production v7 remains retired.
+    with monkeypatch.context() as historical:
+        historical.setattr('discovery.rulers.AVAILABLE_BUILDS', frozenset({'discovery-v7'}))
+        legacy = classify(original, {**garp_payload(), 'algorithm_version': 'discovery-v7'})
     result = classify(company(original), candidate())
     assert result.verdict == 'drop'
     assert 'garp.peg_above_max' in result.evidence_rule_ids
@@ -128,16 +131,18 @@ def test_missing_event_coverage_never_passes_unchanged_share_gate():
 
 
 def test_candidate_is_callable_but_cannot_publish(tmp_path):
-    from sqlalchemy import create_engine
+    from app.db import init_db
     from sqlalchemy.orm import Session
     from discovery.builds import AVAILABLE_BUILDS
     from discovery.rulers import activate
     ruler = candidate()
     assert ruler.algorithm_version == 'discovery-v8'
-    assert 'discovery-v8' not in AVAILABLE_BUILDS
-    with Session(create_engine('sqlite://')) as session:
-        with pytest.raises(ValueError, match='candidate'):
+    assert AVAILABLE_BUILDS == frozenset({'discovery-v8'})
+    engine = init_db(tmp_path / 'unpublished.db')
+    with Session(engine) as session:
+        with pytest.raises(ValueError, match='release|publication'):
             activate(session, ruler, 'synthetic verification')
+    engine.dispose()
 
 
 def test_candidate_policy_and_registry_are_in_digest():
@@ -147,6 +152,7 @@ def test_candidate_policy_and_registry_are_in_digest():
     assert payload_digest(first) != payload_digest(second)
     assert first.metric_contract['version'] == 'selection-metrics-v1'
     assert first.ranking_contract['branch_orders']['nonfinancial'][1] == ('deducted_peg', 'asc')
+    assert first.formulas['return_metric_label'] == 'literal(roic_gross_5y)'
 
 
 def test_quality_absolute_yield_and_deep_cash_use_frozen_evidence():
@@ -205,8 +211,9 @@ def test_actual_executor_persists_rank_audit_and_same_card_metrics():
 
 
 def test_registered_contract_rejects_drift_and_v7_json_is_unchanged():
-    from discovery.rulers import canonical_payload, garp_ruler
-    old = canonical_payload(garp_payload())
+    from discovery.rulers import canonical_payload, garp_ruler, TrackRuler, _canonical_ruler_payload
+    old = _canonical_ruler_payload(TrackRuler.from_payload(
+        {**garp_payload(), 'algorithm_version': 'discovery-v7'}, allow_retired_algorithm=True))
     assert json.loads(old).keys() == garp_payload().keys()
     value = json.loads(canonical_payload(candidate()))
     value['metric_contract']['collection_policy']['restricted_cash_ratio_min'] = '0.1'

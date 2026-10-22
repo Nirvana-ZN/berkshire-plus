@@ -133,6 +133,86 @@ def _retained_excerpt(payload: Mapping[str, object], *, document_sha256: str,
                 sort_keys=True, allow_nan=False, separators=(',', ':'))}
 
 
+RELEASE_SECURITY_FIELDS = frozenset({'exchange', 'listing_date', 'is_st', 'is_delisting',
+    'trading_status', 'is_suspended', 'last_trade_date', 'industry_version', 'industry_as_of',
+    'security_source', 'market_status_code'})
+RELEASE_CALENDAR_FIELDS = frozenset({'calendar_version', 'calendar_source_url',
+    'calendar_document_sha256', 'calendar_coverage_end', 'period_due_dates'})
+
+
+def _release_descriptor(payload, *, source_url, document_sha256):
+    kind = payload.get('kind')
+    def day(value):
+        if type(value) is not str or date.fromisoformat(value).isoformat() != value:
+            raise ValueError('release descriptor requires canonical dates')
+        return value
+    if kind == 'release_universe':
+        from ledger.quotes import is_a_share_code
+        value = payload.get('release_universe')
+        if not isinstance(value, Mapping) or set(value) != {'version', 'market_date', 'trading_dates', 'securities'} or value['version'] != 'release-universe-v1':
+            raise ValueError('release universe descriptor is invalid')
+        day(value['market_date'])
+        calendars = value['trading_dates']
+        if not isinstance(calendars, dict) or not calendars or not set(calendars) <= {'SH', 'SZ'}:
+            raise ValueError('release universe calendars are invalid')
+        for dates in calendars.values():
+            if (not isinstance(dates, list) or not dates or any(type(item) is not str for item in dates)
+                    or dates != sorted(set(dates)) or any(day(item) > value['market_date'] for item in dates)):
+                raise ValueError('release universe calendars are invalid')
+        securities = value['securities']
+        if not isinstance(securities, list) or not securities:
+            raise ValueError('release universe securities are required')
+        codes = []
+        for row in securities:
+            if not isinstance(row, dict) or set(row) != {'code', 'name', 'industry', 'security_status'}:
+                raise ValueError('release universe security shape is invalid')
+            if type(row['code']) is not str or not is_a_share_code(row['code']) or row['code'] != row['code'].upper():
+                raise ValueError('release universe code is invalid')
+            codes.append(row['code'])
+            _text(row['name'], 'security name')
+            if row['industry'] is not None:
+                _text(row['industry'], 'industry')
+            state = row['security_status']
+            if not isinstance(state, dict) or set(state) != RELEASE_SECURITY_FIELDS:
+                raise ValueError('release universe security fields are invalid')
+            for key, item in state.items():
+                if item is None:
+                    continue  # retained unknown state remains a release blocker
+                if key in {'is_st', 'is_delisting', 'is_suspended'}:
+                    if type(item) is not bool:
+                        raise ValueError('release universe state must be boolean or null')
+                elif key == 'market_status_code':
+                    if type(item) is not int:
+                        raise ValueError('release universe market status is invalid')
+                elif key in {'listing_date', 'last_trade_date', 'industry_as_of'}:
+                    day(item)
+                else:
+                    _text(item, key)
+        if codes != sorted(set(codes)) or payload.get('code') != codes[0]:
+            raise ValueError('release universe requires sorted unique codes and first-code anchor')
+        if payload.get('period') != value['market_date']:
+            raise ValueError('release universe period must equal market date')
+        return {'_release_universe': json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False, allow_nan=False)}
+    if kind == 'disclosure_calendar':
+        from discovery.fundamentals import period_order
+        value = payload.get('disclosure_calendar')
+        if not isinstance(value, Mapping) or set(value) != RELEASE_CALENDAR_FIELDS:
+            raise ValueError('disclosure calendar descriptor is invalid')
+        _text(value['calendar_version'], 'calendar version')
+        if value['calendar_source_url'] != source_url or value['calendar_document_sha256'] != document_sha256:
+            raise ValueError('disclosure calendar must bind its retained source')
+        day(value['calendar_coverage_end'])
+        if not isinstance(value['period_due_dates'], dict) or not value['period_due_dates']:
+            raise ValueError('disclosure calendar due dates are required')
+        for period, due in value['period_due_dates'].items():
+            period_order(period)
+            day(due)
+        return {'_disclosure_calendar': json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False, allow_nan=False)}
+    if 'release_universe' in payload or 'disclosure_calendar' in payload:
+        raise ValueError('release descriptors require their explicit evidence kind')
+    return {}
+
+
 def parse_source_evidence(payload: Mapping[str, object]) -> EvidenceRecord:
     """Normalize without inferring trust, publication dates or absent zeros.
 
@@ -187,6 +267,7 @@ def parse_source_evidence(payload: Mapping[str, object]) -> EvidenceRecord:
             # A narrowly typed categorical boundary: callers still cannot inject
             # reserved values or self-certify classification through raw values.
             values['_industry'] = _text(payload.get('industry'), 'industry')
+        values.update(_release_descriptor(payload, source_url=source_url, document_sha256=document_sha256))
         published = _time(payload.get('published_at'), 'published_at')
         updated = _time(payload['source_updated_at'], 'source_updated_at') if payload.get('source_updated_at') is not None else None
         status = payload.get('status', 'untrusted')

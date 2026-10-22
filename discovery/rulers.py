@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextlib import contextmanager
+from weakref import WeakKeyDictionary
 from collections.abc import Mapping, Sequence
 from dataclasses import InitVar, dataclass, field
 from datetime import datetime, timezone
@@ -25,6 +27,7 @@ from ledger.positions import LOCAL_USER_ID
 
 DISCOVERY_PAYLOAD_SCOPE = "weekly-discovery"
 RULER_NOT_READY = "ruler_not_ready"
+_release_sessions = WeakKeyDictionary()
 DISCOVERY_DECIMAL_COMPONENT_LIMIT = 4096
 # Bounds source text, coefficient digits, and exponent before any fixed-point
 # formatting. Accepted values therefore format to at most roughly twice this.
@@ -1645,9 +1648,7 @@ def validate_ruler_version(
             row.payload_json,
             allow_retired_algorithm=allow_retired_algorithm,
         )
-        if ruler.algorithm_version not in AVAILABLE_BUILDS and (
-            ruler.algorithm_version == CANDIDATE_BUILD_VERSION or not allow_retired_algorithm
-        ):
+        if ruler.algorithm_version not in AVAILABLE_BUILDS and not allow_retired_algorithm:
             raise ValueError('candidate build is not a production ruler')
         # Retired payloads were semantically validated at activation; the
         # digest check below still proves they are the activated bytes.
@@ -1724,6 +1725,13 @@ def latest(
     algorithm_version: str | None = None,
 ) -> RulerVersion | None:
     scope = _scope(track_or_scope)
+    if CANDIDATE_BUILD_VERSION in AVAILABLE_BUILDS:
+        receipt = _published_release(session, user_id=user_id)
+        if receipt is None or algorithm_version not in (None, CANDIDATE_BUILD_VERSION):
+            return None
+        expected = receipt['rulers'][track_for_scope(scope)]
+        row = session.get(RulerVersion, expected['id'])
+        return row
     return _newest_valid(
         _rows(session, scope, user_id=user_id),
         track=track_for_scope(scope),
@@ -1746,6 +1754,16 @@ def activate(
         raise ValueError('candidate build cannot be published before production activation')
     payload_json = canonical_payload(ruler)
     digest = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+    if ruler.algorithm_version == CANDIDATE_BUILD_VERSION:
+        permission = _release_sessions.get(session)
+        allowed = (permission is not None and permission['transaction'] is session.get_transaction()
+                   and permission['user_id'] == user_id
+                   and permission['digests'].get(ruler.track) == digest)
+        receipt = None if allowed else _published_release(session, user_id=user_id)
+        if not allowed and (receipt is None or receipt['rulers'][ruler.track]['digest'] != digest):
+            raise ValueError('v8 ruler requires a coverage-qualified atomic release publication')
+        if not allowed:
+            return session.get(RulerVersion, receipt['rulers'][ruler.track]['id'])
     existing = _newest_valid(
         _rows(
             session,
@@ -1862,6 +1880,104 @@ def require_ready(
 status = readiness
 
 
+@contextmanager
+def _release_authorization(session, rulers, *, user_id):
+    """Internal exact-contract capability, bounded by one owner/transaction."""
+    if user_id != LOCAL_USER_ID or session.get_transaction() is None or session in _release_sessions:
+        raise ValueError('release requires the local owner and an exclusive caller transaction')
+    if set(rulers) != set(TRACKS):
+        raise ValueError('release requires all three tracks')
+    _release_sessions[session] = {'user_id': user_id, 'transaction': session.get_transaction(),
+                                 'digests': {track: payload_digest(ruler) for track, ruler in rulers.items()}}
+    try:
+        yield
+    finally:
+        _release_sessions.pop(session, None)
+
+
+def _published_release(session, *, user_id):
+    """Do not skip a corrupt/newer rollback receipt in favour of an old one."""
+    from app.selection_models import SelectionRelease
+    if user_id != LOCAL_USER_ID:
+        return None
+    row = session.scalar(select(SelectionRelease).where(SelectionRelease.user_id == user_id)
+                         .order_by(SelectionRelease.id.desc()).limit(1).execution_options(populate_existing=True))
+    return _validate_publication_receipt(session, row, user_id=user_id)
+
+
+def _validate_publication_receipt(session, row, *, user_id):
+    from app.selection_models import SelectionRelease
+    if (row is None or row.user_id != user_id or user_id != LOCAL_USER_ID
+            or row.action != 'publish' or row.build != CANDIDATE_BUILD_VERSION):
+        return None
+    try:
+        value = json.loads(row.payload_json)
+        canonical = json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False, allow_nan=False)
+        if (canonical != row.payload_json or hashlib.sha256(canonical.encode()).hexdigest() != row.digest
+                or value['user_id'] != user_id or value['action'] != row.action or value['build'] != row.build
+                or value['fill_id'] != row.fill_id or value['previous_id'] != row.previous_id
+                or value['reason'] != row.reason or value['created_at'] != row.created_at.isoformat()
+                or set(value['rulers']) != set(TRACKS) or value['report']['eligible'] is not True
+                or value['report']['build'] != row.build or value['report']['fill_id'] != row.fill_id
+                or value['input_hash'] != value['report']['input_hash']
+                or value['configuration_hash'] != value['report']['configuration_hash']
+                or value['report_hash'] != hashlib.sha256(json.dumps(value['report'], sort_keys=True,
+                    separators=(',', ':'), ensure_ascii=False, allow_nan=False).encode()).hexdigest()):
+            return None
+        if row.previous_id is not None:
+            prior = session.get(SelectionRelease, row.previous_id)
+            if (prior is None or prior.user_id != user_id or prior.id >= row.id
+                    or prior.digest != value['previous_digest']):
+                return None
+        for track, identity in value['rulers'].items():
+            ruler = session.get(RulerVersion, identity['id'])
+            if (ruler is None or ruler.user_id != user_id or ruler.digest != identity['digest']
+                    or ruler.digest != value['report']['ruler_digests'][track]
+                    or json.loads(ruler.payload_json) != value['report']['rulers'][track]):
+                return None
+            validate_ruler_version(ruler, expected_track=track, expected_algorithm_version=CANDIDATE_BUILD_VERSION)
+        return value
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+
+def execution_authorized(session, run):
+    """Authorize frozen execution, preserving its original exact publication.
+
+    A newer valid publication does not replace frozen configuration. A newest
+    rollback, corrupt receipt, missing authority, or retired build fails closed.
+    Call again under the result transaction's SQLite write lock before commit.
+    """
+    from app.selection_models import SelectionRelease
+    if run is None or run.algorithm_version not in AVAILABLE_BUILDS:
+        return False
+    if run.algorithm_version != CANDIDATE_BUILD_VERSION:
+        return True  # Only explicitly available historical test builds reach here.
+    if run.user_id != LOCAL_USER_ID or _published_release(session, user_id=run.user_id) is None:
+        return False
+    try:
+        frozen = json.loads(run.ruler_payloads_json)
+        ids = {track: getattr(run, f'{track}_ruler_version_id') for track in TRACKS}
+        if set(frozen) != set(TRACKS) or any(type(value) is not int for value in ids.values()):
+            return False
+        for row in session.scalars(select(SelectionRelease).where(
+                SelectionRelease.user_id == run.user_id, SelectionRelease.action == 'publish',
+                SelectionRelease.created_at <= run.created_at).order_by(SelectionRelease.id.desc())
+                .execution_options(populate_existing=True)):
+            value = _validate_publication_receipt(session, row, user_id=run.user_id)
+            if value is None:
+                continue
+            if all(value['rulers'][track]['id'] == ids[track]
+                   and frozen[track]['id'] == ids[track]
+                   and frozen[track]['sha256'] == value['rulers'][track]['digest']
+                   and frozen[track]['payload'] == value['report']['rulers'][track]
+                   for track in TRACKS):
+                return True
+    except (AttributeError, KeyError, TypeError, ValueError):
+        pass
+    return False
+
 
 def _legacy_candidate_projection(ruler):
     """Reuse structural gate validation; this object is never executed or published."""
@@ -1893,8 +2009,14 @@ def candidate_ruler(value, *, operating_policy, band='base') -> TrackRuler:
     from discovery.selection_contract import metric_contract, ranking_contract, registered_metrics
     if band not in {'conservative', 'base', 'relaxed'}:
         raise ValueError('unknown candidate hypothesis band')
-    base = _validate_track_semantics(parse_payload(value))
-    if base.algorithm_version == CANDIDATE_BUILD_VERSION:
+    if isinstance(value, TrackRuler):
+        historical = value
+    elif isinstance(value, str):
+        historical = TrackRuler.from_json(value, allow_retired_algorithm=True)
+    else:
+        historical = TrackRuler.from_payload(value, allow_retired_algorithm=True)
+    base = _validate_track_semantics(historical)
+    if base.algorithm_version != 'discovery-v7':
         raise ValueError('candidate factory requires a legacy hypothesis')
     payload = _plain(base.payload())
     specs = registered_metrics(base.track)
@@ -1911,6 +2033,7 @@ def candidate_ruler(value, *, operating_policy, band='base') -> TrackRuler:
     if 'peg_growth_cap' in payload['thresholds']:
         payload['thresholds']['peg_growth_cap'] = '0.25'
     if base.track == 'garp':
+        payload['formulas']['return_metric_label'] = 'literal(roic_gross_5y)'
         payload['thresholds'].pop('return_on_capital_min')
         payload['thresholds']['roic_gross_min'] = {'conservative': '0.12', 'base': '0.1', 'relaxed': '0.08'}[band]
         payload['min_observations']['roic'] = 5
@@ -1937,6 +2060,8 @@ def _validate_candidate(ruler, *, expected_track):
         policies[name] = spec.missing_policy
         if spec.alias:
             formulas[spec.alias] = f'alias({name})'
+    if ruler.track == 'garp':
+        formulas['return_metric_label'] = 'literal(roic_gross_5y)'
     if (ruler.fields != expected_fields or dict(ruler.formulas) != formulas
             or dict(ruler.missing_policy) != policies or ruler.order != base.order
             or _plain(ruler.metric_contract) != _plain(_freeze_json(metric_contract(ruler.track)))

@@ -19,7 +19,12 @@ def decimal_series(*values: str | None) -> tuple[Decimal | None, ...]:
     return tuple(Decimal(value) if value is not None else None for value in values)
 
 
-def discovery_ruler_payload(track: str) -> dict[str, object]:
+def discovery_ruler_payload(track: str, *, build_version=BUILD_VERSION) -> dict[str, object]:
+    if build_version == "discovery-v8" and track in {"quality_discount", "deep_value", "garp"}:
+        import json
+        from discovery.rulers import canonical_payload
+        from tests.test_selection_v8 import candidate
+        return json.loads(canonical_payload(candidate(track)))
     if track == "quality_discount":
         from tests.test_discovery_tracks_quality import quality_payload
 

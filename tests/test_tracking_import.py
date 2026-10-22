@@ -19,7 +19,8 @@ def write_json(root, name, value):
     return {'path': str(path), 'sha256': hashlib.sha256(raw).hexdigest()}
 
 
-def seal_sources(root, records_by_part, *, inventory=None, frozen_input=None):
+def seal_sources(root, records_by_part, *, inventory=None, frozen_input=None,
+                 generated_at='2026-10-20T01:00:00+00:00', reviewed_at='2026-10-20T02:00:00+00:00'):
     """Synthetic raw captures and an independently authored fixture receipt.
 
     These are test attestations, never claims about actual historical feeds.
@@ -48,7 +49,7 @@ def seal_sources(root, records_by_part, *, inventory=None, frozen_input=None):
     parts = {name: write_json(root, f'{name}.json', {'origin': 'normalized_history', 'records': records})
              for name, records in records_by_part.items()}
     source = {'origin': 'retained_source_manifest_v1', 'author': 'fixture extractor',
-        'generated_at': '2026-10-20T01:00:00+00:00', 'records': entries,
+        'generated_at': generated_at, 'records': entries,
         'datasets': {name: ref['sha256'] for name, ref in parts.items()}}
     if inventory is not None:
         source['universe_inventory'] = write_json(root, 'inventory.json',
@@ -62,7 +63,7 @@ def seal_sources(root, records_by_part, *, inventory=None, frozen_input=None):
     manifest_ref = write_json(root, 'source-manifest.json', source)
     review_ref = write_json(root, 'source-review.json', {
         'origin': 'human_review', 'reviewer': 'independent fixture archivist',
-        'reviewed_at': '2026-10-20T02:00:00+00:00', 'manifest_sha256': manifest_ref['sha256'],
+        'reviewed_at': reviewed_at, 'manifest_sha256': manifest_ref['sha256'],
         'decision': 'source_evidence_reviewed', 'independence_basis': 'Separate source reviewer',
         'provenance_assessment': 'Assessed original raw records and extraction linkage',
         'archive_assessment': 'Assessed original version archive and full universe, including exits'})

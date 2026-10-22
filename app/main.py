@@ -15,7 +15,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from app.db import PROJECT_ROOT, create_session_factory, init_db
+from app.db import PROJECT_ROOT, create_session_factory, database_read_only, init_db
 from app.discovery_models import DiscoveryRun
 from app.tracking_routes import create_tracking_router
 from app.discovery_routes import (
@@ -962,6 +962,7 @@ def create_app(
         engine = init_db(db_path)
         session_factory = create_session_factory(engine)
         app.state.engine = engine
+        app.state.schema_read_only = database_read_only(engine)
         app.state.session_factory = session_factory
         app.state.tracking_provider = tracking_provider
         app.state.tracking_clock = tracking_clock or (lambda: datetime.now(timezone.utc))
@@ -996,6 +997,14 @@ def create_app(
         resolved_yaml = _resolve_yaml_dir(yaml_dir)
         app.state.yaml_dir = str(resolved_yaml) if resolved_yaml is not None else None
         app.state.migrate_error = None
+        if app.state.schema_read_only:
+            # No portfolio import/refresh, lock cleanup, worker resumption or
+            # background fetch may run against an unknown schema.
+            try:
+                yield
+            finally:
+                engine.dispose()
+            return
         with session_factory() as session:
             try:
                 migrate_yaml_portfolio(session, resolved_yaml)
@@ -1084,6 +1093,12 @@ def create_app(
         engine.dispose()
 
     app = FastAPI(title="本机工作台", lifespan=lifespan)
+    @app.middleware('http')
+    async def schema_write_guard(request: Request, call_next):
+        if getattr(request.app.state, 'schema_read_only', False) and request.method not in {'GET', 'HEAD', 'OPTIONS'}:
+            return JSONResponse(status_code=503, content={'error': 'database is read-only',
+                'code': 'schema_read_only', 'detail': 'Unknown database schema; compatible historical reads only.'})
+        return await call_next(request)
     app.include_router(create_discovery_router())
     app.include_router(create_tracking_router())
 

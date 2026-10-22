@@ -34,6 +34,7 @@ from app.discovery_models import (
 from app.models import JobLock
 from discovery.aggregate import aggregate_run_status
 from discovery.builds import AVAILABLE_BUILDS, _is_build_available
+from discovery.rulers import execution_authorized
 from discovery.common import CommonVerdict, classify_common
 from discovery.competition import CompetitionCandidate, rank_borda_competition, rank_competition
 from discovery.constants import (
@@ -687,6 +688,12 @@ def _commit_if_current(
         session.rollback()
         return False
     _verify_run_lock(session, run_id)
+    # Flush owns SQLite's writer transaction before authority is re-read. A
+    # rollback during a long callback must win before any results/cohorts commit.
+    session.flush()
+    if not execution_authorized(session, session.get(DiscoveryRun, run_id)):
+        session.rollback()
+        return False
     session.commit()
     return True
 
@@ -1819,7 +1826,8 @@ def drain_run_queue(
         while True:
             session.expire_all()
             run = session.get(DiscoveryRun, run_id)
-            if not _run_is_mutable(run, now_provider):
+            if not _run_is_mutable(run, now_provider) or not execution_authorized(session, run):
+                session.rollback()
                 return DrainOutcome(run_id, True, executed)
             confirm_waiting_layers(session, run, _now(now_provider))
             if not _commit_if_current(session, run_id, now_provider):

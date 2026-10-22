@@ -1,8 +1,8 @@
 # 选股策略总览
 
-更新：2026-10-15。规则按工作区里的 `discovery-v7` 代码与 `scripts/calibrate_discovery.py` 的基准档（base）整理。
+更新：2026-10-23。当前可执行构建为 `discovery-v8`；只有经过本页末尾的数据就绪检查与原子发布后，三轨执行才获授权。真实数据尚未就绪，生产未激活，成熟收益未建立。以下 v7 阈值与运行记录保留为历史说明，v7 已停止执行。
 
-> **当前状态**：2026-10-15 已激活三把 `discovery-v7` 尺子（ruler_versions id 21 质量折价、22 深度价值、23 GARP），基于第 9 次全市场拉取（10-08 快照）校准，并重跑完成了 `2026-W42` 批次（run id 7）。基准档通过：质量折价 24、深度价值 34、GARP 17（同一份数据下 v6 为 24 / 46 / 17，v5 为 9 / 46 / 17，v4 为 12 / 47 / 17）。v7 相对 v6 在深度价值非金融分支新增“盈利塌陷排雷”独立关卡（最新年度扣非净利润较 5 年常态扣非净利润中位数的降幅 `earnings_decline ≤ 30%`，保守 / 基准 / 宽松三档分别为 20% / 30% / 40%），保持 `normalized_earnings` 5 年中位数定义纯粹的同时，淘汰景气高点占满 3 年把中位数锚定在高位、但近两年盈利已结构性崩塌的价值陷阱（如海利尔、志邦家居、一心堂等 12 家公司）；质量折价与 GARP 门槛不变，随版本号重发。下文标了“v4”“v5”“v6”“v7”的地方是相对上一版的改动。
+> **历史记录**：2026-10-15 已激活三把 `discovery-v7` 尺子（ruler_versions id 21 质量折价、22 深度价值、23 GARP），基于第 9 次全市场拉取（10-08 快照）校准，并重跑完成了 `2026-W42` 批次（run id 7）。基准档通过：质量折价 24、深度价值 34、GARP 17（同一份数据下 v6 为 24 / 46 / 17，v5 为 9 / 46 / 17，v4 为 12 / 47 / 17）。v7 相对 v6 在深度价值非金融分支新增“盈利塌陷排雷”独立关卡（最新年度扣非净利润较 5 年常态扣非净利润中位数的降幅 `earnings_decline ≤ 30%`，保守 / 基准 / 宽松三档分别为 20% / 30% / 40%），保持 `normalized_earnings` 5 年中位数定义纯粹的同时，淘汰景气高点占满 3 年把中位数锚定在高位、但近两年盈利已结构性崩塌的价值陷阱（如海利尔、志邦家居、一心堂等 12 家公司）；质量折价与 GARP 门槛不变，随版本号重发。下文标了“v4”“v5”“v6”“v7”的地方是相对上一版的改动。
 
 项目里共有三套与“选股 / 判断”相关的规则（旧版低估值榜已于 2026-10-09 移除，见第 2 节），另有一套指数基金筛选：
 
@@ -273,3 +273,55 @@
 QDII 基金的跟踪误差常在 3% 以上（汇率与时差），代表基金是 QDII 的海外指数较常被这一条挡住。
 
 阈值都在 `screen/index_funds.py` 顶部，改了直接生效，没有尺子账本。
+
+## 9. selection-v8发布与历史边界
+
+这一节描述v8的版本化合约，优先于前文历史版本的每周发现规则。v8可执行不代表已经有可发布的数据；目前生产尚未就绪，未执行生产发布。软件验收、数据源就绪、生产启用、期限结果成熟分别记录。保留的[真实来源抽查](discovery-calibration/selection-evidence-source-audit.md)及 `reports/selection-v8-source-audit-2026-10-22.zip` 不改写，不将两家公司抽查或本地归档哈希扩展成全市场、历史时点或来源真实性认证。`discovery-calibration/v8/` 的三个产物仍为无观测合约，计数和输入指纹为空。
+
+### 9.1 经济含义与证据边界
+
+各分支按适用指标的归一化中位排名贡献排序，同值同分，空列不贡献；风险类型去重后先排序，再应用行业/总名额。代码只打破最终并列，不改变不同经济分数的顺序。经济稀释调整转增、拆合股等非融资股数变化，事件覆盖不全时不可假定零稀释。扣非TTM市盈率和扣非PEG使用同日总市值与可比扣非金额；历史普通PE分位仍单独保留，不拼接口径。
+
+深度价值把可用现金定义为现金减已证实的受限现金，债务负担截断为非负；净现金不能因FCF下降而在债务维度变得更好。GARP使用五年可追溯ROIC gross，需六年投入资本端点，ROE不作隐式替代，银行走独立代理分支。应收、合同资产、存货、受限资金与关联占款保留零/缺失/不可信/不适用及来源，影子信号不自动升级为准入门槛。
+
+研究等级由冻结来源与有效引用决定；模型自报A、无反证范围或无失效条件均不能替代证据。价格带是明确复核假设的确定性计算，模型不能覆盖；缺少假设只观察。共同经济风险按建议后的组合计算，未知占比保留；fail/skip先于经营冻结，减仓不因上限而被阻止。三轨通过、研究建议和纸面组合均不产生真实交易。
+
+### 9.2 来源准备与新填充
+
+来源导入沿用本地 `scripts.import_selection_evidence`：输入是JSON数组，每条保留 `code/kind/period/published_at/observed_at/source_url/document_sha256/basis_id/status/values`，以及 `source_document_path/source_excerpt/report_location/verification/excerpt_verification`。`status=verified`必须有原文、字面摘录或明确人工摘录复核、原文/摘录SHA256、复核人和不晚于原始cutoff的复核时间。导入程序验证保留关系，不自行认证人类身份、真实公开时间或财务字段解释。供应商映射仍不能自动变成可信事实。
+
+先用 `uv run python -m scripts.import_selection_evidence --db <绝对路径> --input <来源JSON> --dry-run` 验证；去掉 `--dry-run` 才追加来源。来源必须先导入，再独立执行新填充，不能修改旧payload补齐。两个新类型的顶层描述符如下，调用方不得在 `values` 注入任何 `_` 保留键：
+
+| kind | 顶层描述符与准确约束 |
+|---|---|
+| `release_universe` | `release_universe` 包含 `version="release-universe-v1"`、`market_date`、`trading_dates={"SH":[...],"SZ":[...]}`（仅实际涉及交易所）和按代码唯一排序的 `securities`。一份清单只挂在全清单第一个代码，`period=market_date`；不向每家公司重复全市场清单。 |
+| `disclosure_calendar` | `disclosure_calendar` 包含 `calendar_version/calendar_source_url/calendar_document_sha256/calendar_coverage_end/period_due_dates`。URL和哈希必须等于该来源记录；每家公司需保留对应日历证据。 |
+
+清单每个证券必须包含 `code/name/industry/security_status`；`security_status` 必须准确包含 `exchange/listing_date/is_st/is_delisting/trading_status/is_suspended/last_trade_date/industry_version/industry_as_of/security_source/market_status_code`。与封存的整个证券集合、分母排除状态、上市年限、行业分组和交易日历逐字段比较。保留未知值不等于确认正常，未知必阻止发布。来源清单不包含应用稍后生成的 `snapshot_at`；该时间由封存输入指纹和原始cutoff另行绑定。
+
+解析器只为上述类型产生 `_release_universe`、`_disclosure_calendar`。日历描述符须等于填充实际冻结的经营政策子集；完整政策还含 `version="operating-v1"/profit_drop/calendar_status="verified"/calendar_complete=true`。必须覆盖cutoff并明确各累计报告期截止日，不能用一个期数清单或空政策代替。所有公司政策必须一致，三把尺子冻结这个实际政策。
+
+现有UI自动填充仍使用默认参数，不能假定它已经启用了这些来源。受控本地调用沿用 `jobs.discovery_data.start_discovery_data_fill(session)` 取得新填充和锁，再调用 `execute_discovery_data_fill(session, market, fill.id, selection_fundamentals=True, selection_source_dir=<保留原文目录>, operating_policy=<完整复核政策>)`；`market`须为现有兼容提供者。正常预算、请求计数、断点、封存和锁机制全部保留。没有新增HTTP或提供者，也不会在发布报告里联网补数。完成后的schema4填充须独立保留完整检查点、实际尝试/请求记录、原始cutoff与来源绑定；旧schema或复制补字段不能通过。
+
+### 9.3 覆盖与原子发布
+
+默认只读命令：`uv run python -m scripts.release_selection_v8 --db <绝对路径> --fill-id <正整数> --dry-run`。指定ID缺失或不合格时不退回其他填充。报告包含输入/配置/来源审计哈希、实际三轨合约、经济语义变化、候选诊断及阻断原因；候选数量不是门槛，报告也不声称自身运行了整个软件测试集。
+
+`selection-readiness-v1` 要求可信共同字段至少95%，各适用新字段/来源窗口至少90%；全体、适用分支、每个非空行业都检查相同最低覆盖，小行业无豁免。上市年限按指标计算：一般五年，五年ROIC gross需要六年；未知上市日、排除状态、行业或无法核对的完整证券清单均阻止发布，不能缩小分母。0/0为 `not_applicable`，比例为空。真实零可计入可信分子；经济判定失败不等于来源缺失。
+
+全部独立软件检查通过、数据合格并得到操作授权后，明确执行 `--apply --reason <理由> --backup-dir <备份目录绝对路径>`。仅本机用户1可发布，不为全局市场填充虚构所有者字段。备份使用SQLite backup API稳定读事务，包含已提交WAL内容；路径必须是预期绝对目录内的新文件，拒绝源库别名、外部路径、已有文件和链接穿越。验证可打开、完整性、外键、所有实际应用表计数和文件SHA256。默认报告不建目录、不写库。
+
+备份前后与写事务中重新比对报告、来源、当前回执和备份哈希；变化即失败。三把尺子与 `selection_releases` 发布回执在同一个事务追加，任一失败全部回滚。回执绑定本机所有者、精确填充、输入/报告/配置/尺子哈希、三轨ID、上次回执、时间、理由和备份。普通 `activate/latest/require_ready` 只认当前有效发布回执的精确三轨，改变全局BUILD_VERSION不提供启动绕过。重复发布重用同一规范尺子并追加可追溯回执。
+
+### 9.4 迁移、回退与纸面跟踪
+
+启动做追加建表/索引与兼容检查，保留旧财务缓存及冻结字节，不执行旧财务TEXT重建、估值序列回填、缓存清空或大表可信完整性推断。应用schema为SQLite `user_version=8`；所有实际应用表的INSERT/UPDATE/DELETE均要求支持连接注册 `selection_writer_version()=8`。旧程序的真实启动路径在写尺子scope之前被拒绝。此机制用于意外版本误用，不是对有权删触发器/改DDL的数据库所有者的安全隔离。未知schema使用只读连接，跳过导入、行情刷新、种子、锁清理、队列恢复等启动写入，兼容GET仍可读；未知未来布局可能无法读取。
+
+新增和保留的选择证据/计算账本包括 `fundamental_evidence/fundamental_coverage/selection_research_assumptions/strategy_experiments/strategy_cohorts/strategy_members/strategy_market_events/strategy_ledger_entries/strategy_observations`，以及T17的 `tracking_requests`、T18的 `portfolio_exposure_versions/portfolio_exposure_selections/portfolio_review_exposure_captures`、T19的 `selection_releases`。备份和写能力守卫动态覆盖全部实际应用表，不能只使用早期十表清单。跟踪请求的终态回执与来源、注册、计算、暴露版本分别保持原有不可变约束。
+
+回退命令为 `uv run python -m scripts.release_selection_v8 --db <绝对路径> --rollback-read-only --reason <理由> --backup-dir <绝对路径>`。它先建立一致备份，然后追加 `read_only` 回执，禁止新发现执行，不删除尺子/证据，不让旧程序重算v8。恢复需要另一份合格发布；不要把原始旧库文件覆盖到正在使用的升级库。
+
+队列按原始注册冻结成员、输入、规则、成本和基准身份；前瞻/回溯分组保持分离。分红应收与付款不双算、停牌/涨跌停未成交保留现金或延迟退出，退市不删除样本。未到期、缺日历/价格/基准源时收益保持不可用；只有来源合格且同修订版本的总回报基准可比较，重叠样本只作描述，不外推年化。现代市场/公告/日历窗口支持1992-01-01起固定UTC+08规则；更早窗口明确报历史时区缺口，早期上市日期仍可保留为元数据。合成未来时钟下的期限完成只验证软件，不能声明真实收益成熟。
+
+
+Execution also requires the original owner-scoped publication receipt for the exact frozen ruler IDs and digests, issued no later than run creation. Later valid publication preserves that original authority; a latest read_only, missing, or invalid receipt blocks queued and resumed execution. A worker flushes pending writes to obtain the SQLite writer lock, revalidates publication authority, then commits. Rollback during a callback therefore prevents new results and cohorts from being published.

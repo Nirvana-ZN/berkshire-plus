@@ -10,6 +10,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
 from app.discovery_models import DiscoveryResult
+from app.db import create_db_engine
 from app.models import ResearchArtifact, ResearchJob
 from scripts import evolve_rulers
 from tests.test_evolve_rulers import _seed_evolution_db
@@ -28,7 +29,7 @@ def test_llm_labels_never_suffice_for_activation():
 def test_model_support_never_confirms_or_writes_rulers(tmp_path: Path, fail_count: int):
     db = tmp_path / "research.db"
     _seed_evolution_db(db)
-    engine = create_engine(f"sqlite:///{db}")
+    engine = create_db_engine(db)
     with Session(engine) as session:
         row = session.scalars(select(DiscoveryResult).where(
             DiscoveryResult.code == "300627.SZ")).one()
@@ -70,7 +71,7 @@ def test_model_support_never_confirms_or_writes_rulers(tmp_path: Path, fail_coun
 def test_gray_is_a_research_label_not_investment_success(tmp_path: Path):
     db = tmp_path / "gray.db"
     _seed_evolution_db(db)
-    engine = create_engine(f"sqlite:///{db}")
+    engine = create_db_engine(db)
     with Session(engine) as session:
         job = session.scalars(select(ResearchJob).where(ResearchJob.code == "300750.SZ")).one()
         artifact = session.scalars(select(ResearchArtifact).where(

@@ -16,6 +16,37 @@ def payload():
     return json.loads(FIXTURE.read_text(encoding='utf-8-sig'))[0]
 
 
+def release_inventory():
+    return {'version': 'release-universe-v1', 'market_date': '2026-09-16',
+        'trading_dates': {'SZ': ['2026-09-15', '2026-09-16']},
+        'securities': [{'code': '000001.SZ', 'name': 'synthetic', 'industry': '制造业',
+            'security_status': {'exchange': 'SZ', 'listing_date': '2000-01-01', 'is_st': False,
+                'is_delisting': False, 'trading_status': 'trading', 'is_suspended': False,
+                'last_trade_date': '2026-09-16', 'industry_version': 'fixture-v1',
+                'industry_as_of': '2026-09-16', 'security_source': 'retained-fixture', 'market_status_code': 1}}]}
+
+
+def test_typed_release_inventory_and_calendar_cannot_inject_reserved_values():
+    from market.evidence import parse_source_evidence
+    data = {**payload(), 'code': '000001.SZ', 'kind': 'release_universe', 'period': '2026-09-16',
+            'values': {}, 'release_universe': release_inventory()}
+    row = parse_source_evidence(data)
+    assert json.loads(row.values['_release_universe']) == release_inventory()
+    calendar = {'calendar_version': 'fixture-calendar-v1', 'calendar_source_url': data['source_url'],
+        'calendar_document_sha256': data['document_sha256'], 'calendar_coverage_end': '2026-12-31',
+        'period_due_dates': {'2025': '2026-04-30', '2026H1': '2026-08-31'}}
+    row = parse_source_evidence({**payload(), 'kind': 'disclosure_calendar', 'values': {},
+                                 'disclosure_calendar': calendar})
+    assert json.loads(row.values['_disclosure_calendar']) == calendar
+    with pytest.raises(ValueError, match='reserved'):
+        parse_source_evidence({**data, 'values': {'_release_universe': '{}'}})
+    with pytest.raises(ValueError, match='anchor'):
+        parse_source_evidence({**data, 'code': '600000.SH'})
+    with pytest.raises(ValueError, match='calendar'):
+        parse_source_evidence({**payload(), 'kind': 'disclosure_calendar', 'values': {},
+            'disclosure_calendar': {**calendar, 'calendar_document_sha256': 'f' * 64}})
+
+
 def test_normalized_json_preserves_missing_zero_and_report_location():
     from market.evidence import parse_source_evidence
     row = parse_source_evidence(payload())

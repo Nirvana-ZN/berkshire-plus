@@ -73,7 +73,7 @@
           "pe_deducted_ttm": "current_mcap/deducted_profit_ttm",
           "pe_percentile": "percentile_rank(current.pe,monthly.pe)",
           "peg": "alias(deducted_peg)",
-          "return_metric_label": "label(primary(annual.roic,fallback=annual.roe))",
+          "return_metric_label": "literal(roic_gross_5y)",
           "return_on_capital": "alias(roic_gross_5y)",
           "revenue_cagr": "cagr(exact_annual.revenue,revenue_cagr_periods)",
           "revenue_consistent_growth_periods": "count(exact_annual.revenue_yoy>=revenue_period_growth_min)",
@@ -789,7 +789,7 @@
         },
         "track": "garp"
       },
-      "ruler_digest": "2ba50aa362b27675c8980031bd3512d0557ba47a2b0a92b0774a6e7aad54690b"
+      "ruler_digest": "895c24a174a161e6e78f5d8b96488d1863aa072ade7926cd5756a37ddcb1cb98"
     },
     "conservative": {
       "counts": null,
@@ -855,7 +855,7 @@
           "pe_deducted_ttm": "current_mcap/deducted_profit_ttm",
           "pe_percentile": "percentile_rank(current.pe,monthly.pe)",
           "peg": "alias(deducted_peg)",
-          "return_metric_label": "label(primary(annual.roic,fallback=annual.roe))",
+          "return_metric_label": "literal(roic_gross_5y)",
           "return_on_capital": "alias(roic_gross_5y)",
           "revenue_cagr": "cagr(exact_annual.revenue,revenue_cagr_periods)",
           "revenue_consistent_growth_periods": "count(exact_annual.revenue_yoy>=revenue_period_growth_min)",
@@ -1571,7 +1571,7 @@
         },
         "track": "garp"
       },
-      "ruler_digest": "6a2d5d6fc29237c14e53048b6e03540e0aa50216d51c433f74d7e6db86f104d9"
+      "ruler_digest": "c80114d5f23b3c3092b7eef873b5b61fc685aa7aa726484aeaeb1c83215fee42"
     },
     "relaxed": {
       "counts": null,
@@ -1637,7 +1637,7 @@
           "pe_deducted_ttm": "current_mcap/deducted_profit_ttm",
           "pe_percentile": "percentile_rank(current.pe,monthly.pe)",
           "peg": "alias(deducted_peg)",
-          "return_metric_label": "label(primary(annual.roic,fallback=annual.roe))",
+          "return_metric_label": "literal(roic_gross_5y)",
           "return_on_capital": "alias(roic_gross_5y)",
           "revenue_cagr": "cagr(exact_annual.revenue,revenue_cagr_periods)",
           "revenue_consistent_growth_periods": "count(exact_annual.revenue_yoy>=revenue_period_growth_min)",
@@ -2353,7 +2353,7 @@
         },
         "track": "garp"
       },
-      "ruler_digest": "d3c32daa2bca3fb59dc50962378ef992b37f48f3ae09766c44274124712edc2b"
+      "ruler_digest": "505095121eae58002de8d132176ff05a9668e225dc5f6b47b724a1c19ba58745"
     }
   },
   "input_fingerprint": null,
