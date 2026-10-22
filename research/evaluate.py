@@ -8,8 +8,10 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from collections.abc import Mapping
-from discovery.fundamental_types import FundamentalSnapshot
+from discovery.fundamental_types import FundamentalSnapshot, MetricResult
 from discovery.fundamentals import deducted_pe, operating_state, plain
+from research.shareholder_return import (CONTRACT_VERSION, calendar_year, latest_progress,
+                                        reporting_window, shareholder_metrics)
 
 from research.llm import LLMClient
 from research.search import fetch_hits
@@ -137,6 +139,8 @@ def run_checklist(llm: LLMClient, payload: EvalInput) -> EvalOutput:
         parsed = _parse_model_json(raw_text)
         structured = normalize_structured(parsed, payload)
     structured["valuation"] = _enrich_valuation(payload)
+    structured.setdefault('shareholder_return', _shareholder_audit(payload))
+    structured.setdefault('realization_path', _normalize_realization(None, payload, structured['shareholder_return']))
     if payload.web_search:
         structured["search_hits"] = [dict(row) for row in payload.search_hits]
     if payload.notices:
@@ -181,6 +185,14 @@ def normalize_structured(raw: object, payload: EvalInput) -> dict[str, Any]:
         verdict = "gray"
     if verdict == "pass" and _deducted_trap_blocks_pass(payload):
         verdict = "gray"
+    shareholder = _shareholder_audit(payload)
+    realization = _normalize_realization(raw.get('realization_path'), payload, shareholder)
+    if (payload.fundamentals is not None or 'realization_path' in raw) and realization['status'] != 'verified':
+        for gate in gates:
+            if gate['name'] == '安全边际' and gate['status'] == 'pass':
+                gate.update(status='gray', reason=gate['reason'] + '；兑现路径及失效条件尚未核实。')
+        if verdict == 'pass':
+            verdict = 'gray'
     return {
         "verdict": verdict,
         "gates": gates,
@@ -190,7 +202,115 @@ def normalize_structured(raw: object, payload: EvalInput) -> dict[str, Any]:
         "data_grade": grade,
         "as_of": {"date": payload.as_of_date, "price": _json_optional(payload.price)},
         "portfolio_fit": fit,
+        "shareholder_return": shareholder,
+        "realization_path": realization,
     }
+
+
+def _shareholder_audit(payload: EvalInput) -> dict[str, Any]:
+    """Frozen cash-year denominators; no live Financial or normalized-FCF fallback."""
+    from discovery.evidence_store import available_at
+    from discovery.fundamentals import _facts_calculation
+
+    snapshot = payload.fundamentals
+    rows = (() if snapshot is None else tuple(row for row in snapshot.annuals + snapshot.interims + snapshot.extensions
+        if row.code == payload.code == snapshot.code and available_at(row) <= snapshot.cutoff_at))
+    coverage = () if snapshot is None or snapshot.code != payload.code else snapshot.coverage
+    window = reporting_window(coverage)
+    year = calendar_year(window)
+    unavailable = MetricResult(None, 'missing', 'matching_annual_denominator_missing', ())
+    fcf = profit = cap = unavailable
+    if year is not None:
+        fcf = _facts_calculation(rows, (('ocf', str(year)), ('capex', str(year))), lambda ocf, capex: ocf - capex)
+        profit = _facts_calculation(rows, (('deducted_net_income', str(year)),), lambda value: value)
+    caps = tuple(row for row in rows if row.kind == 'current_market_cap' and row.status == 'verified')
+    if snapshot is not None and snapshot.current_mcap is not None and caps:
+        amounts = tuple(_as_decimal(row.values.get('current_mcap')) for row in caps)
+        if all(value == snapshot.current_mcap for value in amounts):
+            cap = MetricResult(snapshot.current_mcap, 'verified', None, tuple(sorted(row.evidence_id for row in caps)))
+    metrics = shareholder_metrics(rows, coverage=coverage, mcap=cap.value, fcf=fcf.value, deducted_profit=profit.value)
+    for key, denominator in (('dividend_fcf_ratio', fcf), ('dividend_deducted_profit_ratio', profit),
+                             ('dividend_asof_yield', cap), ('buyback_asof_yield', cap)):
+        metric = metrics[key]
+        if metric.status == 'missing' and denominator.status == 'untrusted':
+            metric = replace(metric, status='untrusted', reason=denominator.reason)
+        metrics[key] = replace(metric, evidence_ids=tuple(sorted(set(metric.evidence_ids) | set(denominator.evidence_ids))))
+    try:
+        plans = [plain(row) for row in latest_progress(rows)
+                 if row.values.get('stage') in {'proposed', 'approved', 'implemented'}]
+    except ValueError:
+        plans = []  # Explicit metric errors retain the affected source IDs.
+    return {'contract_version': CONTRACT_VERSION, 'frozen_input': snapshot is not None,
+        'frozen_fingerprint': snapshot.fingerprint if snapshot is not None else None,
+        'window': None if window is None else {'start': window[0].isoformat(), 'end': window[1].isoformat(), 'annual': year is not None},
+        'yield_basis': 'window_cash/current_asof_market_cap; not_annualized',
+        'metrics': plain(metrics), 'denominators': plain({'annual_fcf': fcf, 'annual_deducted_profit': profit, 'asof_market_cap': cap}),
+        'known_plans': plans}
+
+
+def _normalize_realization(raw: object, payload: EvalInput, shareholder: dict[str, Any]) -> dict[str, Any]:
+    """Check pathway evidence membership/support, never certify investment success."""
+    from discovery.evidence_store import available_at
+    from discovery.constants import CHINA_MARKET_TIMEZONE
+    from market.corporate_actions import shareholder_effective_date, shareholder_stage
+    from market.evidence import _time
+
+    result = {'path': 'unknown', 'claim': '', 'evidence_ids': [], 'counterevidence_ids': [],
+        'falsification_condition': 'Obtain a supported realization pathway and a testable invalidation condition.',
+        'checked_at': payload.fundamentals.cutoff_at.isoformat() if payload.fundamentals is not None else None,
+        'status': 'missing', 'reason': 'realization_path_unverified',
+        'safety_margin_verified': False, 'frozen_input': payload.fundamentals is not None}
+    if not isinstance(raw, dict) or payload.fundamentals is None:
+        return result
+    path = raw.get('path')
+    if path not in {'dividend', 'operating_recovery', 'cancellation', 'asset_realization'}:
+        return result
+    snapshot = payload.fundamentals
+    sources = {row.evidence_id: row for row in snapshot.annuals + snapshot.interims + snapshot.extensions
+        if row.kind != 'coverage_reference' and row.code == payload.code == snapshot.code
+        and row.status == 'verified' and available_at(row) <= snapshot.cutoff_at}
+    ids, counter = raw.get('evidence_ids'), raw.get('counterevidence_ids', [])
+    condition = raw.get('falsification_condition')
+    if (not isinstance(ids, list) or not ids or not all(isinstance(key, str) and key in sources for key in ids)
+            or not isinstance(counter, list) or not all(isinstance(key, str) and key in sources for key in counter)
+            or not isinstance(condition, str) or not condition.strip()):
+        return result
+    metrics = shareholder['metrics']
+    supported = False
+    if path in {'dividend', 'cancellation'}:
+        key, kind, stage = ('dividend_paid', 'dividend', 'paid') if path == 'dividend' else ('buyback_cancelled_shares', 'buyback', 'cancelled')
+        metric = metrics[key]
+        supported = (metric['status'] == 'verified' and Decimal(metric['value']) > 0
+            and any(shareholder_stage(sources[key]) == (kind, stage) and key in metric['evidence_ids']
+                    and (_as_decimal(sources[key].values.get('amount' if path == 'dividend' else 'shares')) or Decimal(0)) > 0
+                    for key in ids))
+    elif path == 'operating_recovery':
+        state = operating_state(snapshot, payload.operating_policy or {})
+        state_ids = {key for metric in state.metrics.values() for key in metric.evidence_ids}
+        supported = state.state == 'improving' and bool(set(ids) & state_ids)
+    else:
+        # A retained asset realization must be an actual implemented event,
+        # not a forecast disposal value or a financial statement balance.
+        for key in ids:
+            row = sources[key]
+            if row.kind != 'asset_realization' or row.values.get('stage') != 'implemented':
+                continue
+            try:
+                supported = (shareholder_effective_date(row) <= snapshot.cutoff_at.astimezone(CHINA_MARKET_TIMEZONE).date()
+                    and (row.values.get('effective_at') is None or _time(row.values['effective_at'], 'effective_at') <= snapshot.cutoff_at)
+                    and (_as_decimal(row.values.get('amount')) or Decimal(0)) > 0)
+            except ValueError:
+                continue
+            if supported:
+                break
+    if not supported:
+        return result
+    result.update(path=path, claim=_as_text(raw.get('claim')) or path,
+        evidence_ids=sorted(set(ids)), counterevidence_ids=sorted(set(counter)),
+        falsification_condition=condition.strip(), status='verified', reason=None)
+    # Verified here means supported source membership; margin still depends on
+    # valuation and all six gates. Never derive a margin from a path alone.
+    return result
 
 
 def render_markdown(name: str, structured: dict[str, Any], *, web_search: bool) -> str:
@@ -254,11 +374,30 @@ def render_markdown(name: str, structured: dict[str, Any], *, web_search: bool) 
         f"研究日期：{as_of.get('date')}",
         f"所用股价：{as_of.get('price') if as_of.get('price') is not None else '无现价'}",
         _valuation_md(structured.get("valuation")),
+        _shareholder_markdown(structured),
         search_note,
         _notices_md(structured.get("notices")),
         "",
     ]
     return "\n".join(lines)
+
+
+def _shareholder_markdown(structured: dict[str, Any]) -> str:
+    audit = structured.get('shareholder_return')
+    path = structured.get('realization_path')
+    if not isinstance(audit, dict) or not isinstance(path, dict):
+        return ''
+    lines = ['', '## 股东回报兑现与价值实现', '',
+        f"兑现路径：{path.get('path')}（{path.get('status')}）",
+        f"路径证据：{', '.join(path.get('evidence_ids', [])) or '未核实'}",
+        f"失效条件：{path.get('falsification_condition')}",
+        f"现金报告窗口：{json.dumps(audit.get('window'), ensure_ascii=False)}；收益率分母为当前时点市值，未作年化。"]
+    for name, metric in audit.get('metrics', {}).items():
+        lines.append(f"- {name}: {metric.get('value') if metric.get('value') is not None else '未知'}"
+                     f" ({metric.get('status')}; {metric.get('reason') or '来源已核对'}); evidence_ids={','.join(metric.get('evidence_ids', []))}")
+    if not audit.get('frozen_input'):
+        lines.append('缺少冻结证据；本次旧版评估尚不满足新的证据研究要求。')
+    return '\n'.join(lines)
 
 
 def _gray_from_facts(payload: EvalInput) -> dict[str, Any]:
@@ -651,10 +790,19 @@ def _build_prompt(payload: EvalInput) -> str:
     valuation = json.dumps(_valuation_zh(snap), ensure_ascii=False)
     search = _search_prompt_block(payload)
     price = _json_optional(payload.price)
+    shareholder = _shareholder_audit(payload)
+    frozen = [] if payload.fundamentals is None else plain(tuple(
+        row for row in payload.fundamentals.annuals + payload.fundamentals.interims + payload.fundamentals.extensions
+        if row.kind != 'coverage_reference'))
+    realization_context = json.dumps({'shareholder_return': shareholder, 'frozen_evidence': frozen}, ensure_ascii=False)
     return (
         f"请对 {payload.name}（{payload.code}）做六关 Checklist 与决策备忘录。"
         f"只输出 JSON，键必须是英文: {', '.join(REQUIRED_KEYS)}。"
         f"verdict 只能是 pass/fail/gray。"
+        f"另给 realization_path 对象：path 为 dividend/operating_recovery/cancellation/asset_realization/unknown，"
+        f"包含 claim、evidence_ids、counterevidence_ids、falsification_condition。仅引用本次冻结证据ID；"
+        f"预案额度不等于已支付分红或已成交回购，激励回购不等于注销。unknown 可以继续研究，但不得据此确认安全边际。"
+        f"银行用资本、资产质量和分红可持续性，不用工业FCF。股东回报与冻结证据：{realization_context}。"
         f"gates 必须是数组（不能是对象），六项且每项含 name/status/reason，"
         f"name 覆盖：{'、'.join(GATE_NAMES)}，status 为 pass/fail/gray。"
         f"mirror_test 必须是五句。"

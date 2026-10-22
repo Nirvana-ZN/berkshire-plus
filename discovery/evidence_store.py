@@ -142,15 +142,39 @@ def select_evidence_as_of(records: Sequence[EvidenceRecord], *, code: str,
                     if row.code == code and available_at(row, historical=historical) <= cutoff}.values())
     # Unreviewed action corrections/withdrawals remain visible as raw evidence,
     # but cannot hide the verified fact that the action parser still needs.
-    superseded = {row.supersedes_id for row in visible
-                  if row.kind != 'capital_event' or (row.status == 'verified'
-                      and row.values.get('stage') in {'implemented', 'withdrawn'})}
+    def authoritative(row):
+        if row.kind == 'capital_event':
+            return row.status == 'verified' and row.values.get('stage') in {'implemented', 'withdrawn'}
+        if row.kind in {'dividend', 'buyback', 'equity_financing', 'buyback_trade'}:
+            return row.status == 'verified' and row.values.get('stage') in {
+                'proposed', 'approved', 'implemented', 'paid', 'executed',
+                'cancelled', 'traded', 'withdrawn', 'revoked'}
+        if row.kind == 'shareholder_return_coverage':
+            return row.status == 'verified' and row.values.get('stage') in {None, 'withdrawn', 'revoked'}
+        return True
+
+    protected = {'capital_event', 'dividend', 'buyback', 'equity_financing',
+                 'buyback_trade', 'shareholder_return_coverage'}
+    superseded = {row.supersedes_id for row in visible if row.kind not in protected}
     by_id = {row.evidence_id: row for row in visible}
     for row in visible:
-        if row.kind == 'capital_event' and row.status == 'verified' and row.values.get('stage') in {'implemented', 'withdrawn'}:
+        if row.kind in protected and authoritative(row):
             parent_id = row.supersedes_id
             seen = set()
             while parent_id in by_id and parent_id not in seen:
+                parent = by_id[parent_id]
+                if row.kind != 'capital_event':
+                    if (parent.code, parent.kind, parent.period) != (row.code, row.kind, row.period):
+                        raise ValueError('shareholder supersession must retain company, kind and period')
+                    if row.kind != 'shareholder_return_coverage' and parent.values.get('plan_id') != row.values.get('plan_id'):
+                        raise ValueError('shareholder supersession must retain plan_id')
+                    # A later proposal cannot withdraw an actual payment/trade.
+                    # Nor may one actual stage erase another stage's ledger.
+                    stage, prior = row.values.get('stage'), parent.values.get('stage')
+                    plans = {'proposed', 'approved', 'implemented'}
+                    if (stage not in {'withdrawn', 'revoked'} and stage != prior
+                            and not {stage, prior} <= plans):
+                        break
                 seen.add(parent_id)
                 superseded.add(parent_id)
                 parent_id = by_id[parent_id].supersedes_id

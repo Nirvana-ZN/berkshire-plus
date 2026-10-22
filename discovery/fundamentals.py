@@ -525,6 +525,26 @@ def coverage_reference_records(snapshot: FundamentalSnapshot) -> dict[str, Evide
 def verified_coverage_sources(snapshot: FundamentalSnapshot, window: CoverageWindow) -> tuple[bool, tuple[str, ...]]:
     """Verify original source trust and any reviewed receipt revision/revocation."""
     records = coverage_reference_records(snapshot)
+    return _verified_coverage_records(records, window, cutoff=snapshot.cutoff_at)
+
+
+def verified_coverage_records(records: Sequence[EvidenceRecord], window: CoverageWindow) -> tuple[bool, tuple[str, ...]]:
+    """The same proof boundary for pure callers with preselected cutoff evidence.
+
+    Unwrap only for proof validation; originals must never become active facts.
+    The caller, like the shareholder calculators, owns cutoff selection.
+    """
+    originals = tuple(_coverage_reference_original(row) if row.kind == 'coverage_reference' else row
+                      for row in records)
+    if any(row.code != window.code for row in originals):
+        return False, window.evidence_ids
+    return _verified_coverage_records({row.evidence_id: row for row in originals}, window,
+        cutoff=max((available_at(row) for row in originals), default=datetime.min.replace(tzinfo=timezone.utc)))
+
+
+def _verified_coverage_records(records, window, *, cutoff):
+    from market.evidence import SHAREHOLDER_COVERAGE_SCOPES
+
     ids = _coverage_reference_closure(records, window.evidence_ids)
     audit_ids = tuple(sorted(ids | set(window.evidence_ids)))
     if not window.evidence_ids or any(key not in records or records[key].status != 'verified'
@@ -532,18 +552,25 @@ def verified_coverage_sources(snapshot: FundamentalSnapshot, window: CoverageWin
         return False, audit_ids
     # Untrusted successors cannot erase a verified withdrawal. The shared
     # selector determines the latest verified source versions at this cutoff.
+    receipt_kind = 'shareholder_return_coverage' if window.kind in SHAREHOLDER_COVERAGE_SCOPES.values() else 'capital_event_coverage'
     receipts = select_evidence_as_of(tuple(records[key] for key in ids
-        if records[key].kind == 'capital_event_coverage' and records[key].status == 'verified'),
-        code=snapshot.code, cutoff=snapshot.cutoff_at)
-    required = {field for key in window.evidence_ids if records[key].kind == 'capital_event_coverage'
+        if records[key].kind == receipt_kind and records[key].status == 'verified'),
+        code=window.code, cutoff=cutoff)
+    if receipt_kind == 'shareholder_return_coverage' and not receipts:
+        return False, audit_ids
+    expected_scope = next((scope for scope, kind in SHAREHOLDER_COVERAGE_SCOPES.items() if kind == window.kind), 'all_capital_actions')
+    required = {field for key in window.evidence_ids if records[key].kind == receipt_kind
                 for field in ('scope', 'complete', 'start', 'end') if field in records[key].values}
     for receipt in receipts:
         values = receipt.values
         if (not required <= values.keys() or values.get('stage') in {'withdrawn', 'revoked'}
-                or values.get('scope', 'all_capital_actions') != 'all_capital_actions'
+                or values.get('scope', 'all_capital_actions') != expected_scope
                 or values.get('complete', 'true') != 'true'):
             return False, audit_ids
         try:
+            if receipt_kind == 'shareholder_return_coverage' and (
+                    values.get('start') != window.start.isoformat() or values.get('end') != window.end.isoformat()):
+                return False, audit_ids
             if (('start' in values and date.fromisoformat(values['start']) > window.start)
                     or ('end' in values and date.fromisoformat(values['end']) < window.end)):
                 return False, audit_ids

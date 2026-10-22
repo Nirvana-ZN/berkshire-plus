@@ -22,6 +22,19 @@ CAPITAL_TEXT_FIELDS = frozenset({
     'start', 'end', 'complete', 'scope', 'evidence_ids',
 })
 
+# Typed source descriptors, never caller-supplied reserved provenance keys.
+SHAREHOLDER_KINDS = frozenset({'dividend', 'buyback', 'equity_financing', 'buyback_trade'})
+SHAREHOLDER_TEXT_FIELDS = frozenset({
+    'stage', 'plan_id', 'window_start', 'window_end', 'accumulation_scope',
+    'effective_at', 'effective_date', 'trade_id', 'purpose',
+})
+SHAREHOLDER_COVERAGE_SCOPES = {
+    'all_dividend_paid': 'shareholder_dividend_paid',
+    'all_buyback_executed': 'shareholder_buyback_executed',
+    'all_buyback_cancelled': 'shareholder_buyback_cancelled',
+    'all_equity_financing_executed': 'shareholder_equity_financing_executed',
+}
+
 SELECTION_EXTENSION_FIELDS = (
     'accounts_receivable', 'contract_assets', 'inventory',
     'total_equity_including_minority', 'interest_expense',
@@ -118,7 +131,11 @@ def parse_source_evidence(payload: Mapping[str, object]) -> EvidenceRecord:
                 raise ValueError('reserved provenance keys must be supplied through explicit metadata fields')
             # Action descriptors are text, never decimal amounts or provenance.
             # All other normalized values retain the financial numeric boundary.
-            if key in CAPITAL_TEXT_FIELDS and str(payload.get('kind', '')).startswith(('capital_', 'buyback_')):
+            kind = payload.get('kind', '')
+            shareholder_text = (kind in SHAREHOLDER_KINDS and key in SHAREHOLDER_TEXT_FIELDS
+                or kind == 'shareholder_return_coverage' and key in CAPITAL_TEXT_FIELDS | {'stage'}
+                or kind == 'asset_realization' and key in {'stage', 'effective_at', 'effective_date'})
+            if shareholder_text or key in CAPITAL_TEXT_FIELDS and str(kind).startswith(('capital_', 'buyback_')):
                 values[key] = _text(value, key) if value is not None else None
             else:
                 values[key] = _decimal(value)
@@ -203,3 +220,47 @@ def parse_event_coverage(receipt: EvidenceRecord, records: Sequence[EvidenceReco
     return CoverageWindow(receipt.code, 'capital_event', start, end,
                           complete == 'true' and reviewed and timely and verified,
                           tuple(ids) + (receipt.evidence_id,))
+
+
+def parse_shareholder_coverage(receipt: EvidenceRecord, records: Sequence[EvidenceRecord]) -> CoverageWindow:
+    """A reviewed complete ledger for one exact kind/stage and (start,end].
+
+    Source dates, not announcement/report years, locate actual cash and shares.
+    Window-scoped cumulative amounts retain their source interval; this receipt
+    cannot convert a cross-year plan-to-date amount into annual cash.
+    """
+    from market.corporate_actions import shareholder_effective_date, shareholder_stage
+
+    if receipt.kind != 'shareholder_return_coverage':
+        raise ValueError('shareholder coverage requires a separate coverage receipt')
+    scope = receipt.values.get('scope')
+    if scope not in SHAREHOLDER_COVERAGE_SCOPES:
+        raise ValueError('shareholder coverage requires an explicit kind/stage scope')
+    start = date.fromisoformat(_text(receipt.values.get('start'), 'start'))
+    end = date.fromisoformat(_text(receipt.values.get('end'), 'end'))
+    complete = receipt.values.get('complete')
+    if complete not in {'true', 'false'}:
+        raise ValueError('coverage complete must be true or false text')
+    ids = json.loads(_text(receipt.values.get('evidence_ids'), 'evidence_ids'))
+    if not isinstance(ids, list) or any(not isinstance(item, str) for item in ids) or len(set(ids)) != len(ids):
+        raise ValueError('coverage evidence_ids must be a unique JSON array of text')
+    supplied = {row.evidence_id: row for row in records}
+    if set(ids) != set(supplied) or any(row.code != receipt.code for row in records):
+        raise ValueError('coverage must reference exactly the supplied same-company evidence')
+    for row in records:
+        kind, stage = shareholder_stage(row)
+        if f'all_{kind}_{stage}' != scope:
+            raise ValueError('shareholder coverage contains a different kind/stage')
+        if not start < shareholder_effective_date(row) <= end:
+            raise ValueError('shareholder execution lies outside the asserted coverage interval')
+    reviewed = receipt.status == 'verified' and receipt.values.get('_verification') is not None
+    timely = False
+    if reviewed:
+        review = json.loads(_text(receipt.values['_verification'], '_verification'))
+        _review({'verification': review})
+        reviewed_at = _time(review['reviewed_at'], 'reviewed_at')
+        closed = (datetime.combine(end, time.min, tzinfo=CHINA_MARKET_TIMEZONE) + timedelta(days=1)).astimezone(timezone.utc)
+        timely = closed <= reviewed_at <= receipt.observed_at
+    return CoverageWindow(receipt.code, SHAREHOLDER_COVERAGE_SCOPES[scope], start, end,
+        complete == 'true' and reviewed and timely and receipt.values.get('stage') not in {'withdrawn', 'revoked'}
+        and all(row.status == 'verified' for row in records), tuple(ids) + (receipt.evidence_id,))

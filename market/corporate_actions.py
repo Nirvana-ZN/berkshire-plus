@@ -15,7 +15,7 @@ Share reconciliation and economic dilution calculations belong to T05.
 
 from collections.abc import Sequence
 from dataclasses import replace
-from datetime import timezone
+from datetime import date, timezone
 from decimal import Decimal, InvalidOperation
 import re
 
@@ -23,6 +23,97 @@ from discovery.evidence_store import available_at
 from discovery.constants import CHINA_MARKET_TIMEZONE
 from discovery.fundamental_types import CapitalEvent, EvidenceRecord
 from market.evidence import _text, _time
+
+
+def shareholder_stage(row: EvidenceRecord) -> tuple[str, str | None]:
+    """Trades are executed cash, never evidence of cancelled shares."""
+    if row.kind == 'buyback_trade' and row.values.get('stage') == 'traded':
+        return 'buyback', 'executed'
+    return row.kind, row.values.get('stage')
+
+
+def shareholder_effective_date(row: EvidenceRecord) -> date:
+    """Retain explicitly date-only source facts without fabricating a time."""
+    exact, business_date = row.values.get('effective_at'), row.values.get('effective_date')
+    if exact is None and business_date is None:
+        raise ValueError('shareholder execution requires an actual effective date')
+    day = _time(exact, 'effective_at').astimezone(CHINA_MARKET_TIMEZONE).date() if exact is not None else None
+    if business_date is not None:
+        explicit = date.fromisoformat(business_date)
+        if explicit.isoformat() != business_date or day is not None and explicit != day:
+            raise ValueError('conflicting shareholder effective date')
+        day = explicit
+    return day
+
+
+def latest_progress(records: Sequence[EvidenceRecord]) -> tuple[EvidenceRecord, ...]:
+    """Select per-plan/stage/period/window cumulative facts, or unique trades.
+
+    Caller supplies cutoff-eligible rows. Verified linked withdrawals are
+    resolved by the shared selector first. An unlinked decreasing cumulative
+    assertion is a source conflict, not a negative trade or an inferred reset.
+    Historical proof wrappers are never current execution facts.
+    """
+    from discovery.evidence_store import select_evidence_as_of
+    from market.evidence import SHAREHOLDER_KINDS
+
+    raw = tuple(row for row in records if row.kind in SHAREHOLDER_KINDS)
+    if not raw:
+        return ()
+    if len({row.code for row in raw}) != 1:
+        raise ValueError('shareholder records require one company')
+    selected = select_evidence_as_of(raw, code=raw[0].code, cutoff=max(map(available_at, raw)))
+    grouped = {}
+    for row in selected:
+        kind, stage = shareholder_stage(row)
+        _text(stage, 'stage')
+        if stage in {'withdrawn', 'revoked'}:
+            continue
+        plan = _text(row.values.get('plan_id'), 'plan_id')
+        scope = row.values.get('accumulation_scope')
+        key = (row.code, kind, stage, plan, row.period, row.values.get('window_start'),
+               row.values.get('window_end'), scope)
+        if scope == 'itemized':
+            # A trade ID identifies the actual economic trade across notices.
+            key = (row.code, kind, stage, 'trade', _text(row.values.get('trade_id'), 'trade_id'))
+        grouped.setdefault(key, []).append(row)
+    result = []
+    for versions in grouped.values():
+        trusted = [row for row in versions if row.status == 'verified']
+        versions = sorted(trusted or versions, key=lambda row: (row.published_at, available_at(row), row.evidence_id))
+        previous = None
+        for row in versions:
+            fields = ('shares',) if row.values.get('stage') == 'cancelled' else ('amount',)
+            for field in fields:
+                value = row.values.get(field)
+                if value is None:
+                    continue
+                try:
+                    amount = Decimal(value)
+                except InvalidOperation as exc:
+                    raise ValueError('invalid shareholder progress amount') from exc
+                if not amount.is_finite() or amount < 0:
+                    raise ValueError('invalid shareholder progress amount')
+                if previous is not None:
+                    before = previous.values.get(field)
+                    if before is not None and amount < Decimal(before):
+                        raise ValueError('decreasing cumulative progress without supersession')
+            if previous is not None:
+                if row.basis_id != previous.basis_id:
+                    raise ValueError('incomparable_progress_basis')
+                def economic_values(item):
+                    values = {key: value for key, value in item.values.items() if not key.startswith('_')}
+                    values['stage'] = shareholder_stage(item)[1]
+                    return values
+                if row.values.get('accumulation_scope') == 'itemized':
+                    semantic = lambda item: (item.basis_id, economic_values(item))
+                    if semantic(row) != semantic(previous):
+                        raise ValueError('conflicting trade identity without supersession')
+                elif row.published_at == previous.published_at and economic_values(row) != economic_values(previous):
+                    raise ValueError('conflicting same-time cumulative progress')
+            previous = row
+        result.append(versions[-1])
+    return tuple(sorted(result, key=lambda row: (shareholder_stage(row), row.period, row.evidence_id)))
 
 
 def _amount(row: EvidenceRecord, field: str, *, positive: bool = False) -> Decimal:
