@@ -447,6 +447,8 @@ SELECTION_FIELD_DICTIONARY: Mapping[str, FieldSpec] = MappingProxyType(
             consolidated_basis="consolidated", period_type="period_end",
             derivation_formula=None, financial_sector_substitute=None,
             missing_policy="None for absent/null/ambiguous values; never infer zero. "
+                           "Gross IC requires this minority-inclusive equity plus verified "
+                           "interest debt; never substitute parent-attributable equity. "
                            "Manual review required; zero/missing/full-market audit incomplete.",
             source_as_of="NOTICE_DATE (publication); UPDATE_DATE (source revision only)",
             trusted=False,
@@ -456,6 +458,8 @@ SELECTION_FIELD_DICTIONARY: Mapping[str, FieldSpec] = MappingProxyType(
             consolidated_basis="consolidated", period_type="cumulative",
             derivation_formula=None, financial_sector_substitute=None,
             missing_policy="None for absent/null/ambiguous values; never infer zero. "
+                           "Independent finance interest expense only; INTEREST_EXPENSE "
+                           "(financial-subsidiary cost) and net FINANCE_EXPENSE are not aliases. "
                            "Manual review required; zero/missing/full-market audit incomplete.",
             source_as_of="NOTICE_DATE (publication); UPDATE_DATE (source revision only)",
             trusted=False,

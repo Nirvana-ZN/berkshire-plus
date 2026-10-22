@@ -117,6 +117,241 @@ def quarter_amount(rows: Sequence[EvidenceRecord], field: str, end_period: str) 
     return _arithmetic(_comparable(rows, field, periods), lambda *v: v[0] if len(v) == 1 else v[0] - v[1])
 
 
+def roic_gross(*, ebit: Decimal, tax_rate: Decimal, ic_begin: Decimal, ic_end: Decimal) -> MetricResult:
+    """Gross IC return as a fraction; selected verified inputs, never vendor ROIC."""
+    inputs = (ebit, tax_rate, ic_begin, ic_end)
+    if any(not isinstance(value, Decimal) or not value.is_finite() for value in inputs):
+        return MetricResult(None, 'untrusted', 'capital_return_inputs_invalid', ())
+    if not 0 <= tax_rate <= 1 or ic_begin <= 0 or ic_end <= 0:
+        return MetricResult(None, 'untrusted', 'capital_return_inputs_out_of_range', ())
+    return _arithmetic(tuple(MetricResult(value, 'verified', None, ()) for value in inputs),
+                       lambda earnings, tax, begin, end: earnings * (1 - tax) / ((begin + end) / 2))
+
+
+def _snapshot_rows(snapshot: FundamentalSnapshot) -> tuple[EvidenceRecord, ...]:
+    # Freeze/repository own supersession selection. Consumers only enforce the
+    # same-company cutoff boundary; they never select another source version.
+    return tuple(row for row in snapshot.annuals + snapshot.interims
+                 if row.kind == 'financial' and row.code == snapshot.code and available_at(row) <= snapshot.cutoff_at)
+
+
+def _on_basis(rows, requirements, result):
+    facts = [_fact(rows, field, period) for field, period in set(requirements)]
+    bases = {basis for fact, basis in facts if fact.status == 'verified'}
+    if len(bases) > 1:
+        ids = tuple(sorted(set(result.evidence_ids).union(*(fact.evidence_ids for fact, _ in facts))))
+        return MetricResult(None, 'untrusted', 'incomparable_basis', ids)
+    return result
+
+
+def _facts_calculation(rows, requirements, fn):
+    return _on_basis(rows, requirements, _arithmetic(tuple(_fact(rows, field, period)[0]
+                                                         for field, period in requirements), fn))
+
+
+def _classification(snapshot):
+    rows = tuple(row for row in snapshot.extensions if row.kind == 'company_classification'
+                 and row.code == snapshot.code and available_at(row) <= snapshot.cutoff_at)
+    ids = tuple(sorted(row.evidence_id for row in rows))
+    if not rows:
+        return MetricResult(None, 'missing', 'industry_classification_missing', ids)
+    trusted = tuple(row for row in rows if row.status == 'verified')
+    if not trusted:
+        status = 'untrusted' if any(row.status == 'untrusted' for row in rows) else 'missing'
+        return MetricResult(None, status, f'industry_classification_{status}', ids)
+    branches = {row.values.get('_industry_branch') for row in trusted}
+    if (len(branches) != 1 or any(row.values.get('_classification_version') != CLASSIFICATION_VERSION for row in trusted)
+            or not branches <= {'bank', 'insurance', 'other_financial', 'nonfinancial', 'unknown'}):
+        return MetricResult(None, 'untrusted', 'industry_classification_invalid', ids)
+    branch = next(iter(branches))
+    ids = tuple(sorted(row.evidence_id for row in trusted))
+    if branch == 'unknown':
+        return MetricResult(None, 'missing', 'industry_branch_unknown', ids)
+    if branch != 'nonfinancial':
+        return MetricResult(None, 'not_applicable', 'industrial_capital_return', ids)
+    return MetricResult(Decimal(1), 'verified', None, ids)
+
+
+def _effective_tax_rate(rows, period):
+    requirements = [('pretax_income', period), ('income_tax', period)]
+    current = [_fact(rows, field, when)[0] for field, when in requirements]
+    failure = _arithmetic(current, lambda *_: Decimal(0))
+    if failure.status != 'verified':
+        return failure, requirements
+    pretax, tax = (fact.value for fact in current)
+    rate = _facts_calculation(rows, requirements, lambda profit, expense: expense / profit) if pretax > 0 else None
+    if rate is not None and rate.status != 'verified':
+        return rate, requirements
+    if rate is not None and 0 <= rate.value <= 1:
+        return rate, requirements
+    # Only a known invalid effective rate invokes fallback. Missing or untrusted
+    # current tax facts never become a historical or statutory estimate.
+    valid = []
+    inspected = list(current)
+    for year in range(int(period) - 3, int(period)):
+        prior_requirements = [('pretax_income', str(year)), ('income_tax', str(year))]
+        profit, _ = _fact(rows, 'pretax_income', str(year))
+        expense, _ = _fact(rows, 'income_tax', str(year))
+        inspected.extend((profit, expense))
+        if profit.status != 'verified' or expense.status != 'verified' or profit.value <= 0:
+            continue
+        prior = _facts_calculation(rows, prior_requirements, lambda p, t: t / p)
+        if prior.status == 'verified' and 0 <= prior.value <= 1:
+            valid.append(prior)
+            requirements.extend(prior_requirements)
+    ids = tuple(sorted({key for fact in inspected for key in fact.evidence_ids}))
+    if not valid:
+        return MetricResult(None, 'missing', f'effective_tax_rate:{period}:missing', ids), requirements
+    ordered = sorted(valid, key=lambda fact: fact.value)
+    middle = len(ordered) // 2
+    median = ordered[middle] if len(ordered) % 2 else _arithmetic(ordered[middle - 1:middle + 1], lambda a, b: (a + b) / 2)
+    return replace(median, evidence_ids=ids), requirements
+
+
+def capital_return(snapshot: FundamentalSnapshot) -> MetricResult:
+    """Five consecutive annual gross ROICs require six year-end IC balances.
+
+    ROE and provider ROIC are separate legacy metrics. All endpoints and tax
+    fallback inputs must share a verified consolidation/currency/accounting basis.
+    """
+    classification = _classification(snapshot)
+    if classification.status != 'verified':
+        return classification
+    rows = _snapshot_rows(snapshot)
+    latest = max((int(row.period) for row in rows if len(row.period) == 4), default=None)
+    if latest is None:
+        return MetricResult(None, 'missing', 'financial_reports_missing', classification.evidence_ids)
+    requirements = []
+    balances = {}
+    for year in range(latest - 5, latest + 1):
+        period = str(year)
+        needed = [('total_equity_including_minority', period), ('interest_debt', period)]
+        requirements.extend(needed)
+        debt, _ = _fact(rows, 'interest_debt', period)
+        balance = _facts_calculation(rows, needed, lambda equity, debt: equity + debt)
+        if debt.value is not None and debt.value < 0:
+            balance = MetricResult(None, 'untrusted', f'interest_debt:{period}:negative', balance.evidence_ids)
+        elif balance.value is not None and balance.value <= 0:
+            balance = MetricResult(None, 'untrusted', f'invested_capital:{period}:not_positive', balance.evidence_ids)
+        balances[year] = balance
+    returns = []
+    for year in range(latest - 4, latest + 1):
+        period = str(year)
+        earnings, _ = _fact(rows, 'ebit', period)
+        if earnings.status == 'verified' or earnings.reason in {'conflicting_facts', 'basis_unverified', f'ebit:{period}:invalid'}:
+            requirements.append(('ebit', period))
+        else:
+            needed = [('pretax_income', period), ('interest_expense', period)]
+            earnings = _facts_calculation(rows, needed, lambda pretax, interest: pretax + interest)
+            requirements.extend(needed)
+        tax, needed = _effective_tax_rate(rows, period)
+        requirements.extend(needed)
+        inputs = (earnings, tax, balances[year - 1], balances[year])
+        # Delegate arithmetic to the public unit-decimal calculation once.
+        ready = _arithmetic(inputs, lambda *_: Decimal(0))
+        if ready.status == 'verified':
+            ready = replace(roic_gross(ebit=earnings.value, tax_rate=tax.value,
+                                      ic_begin=balances[year - 1].value, ic_end=balances[year].value),
+                            evidence_ids=ready.evidence_ids)
+        returns.append(ready)
+    result = _on_basis(rows, requirements, _arithmetic(returns, lambda *values: sum(values) / 5))
+    return replace(result, evidence_ids=tuple(sorted(set(result.evidence_ids + classification.evidence_ids))))
+
+
+def _flow_ratio(rows, numerator, denominator, period):
+    needed = [(field, when) for field in (numerator, denominator) for when in required_ttm_periods(period)]
+    top, bottom = (ttm_amount(rows, field, period) for field in (numerator, denominator))
+    result = _arithmetic((top, bottom), lambda *_: Decimal(0))
+    if result.status == 'verified':
+        result = (MetricResult(None, 'missing', f'{denominator}:{period}:not_positive', result.evidence_ids)
+                  if bottom.value <= 0 else _arithmetic((top, bottom), lambda a, b: a / b))
+    return _on_basis(rows, needed, result)
+
+
+def _balance_ratio(rows, fields, denominator, period):
+    needed = [(field, period) for field in fields] + [(denominator, when) for when in required_ttm_periods(period)]
+    amounts = tuple(_fact(rows, field, period)[0] for field in fields)
+    revenue = ttm_amount(rows, denominator, period)
+    result = _arithmetic((*amounts, revenue), lambda *_: Decimal(0))
+    if result.status == 'verified':
+        if any(amount.value < 0 for amount in amounts):
+            result = MetricResult(None, 'untrusted', f'balance:{period}:negative', result.evidence_ids)
+        elif revenue.value <= 0:
+            result = MetricResult(None, 'missing', f'{denominator}:{period}:not_positive', result.evidence_ids)
+        else:
+            result = _arithmetic((*amounts, revenue), lambda *v: sum(v[:-1]) / v[-1])
+    return _on_basis(rows, needed, result)
+
+
+def collection_metrics(snapshot: FundamentalSnapshot) -> dict[str, MetricResult]:
+    """Auditable shadow explanations; balance endpoints over same-period TTM flows."""
+    rows = _snapshot_rows(snapshot)
+    latest = max((row.period for row in rows), key=period_order, default=None)
+    names = ('receivables_ratio', 'cash_conversion', 'inventory_ratio')
+    if latest is None:
+        return {key: MetricResult(None, 'missing', 'financial_reports_missing', ())
+                for key in (*names, *(f'prior_{name}' for name in names),
+                            *(f'{name}_change' for name in names), 'restricted_cash_ratio')}
+    metrics = {}
+    for label, fields in (('receivables_ratio', ('accounts_receivable', 'contract_assets')),
+                          ('cash_conversion', ('ocf', 'net_income')), ('inventory_ratio', ('inventory',))):
+        periods = (latest, _prior_year(latest))
+        for prefix, period in zip(('', 'prior_'), periods):
+            metrics[prefix + label] = (_flow_ratio(rows, *fields, period) if label == 'cash_conversion'
+                                       else _balance_ratio(rows, fields, 'revenue', period))
+        needed = ([(field, when) for field in fields for period in periods for when in required_ttm_periods(period)]
+                  if label == 'cash_conversion' else
+                  [(field, period) for field in fields for period in periods]
+                  + [('revenue', when) for period in periods for when in required_ttm_periods(period)])
+        metrics[label + '_change'] = _on_basis(rows, needed, _arithmetic(
+            (metrics[label], metrics['prior_' + label]), lambda now, before: now - before))
+    needed = [('restricted_cash', latest), ('cash', latest)]
+    restriction, cash = (_fact(rows, field, latest)[0] for field in ('restricted_cash', 'cash'))
+    ratio = _facts_calculation(rows, needed, lambda *_: Decimal(0))
+    if ratio.status == 'verified':
+        if cash.value <= 0 or restriction.value < 0 or restriction.value > cash.value:
+            ratio = MetricResult(None, 'untrusted', 'restricted_cash_inputs_out_of_range', ratio.evidence_ids)
+        else:
+            ratio = _arithmetic((restriction, cash), lambda a, b: a / b)
+    metrics['restricted_cash_ratio'] = ratio
+    return metrics
+
+
+def collection_signals(snapshot: FundamentalSnapshot, policy: Mapping[str, object]) -> tuple[str, ...]:
+    """Shadow flags/status markers only; callers must never turn these into gates."""
+    required = ('version', 'receivables_ratio_increase_min', 'restricted_cash_ratio_min')
+    if any(key not in policy for key in required):
+        return ('collection_policy_missing',)
+    try:
+        thresholds = tuple(policy[key] for key in required[1:])
+        if policy['version'] != 'collection-v1' or any(not isinstance(value, (str, Decimal)) for value in thresholds):
+            raise ValueError('invalid collection policy')
+        increase, restricted = map(Decimal, thresholds)
+        if any(not value.is_finite() or not 0 <= value <= 1 for value in (increase, restricted)):
+            raise ValueError('invalid collection threshold')
+    except (InvalidOperation, ValueError):
+        return ('collection_policy_untrusted',)
+    metrics = collection_metrics(snapshot)
+    pressure = _arithmetic((metrics['receivables_ratio_change'], metrics['cash_conversion_change']),
+                           lambda a, b: Decimal(int(a >= increase and b < 0)))
+    # Both individually comparable ratios must also describe the same entity.
+    pressure_ids = set(pressure.evidence_ids)
+    pressure_rows = tuple(row for row in _snapshot_rows(snapshot) if row.evidence_id in pressure_ids)
+    needed = [(field, row.period) for row in pressure_rows
+              for field in ('accounts_receivable', 'contract_assets', 'revenue', 'ocf', 'net_income')
+              if field in row.values]
+    pressure = _on_basis(pressure_rows, needed, pressure)
+    material = metrics['restricted_cash_ratio']
+    signals = []
+    for name, result, triggered in (('collection_pressure', pressure, pressure.value == 1),
+                                     ('restricted_cash_material', material, material.value is not None and material.value >= restricted)):
+        if result.status != 'verified':
+            signals.append(f'{name}_{result.status}')
+        elif triggered:
+            signals.append(name)
+    return tuple(signals)
+
+
 def _yoy(current: MetricResult, prior: MetricResult) -> MetricResult:
     if prior.value is not None and prior.value <= 0:
         return MetricResult(None, 'missing', 'comparison_not_positive', tuple(sorted(set(current.evidence_ids + prior.evidence_ids))))

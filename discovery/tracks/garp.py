@@ -9,6 +9,8 @@ from decimal import Decimal
 from types import MappingProxyType
 from typing import TypeAlias
 
+from discovery.fundamental_types import FundamentalSnapshot
+from discovery.fundamentals import capital_return, collection_metrics, collection_signals
 from discovery.industry import classify_industry_branch
 from discovery.metrics import cagr, cash_conversion, mean, percentile_rank
 from discovery.rulers import GARP_FIELD_DOMAIN_POLICY, TrackRuler, garp_ruler
@@ -38,6 +40,15 @@ from discovery.tracks.quality_discount import (
 )
 
 JsonMetric: TypeAlias = None | str | tuple[str, ...]
+
+
+def frozen_fundamental_diagnostics(snapshot: FundamentalSnapshot, policy: Mapping[str, object]) -> dict[str, object]:
+    """Opt-in v8 handoff; shadow diagnostics never enter legacy gates or ranks."""
+    return {'roic_gross_5y': capital_return(snapshot),
+            'collection_metrics': collection_metrics(snapshot),
+            'shadow_signals': collection_signals(snapshot, policy)}
+
+
 _FIELDS = (
     "revenue",
     "deducted_net_income",
