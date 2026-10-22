@@ -1,23 +1,25 @@
-"""Evolve discovery-track rulers from deep-research and portfolio-aftermath outcomes.
+"""Propose research-only ruler hypotheses from model disagreement diagnostics.
 
-Reads the latest completed discovery run and downstream research/aftermath/review
-outcomes, proposes pareto-safe threshold tightenings that drop false positives
-(downstream fail / overvalued / fundamental cut-sell) while preserving protected
-candidates (downstream pass / gray), and optionally activates evolved rulers via
-discovery.rulers.activate().
+Model labels and portfolio research comments are not investment outcomes.
+The default dry-run and --apply both read the database without writing; --apply
+refuses activation until independent validation and a separate release exist.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sqlite3
+from calendar import monthrange
 from collections.abc import Mapping, Sequence
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
 from sqlalchemy import create_engine, select
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
@@ -33,7 +35,6 @@ from app.models import (
     Quote,
     ResearchArtifact,
     ResearchJob,
-    RulerVersion,
 )
 from discovery.builds import BUILD_VERSION
 from discovery.competition import (
@@ -42,7 +43,6 @@ from discovery.competition import (
     rank_competition,
 )
 from discovery.rulers import (
-    activate as activate_ruler,
     canonical_payload,
     deep_value_ruler,
     garp_ruler,
@@ -73,13 +73,11 @@ TRACK_SPECS: Mapping[str, tuple[Any, Any, Mapping[str, Mapping[str, str]]]] = {
     "garp": (gp, garp_ruler, GARP_BANDS),
 }
 
-# Anti-overfitting guards:
-# 1. At most 2 thresholds per track may deviate from the base band (prevents one-way ratchet).
-# 2. Each eliminated false positive may cause at most 3 unresearched collateral drops.
-# 3. Minimum evidence support (Bayesian shrinkage): by default >= 2 independent FPs are required
-#    to promote a threshold tightening from 'shadow_staging' to 'confirmed' live activation.
+# Limit the complexity and collateral exclusions of research hypotheses.
+# These diagnostic guards never establish investment validity or activation.
+# DEFAULT_MIN_SUPPORT is retained only for command-line compatibility.
 MAX_CHANGED_THRESHOLDS_PER_TRACK = 2
-MAX_COLLATERAL_PER_FP = 3
+MAX_COLLATERAL_PER_DISAGREEMENT = 3
 DEFAULT_MIN_SUPPORT = 2
 MAX_NEAR_MISS_REPORT = 15
 
@@ -160,7 +158,7 @@ _SLOWDOWN_REASON_KEYWORDS = ("失速", "下滑", "降速", "负增长")
 
 
 def _causal_allowed_thresholds(outcome: Mapping[str, Any]) -> frozenset[str]:
-    """Return threshold keys causally aligned with a false positive's failed gates."""
+    """Return threshold keys aligned with a model's reported gate disagreement."""
 
     allowed: set[str] = set()
     failed_gates = set(outcome.get("failed_gates") or ())
@@ -188,6 +186,219 @@ def _causal_allowed_thresholds(outcome: Mapping[str, Any]) -> frozenset[str]:
         # Fallback if a fail came purely from portfolio exit without gate tags
         allowed.update(_VALUATION_THRESHOLDS | _QUALITY_MOAT_THRESHOLDS | _CASHFLOW_DEBT_THRESHOLDS)
     return frozenset(allowed)
+
+
+_VALIDATION_BINDINGS = ("proposal_sha256", "ruler_hash", "input_hash")
+_VALIDATION_VARIANTS = {"full_selected", "no_operating_selected", "all_passed"}
+_COVERAGE_DATASETS = {
+    "security_universe", "public_financials", "trading_calendar",
+    "raw_prices", "corporate_actions", "trading_status",
+}
+
+
+class _ValidationRefusal(ValueError):
+    pass
+
+
+def _require_validation(condition: object, reason: str) -> None:
+    if not condition:
+        raise _ValidationRefusal(reason)
+
+
+def _validation_text(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _validation_time(value: object) -> datetime:
+    # Date-only values and naive clocks cannot establish announcement ordering.
+    if not isinstance(value, str) or "T" not in value:
+        raise ValueError("exact timezone-aware timestamp required")
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("timezone required")
+    return parsed
+
+
+def _reject_model_evidence(value: object) -> None:
+    if isinstance(value, Mapping):
+        if (set(value) & {"fail_count", "gray_count", "then_verdict", "live_verdict", "research_label"}
+            or value.get("verdict") in ("fail", "gray", "pass")
+            or any(value.get(key) in {"model_labels", "llm", "research_hypothesis"}
+                   for key in ("origin", "source", "proposal_kind")
+                   if isinstance(value.get(key), str))):
+            raise _ValidationRefusal("independent_validation_required")
+        for child in value.values():
+            _reject_model_evidence(child)
+    elif isinstance(value, list):
+        for child in value:
+            _reject_model_evidence(child)
+
+
+def _retained_document(
+    reference: object, root: Path, *, hash_reason: str = "retained_artifact_hash_mismatch"
+) -> Mapping[str, Any]:
+    _require_validation(isinstance(reference, Mapping), "retained_artifact_required")
+    path, digest = reference.get("path"), reference.get("sha256")
+    _require_validation(_validation_text(path) and _validation_text(digest), "retained_artifact_required")
+    data = (root / path).read_bytes()
+    _require_validation(hashlib.sha256(data).hexdigest() == digest, hash_reason)
+
+    def unique_fields(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON key")
+            result[key] = value
+        return result
+
+    def invalid_constant(value):
+        raise ValueError("nonfinite JSON constant")
+
+    document = json.loads(data.decode("utf-8"), object_pairs_hook=unique_fields,
+                          parse_constant=invalid_constant)
+    _require_validation(isinstance(document, Mapping), "invalid_validation_report")
+    _reject_model_evidence(document)
+    return document
+
+
+def _check_experiment_report(report, documents, root, generated_at):
+    protocol = documents["protocol"]
+    comparison = documents["comparison"]
+    coverage = documents["coverage"]
+    _require_validation(protocol.get("origin") == "preregistered_protocol"
+                        and protocol.get("bindings") == report["bindings"], "preregistration_required")
+    registered, published, start, end, maturity, training_end = (
+        _validation_time(protocol[key]) for key in (
+            "registered_at", "published_run_at", "observation_start", "observation_end",
+            "maturity_at", "training_end"))
+    _require_validation(registered <= published < start, "preregistration_required")
+    _require_validation(training_end < start < end, "time_out_of_sample_required")
+    horizon = protocol.get("horizon_months")
+    _require_validation(type(horizon) is int and horizon in {3, 6, 12}, "mature_observation_required")
+    year, month_zero = divmod(start.year * 12 + start.month - 1 + horizon, 12)
+    target = start.replace(year=year, month=month_zero + 1,
+        day=min(start.day, monthrange(year, month_zero + 1)[1]))
+    _require_validation(start < target <= maturity <= end, "mature_observation_required")
+    _require_validation(all(_validation_text(protocol.get(key)) for key in
+        ("universe", "entry_policy", "cost_policy", "exit_policy"))
+        and set(protocol.get("variants", ())) == _VALIDATION_VARIANTS, "preregistration_required")
+    benchmarks = protocol["benchmarks"]
+    _require_validation(set(benchmarks) == {"primary", "auxiliary"}, "frozen_benchmark_required")
+    for name, benchmark_id in (("primary", "CSI300_TOTAL_RETURN"), ("auxiliary", "CSI500_TOTAL_RETURN")):
+        benchmark = _retained_document(benchmarks[name], root)
+        _require_validation(benchmark.get("origin") == "official_records"
+            and benchmark.get("id") == benchmark_id
+            and isinstance(benchmark.get("records"), list) and benchmark["records"], "frozen_benchmark_required")
+    _require_validation(comparison.get("benchmark_hashes") == {
+        name: reference["sha256"] for name, reference in benchmarks.items()}, "frozen_benchmark_required")
+    _require_validation(coverage.get("origin") == "coverage_manifest"
+        and set(coverage.get("datasets", {})) == _COVERAGE_DATASETS
+        and coverage.get("window_start") == protocol["observation_start"]
+        and coverage.get("window_end") == protocol["observation_end"], "data_coverage_required")
+    for reference in coverage["datasets"].values():
+        dataset = _retained_document(reference, root)
+        _require_validation(dataset.get("origin") == "official_records"
+            and isinstance(dataset.get("records"), list) and dataset["records"], "data_coverage_required")
+    evaluated = _validation_time(comparison["evaluated_at"])
+    _require_validation(end <= evaluated <= generated_at
+        and comparison.get("maturity_at") == protocol["maturity_at"], "mature_observation_required")
+    _require_validation(comparison.get("origin") == "independent_outcomes"
+        and comparison.get("protocol_sha256") == report["artifacts"]["protocol"]["sha256"]
+        and comparison.get("coverage_sha256") == report["artifacts"]["coverage"]["sha256"]
+        and comparison.get("window_start") == protocol["observation_start"]
+        and comparison.get("window_end") == protocol["observation_end"]
+        and set(comparison.get("variants", {})) == _VALIDATION_VARIANTS, "loss_return_comparison_required")
+    for metrics in comparison["variants"].values():
+        for key in ("gross_return", "net_return", "relative_return", "max_drawdown",
+                    "entry_coverage", "exit_completion"):
+            value = metrics.get(key)
+            number = _decimal(value)
+            _require_validation(isinstance(value, str) and number is not None, "loss_return_comparison_required")
+            if key in {"entry_coverage", "exit_completion", "max_drawdown"}:
+                _require_validation(Decimal(0) <= number <= Decimal(1), "loss_return_comparison_required")
+            if key == "exit_completion":
+                _require_validation(number == Decimal(1), "mature_observation_required")
+
+
+def activation_eligibility(
+    *, proposal_kind: str, evidence: Mapping[str, object]
+) -> tuple[bool, str | None]:
+    """Audit retained evidence for later release review; never publishes a ruler.
+
+    Reports and referenced JSON artifacts bind exact bytes. A separately retained,
+    dated human receipt assesses provenance and independence that hashes cannot
+    establish. This helper does not claim statistical or investment success.
+    """
+    if proposal_kind == "research_hypothesis":
+        return False, "independent_validation_required"
+    if proposal_kind not in {"data_error_fix", "validated_experiment"}:
+        return False, "unsupported_proposal_kind"
+    if not evidence.get("report_path") or not evidence.get("report_sha256"):
+        return False, "validation_report_required"
+    try:
+        _reject_model_evidence(evidence)
+        report_path = Path(evidence["report_path"])
+        root = report_path.parent
+        report = _retained_document({"path": report_path.name,
+            "sha256": evidence["report_sha256"]}, root,
+            hash_reason="validation_report_hash_mismatch")
+        source = "deterministic_reproduction" if proposal_kind == "data_error_fix" else "independent_outcomes"
+        _require_validation(type(report.get("schema_version")) is int and report["schema_version"] == 1
+            and report.get("proposal_kind") == proposal_kind and report.get("source") == source,
+            "invalid_validation_report")
+        _require_validation(_validation_text(report.get("release_reason")), "release_reason_required")
+        _require_validation(_validation_text(report.get("author")), "invalid_validation_report")
+        generated = _validation_time(report["generated_at"])
+        _require_validation(generated <= datetime.now(timezone.utc), "invalid_validation_report")
+        artifacts = report["artifacts"]
+        documents = {name: _retained_document(reference, root) for name, reference in artifacts.items()}
+        for key, name in zip(_VALIDATION_BINDINGS, ("proposal", "ruler", "input")):
+            _require_validation(evidence.get(key) == report["bindings"].get(key)
+                == artifacts[name]["sha256"], "validation_binding_mismatch")
+        _require_validation(evidence.get("review_path") and evidence.get("review_sha256"), "independent_review_required")
+        review = _retained_document({"path": evidence["review_path"],
+            "sha256": evidence["review_sha256"]}, root)
+        _require_validation(review.get("origin") == "human_review"
+            and _validation_text(review.get("reviewer")) and review["reviewer"] != report["author"]
+            and generated <= _validation_time(review["reviewed_at"]) <= datetime.now(timezone.utc)
+            and review.get("report_sha256") == evidence["report_sha256"]
+            and review.get("decision") == "eligible_for_release_review"
+            and all(_validation_text(review.get(key)) for key in ("independence_basis", "provenance_assessment")),
+            "independent_review_required")
+        if proposal_kind == "data_error_fix":
+            source_doc, acceptance = documents["source"], documents["acceptance"]
+            _require_validation(source_doc.get("origin") == "official_records"
+                and isinstance(source_doc.get("records"), list) and source_doc["records"]
+                and acceptance.get("origin") == "deterministic_reproduction"
+                and acceptance.get("bindings") == report["bindings"]
+                and acceptance.get("source_sha256") == artifacts["source"]["sha256"]
+                and isinstance(acceptance.get("cases"), list) and acceptance["cases"],
+                "deterministic_acceptance_required")
+            for case in acceptance["cases"]:
+                _require_validation(_validation_text(case.get("id"))
+                    and _validation_text(case.get("expected"))
+                    and case["expected"] == case.get("actual"), "deterministic_acceptance_required")
+        else:
+            _check_experiment_report(report, documents, root, generated)
+        return True, None
+    except _ValidationRefusal as exc:
+        return False, str(exc)
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
+        return False, "invalid_validation_report"
+
+
+def _research_validation_report() -> dict[str, object]:
+    return {
+        "eligible": False,
+        "reason": "independent_validation_required",
+        "evidence_gaps": [
+            "deterministic_acceptance_or_independent_out_of_sample_report",
+            "report_source_hash_and_proposal_bindings",
+            "preregistration_frozen_benchmark_maturity_and_data_coverage",
+            "loss_return_comparison_and_release_reason",
+            "dated_independent_human_review_receipt",
+        ],
+    }
 
 
 def _decimal(value: object) -> Decimal | None:
@@ -530,7 +741,7 @@ def _load_downstream_outcomes(session: Session) -> dict[str, dict[str, Any]]:
         rev_action = rev.get("action", "")
         rev_light = rev.get("rule_light", "none")
         # A review 'sell' (or 'cut' when thesis is fail) is a full exit; a 'cut' on a
-        # pass/gray thesis is a partial trim/rebalance, not a selection false positive.
+        # pass/gray thesis is a research trim/rebalance rather than disagreement.
         fundamental_exit = rev_action == "sell" and rev_light != "hit"
         failed_gates = [
             str(g.get("name"))
@@ -542,7 +753,7 @@ def _load_downstream_outcomes(session: Session) -> dict[str, dict[str, Any]]:
             for g in parsed.get("gates", ())
             if isinstance(g, Mapping) and g.get("status") == "fail"
         ]
-        effective = (
+        research_label = (
             "fail"
             if (then_verdict == "fail" or live == "fail" or fundamental_exit)
             else then_verdict
@@ -558,7 +769,7 @@ def _load_downstream_outcomes(session: Session) -> dict[str, dict[str, Any]]:
             "review_rule_light": rev_light if rev_action else None,
             "failed_gates": failed_gates,
             "failed_gate_reasons": failed_gate_reasons,
-            "effective_outcome": effective,
+            "research_label": research_label,
         }
     return outcomes
 
@@ -606,10 +817,10 @@ def _evolve_single_track(
         }
 
     # Keep rows that passed track_gate under the baseline ruler for fast pareto evaluation,
-    # researched rows that were dropped (false negatives), and single-rule near-miss drops
+    # research gate disagreements and single-rule near-miss drops
     # that pass under the relaxed calibration band (for Reject Inference).
     passed_rows: list[tuple[str, dict[str, object]]] = []
-    false_negatives: list[dict[str, object]] = []
+    research_gate_disagreement: list[dict[str, object]] = []
     raw_near_misses: list[tuple[str, str | None, str, dict[str, object]]] = []
     for row in stage_rows:
         metrics = json.loads(row.metrics_json)
@@ -618,8 +829,8 @@ def _evolve_single_track(
         if row.verdict == "pass":
             passed_rows.append((row.code, metrics))
         else:
-            if out is not None and out["effective_outcome"] == "pass":
-                false_negatives.append(
+            if out is not None and out["research_label"] == "pass":
+                research_gate_disagreement.append(
                     {
                         "code": row.code,
                         "name": out["name"],
@@ -652,7 +863,7 @@ def _evolve_single_track(
     for rank_idx, nm_code in enumerate(near_miss_order, start=1):
         rsn, rule, _ = near_miss_by_code[nm_code]
         nm_out = outcomes.get(nm_code)
-        eff = str(nm_out["effective_outcome"]) if nm_out is not None else None
+        eff = str(nm_out["research_label"]) if nm_out is not None else None
         bucket = gate_stats.setdefault(
             rule,
             {"total_near_miss": 0, "researched_pass_or_gray": 0, "researched_fail": 0},
@@ -682,20 +893,15 @@ def _evolve_single_track(
     near_miss_gate_summary = {
         rule: {
             **stats,
-            "relaxation_signal": (
-                "consider_relaxing"
-                if stats["researched_pass_or_gray"] >= min_support
-                and stats["researched_fail"] == 0
-                else "hold_or_audit"
-            ),
+            "relaxation_signal": "independent_validation_required",
         }
         for rule, stats in sorted(
             gate_stats.items(), key=lambda item: (-item[1]["total_near_miss"], item[0])
         )
     }
 
-    false_positives: list[tuple[str, dict[str, object], Mapping[str, Any]]] = []
-    protected: list[tuple[str, dict[str, object], Mapping[str, Any]]] = []
+    research_disagreement: list[tuple[str, dict[str, object], Mapping[str, Any]]] = []
+    research_agreement: list[tuple[str, dict[str, object], Mapping[str, Any]]] = []
     interim_by_code = _load_interim_by_code(
         session, [code for code, _ in passed_rows]
     )
@@ -711,7 +917,7 @@ def _evolve_single_track(
         )
         if alert is not None:
             interim_alerts_by_code[code] = alert
-            eff_out = str(out["effective_outcome"]) if out is not None else None
+            eff_out = str(out["research_label"]) if out is not None else None
             interim_deterioration_alerts.append(
                 {
                     "code": code,
@@ -726,17 +932,16 @@ def _evolve_single_track(
             )
         if out is None:
             continue
-        if out["effective_outcome"] == "fail":
-            false_positives.append((code, metrics, out))
-        elif out["effective_outcome"] in {"pass", "gray"}:
-            protected.append((code, metrics, out))
+        if out["research_label"] == "fail":
+            research_disagreement.append((code, metrics, out))
+        elif out["research_label"] in {"pass", "gray"}:
+            research_agreement.append((code, metrics, out))
 
     selected_changes: dict[str, dict[str, object]] = {}
     shadow_flagged_candidates: list[dict[str, object]] = []
     rejected_overfit_candidates: list[dict[str, object]] = []
     working_payload = json.loads(json.dumps(base_payload))
-    confirmed_payload = json.loads(json.dumps(base_payload))
-    remaining_fps = list(false_positives)
+    remaining_disagreements = list(research_disagreement)
     base_band_thresholds = bands["base"]
     prior_deviations = {
         k
@@ -744,14 +949,12 @@ def _evolve_single_track(
         if k in base_band_thresholds and str(v) != str(base_band_thresholds[k])
     }
 
-    # Greedily select minimal threshold tightenings that eliminate remaining FPs
-    # while enforcing 5 anti-overfitting guards:
-    #   (1) Causal gate alignment between deep-research failure reason and threshold
+    # Explore minimal research hypotheses, limiting complexity and collateral drops:
+    #   (1) Align the reported research gate with the threshold
     #   (2) Coarse economic grid steps (no 1/4-step quantile sniping)
-    #   (3) Max collateral drop ratio (<= MAX_COLLATERAL_PER_FP unresearched drops per FP)
+    #   (3) Max collateral drop ratio (<= MAX_COLLATERAL_PER_DISAGREEMENT unresearched drops per disagreement)
     #   (4) Complexity budget (<= MAX_CHANGED_THRESHOLDS_PER_TRACK deviations from base band)
-    #   (5) Minimum evidence support (min_support): single-sample rules stay in shadow_staging
-    while remaining_fps:
+    while remaining_disagreements:
         current_deviations = prior_deviations | set(selected_changes)
         current_ruler = validate_fn(working_payload)
         current_pass_codes = {
@@ -777,13 +980,13 @@ def _evolve_single_track(
                     continue
                 if any(
                     _eval_company_metrics(track, trial_ruler, pm)[0] != "pass"
-                    for _, pm, _ in protected
+                    for _, pm, _ in research_agreement
                 ):
                     continue
                 causally_dropped: list[str] = []
                 spurious_dropped: list[str] = []
                 drop_reasons: dict[str, str] = {}
-                for fp_code, fp_m, fp_out in remaining_fps:
+                for fp_code, fp_m, fp_out in remaining_disagreements:
                     verdict, reason = _eval_company_metrics(track, trial_ruler, fp_m)
                     if verdict != "pass":
                         drop_reasons[fp_code] = str(reason or verdict)
@@ -812,7 +1015,7 @@ def _evolve_single_track(
                     elif c in current_pass_codes and c not in outcomes:
                         collateral_items.append((c, str(reason or verdict)))
                 collateral_drops = len(collateral_items)
-                if collateral_drops > MAX_COLLATERAL_PER_FP * len(causally_dropped):
+                if collateral_drops > MAX_COLLATERAL_PER_DISAGREEMENT * len(causally_dropped):
                     if idx == 0:
                         rejected_overfit_candidates.append(
                             {
@@ -825,7 +1028,7 @@ def _evolve_single_track(
                             }
                         )
                     continue
-                # Prefer: more causal FPs dropped -> higher total_pass -> smaller step index -> lexical tie-break
+                # Prefer: more aligned research disagreements excluded -> higher total_pass -> smaller step index -> lexical tie-break
                 score = (len(causally_dropped), total_pass, -idx, key, cand_val)
                 if best_choice is None or score > best_choice[0]:
                     best_choice = (
@@ -841,33 +1044,27 @@ def _evolve_single_track(
             break
         _, chosen_key, chosen_val, dropped_codes, drop_reasons, collateral_items = best_choice
         working_payload["thresholds"][chosen_key] = chosen_val
-        is_confirmed = len(dropped_codes) >= min_support
-        if is_confirmed:
-            confirmed_payload["thresholds"][chosen_key] = chosen_val
         ref_names = [ str(outcomes[c]["name"]) for c in dropped_codes ]
-        if not is_confirmed:
-            for col_code, col_reason in collateral_items:
-                shadow_flagged_candidates.append(
-                    {
-                        "code": col_code,
-                        "name": names.get(col_code, col_code),
-                        "triggered_threshold": f"{chosen_key}: {current_thresholds[chosen_key]}->{chosen_val}",
-                        "drop_reason": col_reason,
-                        "reference_false_positives": ref_names,
-                        "warning": f"同病相怜预警：触发与已证伪样本【{','.join(ref_names)}】相同的 {col_reason}",
-                    }
-                )
+        for col_code, col_reason in collateral_items:
+            shadow_flagged_candidates.append(
+                {
+                    "code": col_code,
+                    "name": names.get(col_code, col_code),
+                    "triggered_threshold": f"{chosen_key}: {current_thresholds[chosen_key]}->{chosen_val}",
+                    "drop_reason": col_reason,
+                    "reference_research_disagreement": ref_names,
+                    "warning": f"研究分歧预警：触发与待验证样本【{','.join(ref_names)}】相同的 {col_reason}",
+                }
+            )
         selected_changes[chosen_key] = {
             "from": current_thresholds[chosen_key],
             "to": chosen_val,
             "conservative_reference": conservative_thresholds.get(chosen_key),
-            "status": "confirmed" if is_confirmed else "shadow_staging",
+            "status": "research_hypothesis",
             "collateral_unresearched_drops": len(collateral_items),
             "collateral_codes": [c for c, _ in collateral_items],
-            "evidence_confidence": (
-                "confirmed" if len(dropped_codes) >= 2 else "single_sample_caution"
-            ),
-            "dropped_false_positives": [
+            "evidence_confidence": "independent_validation_required",
+            "excluded_research_disagreement": [
                 {
                     "code": c,
                     "name": outcomes[c]["name"],
@@ -877,15 +1074,11 @@ def _evolve_single_track(
                 for c in dropped_codes
             ],
         }
-        remaining_fps = [
-            item for item in remaining_fps if item[0] not in set(dropped_codes)
+        remaining_disagreements = [
+            item for item in remaining_disagreements if item[0] not in set(dropped_codes)
         ]
 
-    confirmed_changes = {
-        k: v for k, v in selected_changes.items() if v["status"] == "confirmed"
-    }
-    evolved_ruler = validate_fn(confirmed_payload)
-    evolved_json = canonical_payload(evolved_ruler)
+    evolved_ruler = active_ruler
     shadow_ruler = validate_fn(working_payload)
     shadow_json = canonical_payload(shadow_ruler)
     evolved_survived = [
@@ -921,7 +1114,7 @@ def _evolve_single_track(
             "borda_rank": v.rank,
             "lexicographic_rank": lex_by_code[v.code].rank,
             "researched_outcome": (
-                str(outcomes[v.code]["effective_outcome"])
+                str(outcomes[v.code]["research_label"])
                 if v.code in outcomes
                 else None
             ),
@@ -936,7 +1129,7 @@ def _evolve_single_track(
             "lexicographic_rank": v.rank,
             "borda_rank": borda_by_code[v.code].rank,
             "researched_outcome": (
-                str(outcomes[v.code]["effective_outcome"])
+                str(outcomes[v.code]["research_label"])
                 if v.code in outcomes
                 else None
             ),
@@ -946,25 +1139,27 @@ def _evolve_single_track(
     ]
 
     change_summaries = [
-        f"{k} {info['from']}->{info['to']} [{info['status']}] (拦截{','.join( d['name'] for d in info['dropped_false_positives'] )})"
+        f"{k} {info['from']}->{info['to']} [{info['status']}] (拦截{','.join( d['name'] for d in info['excluded_research_disagreement'] )})"
         for k, info in selected_changes.items()
     ]
     reason_text = (
-        f"事后反馈自动进化（基于 run {run.id} 与 {len(outcomes)} 家深研/持仓结果，min_support={min_support}）："
+        f"待独立验证的研究假设（基于 run {run.id} 与 {len(outcomes)} 家模型研究记录，兼容参数 min_support={min_support}）："
         + ("；".join(change_summaries) if change_summaries else "当前尺子已无帕累托可收紧空间")
-        + f"。正式通过 {len(passed_rows)}->{len(evolved_survived)}（含影子观察则为 {len(shadow_survived)}），受保护样本 {len(protected)}/{len(protected)} 保留。"
+        + f"。基准通过 {len(passed_rows)}->{len(evolved_survived)}（含影子观察则为 {len(shadow_survived)}），研究标签一致样本 {len(research_agreement)}/{len(research_agreement)} 保留。"
     )
 
     return {
         "track": track,
         "status": "ready",
+        "proposal_kind": "research_hypothesis",
+        "validation_report": _research_validation_report(),
         "min_support": min_support,
         "baseline_ruler_version_id": active_row.id,
         "baseline_digest": active_row.digest,
         "evolved_digest": payload_digest(evolved_ruler),
         "shadow_digest": payload_digest(shadow_ruler),
-        "changed": bool(confirmed_changes),
-        "has_shadow_staging": len(selected_changes) > len(confirmed_changes),
+        "changed": False,
+        "has_shadow_staging": bool(selected_changes),
         "threshold_changes": selected_changes,
         "shadow_flagged_candidates": shadow_flagged_candidates,
         "interim_deterioration_alerts": interim_deterioration_alerts,
@@ -982,24 +1177,24 @@ def _evolve_single_track(
             "shadow_track_pass": len(shadow_survived),
             "evolved_competition_pass": len(comp_pass_codes),
             "borda_competition_pass": len(borda_pass_codes),
-            "false_positives_total": len(false_positives),
-            "false_positives_eliminated": len(false_positives) - len(remaining_fps),
-            "false_positives_caught_by_interim": sum(
-                1 for code, _, _ in false_positives if code in interim_alerts_by_code
+            "research_disagreement_total": len(research_disagreement),
+            "research_disagreement_excluded_by_hypothesis": len(research_disagreement) - len(remaining_disagreements),
+            "research_disagreement_caught_by_interim": sum(
+                1 for code, _, _ in research_disagreement if code in interim_alerts_by_code
             ),
-            "protected_hit_by_interim": sum(
-                1 for code, _, _ in protected if code in interim_alerts_by_code
+            "research_agreement_hit_by_interim": sum(
+                1 for code, _, _ in research_agreement if code in interim_alerts_by_code
             ),
             "unresearched_flagged_by_interim": sum(
                 1
                 for item in interim_deterioration_alerts
                 if item["researched_outcome"] is None
             ),
-            "protected_retained": len(protected),
-            "protected_total": len(protected),
+            "research_agreement_retained": len(research_agreement),
+            "research_agreement_total": len(research_agreement),
             "near_miss_total": len(raw_near_misses),
         },
-        "false_positives": [
+        "research_disagreement": [
             {
                 "code": code,
                 "name": out["name"],
@@ -1007,22 +1202,22 @@ def _evolve_single_track(
                 "live_verdict": out["live_verdict"],
                 "review_action": out["review_action"],
                 "failed_gates": out["failed_gates"],
-                "eliminated": code not in {c for c, _, _ in remaining_fps},
+                "eliminated": code not in {c for c, _, _ in remaining_disagreements},
                 "interim_deterioration": interim_alerts_by_code.get(code),
             }
-            for code, _, out in false_positives
+            for code, _, out in research_disagreement
         ],
-        "protected_samples": [
+        "research_agreement": [
             {
                 "code": code,
                 "name": out["name"],
-                "effective_outcome": out["effective_outcome"],
+                "research_label": out["research_label"],
             }
-            for code, _, out in protected
+            for code, _, out in research_agreement
         ],
-        "false_negatives": false_negatives,
+        "research_gate_disagreement": research_gate_disagreement,
         "recommended_reason": reason_text,
-        "proposal": json.loads(evolved_json),
+        "proposal": json.loads(shadow_json),
         "shadow_proposal": json.loads(shadow_json),
     }
 
@@ -1034,21 +1229,31 @@ def evolve(
     min_support: int = DEFAULT_MIN_SUPPORT,
     apply: bool = False,
 ) -> dict[str, object]:
-    """Compute (and optionally activate) aftermath-evolved discovery rulers."""
+    """Compute research hypotheses; applying model-derived proposals is refused."""
 
     if min_support < 1:
         raise ValueError("min_support must be >= 1")
+    # Guard before opening a connection: even refused --apply is strictly read-only.
+    eligible, refusal = activation_eligibility(
+        proposal_kind="research_hypothesis", evidence={}
+    )
+    validation = _research_validation_report()
+    metadata = {
+        "proposal_kind": "research_hypothesis",
+        "validation_report": validation,
+        "applied": False,
+        "activated_ruler_version_ids": {},
+    }
+    refusal_reasons = [refusal] if apply and not eligible else []
     path = Path(db_path)
     if not path.is_file():
-        return {"status": "blocked", "blocked_reasons": ["database_missing"]}
-    if apply:
-        engine = create_engine(f"sqlite:///{path.resolve()}")
-    else:
-        engine = create_engine(
-            "sqlite://",
-            creator=lambda: _read_only_connection(path),
-            poolclass=StaticPool,
-        )
+        return {**metadata, "status": "blocked",
+                "blocked_reasons": refusal_reasons + ["database_missing"]}
+    engine = create_engine(
+        "sqlite://",
+        creator=lambda: _read_only_connection(path),
+        poolclass=StaticPool,
+    )
     try:
         with Session(engine) as session:
             run = session.scalars(
@@ -1058,14 +1263,16 @@ def evolve(
             ).first()
             if run is None:
                 return {
+                    **metadata,
                     "status": "blocked",
-                    "blocked_reasons": ["no_completed_discovery_run"],
+                    "blocked_reasons": refusal_reasons + ["no_completed_discovery_run"],
                 }
             outcomes = _load_downstream_outcomes(session)
             if not outcomes:
                 return {
+                    **metadata,
                     "status": "blocked",
-                    "blocked_reasons": ["no_downstream_outcomes"],
+                    "blocked_reasons": refusal_reasons + ["no_downstream_outcomes"],
                 }
             snapshots = session.scalars(
                 select(DiscoveryInputSnapshot).where(
@@ -1075,7 +1282,6 @@ def evolve(
             industries = {row.code: row.industry for row in snapshots}
             names = {row.code: row.name for row in snapshots}
             track_reports: dict[str, dict[str, object]] = {}
-            activated_ids: dict[str, int] = {}
             for track in tracks:
                 if track not in TRACK_SPECS:
                     raise ValueError(f"unsupported discovery track: {track}")
@@ -1088,17 +1294,7 @@ def evolve(
                     names,
                     min_support=min_support,
                 )
-                if apply and report.get("status") == "ready" and report.get("changed"):
-                    row = activate_ruler(
-                        session,
-                        report["proposal"],  # type: ignore[arg-type]
-                        report["recommended_reason"],
-                    )
-                    activated_ids[track] = row.id
-                    report["activated_ruler_version_id"] = row.id
                 track_reports[track] = report
-            if apply and activated_ids:
-                session.commit()
             track_membership: dict[str, list[str]] = {}
             shadow_codes: set[str] = set()
             interim_codes: set[str] = set()
@@ -1118,7 +1314,7 @@ def evolve(
                     "tracks": matched_tracks,
                     "track_count": len(matched_tracks),
                     "researched_outcome": (
-                        str(outcomes[c]["effective_outcome"])
+                        str(outcomes[c]["research_label"])
                         if c in outcomes
                         else None
                     ),
@@ -1132,22 +1328,27 @@ def evolve(
                 if len(matched_tracks) >= 2
             ]
             return {
-                "schema_version": 1,
+                **metadata,
+                "schema_version": 2,
                 "algorithm_build": BUILD_VERSION,
                 "status": (
                     "ready"
-                    if all(r.get("status") == "ready" for r in track_reports.values())
+                    if not refusal_reasons and all(r.get("status") == "ready" for r in track_reports.values())
                     else "blocked"
                 ),
                 "source_discovery_run_id": run.id,
                 "source_week_key": run.week_key,
                 "downstream_outcomes_count": len(outcomes),
                 "min_support": min_support,
-                "applied": apply,
-                "activated_ruler_version_ids": activated_ids,
+                "blocked_reasons": refusal_reasons,
                 "cross_track_consensus": cross_track_consensus,
                 "tracks": track_reports,
             }
+    except OperationalError:
+        if not apply:
+            raise
+        return {**metadata, "status": "blocked",
+                "blocked_reasons": refusal_reasons + ["research_diagnostics_unavailable"]}
     finally:
         engine.dispose()
 
@@ -1165,12 +1366,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--min-support",
         type=int,
         default=DEFAULT_MIN_SUPPORT,
-        help="Minimum number of eliminated FPs required to promote a rule from shadow_staging to confirmed (default: 2).",
+        help="Legacy diagnostic parameter; never confirms or activates model hypotheses (default: 2).",
     )
     parser.add_argument(
         "--apply",
         action="store_true",
-        help="Activate confirmed evolved rulers in ruler_versions when changes exist.",
+        help="Request activation (model research hypotheses are refused without database writes).",
     )
     args = parser.parse_args(argv)
     if args.output is not None and _paths_alias(args.db, args.output):
