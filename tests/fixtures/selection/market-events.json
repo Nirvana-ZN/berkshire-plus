@@ -1,0 +1,5 @@
+[
+  {"event_id":"cash-ex-v1","economic_event_id":"cash-ex","code":"AAA","type":"dividend_ex","effective_at":"2026-02-02T01:00:00+00:00","observed_at":"2026-02-02T08:00:00+00:00","source_id":"synthetic-reviewed","cash_per_share":"1","pay_date":"2026-02-04"},
+  {"event_id":"split-v1","economic_event_id":"split","code":"AAA","type":"split","effective_at":"2026-02-03T01:00:00+00:00","observed_at":"2026-02-03T08:00:00+00:00","source_id":"synthetic-reviewed","factor":"2"},
+  {"event_id":"cash-paid-v1","economic_event_id":"cash-paid","code":"AAA","type":"dividend_paid","effective_at":"2026-02-04T06:00:00+00:00","observed_at":"2026-02-04T08:00:00+00:00","source_id":"synthetic-reviewed","ex_event_id":"cash-ex-v1"}
+]

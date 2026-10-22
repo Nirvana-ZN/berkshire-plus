@@ -107,6 +107,60 @@ class StrategyMember(Base):
     selection_reason: Mapped[str] = mapped_column(Text, nullable=False)
 
 
+class StrategyMarketEvent(Base):
+    __tablename__ = 'strategy_market_events'
+    __table_args__ = (Index('ix_strategy_market_economic_cutoff', 'economic_event_id', 'observed_at'),)
+
+    event_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    economic_event_id: Mapped[str] = mapped_column(Text, nullable=False)
+    code: Mapped[str] = mapped_column(Text, nullable=False)
+    type: Mapped[str] = mapped_column(Text, nullable=False)
+    effective_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+    observed_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+    source_id: Mapped[str] = mapped_column(Text, nullable=False)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    digest: Mapped[str] = mapped_column(Text, nullable=False)
+    supersedes_id: Mapped[str | None] = mapped_column(
+        ForeignKey('strategy_market_events.event_id', ondelete='RESTRICT'))
+
+
+class StrategyLedgerEntry(Base):
+    __tablename__ = 'strategy_ledger_entries'
+    __table_args__ = (
+        UniqueConstraint('cohort_id', 'horizon_months', 'event_id', 'entry_kind', 'calculation_version'),
+        CheckConstraint('horizon_months IN (3,6,12)'),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    cohort_id: Mapped[int] = mapped_column(ForeignKey('strategy_cohorts.id', ondelete='RESTRICT'), nullable=False)
+    horizon_months: Mapped[int] = mapped_column(nullable=False)
+    event_id: Mapped[str] = mapped_column(ForeignKey('strategy_market_events.event_id', ondelete='RESTRICT'), nullable=False)
+    entry_kind: Mapped[str] = mapped_column(Text, nullable=False)
+    sequence: Mapped[int] = mapped_column(nullable=False)
+    shares_after: Mapped[str] = mapped_column(Text, nullable=False)
+    cash_after: Mapped[str] = mapped_column(Text, nullable=False)
+    receivable_after: Mapped[str] = mapped_column(Text, nullable=False)
+    cost: Mapped[str] = mapped_column(Text, nullable=False)
+    calculation_version: Mapped[str] = mapped_column(Text, nullable=False)
+
+
+class StrategyObservation(Base):
+    __tablename__ = 'strategy_observations'
+    __table_args__ = (
+        UniqueConstraint('cohort_id', 'horizon_months', 'as_of', 'calculation_version', 'event_digest'),
+        CheckConstraint('horizon_months IN (3,6,12)'),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    cohort_id: Mapped[int] = mapped_column(ForeignKey('strategy_cohorts.id', ondelete='RESTRICT'), nullable=False)
+    horizon_months: Mapped[int] = mapped_column(nullable=False)
+    as_of: Mapped[date] = mapped_column(Date, nullable=False)
+    state: Mapped[str] = mapped_column(Text, nullable=False)
+    metrics_json: Mapped[str] = mapped_column(Text, nullable=False)
+    event_digest: Mapped[str] = mapped_column(Text, nullable=False)
+    calculation_version: Mapped[str] = mapped_column(Text, nullable=False)
+
+
 def strategy_guard_statements():
     """Shared by metadata creation and idempotent initialization of existing DBs."""
     for model in (StrategyExperiment, StrategyCohort, StrategyMember):
@@ -138,6 +192,23 @@ def strategy_guard_statements():
            "AND json_extract(m.value, '$.gate_result_id') = NEW.gate_result_id "
            "AND json_extract(m.value, '$.selection_reason') = NEW.selection_reason) "
            "BEGIN SELECT RAISE(ABORT, 'strategy membership is immutable'); END")
+    for model, duplicate in (
+        (StrategyMarketEvent, 'event_id = NEW.event_id'),
+        (StrategyLedgerEntry, 'id = NEW.id OR (cohort_id = NEW.cohort_id AND '
+         'horizon_months = NEW.horizon_months AND event_id = NEW.event_id AND '
+         'entry_kind = NEW.entry_kind AND calculation_version = NEW.calculation_version)'),
+        (StrategyObservation, 'id = NEW.id OR (cohort_id = NEW.cohort_id AND '
+         'horizon_months = NEW.horizon_months AND as_of = NEW.as_of AND '
+         'calculation_version = NEW.calculation_version AND event_digest = NEW.event_digest)'),
+    ):
+        table = model.__tablename__
+        for action in ('UPDATE', 'DELETE'):
+            yield (f'CREATE TRIGGER IF NOT EXISTS trg_{table}_{action.lower()} '
+                   f'BEFORE {action} ON {table} BEGIN '
+                   "SELECT RAISE(ABORT, 'strategy calculations are append-only'); END")
+        yield (f'CREATE TRIGGER IF NOT EXISTS trg_{table}_replace BEFORE INSERT ON {table} '
+               f'WHEN EXISTS (SELECT 1 FROM {table} WHERE {duplicate}) BEGIN '
+               "SELECT RAISE(ABORT, 'strategy calculations are immutable'); END")
 
 
 for _statement in strategy_guard_statements():
