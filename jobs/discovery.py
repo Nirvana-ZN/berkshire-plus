@@ -58,6 +58,8 @@ from discovery.snapshot import (
     load_frozen_inputs,
 )
 from discovery.rulers import deep_value_ruler, garp_ruler, quality_discount_ruler
+from discovery.selection_contract import is_candidate, rank_inputs, load_fundamentals, eligible_legacy_company
+from discovery.ranking import rank_candidates, ranking_audit
 from discovery.tracks.deep_value import classify as classify_deep_value
 from discovery.tracks.garp import classify as classify_garp
 from discovery.tracks.quality_discount import (
@@ -337,8 +339,16 @@ def _competition_metrics(
     company: FrozenCompanyInput,
     raw_metrics: Mapping[str, object],
     extra_flags: Sequence[str] = (),
+    *, ruler=None,
 ) -> dict[str, object]:
     out = dict(raw_metrics)
+    candidate = ruler is not None and is_candidate(ruler)
+    if candidate:
+        company, _ = eligible_legacy_company(company, load_fundamentals(company, ruler))
+    policy = ruler.ranking_contract['annual_risk_policy'] if candidate else {}
+    def threshold(name, legacy):
+        return Decimal(policy[name]) if candidate else Decimal(legacy)
+    incomplete_risks = False
     operating = company.fields.get('operating_result')
     if isinstance(operating, Mapping):
         out['operating_result'] = operating
@@ -350,8 +360,14 @@ def _competition_metrics(
         if not ef:
             continue
         if str(ef).startswith("interim_yoy:"):
+            text = str(ef).split(":", 1)[1]
+            if candidate:
+                value = _dec_or_none(text)
+                if value is not None:
+                    out['_interim_yoy'] = str(value)
+                continue
             try:
-                out["_interim_yoy"] = float(str(ef).split(":", 1)[1])
+                out["_interim_yoy"] = float(text)
             except ValueError:
                 pass
             continue
@@ -359,7 +375,7 @@ def _competition_metrics(
             flags.append(str(ef))
     pb = _dec_or_none(company.fields.get("pb"))
     roe_mean = _dec_or_none(raw_metrics.get("roe_mean"))
-    if pb is not None and pb > Decimal("8") and roe_mean is not None and roe_mean > Decimal("50"):
+    if pb is not None and pb > threshold("pb_min", "8") and roe_mean is not None and roe_mean > threshold("roe_mean_min", "50"):
         flags.append("thin_equity_high_pb")
 
     hist = company.fields.get("financial_history") or ()
@@ -370,6 +386,13 @@ def _competition_metrics(
         p = str(row.get("period") or "")
         vals = row.get("values")
         if p.isdigit() and len(p) == 4 and isinstance(vals, Mapping):
+            if candidate:
+                sources = row.get('field_sources', {})
+                provenance = row.get('provenance', {})
+                vals = {key: value if isinstance(sources.get(key), Mapping)
+                        and sources[key].get('trusted') is True
+                        and tuple(provenance.get(key, ())) == ('discovery',) else None
+                        for key, value in vals.items()}
             ann_vals.append((int(p), vals))
     ann_vals.sort(key=lambda x: x[0])
 
@@ -377,10 +400,10 @@ def _competition_metrics(
         latest_vals = ann_vals[-1][1]
         gw = _dec_or_none(latest_vals.get("goodwill"))
         na = _dec_or_none(latest_vals.get("net_assets"))
-        if gw is not None and gw > 0 and na is not None and na > 0 and (gw / na) > Decimal("0.25"):
+        if gw is not None and gw > 0 and na is not None and na > 0 and (gw / na) > threshold("goodwill_to_equity_min", "0.25"):
             flags.append("goodwill_bloat")
 
-        is_fin = (
+        is_fin = raw_metrics.get('ranking_branch') == 'bank' if candidate else (
             raw_metrics.get("branch") == "financial"
             or raw_metrics.get("quality_branch") == "bank"
             or "银行" in (company.industry or "")
@@ -390,7 +413,7 @@ def _competition_metrics(
         if not is_fin:
             l_ni = _dec_or_none(latest_vals.get("net_income"))
             l_ocf = _dec_or_none(latest_vals.get("ocf"))
-            if l_ni is not None and l_ni > 0 and l_ocf is not None and (l_ocf / l_ni) < Decimal("0.40"):
+            if l_ni is not None and l_ni > 0 and l_ocf is not None and (l_ocf / l_ni) < threshold("recent_cash_conversion_max", "0.40"):
                 flags.append("recent_ocf_collapse")
             if len(ann_vals) >= 2:
                 v0, v1 = ann_vals[-1][1], ann_vals[-2][1]
@@ -418,7 +441,7 @@ def _competition_metrics(
             dni_cur = _dec_or_none(ann_vals[-1][1].get("deducted_net_income"))
             dni_prev = _dec_or_none(ann_vals[-2][1].get("deducted_net_income"))
             if dni_cur is not None and dni_prev is not None and dni_prev > 0:
-                if (dni_cur - dni_prev) / dni_prev <= Decimal("-0.15"):
+                if (dni_cur - dni_prev) / dni_prev <= threshold("deducted_drop_max", "-0.15"):
                     flags.append("annual_deducted_drop")
 
         roes = [
@@ -426,10 +449,22 @@ def _competition_metrics(
             for _, v in ann_vals[-4:]
             if _dec_or_none(v.get("roe")) is not None
         ]
-        if len(roes) == 4 and roes[0] > roes[1] > roes[2] > roes[3] and (roes[0] - roes[3]) >= Decimal("4"):  # type: ignore[operator]
+        if len(roes) == 4 and roes[0] > roes[1] > roes[2] > roes[3] and (roes[0] - roes[3]) >= threshold("roe_decline_min", "4"):  # type: ignore[operator]
             flags.append("roe_step_down_3y")
 
-    out["risk_flags"] = tuple(dict.fromkeys(flags))
+    out['risk_flags'] = tuple(dict.fromkeys(flags))
+    if candidate:
+        # An unavailable annual risk input cannot certify an empty risk set.
+        required = ('goodwill', 'net_assets', 'deducted_net_income', 'roe')
+        if out.get('ranking_branch') != 'bank':
+            required += ('net_income', 'ocf', 'capex')
+        incomplete_risks = (len(ann_vals) < 5 or any(vals.get(field) is None
+                            for _, vals in ann_vals[-5:] for field in required))
+        formal = [flag for flag in out['risk_flags'] if not flag.startswith(('collection_', 'restricted_cash_'))]
+        if incomplete_risks:
+            formal.append('annual_risk_evidence_missing')
+        out['verified_risk_types'] = tuple(sorted(set(formal)))
+        out['operating_state'] = operating.get('state') if isinstance(operating, Mapping) else 'unknown'
     return out
 
 
@@ -470,20 +505,21 @@ def builtin_track_executor(
         metrics = {
             candidate.code: _competition_metrics(
                 companies[candidate.code], _plain_metrics(candidate.metrics_json),
-                candidate.extra_risk_flags)
+                candidate.extra_risk_flags, ruler=ruler)
             for candidate in context.candidates
         }
-        ranked = rank_borda_competition(
-            tuple(
-                CompetitionCandidate(
-                    code=candidate.code,
-                    industry=companies[candidate.code].industry,
-                    metrics=metrics[candidate.code],
-                )
-                for candidate in context.candidates
-            ),
-            ruler.order,
-        )
+        entrants = tuple(CompetitionCandidate(
+            code=candidate.code, industry=companies[candidate.code].industry,
+            metrics=rank_inputs(metrics[candidate.code], ruler) if is_candidate(ruler) else metrics[candidate.code])
+            for candidate in context.candidates)
+        if is_candidate(ruler):
+            ranked = rank_candidates(entrants, ruler.ranking_contract)
+            audits = ranking_audit(entrants, ruler.ranking_contract)
+            for code, audit in audits.items():
+                metrics[code]['ranking_audit'] = audit
+                metrics[code]['rank_score'] = audit['rank_score']
+        else:
+            ranked = rank_borda_competition(entrants, ruler.order)
         cards = {
             row.code: build_evidence_card(
                 row.code,

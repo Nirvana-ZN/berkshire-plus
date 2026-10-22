@@ -9,6 +9,7 @@ import json
 from types import MappingProxyType
 
 from discovery.industry import classify_industry_branch
+from discovery.builds import CANDIDATE_BUILD_VERSION
 from discovery.tracks.quality_discount import (
     MAX_ARITHMETIC_PRECISION,
     _divide as _bounded_divide,
@@ -553,6 +554,9 @@ def _fact_specs(
     metrics: Mapping[str, object],
     ruler: Mapping[str, object],
 ) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    if ruler.get('algorithm_version') == CANDIDATE_BUILD_VERSION:
+        order = ruler['ranking_contract']['branch_orders'][metrics['ranking_branch']]
+        return tuple((field, (field,)) for field, _ in order)
     branch = metrics.get("quality_branch") or metrics.get("branch")
     branches = ruler.get("sector_branches")
     if isinstance(branches, Mapping) and type(branch) is str:
@@ -596,6 +600,14 @@ def _reliable_inputs(
     ruler: Mapping[str, object],
     branch: object,
 ) -> Mapping[str, object] | None:
+    if ruler.get('algorithm_version') == CANDIDATE_BUILD_VERSION:
+        result = metrics.get('metric_results', {}).get(field)
+        if result is not None:
+            value = _decimal(result.get('value'))
+            if result.get('status') != 'verified' or value is None or value != _decimal(metrics.get(field)):
+                return None
+            return {field: metrics[field], 'metric_result': result,
+                    'metric_contract_version': ruler['metric_contract']['version']}
     policies = ruler.get("missing_policy")
     minimums = ruler.get("min_observations")
     if not isinstance(policies, Mapping) or not isinstance(minimums, Mapping):
@@ -606,6 +618,8 @@ def _reliable_inputs(
     if type(value) not in {str, int}:
         return None
     requirement = _OBSERVATION_REQUIREMENTS.get(field)
+    if field == 'deducted_profit_consistent_growth_periods' and ruler.get('algorithm_version') == CANDIDATE_BUILD_VERSION:
+        requirement = ('deducted_profit_growth', 'deducted_profit_growth_observations')
     if requirement is None:
         return None
     minimum_name, count_name = requirement
@@ -690,6 +704,10 @@ def _fact_items(
         provenance, as_of = _provenance(fields, source_as_of)
         inputs.update(provenance)
         text = ",".join(f"{field}={metrics[field]}" for field in fields)
+        if ruler.get('algorithm_version') == CANDIDATE_BUILD_VERSION:
+            inputs['ranking_audit'] = metrics.get('ranking_audit')
+            labels = metrics.get('metric_labels', {})
+            text = ','.join(f'{labels.get(field, field)}={metrics[field]}' for field in fields)
         if (
             fields == ("return_on_capital",)
             and metrics.get("return_metric_label") == "roe_fallback"
@@ -942,6 +960,21 @@ def build_evidence_card(
     dates = _source_dates(source_as_of)
 
     facts = _fact_items(track, metrics, ruler, dates)
+    if ruler.get('algorithm_version') == CANDIDATE_BUILD_VERSION:
+        # One auditable counter-evidence item retains every signal, including
+        # competition additions and explicitly non-ranking shadow diagnostics.
+        rank = metrics.get('ranking_audit', {})
+        state = rank.get('risk_state', 'unknown')
+        risk = _item(kind='risk', category='worsening_trend' if state in {'watch', 'deteriorating'} else None,
+            rule_id=f'{track}.risk.selection_v8',
+            inputs={key: metrics.get(key) for key in ('ranking_audit', 'risk_flags', 'verified_risk_types',
+                'operating_result', 'operating_policy', 'freeze_new_positions', 'metric_results',
+                'collection_metrics', 'collection_policy', 'shadow_signals', 'fundamental_fingerprint')},
+            text=f'研究风险层级：{state}；回款与受限资金信号仅作影子证据。',
+            as_of=dates['financial'], completeness='partial' if state == 'unknown' else 'complete')
+        sufficient = len(facts) >= 3
+        return EvidenceCard(code, 'pass' if sufficient else 'insufficient',
+                            None if sufficient else 'evidence_facts_insufficient', facts + (risk,))
     risks = tuple(
         item
         for item in (

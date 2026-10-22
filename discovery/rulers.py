@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping, Sequence
-from dataclasses import InitVar, dataclass
+from dataclasses import InitVar, dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from math import isfinite
@@ -17,7 +17,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 from app.models import RulerVersion
-from discovery.builds import AVAILABLE_BUILDS, RETIRED_BUILDS
+from discovery.builds import AVAILABLE_BUILDS, CANDIDATE_BUILD_VERSION, RETIRED_BUILDS
 from discovery.industry import classify_industry_branch
 from discovery.quality_contract import quality_ruler_branch_policies
 from discovery.tracks import SCOPE_TRACKS, TRACKS, scope_for_track, track_for_scope
@@ -822,6 +822,9 @@ class TrackRuler:
     order: tuple[tuple[str, str, str], ...]
     industry_version: str
     algorithm_version: str
+    ranking_contract: Mapping[str, object] = field(default_factory=dict)
+    operating_policy: Mapping[str, object] = field(default_factory=dict)
+    metric_contract: Mapping[str, object] = field(default_factory=dict)
     _allow_retired_algorithm: InitVar[bool] = False
 
     def __post_init__(self, _allow_retired_algorithm: bool) -> None:
@@ -919,12 +922,20 @@ class TrackRuler:
         )
         if (
             not _allow_retired_algorithm
-            and algorithm_version not in AVAILABLE_BUILDS
+            and algorithm_version not in (AVAILABLE_BUILDS | {CANDIDATE_BUILD_VERSION})
         ):
             raise ValueError(
                 f"algorithm build is unavailable: {algorithm_version}"
             )
 
+        for name in ('ranking_contract', 'operating_policy', 'metric_contract'):
+            value = getattr(self, name)
+            if not isinstance(value, Mapping):
+                raise TypeError(f'{name} must be an object')
+            _reject_aliases_and_cycles(value, active=set(), seen=set())
+            if algorithm_version != CANDIDATE_BUILD_VERSION and value:
+                raise ValueError('selection contracts require the candidate build')
+            object.__setattr__(self, name, _freeze_json(value))
         object.__setattr__(self, "scope", scope)
         object.__setattr__(self, "fields", fields)
         object.__setattr__(self, "formulas", formulas)
@@ -958,6 +969,10 @@ class TrackRuler:
                 "order": self.order,
                 "industry_version": self.industry_version,
                 "algorithm_version": self.algorithm_version,
+                **({'ranking_contract': self.ranking_contract,
+                    'operating_policy': self.operating_policy,
+                    'metric_contract': self.metric_contract}
+                   if self.algorithm_version == CANDIDATE_BUILD_VERSION else {}),
             }
         )
 
@@ -971,9 +986,11 @@ class TrackRuler:
         if not isinstance(payload, Mapping):
             raise TypeError("ruler payload must be an object")
         _reject_aliases_and_cycles(payload, active=set(), seen=set())
-        if set(payload) != _PAYLOAD_KEYS:
-            missing = sorted(_PAYLOAD_KEYS - set(payload))
-            extra = sorted(set(payload) - _PAYLOAD_KEYS)
+        keys = _PAYLOAD_KEYS | ({'ranking_contract', 'operating_policy', 'metric_contract'}
+                                if payload.get('algorithm_version') == CANDIDATE_BUILD_VERSION else set())
+        if set(payload) != keys:
+            missing = sorted(keys - set(payload))
+            extra = sorted(set(payload) - keys)
             raise ValueError(
                 f"ruler payload keys mismatch; missing={missing}, extra={extra}"
             )
@@ -998,6 +1015,9 @@ class TrackRuler:
             order=payload["order"],  # type: ignore[arg-type]
             industry_version=payload["industry_version"],  # type: ignore[arg-type]
             algorithm_version=payload["algorithm_version"],  # type: ignore[arg-type]
+            ranking_contract=payload.get('ranking_contract', {}),
+            operating_policy=payload.get('operating_policy', {}),
+            metric_contract=payload.get('metric_contract', {}),
             _allow_retired_algorithm=allow_retired_algorithm,
         )
 
@@ -1040,7 +1060,7 @@ class TrackRuler:
 
 def parse_payload(value: TrackRuler | Mapping[str, object] | str) -> TrackRuler:
     if isinstance(value, TrackRuler):
-        if value.algorithm_version not in AVAILABLE_BUILDS:
+        if value.algorithm_version not in (AVAILABLE_BUILDS | {CANDIDATE_BUILD_VERSION}):
             raise ValueError(
                 f"algorithm build is unavailable: {value.algorithm_version}"
             )
@@ -1053,6 +1073,8 @@ def parse_payload(value: TrackRuler | Mapping[str, object] | str) -> TrackRuler:
 def validate_quality_discount_ruler(ruler: TrackRuler) -> TrackRuler:
     """Require the complete, explicitly supported quality ruler schema."""
 
+    if isinstance(ruler, TrackRuler) and ruler.algorithm_version == CANDIDATE_BUILD_VERSION:
+        return _validate_candidate(ruler, expected_track="quality_discount")
     if not isinstance(ruler, TrackRuler) or ruler.track != "quality_discount":
         raise ValueError("quality discount ruler scope is required")
     if ruler.fields != QUALITY_DISCOUNT_FIELDS:
@@ -1271,6 +1293,8 @@ def quality_discount_ruler(
 def validate_deep_value_ruler(ruler: TrackRuler) -> TrackRuler:
     """Require the complete deep-value schema implemented by this build."""
 
+    if isinstance(ruler, TrackRuler) and ruler.algorithm_version == CANDIDATE_BUILD_VERSION:
+        return _validate_candidate(ruler, expected_track="deep_value")
     if not isinstance(ruler, TrackRuler) or ruler.track != "deep_value":
         raise ValueError("deep value ruler scope is required")
     if ruler.fields != DEEP_VALUE_FIELDS:
@@ -1400,6 +1424,8 @@ def deep_value_ruler(
 def validate_garp_ruler(ruler: TrackRuler) -> TrackRuler:
     """Require the exact GARP contract implemented by this build."""
 
+    if isinstance(ruler, TrackRuler) and ruler.algorithm_version == CANDIDATE_BUILD_VERSION:
+        return _validate_candidate(ruler, expected_track="garp")
     if not isinstance(ruler, TrackRuler) or ruler.track != "garp":
         raise ValueError("GARP ruler scope is required")
     if ruler.fields != GARP_FIELDS:
@@ -1619,6 +1645,10 @@ def validate_ruler_version(
             row.payload_json,
             allow_retired_algorithm=allow_retired_algorithm,
         )
+        if ruler.algorithm_version not in AVAILABLE_BUILDS and (
+            ruler.algorithm_version == CANDIDATE_BUILD_VERSION or not allow_retired_algorithm
+        ):
+            raise ValueError('candidate build is not a production ruler')
         # Retired payloads were semantically validated at activation; the
         # digest check below still proves they are the activated bytes.
         if ruler.algorithm_version not in RETIRED_BUILDS:
@@ -1712,6 +1742,8 @@ def activate(
     if not reason_text:
         raise ValueError("ruler activation reason must not be blank")
     ruler = _validate_track_semantics(parse_payload(value))
+    if ruler.algorithm_version not in AVAILABLE_BUILDS:
+        raise ValueError('candidate build cannot be published before production activation')
     payload_json = canonical_payload(ruler)
     digest = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
     existing = _newest_valid(
@@ -1828,3 +1860,100 @@ def require_ready(
 
 
 status = readiness
+
+
+
+def _legacy_candidate_projection(ruler):
+    """Reuse structural gate validation; this object is never executed or published."""
+    payload = _plain(ruler.payload())
+    track = ruler.track
+    schemas = {'quality_discount': (QUALITY_DISCOUNT_FIELDS, QUALITY_DISCOUNT_FORMULAS, QUALITY_DISCOUNT_ORDER),
+               'deep_value': (DEEP_VALUE_FIELDS, DEEP_VALUE_FORMULAS, DEEP_VALUE_ORDER),
+               'garp': (GARP_FIELDS, GARP_FORMULAS, GARP_ORDER)}
+    fields, formulas, order = schemas[track]
+    payload.update(fields=list(fields), formulas=dict(formulas), order=[list(row) for row in order],
+                   missing_policy={key: ruler.missing_policy[key] for key in fields}, algorithm_version='discovery-v7')
+    for key in ('ranking_contract', 'operating_policy', 'metric_contract'):
+        payload.pop(key)
+    if track == 'garp':
+        payload['thresholds'].pop('roic_gross_min')
+        payload['thresholds']['return_on_capital_min'] = '10'
+        branch = payload['sector_branches']['nonfinancial']
+        branch['return_metric_policy'] = 'roic_then_roe'
+        branch['evidence_fields'] = ['revenue_cagr', 'deducted_profit_cagr', 'return_on_capital', 'peg']
+    return _validate_track_semantics(TrackRuler.from_payload(payload, allow_retired_algorithm=True))
+
+
+def candidate_ruler(value, *, operating_policy, band='base') -> TrackRuler:
+    """Build a callable, unpublished v8 contract from a validated v7 hypothesis.
+
+    The caller supplies the exact frozen operating policy ({} retains unknown).
+    No source collection, database access or production activation occurs here.
+    """
+    from discovery.selection_contract import metric_contract, ranking_contract, registered_metrics
+    if band not in {'conservative', 'base', 'relaxed'}:
+        raise ValueError('unknown candidate hypothesis band')
+    base = _validate_track_semantics(parse_payload(value))
+    if base.algorithm_version == CANDIDATE_BUILD_VERSION:
+        raise ValueError('candidate factory requires a legacy hypothesis')
+    payload = _plain(base.payload())
+    specs = registered_metrics(base.track)
+    payload['algorithm_version'] = CANDIDATE_BUILD_VERSION
+    payload['ranking_contract'] = ranking_contract(base.track)
+    payload['metric_contract'] = metric_contract(base.track)
+    payload['operating_policy'] = _plain(_freeze_json(operating_policy))
+    payload['fields'] = list(dict.fromkeys((*base.fields, *specs)))
+    for name, spec in specs.items():
+        payload['formulas'][name] = spec.formula
+        payload['missing_policy'][name] = spec.missing_policy
+        if spec.alias:
+            payload['formulas'][spec.alias] = f'alias({name})'
+    if 'peg_growth_cap' in payload['thresholds']:
+        payload['thresholds']['peg_growth_cap'] = '0.25'
+    if base.track == 'garp':
+        payload['thresholds'].pop('return_on_capital_min')
+        payload['thresholds']['roic_gross_min'] = {'conservative': '0.12', 'base': '0.1', 'relaxed': '0.08'}[band]
+        payload['min_observations']['roic'] = 5
+        branch = payload['sector_branches']['nonfinancial']
+        branch['return_metric_policy'] = 'verified_roic_gross_only'
+        branch['evidence_fields'] = ['revenue_cagr', 'deducted_profit_cagr', 'roic_gross_5y', 'deducted_peg']
+    return _validate_candidate(TrackRuler.from_payload(json.loads(json.dumps(payload))), expected_track=base.track)
+
+
+def _validate_candidate(ruler, *, expected_track):
+    from discovery.selection_contract import metric_contract, ranking_contract, registered_metrics
+    if ruler.track != expected_track:
+        raise ValueError('candidate track mismatch')
+    try:
+        base = _legacy_candidate_projection(ruler)
+    except (KeyError, TypeError) as error:
+        raise ValueError('candidate contract is incomplete') from error
+    specs = registered_metrics(ruler.track)
+    expected_fields = tuple(dict.fromkeys((*base.fields, *specs)))
+    formulas = dict(base.formulas)
+    policies = dict(base.missing_policy)
+    for name, spec in specs.items():
+        formulas[name] = spec.formula
+        policies[name] = spec.missing_policy
+        if spec.alias:
+            formulas[spec.alias] = f'alias({name})'
+    if (ruler.fields != expected_fields or dict(ruler.formulas) != formulas
+            or dict(ruler.missing_policy) != policies or ruler.order != base.order
+            or _plain(ruler.metric_contract) != _plain(_freeze_json(metric_contract(ruler.track)))
+            or _plain(ruler.ranking_contract) != _plain(_freeze_json(ranking_contract(ruler.track)))):
+        raise ValueError('candidate metric/ranking contract mismatch')
+    if 'peg_growth_cap' in ruler.thresholds and Decimal(ruler.thresholds['peg_growth_cap']) != Decimal('.25'):
+        raise ValueError('candidate PEG growth cap must be 0.25')
+    if ruler.track == 'garp':
+        branch = ruler.sector_branches['nonfinancial']
+        if (not 0 < Decimal(ruler.thresholds['roic_gross_min']) <= 1
+                or ruler.min_observations['roic'] != 5
+                or branch['return_metric_policy'] != 'verified_roic_gross_only'
+                or tuple(branch['evidence_fields']) != ('revenue_cagr', 'deducted_profit_cagr', 'roic_gross_5y', 'deducted_peg')):
+            raise ValueError('candidate gross ROIC policy mismatch')
+    common = ruler.sector_branches['common']
+    if ruler.track in {'quality_discount', 'deep_value'}:
+        windows = common['lookback_windows']
+        if windows['normalized_earnings'] != 5 or (ruler.track == 'deep_value' and windows['fcf'] != 5):
+            raise ValueError('candidate normalization requires five annuals')
+    return ruler

@@ -15,6 +15,8 @@ from discovery.industry import classify_industry_branch
 from discovery.metrics import cagr, cash_conversion, mean, percentile_rank
 from discovery.rulers import GARP_FIELD_DOMAIN_POLICY, TrackRuler, garp_ruler
 from discovery.snapshot import FrozenCompanyInput
+from discovery.selection_contract import (is_candidate, input_schema_matches, load_fundamentals,
+                                          apply_metrics, SelectionInputError, eligible_legacy_company)
 from discovery.tracks.quality_discount import (
     MAX_FINANCIAL_ROWS,
     _AS_OF_KEYS,
@@ -489,31 +491,32 @@ def _metric_values(
             None if slowdown is None else max(Decimal(0), slowdown)
         )
 
-    return_window = windows.get("return_on_capital")
-    roic_rows = _available(return_window, "roic")
-    roe_rows = _available(return_window, "roe")
-    counts["roic"] = len(roic_rows)
-    counts["roe_fallback"] = len(roe_rows)
-    audit["roic_observations"] = str(len(roic_rows))
-    audit["roe_fallback_observations"] = str(len(roe_rows))
-    if roic_rows:
-        audit["return_metric_label"] = "roic"
-        if (
-            len(roic_rows) >= ruler.min_observations["roic"]
-            and _latest(return_window, roic_rows)
-        ):
-            metrics["return_on_capital"] = mean(
-                row.values["roic"] for row in roic_rows
-            )
-    else:
-        audit["return_metric_label"] = "roe_fallback"
-        if (
-            len(roe_rows) >= ruler.min_observations["roe_fallback"]
-            and _latest(return_window, roe_rows)
-        ):
-            metrics["return_on_capital"] = mean(
-                row.values["roe"] for row in roe_rows
-            )
+    if not is_candidate(ruler):
+        return_window = windows.get("return_on_capital")
+        roic_rows = _available(return_window, "roic")
+        roe_rows = _available(return_window, "roe")
+        counts["roic"] = len(roic_rows)
+        counts["roe_fallback"] = len(roe_rows)
+        audit["roic_observations"] = str(len(roic_rows))
+        audit["roe_fallback_observations"] = str(len(roe_rows))
+        if roic_rows:
+            audit["return_metric_label"] = "roic"
+            if (
+                len(roic_rows) >= ruler.min_observations["roic"]
+                and _latest(return_window, roic_rows)
+            ):
+                metrics["return_on_capital"] = mean(
+                    row.values["roic"] for row in roic_rows
+                )
+        else:
+            audit["return_metric_label"] = "roe_fallback"
+            if (
+                len(roe_rows) >= ruler.min_observations["roe_fallback"]
+                and _latest(return_window, roe_rows)
+            ):
+                metrics["return_on_capital"] = mean(
+                    row.values["roe"] for row in roe_rows
+                )
 
     cash_window = windows.get("cash_conversion")
     cash_rows = tuple(
@@ -533,7 +536,8 @@ def _metric_values(
     dilution_rows = _available(dilution_window, "shares")
     counts["dilution"] = len(dilution_rows)
     if (
-        len(dilution_rows) >= ruler.min_observations["dilution"]
+        not is_candidate(ruler)
+        and len(dilution_rows) >= ruler.min_observations["dilution"]
         and _exact_endpoints(dilution_window, dilution_rows)
     ):
         metrics["dilution_rate"] = _subtract(
@@ -631,7 +635,7 @@ def _metric_values(
         metrics["current_pe"] = current_pe
         metrics["pe_percentile"] = percentile_rank(current_pe, pe)
     growth = metrics["deducted_profit_cagr"]
-    if growth is not None and growth > 0:
+    if not is_candidate(ruler) and growth is not None and growth > 0:
         metrics["capped_growth"] = min(
             growth, Decimal(ruler.thresholds["peg_growth_cap"])
         )
@@ -735,6 +739,11 @@ def _gate_failures(
             elif value > Decimal(ruler.thresholds[threshold]):
                 failures.append(("drop", f"{metric}_above_max"))
         return failures
+    if gate == "return_on_capital" and is_candidate(ruler):
+        value = metrics['roic_gross_5y']
+        if value is None:
+            return [_missing('roic_gross_insufficient')]
+        return [('drop', 'roic_gross_below_min')] if value < Decimal(ruler.thresholds['roic_gross_min']) else []
     if gate == "return_on_capital":
         value = metrics["return_on_capital"]
         minimum = "roic" if label == "roic" else "roe_fallback"
@@ -853,10 +862,11 @@ def _gate_failures(
             ruler.thresholds["pe_percentile_max"]
         ):
             failures.append(("drop", "valuation_pe_percentile_above_max"))
-        if metrics["current_pe"] is None:
-            failures.append(_missing("current_pe_insufficient"))
-        elif metrics["current_pe"] > Decimal(ruler.thresholds["pe_max"]):
-            failures.append(("drop", "current_pe_above_max"))
+        pe_key = 'pe_deducted_ttm' if is_candidate(ruler) else 'current_pe'
+        if metrics[pe_key] is None:
+            failures.append(_missing(f'{pe_key}_insufficient'))
+        elif metrics[pe_key] > Decimal(ruler.thresholds['pe_max']):
+            failures.append(('drop', f'{pe_key}_above_max'))
         return failures
     raise ValueError(f"unsupported GARP gate: {gate}")
 
@@ -869,6 +879,8 @@ def classify(company: FrozenCompanyInput, ruler: TrackRuler) -> TrackVerdict:
         raise TypeError("company must be a FrozenCompanyInput")
     code = company.code if type(company.code) is str else ""
     metrics = _empty_metrics(code)
+    if is_candidate(ruler):
+        metrics['ranking_branch'] = 'unknown'
     try:
         if (
             type(company.code) is not str
@@ -887,9 +899,7 @@ def classify(company: FrozenCompanyInput, ruler: TrackRuler) -> TrackVerdict:
                     company.ruler_version_ids,
                 )
             )
-            or set(company.fields) != _FIELD_KEYS
-            or set(company.sources) != _SOURCE_KEYS
-            or set(company.as_of) != _AS_OF_KEYS
+            or not input_schema_matches(company, ruler, _FIELD_KEYS, _SOURCE_KEYS, _AS_OF_KEYS)
             or set(company.security_status) != _SECURITY_KEYS
             or company.fields["listing_date"]
             != company.security_status["listing_date"]
@@ -899,6 +909,8 @@ def classify(company: FrozenCompanyInput, ruler: TrackRuler) -> TrackVerdict:
 
         shared = classify_industry_branch(company.industry)
         metrics["branch"] = shared
+        if is_candidate(ruler) and shared == "nonfinancial":
+            metrics["ranking_branch"] = shared
         if company.security_status["industry_version"] != ruler.industry_version:
             return _verdict(
                 code,
@@ -957,6 +969,10 @@ def classify(company: FrozenCompanyInput, ruler: TrackRuler) -> TrackVerdict:
         ):
             raise _SnapshotInvalid("snapshot look-ahead")
 
+        snapshot = load_fundamentals(company, ruler) if is_candidate(ruler) else None
+        if snapshot is not None:
+            company, eligibility = eligible_legacy_company(company, snapshot)
+            metrics['legacy_field_eligibility'] = eligibility
         history = _financial_history(company, financial_as_of)
         windows, audit, stale = _windows(
             history, ruler, company.snapshot_at.date()
@@ -991,10 +1007,14 @@ def classify(company: FrozenCompanyInput, ruler: TrackRuler) -> TrackVerdict:
             company, ruler, windows, valuations
         )
         metrics.update(calculation_audit)
-    except _SnapshotInvalid as error:
+        if is_candidate(ruler):
+            apply_metrics(company, ruler, shared, windows, calculated, counts, metrics, snapshot=snapshot)
+    except (_SnapshotInvalid, SelectionInputError) as error:
         reason = str(error)
         evidence: tuple[str, ...] = ()
-        if isinstance(error, (_DomainInvalid, _AnnualPeriodDuplicate)):
+        if isinstance(error, SelectionInputError):
+            reason = 'selection_evidence_invalid'
+        elif isinstance(error, (_DomainInvalid, _AnnualPeriodDuplicate)):
             evidence = (f"garp.{reason}",)
         elif "valuation" in reason:
             reason = "valuation_history_invalid"
@@ -1039,7 +1059,7 @@ def classify(company: FrozenCompanyInput, ruler: TrackRuler) -> TrackVerdict:
         key=lambda row: row.year,
         default=None,
     )
-    if latest_row is not None and calculated["current_pe"] is not None:
+    if not is_candidate(ruler) and latest_row is not None and calculated["current_pe"] is not None:
         deducted = latest_row.values["deducted_net_income"]
         ttm_earnings = _divide(
             _multiply(

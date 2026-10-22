@@ -7,6 +7,9 @@ from typing import TypeVar
 
 BUILD_VERSION = "discovery-v7"
 AVAILABLE_BUILDS = frozenset({BUILD_VERSION})
+CANDIDATE_BUILD_VERSION = "discovery-v8"
+# Callable validation is deliberately separate from production publication.
+CALLABLE_BUILDS = AVAILABLE_BUILDS | frozenset({CANDIDATE_BUILD_VERSION})
 RETIRED_BUILDS = frozenset(
     {
         "discovery-v2",

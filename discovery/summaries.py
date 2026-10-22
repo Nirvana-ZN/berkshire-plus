@@ -418,6 +418,7 @@ def _result_values(
         by_code[code] = {
             "row": row,
             "verdict": verdict,
+            "metrics": metrics,
         }
     return by_code, {
         metric: tuple(values) for metric, values in numeric.items()
@@ -493,6 +494,12 @@ def _validate_counters(
 def _track_threshold(
     key: str, known_metrics: frozenset[str]
 ) -> tuple[str | None, str | None]:
+    selection = {'roic_gross_min': ('roic_gross_5y', 'gte'),
+                 'dilution_rate_max': ('economic_dilution', 'lte'),
+                 'net_debt_to_normalized_fcf_max': ('debt_burden', 'lte'),
+                 'pe_max': ('pe_deducted_ttm', 'lte'), 'peg_max': ('deducted_peg', 'lte')}
+    if key in selection and selection[key][0] in known_metrics:
+        return selection[key]
     if key in known_metrics:
         return key, None
     suffixes = (
@@ -726,7 +733,7 @@ def build_stage_summary(
         for code, item in result_values.items()
     }
     distributions = _distributions(numeric)
-    return {
+    result = {
         "schema_version": SUMMARY_SCHEMA_VERSION,
         "stage": identity,
         "rules": [dict(rule) for rule in rules],
@@ -744,3 +751,29 @@ def build_stage_summary(
         "distributions": distributions,
         "threshold_markers": _markers(thresholds, numeric),
     }
+    selection = (selection_result_summary(item['metrics'] for item in result_values.values())
+                 if identity['algorithm_version'] == 'discovery-v8' else None)
+    if selection is not None:
+        result['selection_evidence'] = selection
+    return result
+
+
+def selection_result_summary(metrics):
+    """Summarize frozen v8 statuses; shadow evidence never becomes a risk tier."""
+    rows = tuple(row for row in metrics if 'metric_results' in row)
+    if not rows:
+        return None
+    risks, statuses, exclusions = {}, {}, {}
+    for row in rows:
+        audit = row.get('ranking_audit', {})
+        state = audit.get('risk_state', 'unknown')
+        risks[state] = risks.get(state, 0) + 1
+        reason = audit.get('cap_exclusion_reason')
+        if reason:
+            exclusions[reason] = exclusions.get(reason, 0) + 1
+        for name, metric in row['metric_results'].items():
+            counts = statuses.setdefault(name, {})
+            status = metric['status']
+            counts[status] = counts.get(status, 0) + 1
+    return {'risk_states': risks, 'metric_statuses': statuses, 'cap_exclusions': exclusions,
+            'score_meaning': 'branch_local_research_queue', 'collection_effect': 'shadow_only'}

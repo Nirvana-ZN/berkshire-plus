@@ -8,11 +8,13 @@ and 1 is reserved for invalid CLI usage or an unexpected operational failure.
 from __future__ import annotations
 
 import argparse
+import hashlib
+from datetime import datetime
 import json
 import sqlite3
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import replace
+from dataclasses import fields, replace
 from decimal import Decimal, InvalidOperation
 from fractions import Fraction
 from pathlib import Path
@@ -2289,6 +2291,73 @@ def _paths_alias(left: Path, right: Path) -> bool:
         return False
 
 
+def calibrate_candidate(*, track: str, companies=(), operating_policy=None,
+                        selection_source_dir: Path | None = None) -> dict[str, object]:
+    """Offline candidate hypotheses; supplied samples are explicitly synthetic.
+
+    No database or network is opened. Source-directory configuration is retained
+    for a future explicitly enabled schema4 fill, never executed by calibration.
+    """
+    from discovery.builds import CANDIDATE_BUILD_VERSION
+    from discovery.rulers import candidate_ruler, payload_digest
+    from discovery.fundamentals import plain
+    from discovery.selection_contract import rank_inputs
+    from discovery.competition import CompetitionCandidate
+    from discovery.ranking import ranking_audit
+    from jobs.discovery import _competition_metrics
+
+    samples = tuple(companies)
+    if any(not isinstance(row, FrozenCompanyInput) or row.algorithm_version != CANDIDATE_BUILD_VERSION for row in samples):
+        raise ValueError('candidate calibration requires supplied v8 FrozenCompanyInput fixtures')
+    versions = {row.security_status['industry_version'] for row in samples}
+    if len(versions) > 1:
+        raise ValueError('candidate fixtures must share an industry version')
+    industry_version = next(iter(versions), 'candidate-unreviewed')
+    policy = {} if operating_policy is None else operating_policy
+    hypotheses = {}
+    bands = {'quality_discount': HYPOTHESIS_BANDS, 'deep_value': DEEP_VALUE_BANDS, 'garp': GARP_BANDS}[track]
+    for band, thresholds in bands.items():
+        kwargs = {'industry_version': industry_version, 'valuation_ratio_method': 'PE_TTM/PB_MRQ'}
+        if track == 'quality_discount':
+            # These labels define candidate branch hypotheses, not observations.
+            legacy = _quality_payload(thresholds, industries=[*[row.industry for row in samples], '制造业', '银行', *QUALITY_CYCLICAL_INDUSTRIES], **kwargs)
+        elif track == 'deep_value':
+            legacy = _deep_value_payload(thresholds, **kwargs)
+        else:
+            legacy = _garp_payload(thresholds, **kwargs)
+        ruler = candidate_ruler(legacy, operating_policy=policy, band=band)
+        verdicts = tuple(_classify(track, row, ruler.payload()) for row in samples)
+        metrics = {row.code: (_competition_metrics(company, row.metrics, ruler=ruler)
+                             if row.verdict == 'pass' else dict(row.metrics))
+                   for company, row in zip(samples, verdicts)}
+        entrants = tuple(CompetitionCandidate(row.code, company.industry, rank_inputs(metrics[row.code], ruler))
+                         for company, row in zip(samples, verdicts) if row.verdict == 'pass')
+        hypotheses[band] = {'ruler': json.loads(canonical_payload(ruler)), 'ruler_digest': payload_digest(ruler),
+            'counts': ({status: sum(row.verdict == status for row in verdicts) for status in ('pass', 'drop', 'insufficient')}
+                       if samples else None),
+            'results': [{'code': row.code, 'verdict': row.verdict, 'reason': row.reason,
+                         'metrics': plain(metrics[row.code])} for row in verdicts],
+            'ranking_audit': ranking_audit(entrants, ruler.ranking_contract) if entrants else {}}
+    return {'algorithm_version': CANDIDATE_BUILD_VERSION, 'track': track, 'status': 'candidate_blocked',
+        'software_validation': 'candidate_contract_validated', 'source_readiness': 'incomplete',
+        'production_activation': 'inactive_T19_required', 'outcome_maturity': 'not_started',
+        'source_mode': 'synthetic_frozen_schema4' if samples else 'contract_only_no_observations',
+        'selection_fundamentals': True,
+        'selection_source_dir': str(selection_source_dir) if selection_source_dir else None,
+        'operating_policy': plain(policy),
+        'input_fingerprint': hashlib.sha256(canonical_json([
+            {field.name: plain(getattr(row, field.name)) for field in fields(row)}
+            for row in samples]).encode()).hexdigest() if samples else None,
+        'sample_count': len(samples) if samples else None,
+        'blockers': ['reviewed_official_calendar_unavailable', 'restricted_cash_source_unready',
+                     'selection_field_trusted_coverage_unproven', 'capital_action_coverage_unproven',
+                     'whole_market_current_cap_readiness_unproven'],
+        'semantic_changes': ['deducted_ttm_valuation', 'economic_dilution', 'usable_cash_debt',
+                             'fractional_gross_roic_candidate_threshold', 'branch_normalized_ranking'],
+        'coverage_change': 'not_measured_without_applicable_production_sample',
+        'hypotheses': hypotheses}
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -2298,10 +2367,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--db", type=Path, default=DEFAULT_DB)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument('--candidate-v8', action='store_true')
+    parser.add_argument('--candidate-fixture', type=Path)
+    parser.add_argument('--operating-policy', type=Path)
+    parser.add_argument('--selection-source-dir', type=Path)
     args = parser.parse_args(argv)
     if _paths_alias(args.db, args.output):
         parser.error("--output must not alias --db")
-    artifact = calibrate(args.db, track=args.track)
+    if args.candidate_v8:
+        samples = ()
+        if args.candidate_fixture:
+            fixture = json.loads(args.candidate_fixture.read_text(encoding='utf-8'))
+            if fixture.get('fixture_kind') != 'synthetic':
+                parser.error('candidate fixture must explicitly declare fixture_kind=synthetic')
+            samples = tuple(FrozenCompanyInput(**{**row, 'snapshot_at': datetime.fromisoformat(row['snapshot_at'])})
+                            for row in fixture['companies'])
+        policy = json.loads(args.operating_policy.read_text(encoding='utf-8')) if args.operating_policy else {}
+        artifact = calibrate_candidate(track=args.track, companies=samples, operating_policy=policy,
+                                       selection_source_dir=args.selection_source_dir)
+    else:
+        if args.candidate_fixture or args.operating_policy or args.selection_source_dir:
+            parser.error('candidate configuration requires --candidate-v8')
+        artifact = calibrate(args.db, track=args.track)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(
         json.dumps(

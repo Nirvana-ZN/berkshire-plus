@@ -532,15 +532,35 @@ def classification_evidence(source: EvidenceRecord, *, industry: str, version: s
 
 def deducted_pe(snapshot: FundamentalSnapshot) -> MetricResult:
     """Current dated cap over positive deducted TTM; no annual-share fallback."""
+    return deducted_valuation(snapshot)['pe_deducted_ttm']
+
+
+def deducted_valuation(snapshot: FundamentalSnapshot) -> dict[str, MetricResult]:
+    """Shared frozen TTM/PE calculation for valuation, PEG and earnings yield."""
     rows = snapshot.annuals + snapshot.interims
     latest = max((row.period for row in rows), key=period_order, default=None)
     profit = ttm_amount(rows, 'deducted_net_income', latest) if latest else MetricResult(None, 'missing', 'financial_reports_missing', ())
     if profit.value is not None and profit.value <= 0:
-        return MetricResult(None, 'missing', 'deducted_profit_not_positive', profit.evidence_ids)
+        profit = MetricResult(None, 'missing', 'deducted_profit_not_positive', profit.evidence_ids)
     cap = MetricResult(snapshot.current_mcap, 'verified' if snapshot.current_mcap is not None else 'missing',
                        None if snapshot.current_mcap is not None else 'current_mcap_missing',
                        tuple(row.evidence_id for row in snapshot.extensions if row.kind == 'current_market_cap'))
-    return _arithmetic((cap, profit), lambda market_cap, earnings: market_cap / earnings)
+    if cap.value is not None and cap.value <= 0:
+        cap = replace(cap, value=None, status='missing', reason='current_mcap_not_positive')
+    return {'deducted_profit_ttm': profit,
+            'pe_deducted_ttm': _arithmetic((cap, profit), lambda market_cap, earnings: market_cap / earnings)}
+
+
+def deducted_peg(*, mcap: Decimal, deducted_ttm: Decimal, growth: Decimal) -> MetricResult:
+    """Deducted TTM valuation over capped fractional growth; no reported-PE fallback."""
+    values = (mcap, deducted_ttm, growth)
+    for name, value in zip(('current_mcap', 'deducted_profit', 'growth'), values):
+        if not isinstance(value, Decimal) or not value.is_finite():
+            return MetricResult(None, 'untrusted', f'{name}_invalid', ())
+        if value <= 0:
+            return MetricResult(None, 'missing', f'{name}_not_positive', ())
+    return _arithmetic(tuple(MetricResult(value, 'verified', None, ()) for value in values),
+                       lambda cap, profit, rate: (cap / profit) / (min(rate, Decimal('.25')) * 100))
 
 
 def market_cap_evidence(quote, *, code: str, market_date: date | None, cutoff_at: datetime) -> EvidenceRecord:
