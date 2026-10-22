@@ -3,14 +3,17 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import threading
 from collections.abc import Callable, Mapping
-from datetime import date, datetime, timedelta, timezone
+from contextlib import suppress
+from datetime import datetime, timedelta, timezone
 from math import isfinite
 from uuid import uuid4
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
@@ -41,7 +44,6 @@ from discovery.evidence import (
     PersistedEvidenceItem,
     verify_canonical_evidence_card,
 )
-from discovery.overrides import OVERRIDE_ACTIONS
 from discovery.summaries import DiscoverySummaryError, build_stage_summary
 from discovery.snapshot import (
     ProductionSnapshot,
@@ -50,7 +52,7 @@ from discovery.snapshot import (
     freeze_inputs,
     load_frozen_inputs,
 )
-from jobs.discovery import drain_run_queue
+from jobs.discovery import drain_discovery_subprocess, drain_run_queue
 from jobs.lock import (
     ACTIVE_STATUSES,
     JOB_TYPE_DISCOVERY,
@@ -661,19 +663,24 @@ def _result_json(
     row: object,
     name: str,
     override: DiscoveryOverride | None = None,
+    *,
+    include_metrics: bool = True,
 ) -> dict[str, object]:
     verdict = (
         row.verdict
         if override is None
         else ("pass" if override.action == "forced_pass" else "drop")
     )
+    # Full-market drop/insufficient rows are thousands of metric blobs.
+    # The summary still reads every metric. The table only needs them for passes.
+    metrics = dict(_metrics(row.metrics_json)) if include_metrics else {}
     return {
         "code": row.code,
         "name": name,
         "verdict": verdict,
         "original_verdict": row.verdict,
         "reason": row.reason,
-        "metrics": dict(_metrics(row.metrics_json)),
+        "metrics": metrics,
         "override": None if override is None else _override_json(override),
         **({"rank": row.rank} if isinstance(row, DiscoveryResult) else {}),
         "created_at": _iso(row.created_at),
@@ -746,27 +753,90 @@ def _partition(
     overrides: Mapping[str, DiscoveryOverride] | None = None,
 ) -> dict[str, list[dict[str, object]]]:
     override_rows = overrides or {}
+    # ponytail: a full-market stage is ~3.5k metric blobs (~25MB) and the
+    # page aborts the read at 5s. At or below this many rows, keep every
+    # metric. Above it, only pass rows carry metrics; the summary still
+    # covers the rest. Upgrade path: paginate the stage table.
+    keep_all_metrics = len(rows) <= 200
+
+    def effective(row: object) -> str:
+        if row.code not in override_rows:
+            return row.verdict
+        return (
+            "pass"
+            if override_rows[row.code].action == "forced_pass"
+            else "drop"
+        )
+
     return {
         verdict: [
             _result_json(
                 row,
                 _frozen_name(names, row.code),
                 override_rows.get(row.code),
+                include_metrics=keep_all_metrics or effective(row) == "pass",
             )
             for row in rows
-            if (
-                row.verdict
-                if row.code not in override_rows
-                else (
-                    "pass"
-                    if override_rows[row.code].action == "forced_pass"
-                    else "drop"
-                )
-            )
-            == verdict
+            if effective(row) == verdict
         ]
         for verdict in ("pass", "drop", "insufficient")
     }
+
+
+# A finished stage's results never change (a retry is a new stage row), but
+# summarizing a full-market stage re-validates ~440k decimals (~4 s); a page
+# load reads every stage, so recomputing starves /current past its timeout.
+# ponytail: process-wide and never evicted; one summary per stage attempt.
+_STAGE_SUMMARIES: dict[tuple[object, ...], dict[str, object]] = {}
+
+
+def _stage_summary(
+    session: Session,
+    stage: DiscoveryCommonStage | DiscoveryStage,
+    rows: list,
+    overrides: list | tuple = (),
+    ruler: RulerVersion | None = None,
+) -> dict[str, object]:
+    if stage.status in ("queued", "running"):
+        return build_stage_summary(stage, rows, overrides, ruler)
+    key = (
+        str(session.get_bind().url),
+        type(stage).__name__,
+        stage.id,
+        stage.status,
+        stage.updated_at,
+        None if ruler is None else ruler.id,
+        tuple((row.id, row.action) for row in overrides),
+    )
+    summary = _STAGE_SUMMARIES.get(key)
+    if summary is None:
+        summary = build_stage_summary(stage, rows, overrides, ruler)
+        _STAGE_SUMMARIES[key] = summary
+    return summary
+
+
+def warm_current_stage_summaries(app) -> None:
+    """Summarize this week's stages before the first page load asks for them."""
+    with app.state.session_factory() as session:
+        run = session.scalar(
+            select(DiscoveryRun)
+            .where(
+                DiscoveryRun.user_id == LOCAL_USER_ID,
+                DiscoveryRun.week_key == china_week_key(_now(app)),
+                DiscoveryRun.current.is_(True),
+            )
+            .order_by(DiscoveryRun.id.desc())
+        )
+        if run is None:
+            return
+        # A corrupt stage reports itself when the page asks for it.
+        unreadable = (CorruptDiscoveryResult, DiscoverySummaryError)
+        with suppress(*unreadable):
+            _common_payload(session, run)
+        for track in TRACKS:
+            for stage in TRACK_STAGES:
+                with suppress(*unreadable):
+                    _track_payload(session, run, track, stage)
 
 
 def _common_payload(session: Session, run: DiscoveryRun):
@@ -804,7 +874,7 @@ def _common_payload(session: Session, run: DiscoveryRun):
     summaries: dict[int, dict[str, object]] = {}
     for stage in stages:
         rows = by_attempt.get(stage.attempt, [])
-        summary = build_stage_summary(stage, rows)
+        summary = _stage_summary(session, stage, rows)
         summaries[stage.id] = summary
         attempts.append(
             _common_stage_json(stage)
@@ -934,7 +1004,8 @@ def _track_payload(
         attempt_overrides = {
             row.code: row for row in attempt_override_rows
         }
-        summary = build_stage_summary(
+        summary = _stage_summary(
+            session,
             attempt,
             rows,
             attempt_override_rows,
@@ -1108,7 +1179,109 @@ def _fresh_mutation_checkpoint(
     return run, commit_at, rejection
 
 
+# ponytail: one job object for the process. KILL_ON_JOB_CLOSE reaps drain
+# children when this process exits. If the job cannot be created, an orphan
+# can keep writing until the next startup clears the stale lock.
+_DRAIN_JOB: list[int] = []
+
+
+def _assign_kill_on_close(pid: int | None) -> None:
+    if os.name != "nt" or not pid:
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        if not _DRAIN_JOB:
+            job = kernel32.CreateJobObjectW(None, None)
+            if not job:
+                return
+
+            class _Basic(ctypes.Structure):
+                _fields_ = [
+                    ("PerProcessUserTimeLimit", ctypes.c_int64),
+                    ("PerJobUserTimeLimit", ctypes.c_int64),
+                    ("LimitFlags", wintypes.DWORD),
+                    ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t),
+                    ("ActiveProcessLimit", wintypes.DWORD),
+                    ("Affinity", ctypes.c_size_t),
+                    ("PriorityClass", wintypes.DWORD),
+                    ("SchedulingClass", wintypes.DWORD),
+                ]
+
+            class _Io(ctypes.Structure):
+                _fields_ = [
+                    ("ReadOperationCount", ctypes.c_uint64),
+                    ("WriteOperationCount", ctypes.c_uint64),
+                    ("OtherOperationCount", ctypes.c_uint64),
+                    ("ReadTransferCount", ctypes.c_uint64),
+                    ("WriteTransferCount", ctypes.c_uint64),
+                    ("OtherTransferCount", ctypes.c_uint64),
+                ]
+
+            class _Extended(ctypes.Structure):
+                _fields_ = [
+                    ("Basic", _Basic),
+                    ("IoInfo", _Io),
+                    ("ProcessMemoryLimit", ctypes.c_size_t),
+                    ("JobMemoryLimit", ctypes.c_size_t),
+                    ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                    ("PeakJobMemoryUsed", ctypes.c_size_t),
+                ]
+
+            info = _Extended()
+            info.Basic.LimitFlags = 0x2000
+            if not kernel32.SetInformationJobObject(
+                job,
+                9,
+                ctypes.byref(info),
+                ctypes.sizeof(info),
+            ):
+                kernel32.CloseHandle(job)
+                return
+            _DRAIN_JOB.append(job)
+        process = kernel32.OpenProcess(0x0100 | 0x0001, False, pid)
+        if process:
+            kernel32.AssignProcessToJobObject(_DRAIN_JOB[0], process)
+            kernel32.CloseHandle(process)
+    except Exception:
+        logger.warning("发现子进程未能绑定父进程退出", exc_info=True)
+
+
+def _drain_out_of_process(app, run_id: int, owner_token: str) -> None:
+    import multiprocessing
+
+    db_path = app.state.engine.url.database
+    if type(db_path) is not str or not db_path:
+        logger.error("发现队列无法脱离 API 进程：数据库路径不可用")
+        return
+    ctx = multiprocessing.get_context("spawn")
+    process = ctx.Process(
+        target=drain_discovery_subprocess,
+        args=(db_path, run_id, owner_token),
+    )
+    process.start()
+    _assign_kill_on_close(process.pid)
+    process.join()
+    if process.exitcode != 0:
+        logger.error(
+            "发现队列子进程退出 run=%s code=%s",
+            run_id,
+            process.exitcode,
+        )
+
+
 def _drain(app, run_id: int, owner_token: str) -> None:
+    if getattr(app.state, "discovery_offload_drain", False):
+        try:
+            _drain_out_of_process(app, run_id, owner_token)
+            if hasattr(app.state, "session_factory"):
+                warm_current_stage_summaries(app)
+        except Exception:
+            logger.exception("发现队列执行失败")
+        return
     factory = app.state.session_factory
     with factory() as session:
         try:
@@ -1221,51 +1394,6 @@ def _read_after_dispatch(app, run_id: int):
         return _run_payload(session, run)
 
 
-def _new_track_stage(
-    run: DiscoveryRun,
-    *,
-    track: str,
-    stage: str,
-    created_at: datetime,
-    parent: DiscoveryCommonStage | DiscoveryStage,
-    attempt: int = 1,
-) -> DiscoveryStage:
-    if stage == "track_gate":
-        if not isinstance(parent, DiscoveryCommonStage):
-            raise ValueError("track gate requires a common-stage parent")
-        common_stage_id = parent.id
-        predecessor_stage_id = None
-        predecessor_stage = None
-    else:
-        if not isinstance(parent, DiscoveryStage):
-            raise ValueError(f"{stage} requires a track-stage parent")
-        common_stage_id = None
-        predecessor_stage_id = parent.id
-        predecessor_stage = parent.stage
-    return DiscoveryStage(
-        run_id=run.id,
-        track=track,
-        stage=stage,
-        attempt=attempt,
-        status="queued",
-        total_count=0,
-        pass_count=0,
-        drop_count=0,
-        insufficient_count=0,
-        error=None,
-        input_fingerprint=run.input_fingerprint,
-        ruler_version_id=getattr(run, f"{track}_ruler_version_id"),
-        algorithm_version=run.algorithm_version,
-        common_stage_id=common_stage_id,
-        predecessor_stage_id=predecessor_stage_id,
-        predecessor_stage=predecessor_stage,
-        failure_kind=None,
-        superseded_at=None,
-        created_at=created_at,
-        updated_at=created_at,
-    )
-
-
 def _exact_parent(
     session: Session, row: DiscoveryStage
 ) -> DiscoveryCommonStage | DiscoveryStage | None:
@@ -1298,6 +1426,137 @@ def _exact_parent(
     )
 
 
+def _effective_competition_rows(
+    session: Session, competition: DiscoveryStage
+) -> list[tuple[DiscoveryResult, DiscoveryOverride | None]]:
+    rows = session.scalars(
+        select(DiscoveryResult)
+        .where(
+            DiscoveryResult.run_id == competition.run_id,
+            DiscoveryResult.track == competition.track,
+            DiscoveryResult.stage == "competition",
+            DiscoveryResult.attempt == competition.attempt,
+        )
+        .order_by(DiscoveryResult.code, DiscoveryResult.id)
+    ).all()
+    overrides = {
+        row.code: row
+        for row in session.scalars(
+            select(DiscoveryOverride).where(
+                DiscoveryOverride.run_id == competition.run_id,
+                DiscoveryOverride.track == competition.track,
+                DiscoveryOverride.stage == "competition",
+                DiscoveryOverride.attempt == competition.attempt,
+            )
+        ).all()
+    }
+    return [(row, overrides.get(row.code)) for row in rows]
+
+
+def _researchable_competition_entrants(
+    session: Session, competition: DiscoveryStage
+) -> list[DiscoveryResult]:
+    """Return effective pass rows backed by a canonical frozen-input card."""
+
+    evidence_by_code: dict[str, list[DiscoveryEvidence]] = {}
+    for item in session.scalars(
+        select(DiscoveryEvidence)
+        .where(
+            DiscoveryEvidence.run_id == competition.run_id,
+            DiscoveryEvidence.track == competition.track,
+            DiscoveryEvidence.stage == "competition",
+            DiscoveryEvidence.competition_stage_id == competition.id,
+            DiscoveryEvidence.competition_attempt == competition.attempt,
+        )
+        .order_by(
+            DiscoveryEvidence.code,
+            DiscoveryEvidence.kind,
+            DiscoveryEvidence.rule_id,
+            DiscoveryEvidence.id,
+        )
+    ):
+        evidence_by_code.setdefault(item.code, []).append(item)
+    rows = _effective_competition_rows(session, competition)
+    try:
+        frozen = load_frozen_inputs(
+            session,
+            competition.run_id,
+            codes=(row.code for row, _override in rows),
+        )
+        ruler_entry = frozen.ruler_payloads.get(competition.track)
+        if (
+            not isinstance(ruler_entry, Mapping)
+            or ruler_entry.get("id") != competition.ruler_version_id
+            or not isinstance(ruler_entry.get("payload"), Mapping)
+            or frozen.ruler_version_ids.get(competition.track)
+            != competition.ruler_version_id
+        ):
+            return []
+        ruler = ruler_entry["payload"]
+    except (KeyError, TypeError, ValueError):
+        return []
+    companies = {company.code: company for company in frozen.companies}
+    valid_codes: set[str] = set()
+    for row, _override in rows:
+        company = companies.get(row.code)
+        if company is None:
+            continue
+        try:
+            metrics = _persisted_json(row.metrics_json)
+            if type(metrics) is not dict:
+                continue
+            items = [
+                PersistedEvidenceItem(
+                    code=item.code,
+                    ruler_version_id=item.ruler_version_id,
+                    rule_version=item.rule_version,
+                    kind=item.kind,
+                    rule_id=item.rule_id,
+                    input_fields=_persisted_json(item.input_fields_json),
+                    display_text=item.display_text,
+                    as_of=item.as_of,
+                    data_completeness=item.data_completeness,
+                )
+                for item in evidence_by_code.get(row.code, [])
+            ]
+        except (CorruptDiscoveryResult, TypeError, ValueError):
+            continue
+        if (
+            sum(item.kind == "fact" for item in items) >= 3
+            and verify_canonical_evidence_card(
+                track=competition.track,
+                ruler=ruler,
+                ruler_version_id=competition.ruler_version_id,
+                code=row.code,
+                metrics=metrics,
+                verdict=row.verdict,
+                rank=row.rank,
+                reason=row.reason,
+                company_code=company.code,
+                company_industry=company.industry,
+                source_as_of={
+                    key: company.as_of.get(key)
+                    for key in ("security", "financial", "valuation")
+                },
+                items=items,
+            )
+        ):
+            valid_codes.add(row.code)
+
+    return [
+        row
+        for row, override in rows
+        if (
+            row.verdict
+            if override is None
+            else ("pass" if override.action == "forced_pass" else "drop")
+        )
+        == "pass"
+        and row.reason != "evidence_facts_insufficient"
+        and row.code in valid_codes
+    ]
+
+
 def _discovery_research_name(
     session: Session,
     run: DiscoveryRun,
@@ -1305,13 +1564,10 @@ def _discovery_research_name(
     track: str,
     code: str,
 ) -> str | None:
-    adjudication = _latest_track(
-        session, run.id, track, "adjudication"
-    )
-    if (
-        adjudication is None
-        or adjudication.status not in {"confirmed", "insufficient_candidates"}
-    ):
+    adjudication = _latest_track(session, run.id, track, "adjudication")
+    if adjudication is None:
+        return _confirmed_competition_name(session, run, track=track, code=code)
+    if adjudication.status not in {"confirmed", "insufficient_candidates"}:
         return None
     competition = _exact_parent(session, adjudication)
     if not isinstance(competition, DiscoveryStage):
@@ -1354,6 +1610,35 @@ def _discovery_research_name(
         or code not in eligible_codes
         or frozen is None
     ):
+        return None
+    return frozen.name
+
+
+def _confirmed_competition_name(
+    session: Session,
+    run: DiscoveryRun,
+    *,
+    track: str,
+    code: str,
+) -> str | None:
+    competition = _latest_track(session, run.id, track, "competition")
+    if (
+        not isinstance(competition, DiscoveryStage)
+        or competition.status != "confirmed"
+        or code
+        not in {
+            row.code
+            for row in _researchable_competition_entrants(session, competition)
+        }
+    ):
+        return None
+    frozen = session.scalar(
+        select(DiscoveryInputSnapshot).where(
+            DiscoveryInputSnapshot.run_id == run.id,
+            DiscoveryInputSnapshot.code == code,
+        )
+    )
+    if frozen is None or not frozen.name.strip():
         return None
     return frozen.name
 
@@ -1580,632 +1865,6 @@ def _lineage_rejection(row: DiscoveryStage) -> JSONResponse:
     )
 
 
-def _effective_competition_rows(
-    session: Session, competition: DiscoveryStage
-) -> list[tuple[DiscoveryResult, DiscoveryOverride | None]]:
-    rows = session.scalars(
-        select(DiscoveryResult)
-        .where(
-            DiscoveryResult.run_id == competition.run_id,
-            DiscoveryResult.track == competition.track,
-            DiscoveryResult.stage == "competition",
-            DiscoveryResult.attempt == competition.attempt,
-        )
-        .order_by(DiscoveryResult.code, DiscoveryResult.id)
-    ).all()
-    overrides = {
-        row.code: row
-        for row in session.scalars(
-            select(DiscoveryOverride).where(
-                DiscoveryOverride.run_id == competition.run_id,
-                DiscoveryOverride.track == competition.track,
-                DiscoveryOverride.stage == "competition",
-                DiscoveryOverride.attempt == competition.attempt,
-            )
-        ).all()
-    }
-    return [(row, overrides.get(row.code)) for row in rows]
-
-
-def _researchable_competition_entrants(
-    session: Session, competition: DiscoveryStage
-) -> list[DiscoveryResult]:
-    """Return effective pass rows backed by a canonical frozen-input card."""
-
-    evidence_by_code: dict[str, list[DiscoveryEvidence]] = {}
-    for item in session.scalars(
-        select(DiscoveryEvidence)
-        .where(
-            DiscoveryEvidence.run_id == competition.run_id,
-            DiscoveryEvidence.track == competition.track,
-            DiscoveryEvidence.stage == "competition",
-            DiscoveryEvidence.competition_stage_id == competition.id,
-            DiscoveryEvidence.competition_attempt == competition.attempt,
-        )
-        .order_by(
-            DiscoveryEvidence.code,
-            DiscoveryEvidence.kind,
-            DiscoveryEvidence.rule_id,
-            DiscoveryEvidence.id,
-        )
-    ):
-        evidence_by_code.setdefault(item.code, []).append(item)
-    try:
-        frozen = load_frozen_inputs(session, competition.run_id)
-        ruler_entry = frozen.ruler_payloads.get(competition.track)
-        if (
-            not isinstance(ruler_entry, Mapping)
-            or ruler_entry.get("id") != competition.ruler_version_id
-            or not isinstance(ruler_entry.get("payload"), Mapping)
-            or frozen.ruler_version_ids.get(competition.track)
-            != competition.ruler_version_id
-        ):
-            return []
-        ruler = ruler_entry["payload"]
-    except (KeyError, TypeError, ValueError):
-        return []
-    companies = {company.code: company for company in frozen.companies}
-    valid_codes: set[str] = set()
-    rows = _effective_competition_rows(session, competition)
-    for row, _override in rows:
-        company = companies.get(row.code)
-        if company is None:
-            continue
-        try:
-            metrics = _persisted_json(row.metrics_json)
-            if type(metrics) is not dict:
-                continue
-            items = [
-                PersistedEvidenceItem(
-                    code=item.code,
-                    ruler_version_id=item.ruler_version_id,
-                    rule_version=item.rule_version,
-                    kind=item.kind,
-                    rule_id=item.rule_id,
-                    input_fields=_persisted_json(item.input_fields_json),
-                    display_text=item.display_text,
-                    as_of=item.as_of,
-                    data_completeness=item.data_completeness,
-                )
-                for item in evidence_by_code.get(row.code, [])
-            ]
-        except (CorruptDiscoveryResult, TypeError, ValueError):
-            continue
-        if (
-            sum(item.kind == "fact" for item in items) >= 3
-            and verify_canonical_evidence_card(
-                track=competition.track,
-                ruler=ruler,
-                ruler_version_id=competition.ruler_version_id,
-                code=row.code,
-                metrics=metrics,
-                verdict=row.verdict,
-                rank=row.rank,
-                reason=row.reason,
-                company_code=company.code,
-                company_industry=company.industry,
-                source_as_of={
-                    key: company.as_of.get(key)
-                    for key in ("security", "financial", "valuation")
-                },
-                items=items,
-            )
-        ):
-            valid_codes.add(row.code)
-
-    return [
-        row
-        for row, override in rows
-        if (
-            row.verdict
-            if override is None
-            else ("pass" if override.action == "forced_pass" else "drop")
-        )
-        == "pass"
-        and row.reason != "evidence_facts_insufficient"
-        and row.code in valid_codes
-    ]
-
-
-def _evidence_insufficient_rejection() -> JSONResponse:
-    return _error(
-        409,
-        error="候选证据不足",
-        code="DISCOVERY_EVIDENCE_INSUFFICIENT",
-        detail="有效入围公司必须具有 3–5 条可靠事实及至少一条风险证据",
-    )
-
-
-def _confirm_common(
-    app,
-    session: Session,
-    run: DiscoveryRun,
-    expectation: Mapping[str, object],
-) -> tuple[str | None, JSONResponse | None]:
-    current = _latest_common(session, run.id)
-    if current is None:
-        return False, _error(
-            404,
-            error="未找到",
-            code="DISCOVERY_STAGE_NOT_FOUND",
-            detail="没有共同排雷阶段",
-        )
-    stale = _stage_precondition_rejection(session, expectation, current)
-    if stale is not None:
-        return False, stale
-    if current.status == "confirmed":
-        return False, None
-    if current.status != "waiting_confirmation":
-        return False, _error(
-            409,
-            error="阶段不可确认",
-            code="DISCOVERY_STAGE_NOT_CONFIRMABLE",
-            detail=f"共同排雷当前状态为 {current.status}",
-        )
-    owner_token = acquire_discovery(session, run.id)
-    if owner_token is None:
-        session.rollback()
-        session.expire_all()
-        refreshed = session.get(DiscoveryCommonStage, current.id)
-        if refreshed is not None and refreshed.status == "confirmed":
-            return False, None
-        return False, _locked(session)
-    run, now, rejection = _fresh_mutation_checkpoint(
-        app,
-        session,
-        run.id,
-        owner_token=owner_token,
-    )
-    if rejection is not None:
-        return False, rejection
-    assert run is not None
-    current = session.get(DiscoveryCommonStage, current.id)
-    if current is None:
-        session.rollback()
-        return False, _error(
-            404,
-            error="未找到",
-            code="DISCOVERY_STAGE_NOT_FOUND",
-            detail="没有共同排雷阶段",
-        )
-    stale = _stage_precondition_rejection(session, expectation, current)
-    if stale is not None:
-        session.rollback()
-        return False, stale
-    expected_updated_at = current.updated_at
-    result = session.execute(
-        update(DiscoveryCommonStage)
-        .where(
-            DiscoveryCommonStage.id == current.id,
-            DiscoveryCommonStage.attempt == current.attempt,
-            DiscoveryCommonStage.input_fingerprint
-            == current.input_fingerprint,
-            DiscoveryCommonStage.updated_at == expected_updated_at,
-            DiscoveryCommonStage.status == "waiting_confirmation",
-            DiscoveryCommonStage.superseded_at.is_(None),
-        )
-        .values(
-            status="confirmed",
-            confirmed_at=now,
-            updated_at=_next_stage_updated_at(current, now),
-        )
-    )
-    if int(result.rowcount or 0) != 1:
-        session.rollback()
-        return (
-            (False, _stage_claim_conflict())
-            if _has_stage_expectation(expectation)
-            else (False, None)
-        )
-    session.add_all(
-        _new_track_stage(
-            run,
-            track=track,
-            stage="track_gate",
-            created_at=now,
-            parent=current,
-        )
-        for track in _TRACK_ORDER
-    )
-    run.status = "running"
-    run.updated_at = now
-    session.commit()
-    return owner_token, None
-
-
-def _confirm_track(
-    app,
-    session: Session,
-    run: DiscoveryRun,
-    track: str,
-    stage: str,
-    expectation: Mapping[str, object],
-) -> tuple[str | None, JSONResponse | None]:
-    current = _latest_track(session, run.id, track, stage)
-    if current is None:
-        return False, _error(
-            404,
-            error="未找到",
-            code="DISCOVERY_STAGE_NOT_FOUND",
-            detail=f"没有 {track}/{stage} 阶段",
-        )
-    stale = _stage_precondition_rejection(session, expectation, current)
-    if stale is not None:
-        return False, stale
-    parent = _exact_parent(session, current)
-    if parent is None:
-        return False, _lineage_rejection(current)
-    if current.status in {"confirmed", "insufficient_candidates"}:
-        return False, None
-    if current.status != "waiting_confirmation":
-        return False, _error(
-            409,
-            error="阶段不可确认",
-            code="DISCOVERY_STAGE_NOT_CONFIRMABLE",
-            detail=f"{track}/{stage} 当前状态为 {current.status}",
-        )
-    next_stage = {
-        "track_gate": "competition",
-        "competition": "adjudication",
-    }.get(stage)
-    owner_token = acquire_discovery(session, run.id)
-    if owner_token is None:
-        session.rollback()
-        session.expire_all()
-        refreshed = session.get(DiscoveryStage, current.id)
-        if refreshed is not None and refreshed.status in {
-            "confirmed",
-            "insufficient_candidates",
-        }:
-            return False, None
-        return False, _locked(session)
-    exact_stage_id = current.id
-    run, _acquired_at, rejection = _fresh_mutation_checkpoint(
-        app,
-        session,
-        run.id,
-        owner_token=owner_token,
-    )
-    if rejection is not None:
-        return False, rejection
-    assert run is not None
-    current = session.get(DiscoveryStage, exact_stage_id)
-    if current is None:
-        session.rollback()
-        return False, _error(
-            404,
-            error="未找到",
-            code="DISCOVERY_STAGE_NOT_FOUND",
-            detail=f"没有 {track}/{stage} 阶段",
-        )
-    stale = _stage_precondition_rejection(session, expectation, current)
-    if stale is not None:
-        session.rollback()
-        return False, stale
-    if stage == "adjudication":
-        session.expire_all()
-        current = session.get(DiscoveryStage, exact_stage_id)
-        if current is None:
-            session.rollback()
-            return False, _error(
-                404,
-                error="未找到",
-                code="DISCOVERY_STAGE_NOT_FOUND",
-                detail=f"没有 {track}/{stage} 阶段",
-            )
-        stale = _stage_precondition_rejection(
-            session, expectation, current
-        )
-        if stale is not None:
-            session.rollback()
-            return False, stale
-        if current.status in {"confirmed", "insufficient_candidates"}:
-            release(
-                session,
-                run.id,
-                JOB_TYPE_DISCOVERY,
-                owner_token=owner_token,
-            )
-            session.commit()
-            return False, None
-        if (
-            current.status != "waiting_confirmation"
-            or current.superseded_at is not None
-        ):
-            session.rollback()
-            return False, _error(
-                409,
-                error="阶段不可确认",
-                code="DISCOVERY_STAGE_NOT_CONFIRMABLE",
-                detail=f"{track}/{stage} 当前状态为 {current.status}",
-            )
-        parent = _exact_parent(session, current)
-        if not isinstance(parent, DiscoveryStage):
-            session.rollback()
-            return False, _lineage_rejection(current)
-        assert isinstance(parent, DiscoveryStage)
-        effective_entrants = [
-            row
-            for row, override in _effective_competition_rows(session, parent)
-            if (
-                row.verdict
-                if override is None
-                else ("pass" if override.action == "forced_pass" else "drop")
-            )
-            == "pass"
-        ]
-        entrants = _researchable_competition_entrants(session, parent)
-        if {row.code for row in entrants} != {
-            row.code for row in effective_entrants
-        }:
-            release(
-                session,
-                run.id,
-                JOB_TYPE_DISCOVERY,
-                owner_token=owner_token,
-            )
-            session.commit()
-            return False, _evidence_insufficient_rejection()
-        decisions = session.scalars(
-            select(DiscoveryDecision)
-            .where(
-                DiscoveryDecision.run_id == run.id,
-                DiscoveryDecision.track == track,
-                DiscoveryDecision.competition_stage_id == parent.id,
-                DiscoveryDecision.competition_attempt == parent.attempt,
-            )
-            .order_by(DiscoveryDecision.code, DiscoveryDecision.id)
-        ).all()
-        entrant_codes = {row.code for row in entrants}
-        decision_by_code = {row.code: row for row in decisions}
-        if set(decision_by_code) != entrant_codes:
-            session.rollback()
-            return False, _error(
-                409,
-                error="裁决不完整",
-                code="DISCOVERY_DECISIONS_INCOMPLETE",
-                detail="每个有效入围公司必须恰有一个裁决",
-            )
-        keepers = sorted(
-            (
-                row
-                for row in decisions
-                if row.decision == "keep"
-            ),
-            key=lambda row: row.code,
-        )
-        if len(keepers) > 5:
-            session.rollback()
-            return False, _error(
-                409,
-                error="保留数量过多",
-                code="DISCOVERY_TOO_MANY_KEEPERS",
-                detail="每条轨道最多保留 5 家公司",
-            )
-        existing = session.scalar(
-            select(func.count())
-            .select_from(DiscoveryResult)
-            .where(
-                DiscoveryResult.run_id == run.id,
-                DiscoveryResult.track == track,
-                DiscoveryResult.stage == "adjudication",
-                DiscoveryResult.attempt == current.attempt,
-            )
-        )
-        if existing:
-            session.rollback()
-            return False, _error(
-                409,
-                error="历史冲突",
-                code="DISCOVERY_RESULT_HISTORY_CONFLICT",
-                detail="待确认裁决阶段已有持久化结果",
-            )
-        run, now, rejection = _fresh_mutation_checkpoint(
-            app,
-            session,
-            run.id,
-            owner_token=owner_token,
-        )
-        if rejection is not None:
-            return False, rejection
-        assert run is not None
-        current = session.get(DiscoveryStage, exact_stage_id)
-        if current is None:
-            session.rollback()
-            return False, _error(
-                404,
-                error="未找到",
-                code="DISCOVERY_STAGE_NOT_FOUND",
-                detail=f"没有 {track}/{stage} 阶段",
-            )
-        stale = _stage_precondition_rejection(
-            session, expectation, current
-        )
-        if stale is not None:
-            session.rollback()
-            return False, stale
-        keeper_rank = {
-            row.code: index
-            for index, row in enumerate(keepers, start=1)
-        }
-        target = "confirmed" if len(keepers) >= 3 else "insufficient_candidates"
-        expected_updated_at = current.updated_at
-        changed = session.execute(
-            update(DiscoveryStage)
-            .where(
-                DiscoveryStage.id == current.id,
-                DiscoveryStage.attempt == current.attempt,
-                DiscoveryStage.input_fingerprint
-                == current.input_fingerprint,
-                DiscoveryStage.ruler_version_id
-                == current.ruler_version_id,
-                DiscoveryStage.updated_at == expected_updated_at,
-                DiscoveryStage.status == "waiting_confirmation",
-                DiscoveryStage.superseded_at.is_(None),
-            )
-            .values(
-                status=target,
-                total_count=len(decisions),
-                pass_count=len(keepers),
-                drop_count=len(decisions) - len(keepers),
-                insufficient_count=0,
-                confirmed_at=now,
-                updated_at=_next_stage_updated_at(current, now),
-            )
-        )
-        if int(changed.rowcount or 0) != 1:
-            session.rollback()
-            if not _has_stage_expectation(expectation):
-                session.expire_all()
-                refreshed = session.get(DiscoveryStage, exact_stage_id)
-                if refreshed is not None and refreshed.status in {
-                    "confirmed",
-                    "insufficient_candidates",
-                }:
-                    return False, None
-            return False, _stage_claim_conflict()
-        session.add_all(
-            DiscoveryResult(
-                run_id=run.id,
-                track=track,
-                stage="adjudication",
-                attempt=current.attempt,
-                code=decision.code,
-                verdict="pass" if decision.decision == "keep" else "drop",
-                reason=(
-                    decision.keep_note
-                    if decision.decision == "keep"
-                    else decision.exclusion_reason
-                ),
-                metrics_json=canonical_json(
-                    {
-                        "decision": decision.decision,
-                        "competition_stage_id": parent.id,
-                        "competition_attempt": parent.attempt,
-                    }
-                ),
-                rank=keeper_rank.get(decision.code),
-                created_at=now,
-            )
-            for decision in sorted(decisions, key=lambda row: row.code)
-        )
-        session.flush()
-        run.status = _aggregate(session, run)
-        run.updated_at = now
-        release(
-            session,
-            run.id,
-            JOB_TYPE_DISCOVERY,
-            owner_token=owner_token,
-        )
-        session.commit()
-        return False, None
-    assert next_stage is not None
-    run, now, rejection = _fresh_mutation_checkpoint(
-        app,
-        session,
-        run.id,
-        owner_token=owner_token,
-    )
-    if rejection is not None:
-        return False, rejection
-    assert run is not None
-    current = session.get(DiscoveryStage, exact_stage_id)
-    if current is None:
-        session.rollback()
-        return False, _error(
-            404,
-            error="未找到",
-            code="DISCOVERY_STAGE_NOT_FOUND",
-            detail=f"没有 {track}/{stage} 阶段",
-        )
-    stale = _stage_precondition_rejection(session, expectation, current)
-    if stale is not None:
-        session.rollback()
-        return False, stale
-    if stage == "competition":
-        effective_codes = {
-            row.code
-            for row, override in _effective_competition_rows(
-                session, current
-            )
-            if (
-                row.verdict
-                if override is None
-                else (
-                    "pass"
-                    if override.action == "forced_pass"
-                    else "drop"
-                )
-            )
-            == "pass"
-        }
-        eligible_codes = {
-            row.code
-            for row in _researchable_competition_entrants(
-                session, current
-            )
-        }
-        if eligible_codes != effective_codes:
-            release(
-                session,
-                run.id,
-                JOB_TYPE_DISCOVERY,
-                owner_token=owner_token,
-            )
-            session.commit()
-            return False, _evidence_insufficient_rejection()
-    expected_updated_at = current.updated_at
-    result = session.execute(
-        update(DiscoveryStage)
-        .where(
-            DiscoveryStage.id == current.id,
-            DiscoveryStage.attempt == current.attempt,
-            DiscoveryStage.input_fingerprint == current.input_fingerprint,
-            DiscoveryStage.ruler_version_id == current.ruler_version_id,
-            DiscoveryStage.updated_at == expected_updated_at,
-            DiscoveryStage.status == "waiting_confirmation",
-            DiscoveryStage.superseded_at.is_(None),
-        )
-        .values(
-            status="confirmed",
-            confirmed_at=now,
-            updated_at=_next_stage_updated_at(current, now),
-        )
-    )
-    if int(result.rowcount or 0) != 1:
-        session.rollback()
-        return (
-            (False, _stage_claim_conflict())
-            if _has_stage_expectation(expectation)
-            else (False, None)
-        )
-    session.add(
-        _new_track_stage(
-            run,
-            track=track,
-            stage=next_stage,
-            created_at=now,
-            parent=current,
-            attempt=(
-                session.scalar(
-                    select(func.max(DiscoveryStage.attempt)).where(
-                        DiscoveryStage.run_id == run.id,
-                        DiscoveryStage.track == track,
-                        DiscoveryStage.stage == next_stage,
-                    )
-                )
-                or 0
-            )
-            + 1,
-        )
-    )
-    run.status = "running"
-    run.updated_at = now
-    session.commit()
-    return owner_token, None
-
-
 def resume_discovery_queues(app) -> None:
     """Adopt each resumable queue once after stale-lock cleanup."""
 
@@ -2225,7 +1884,9 @@ def resume_discovery_queues(app) -> None:
                         .select_from(DiscoveryCommonStage)
                         .where(
                             DiscoveryCommonStage.run_id == DiscoveryRun.id,
-                            DiscoveryCommonStage.status == "queued",
+                            DiscoveryCommonStage.status.in_(
+                                ("queued", "waiting_confirmation")
+                            ),
                             DiscoveryCommonStage.superseded_at.is_(None),
                         )
                         .scalar_subquery()
@@ -2233,7 +1894,9 @@ def resume_discovery_queues(app) -> None:
                         .select_from(DiscoveryStage)
                         .where(
                             DiscoveryStage.run_id == DiscoveryRun.id,
-                            DiscoveryStage.status == "queued",
+                            DiscoveryStage.status.in_(
+                                ("queued", "waiting_confirmation")
+                            ),
                             DiscoveryStage.superseded_at.is_(None),
                         )
                         .scalar_subquery()
@@ -2320,6 +1983,18 @@ def resume_discovery_queues(app) -> None:
         logger.error("启动恢复发现队列线程失败: %s", error)
 
 
+def _data_not_ready_detail(error: BaseException) -> str:
+    known = {
+        "latest discovery data fill is not ready": (
+            "全市场数据快照尚未完成，还不能开始本周发现"
+        ),
+        "discovery data is being mutated": (
+            "全市场数据正在更新，完成前不能开始本周发现"
+        ),
+    }
+    return known.get(str(error), str(error))
+
+
 def create_discovery_router() -> APIRouter:
     router = APIRouter(prefix="/api/discoveries")
 
@@ -2402,7 +2077,7 @@ def create_discovery_router() -> APIRouter:
                         409,
                         error="候选不可评估",
                         code="DISCOVERY_CANDIDATE_NOT_RESEARCHABLE",
-                        detail="仅可评估已有最终保留决定和证据的候选",
+                        detail="仅可评估通过轨道筛选的公司",
                     )
                 existing = _existing_discovery_research(
                     session, run.id, code
@@ -2453,7 +2128,7 @@ def create_discovery_router() -> APIRouter:
                         409,
                         error="候选不可评估",
                         code="DISCOVERY_CANDIDATE_NOT_RESEARCHABLE",
-                        detail="仅可评估已有最终保留决定和证据的候选",
+                        detail="仅可评估通过轨道筛选的公司",
                     )
                 existing = _existing_discovery_research(
                     session, run.id, code
@@ -2470,6 +2145,7 @@ def create_discovery_router() -> APIRouter:
                     .where(
                         DiscoveryRun.user_id == run.user_id,
                         DiscoveryRun.week_key == run.week_key,
+                        DiscoveryRun.status != "abandoned",
                     )
                 )
                 if int(accepted or 0) >= _DISCOVERY_RESEARCH_WEEKLY_QUOTA:
@@ -2539,6 +2215,11 @@ def create_discovery_router() -> APIRouter:
         payload, rejected = await _object_body(request, "INVALID_DISCOVERY")
         if rejected is not None:
             return rejected
+        # The full-market snapshot takes minutes of CPU; on the event loop it
+        # stalls every other request, including the page's 5 s polls.
+        return await run_in_threadpool(create_discovery_blocking, request, payload)
+
+    def create_discovery_blocking(request: Request, payload: Mapping):
         sync = _truthy(payload.get("sync")) and bool(
             getattr(request.app.state, "allow_sync", False)
         )
@@ -2704,7 +2385,7 @@ def create_discovery_router() -> APIRouter:
                     409,
                     error="数据未就绪",
                     code="DATA_NOT_READY",
-                    detail=str(error),
+                    detail=_data_not_ready_detail(error),
                 )
         dispatch_error = _dispatch(
             request.app, run_id, owner_token, sync=sync
@@ -2712,6 +2393,45 @@ def create_discovery_router() -> APIRouter:
         if dispatch_error is not None:
             return dispatch_error
         return _read_after_dispatch(request.app, run_id)
+
+    def _rule_only(session: Session, run_id: int):
+        run = _owned_run(session, run_id)
+        if run is None:
+            return _error(
+                404,
+                error="未找到",
+                code="DISCOVERY_NOT_FOUND",
+                detail=f"没有发现批次 {run_id}",
+            )
+        return _error(
+            409,
+            error="发现结果不可人工改写",
+            code="DISCOVERY_RULE_ONLY",
+            detail="每周发现只发布尺子结果，不能覆盖、裁决或手工确认",
+        )
+
+    @router.post("/{run_id}/overrides")
+    async def reject_override(request: Request, run_id: int):
+        with request.app.state.session_factory() as session:
+            return _rule_only(session, run_id)
+
+    @router.post("/{run_id}/decisions")
+    async def reject_decision(request: Request, run_id: int):
+        with request.app.state.session_factory() as session:
+            return _rule_only(session, run_id)
+
+    @router.post("/{run_id}/stages/safety/confirm")
+    async def reject_safety_confirm(request: Request, run_id: int):
+        with request.app.state.session_factory() as session:
+            return _rule_only(session, run_id)
+
+    @router.post("/{run_id}/tracks/{track}/stages/{stage}/confirm")
+    async def reject_track_confirm(
+        request: Request, run_id: int, track: str, stage: str
+    ):
+        del track, stage
+        with request.app.state.session_factory() as session:
+            return _rule_only(session, run_id)
 
     @router.get("/current")
     def current_discovery(request: Request):
@@ -2773,52 +2493,6 @@ def create_discovery_router() -> APIRouter:
                 )
             return body
 
-    @router.post("/{run_id}/stages/safety/confirm")
-    async def confirm_safety(request: Request, run_id: int):
-        payload, rejected = await _object_body(
-            request, "INVALID_DISCOVERY_CONFIRMATION"
-        )
-        if rejected is not None:
-            return rejected
-        sync = _truthy(payload.get("sync")) and bool(
-            getattr(request.app.state, "allow_sync", False)
-        )
-        now = _now(request.app)
-        factory = request.app.state.session_factory
-        with factory() as session:
-            run = _owned_run(session, run_id)
-            if run is None:
-                return _error(
-                    404,
-                    error="未找到",
-                    code="DISCOVERY_NOT_FOUND",
-                    detail=f"没有发现批次 {run_id}",
-                )
-            immutable = _mutation_guard(run, now)
-            if immutable is not None:
-                return immutable
-            dispatch, failed = _confirm_common(
-                request.app,
-                session,
-                run,
-                payload,
-            )
-            if failed is not None:
-                return failed
-            if not dispatch:
-                dispatch, failed = _acquire_queued_work(
-                    request.app,
-                    session,
-                    run,
-                )
-                if failed is not None:
-                    return failed
-        if dispatch:
-            failed = _dispatch(request.app, run_id, dispatch, sync=sync)
-            if failed is not None:
-                return failed
-        return _read_after_dispatch(request.app, run_id)
-
     @router.post("/{run_id}/stages/safety/retry")
     async def retry_safety(request: Request, run_id: int):
         payload, rejected = await _object_body(
@@ -2826,6 +2500,9 @@ def create_discovery_router() -> APIRouter:
         )
         if rejected is not None:
             return rejected
+        return await run_in_threadpool(retry_safety_blocking, request, run_id, payload)
+
+    def retry_safety_blocking(request: Request, run_id: int, payload: Mapping):
         sync = _truthy(payload.get("sync")) and bool(
             getattr(request.app.state, "allow_sync", False)
         )
@@ -3082,63 +2759,6 @@ def create_discovery_router() -> APIRouter:
                 )
             return body
 
-    @router.post("/{run_id}/tracks/{track}/stages/{stage}/confirm")
-    async def confirm_track_stage(
-        request: Request, run_id: int, track: str, stage: str
-    ):
-        payload, rejected = await _object_body(
-            request, "INVALID_DISCOVERY_CONFIRMATION"
-        )
-        if rejected is not None:
-            return rejected
-        if track not in TRACKS or stage not in TRACK_STAGES:
-            return _error(
-                404,
-                error="未找到",
-                code="DISCOVERY_STAGE_NOT_FOUND",
-                detail="未知轨道或阶段",
-            )
-        sync = _truthy(payload.get("sync")) and bool(
-            getattr(request.app.state, "allow_sync", False)
-        )
-        now = _now(request.app)
-        factory = request.app.state.session_factory
-        with factory() as session:
-            run = _owned_run(session, run_id)
-            if run is None:
-                return _error(
-                    404,
-                    error="未找到",
-                    code="DISCOVERY_NOT_FOUND",
-                    detail=f"没有发现批次 {run_id}",
-                )
-            immutable = _mutation_guard(run, now)
-            if immutable is not None:
-                return immutable
-            dispatch, failed = _confirm_track(
-                request.app,
-                session,
-                run,
-                track,
-                stage,
-                payload,
-            )
-            if failed is not None:
-                return failed
-            if not dispatch:
-                dispatch, failed = _acquire_queued_work(
-                    request.app,
-                    session,
-                    run,
-                )
-                if failed is not None:
-                    return failed
-        if dispatch:
-            failed = _dispatch(request.app, run_id, dispatch, sync=sync)
-            if failed is not None:
-                return failed
-        return _read_after_dispatch(request.app, run_id)
-
     @router.post("/{run_id}/tracks/{track}/stages/{stage}/retry")
     async def retry_track_stage(
         request: Request, run_id: int, track: str, stage: str
@@ -3148,6 +2768,13 @@ def create_discovery_router() -> APIRouter:
         )
         if rejected is not None:
             return rejected
+        return await run_in_threadpool(
+            retry_track_stage_blocking, request, run_id, track, stage, payload
+        )
+
+    def retry_track_stage_blocking(
+        request: Request, run_id: int, track: str, stage: str, payload: Mapping
+    ):
         if track not in TRACKS or stage not in TRACK_STAGES:
             return _error(
                 404,
@@ -3400,727 +3027,6 @@ def create_discovery_router() -> APIRouter:
                 return failed
         return _read_after_dispatch(request.app, run_id)
 
-    @router.post("/{run_id}/tracks/{track}/stages/{stage}/reopen")
-    async def reopen_track_stage(
-        request: Request, run_id: int, track: str, stage: str
-    ):
-        payload, rejected = await _object_body(
-            request, "INVALID_DISCOVERY_REOPEN"
-        )
-        if rejected is not None:
-            return rejected
-        if track not in TRACKS or stage not in TRACK_STAGES:
-            return _error(
-                404,
-                error="未找到",
-                code="DISCOVERY_STAGE_NOT_FOUND",
-                detail="未知轨道或阶段",
-            )
-        sync = _truthy(payload.get("sync")) and bool(
-            getattr(request.app.state, "allow_sync", False)
-        )
-        now = _now(request.app)
-        factory = request.app.state.session_factory
-        with factory() as session:
-            run = _owned_run(session, run_id)
-            if run is None:
-                return _error(
-                    404,
-                    error="未找到",
-                    code="DISCOVERY_NOT_FOUND",
-                    detail=f"没有发现批次 {run_id}",
-                )
-            immutable = _mutation_guard(run, now)
-            if immutable is not None:
-                return immutable
-            if stage == "adjudication":
-                return _error(
-                    409,
-                    error="阶段不可重开",
-                    code="invalid_reopen_stage",
-                    detail="最终裁决必须通过重开 competition 建立新决定集",
-                )
-            observed = _latest_track(session, run.id, track, stage)
-            reopen_target_id = None if observed is None else observed.id
-            if (
-                observed is not None
-                and observed.reopen_of_stage_id is not None
-                and observed.status in {"queued", "running"}
-                and (
-                    (held := lock_status(session)) is not None
-                    and held.get("type") == JOB_TYPE_DISCOVERY
-                    and held.get("job_id") == run.id
-                )
-            ):
-                return _run_payload(session, run)
-            owner_token = acquire_discovery(session, run.id)
-            if owner_token is None:
-                session.rollback()
-                session.expire_all()
-                latest = _latest_track(
-                    session, run.id, track, stage
-                )
-                if (
-                    reopen_target_id is not None
-                    and latest is not None
-                    and latest.reopen_of_stage_id == reopen_target_id
-                ):
-                    return _run_payload(session, run)
-                return _locked(session)
-            run, _acquired_at, rejection = _fresh_mutation_checkpoint(
-                request.app,
-                session,
-                run.id,
-                owner_token=owner_token,
-            )
-            if rejection is not None:
-                return rejection
-            assert run is not None
-            selected = _latest_track(session, run.id, track, stage)
-            if selected is None:
-                session.rollback()
-                return _error(
-                    404,
-                    error="未找到",
-                    code="DISCOVERY_STAGE_NOT_FOUND",
-                    detail="指定阶段不存在",
-                )
-            if (
-                reopen_target_id is not None
-                and selected.reopen_of_stage_id == reopen_target_id
-            ):
-                if selected.status == "queued":
-                    session.commit()
-                    redispatch = owner_token
-                else:
-                    release(
-                        session,
-                        run.id,
-                        JOB_TYPE_DISCOVERY,
-                        owner_token=owner_token,
-                    )
-                    session.commit()
-                    return _run_payload(session, run)
-            else:
-                redispatch = None
-            if redispatch is not None:
-                pass
-            elif selected.status == "waiting_confirmation":
-                session.rollback()
-                return _error(
-                    409,
-                    error="阶段无需重开",
-                    code="DISCOVERY_REOPEN_WAITING",
-                    detail="待确认阶段可直接编辑覆盖",
-                )
-            elif selected.status != "confirmed":
-                session.rollback()
-                return _error(
-                    409,
-                    error="阶段不可重开",
-                    code="DISCOVERY_REOPEN_NOT_ALLOWED",
-                    detail="仅已确认阶段可重开",
-                )
-            elif _exact_parent(session, selected) is None:
-                session.rollback()
-                return _lineage_rejection(selected)
-            elif (
-                selected.input_fingerprint != run.input_fingerprint
-                or selected.ruler_version_id
-                != getattr(run, f"{track}_ruler_version_id")
-                or not _is_build_available(
-                    selected.algorithm_version, AVAILABLE_BUILDS
-                )
-            ):
-                session.rollback()
-                return _error(
-                    409,
-                    error="算法不可用",
-                    code="algorithm_unavailable",
-                    detail="冻结输入、尺子或保存构建不可用",
-                )
-            if redispatch is None:
-                try:
-                    frozen = load_frozen_inputs(session, run.id)
-                    ruler = frozen.ruler_payloads.get(track)
-                    if (
-                        selected.ruler_version_id is None
-                        or not isinstance(ruler, Mapping)
-                        or ruler.get("id") != selected.ruler_version_id
-                    ):
-                        raise ValueError("frozen ruler is unavailable")
-                except (TypeError, ValueError):
-                    session.rollback()
-                    return _error(
-                        409,
-                        error="算法不可用",
-                        code="algorithm_unavailable",
-                        detail="冻结输入、尺子载荷或保存构建不可用",
-                    )
-            if redispatch is None:
-                selected_id = selected.id
-                run, commit_at, rejection = _fresh_mutation_checkpoint(
-                    request.app,
-                    session,
-                    run.id,
-                    owner_token=owner_token,
-                )
-                if rejection is not None:
-                    return rejection
-                assert run is not None
-                selected = session.get(DiscoveryStage, selected_id)
-                if selected is None:
-                    session.rollback()
-                    return _error(
-                        404,
-                        error="未找到",
-                        code="DISCOVERY_STAGE_NOT_FOUND",
-                        detail="指定阶段不存在",
-                    )
-                current_rows = session.scalars(
-                    select(DiscoveryStage).where(
-                        DiscoveryStage.run_id == run.id,
-                        DiscoveryStage.track == track,
-                        DiscoveryStage.superseded_at.is_(None),
-                    )
-                ).all()
-                affected_ids = {selected.id}
-                while True:
-                    before = len(affected_ids)
-                    affected_ids.update(
-                        row.id
-                        for row in current_rows
-                        if row.predecessor_stage_id in affected_ids
-                    )
-                    if len(affected_ids) == before:
-                        break
-                session.execute(
-                    update(DiscoveryStage)
-                    .where(
-                        DiscoveryStage.id.in_(affected_ids),
-                        DiscoveryStage.superseded_at.is_(None),
-                    )
-                    .values(
-                        superseded_at=commit_at,
-                        updated_at=commit_at,
-                    )
-                )
-                session.add(
-                    DiscoveryStage(
-                        run_id=run.id,
-                        track=track,
-                        stage=stage,
-                        attempt=selected.attempt + 1,
-                        status="queued",
-                        total_count=0,
-                        pass_count=0,
-                        drop_count=0,
-                        insufficient_count=0,
-                        error=None,
-                        confirmed_at=None,
-                        input_fingerprint=selected.input_fingerprint,
-                        ruler_version_id=selected.ruler_version_id,
-                        algorithm_version=selected.algorithm_version,
-                        common_stage_id=selected.common_stage_id,
-                        predecessor_stage_id=selected.predecessor_stage_id,
-                        predecessor_stage=selected.predecessor_stage,
-                        retry_of_stage_id=None,
-                        reopen_of_stage_id=selected.id,
-                        failure_kind=None,
-                        superseded_at=None,
-                        created_at=commit_at,
-                        updated_at=commit_at,
-                    )
-                )
-                run.status = "running"
-                run.updated_at = commit_at
-                session.commit()
-                redispatch = owner_token
-        assert redispatch is not None
-        failed = _dispatch(
-            request.app, run_id, redispatch, sync=sync
-        )
-        if failed is not None:
-            return failed
-        return _read_after_dispatch(request.app, run_id)
-
-    @router.post("/{run_id}/overrides")
-    async def save_override(request: Request, run_id: int):
-        payload, rejected = await _object_body(
-            request, "INVALID_DISCOVERY_OVERRIDE"
-        )
-        if rejected is not None:
-            return rejected
-        track = payload.get("track")
-        stage_name = payload.get("stage")
-        code = payload.get("code")
-        action = payload.get("action")
-        reason = payload.get("reason")
-        if (
-            type(track) is not str
-            or track not in TRACKS
-            or type(stage_name) is not str
-            or stage_name not in TRACK_STAGES
-            or type(code) is not str
-            or not code.strip()
-            or type(action) is not str
-            or action not in OVERRIDE_ACTIONS
-            or type(reason) is not str
-            or not reason.strip()
-        ):
-            return _error(
-                400,
-                error="覆盖无效",
-                code="INVALID_DISCOVERY_OVERRIDE",
-                detail="轨道、阶段、代码、动作和非空理由均为必填",
-            )
-        now = _now(request.app)
-        with request.app.state.session_factory() as session:
-            run = _owned_run(session, run_id)
-            if run is None:
-                return _error(
-                    404,
-                    error="未找到",
-                    code="DISCOVERY_NOT_FOUND",
-                    detail=f"没有发现批次 {run_id}",
-                )
-            immutable = _mutation_guard(run, now)
-            if immutable is not None:
-                return immutable
-            stage_row = _latest_track(
-                session, run.id, track, stage_name
-            )
-            if stage_row is None:
-                return _error(
-                    404,
-                    error="未找到",
-                    code="DISCOVERY_STAGE_NOT_FOUND",
-                    detail="指定阶段不存在",
-                )
-            supplied_attempt = payload.get("attempt")
-            if supplied_attempt is not None and (
-                type(supplied_attempt) is not int
-                or supplied_attempt != stage_row.attempt
-            ):
-                return _error(
-                    409,
-                    error="阶段已变化",
-                    code="DISCOVERY_STALE_ATTEMPT",
-                    detail="客户端 attempt 不是当前阶段",
-                )
-            stale = _stage_precondition_rejection(
-                session, payload, stage_row
-            )
-            if stale is not None:
-                return stale
-            stage_id = stage_row.id
-            run, commit_at, rejection = _fresh_mutation_checkpoint(
-                request.app,
-                session,
-                run.id,
-            )
-            if rejection is not None:
-                return rejection
-            assert run is not None
-            stage_row = session.get(DiscoveryStage, stage_id)
-            if stage_row is None:
-                return _error(
-                    404,
-                    error="未找到",
-                    code="DISCOVERY_STAGE_NOT_FOUND",
-                    detail="指定阶段不存在",
-                )
-            stale = _stage_precondition_rejection(
-                session, payload, stage_row
-            )
-            if stale is not None:
-                session.rollback()
-                return stale
-            expected_updated_at = stage_row.updated_at
-            try:
-                changed = session.execute(
-                    update(DiscoveryStage)
-                    .where(
-                        DiscoveryStage.id == stage_row.id,
-                        DiscoveryStage.attempt == stage_row.attempt,
-                        DiscoveryStage.input_fingerprint
-                        == stage_row.input_fingerprint,
-                        DiscoveryStage.ruler_version_id
-                        == stage_row.ruler_version_id,
-                        DiscoveryStage.updated_at
-                        == expected_updated_at,
-                        DiscoveryStage.status
-                        == "waiting_confirmation",
-                        DiscoveryStage.superseded_at.is_(None),
-                    )
-                    .values(
-                        updated_at=_next_stage_updated_at(
-                            stage_row, commit_at
-                        )
-                    )
-                )
-            except OperationalError:
-                session.rollback()
-                return _stage_claim_conflict()
-            if int(changed.rowcount or 0) != 1:
-                session.rollback()
-                return (
-                    _stage_claim_conflict()
-                    if _has_stage_expectation(payload)
-                    else _error(
-                        409,
-                        error="覆盖不可编辑",
-                        code="DISCOVERY_OVERRIDE_NOT_EDITABLE",
-                        detail="覆盖仅可在待确认阶段编辑",
-                    )
-                )
-            exists = session.scalar(
-                select(DiscoveryResult.id).where(
-                    DiscoveryResult.run_id == run.id,
-                    DiscoveryResult.track == track,
-                    DiscoveryResult.stage == stage_name,
-                    DiscoveryResult.attempt == stage_row.attempt,
-                    DiscoveryResult.code == code,
-                )
-            )
-            if exists is None:
-                session.rollback()
-                return _error(
-                    409,
-                    error="结果不存在",
-                    code="DISCOVERY_RESULT_NOT_FOUND",
-                    detail="代码不属于该精确阶段结果",
-                )
-            row = session.scalar(
-                select(DiscoveryOverride).where(
-                    DiscoveryOverride.run_id == run.id,
-                    DiscoveryOverride.track == track,
-                    DiscoveryOverride.stage == stage_name,
-                    DiscoveryOverride.attempt == stage_row.attempt,
-                    DiscoveryOverride.code == code,
-                )
-            )
-            if row is None:
-                row = DiscoveryOverride(
-                    run_id=run.id,
-                    track=track,
-                    stage=stage_name,
-                    attempt=stage_row.attempt,
-                    code=code,
-                    action=action,
-                    reason=reason.strip(),
-                    created_at=commit_at,
-                )
-                session.add(row)
-            else:
-                row.action = action
-                row.reason = reason.strip()
-                row.created_at = commit_at
-            try:
-                session.commit()
-            except OperationalError:
-                session.rollback()
-                return _stage_claim_conflict()
-            session.refresh(row)
-            return _override_json(row)
-
-    @router.delete("/{run_id}/overrides/{override_id}")
-    def delete_override(request: Request, run_id: int, override_id: int):
-        now = _now(request.app)
-        with request.app.state.session_factory() as session:
-            run = _owned_run(session, run_id)
-            if run is None:
-                return _error(
-                    404,
-                    error="未找到",
-                    code="DISCOVERY_OVERRIDE_NOT_FOUND",
-                    detail="覆盖不存在",
-                )
-            immutable = _mutation_guard(run, now)
-            if immutable is not None:
-                return immutable
-            row = session.get(DiscoveryOverride, override_id)
-            if row is None or row.run_id != run_id:
-                return _error(
-                    404,
-                    error="未找到",
-                    code="DISCOVERY_OVERRIDE_NOT_FOUND",
-                    detail="覆盖不存在",
-                )
-            stage_row = _latest_track(
-                session, run.id, row.track, row.stage
-            )
-            if (
-                stage_row is None
-                or stage_row.attempt != row.attempt
-            ):
-                return _error(
-                    409,
-                    error="覆盖不可编辑",
-                    code="DISCOVERY_OVERRIDE_NOT_EDITABLE",
-                    detail="覆盖不属于当前阶段",
-                )
-            stage_id = stage_row.id
-            run, commit_at, rejection = _fresh_mutation_checkpoint(
-                request.app,
-                session,
-                run.id,
-            )
-            if rejection is not None:
-                return rejection
-            assert run is not None
-            row = session.get(DiscoveryOverride, override_id)
-            stage_row = session.get(DiscoveryStage, stage_id)
-            if row is None or stage_row is None:
-                return _error(
-                    404,
-                    error="未找到",
-                    code="DISCOVERY_OVERRIDE_NOT_FOUND",
-                    detail="覆盖不存在",
-                )
-            changed = session.execute(
-                update(DiscoveryStage)
-                .where(
-                    DiscoveryStage.id == stage_row.id,
-                    DiscoveryStage.attempt == stage_row.attempt,
-                    DiscoveryStage.input_fingerprint
-                    == stage_row.input_fingerprint,
-                    DiscoveryStage.ruler_version_id
-                    == stage_row.ruler_version_id,
-                    DiscoveryStage.updated_at == stage_row.updated_at,
-                    DiscoveryStage.status == "waiting_confirmation",
-                    DiscoveryStage.superseded_at.is_(None),
-                )
-                .values(
-                    updated_at=_next_stage_updated_at(
-                        stage_row, commit_at
-                    )
-                )
-            )
-            if int(changed.rowcount or 0) != 1:
-                session.rollback()
-                return _error(
-                    409,
-                    error="覆盖不可编辑",
-                    code="DISCOVERY_OVERRIDE_NOT_EDITABLE",
-                    detail="覆盖仅可在待确认阶段删除",
-                )
-            session.delete(row)
-            session.commit()
-            return {"deleted": True, "id": override_id}
-
-    @router.post("/{run_id}/decisions")
-    async def save_decision(request: Request, run_id: int):
-        payload, rejected = await _object_body(
-            request, "INVALID_DISCOVERY_DECISION"
-        )
-        if rejected is not None:
-            return rejected
-        track = payload.get("track")
-        code = payload.get("code")
-        decision = payload.get("decision")
-        reason = payload.get("reason")
-        note = payload.get("note")
-        if (
-            type(track) is not str
-            or track not in TRACKS
-            or type(code) is not str
-            or not code.strip()
-            or type(decision) is not str
-            or decision not in {"keep", "exclude"}
-            or (
-                decision == "exclude"
-                and (type(reason) is not str or not reason.strip())
-            )
-            or (decision == "keep" and note is not None and type(note) is not str)
-        ):
-            return _error(
-                400,
-                error="裁决无效",
-                code="INVALID_DISCOVERY_DECISION",
-                detail="裁决必须是 keep/exclude，exclude 需要非空理由",
-            )
-        now = _now(request.app)
-        with request.app.state.session_factory() as session:
-            run = _owned_run(session, run_id)
-            if run is None:
-                return _error(
-                    404,
-                    error="未找到",
-                    code="DISCOVERY_NOT_FOUND",
-                    detail=f"没有发现批次 {run_id}",
-                )
-            immutable = _mutation_guard(run, now)
-            if immutable is not None:
-                return immutable
-            adjudication = _latest_track(
-                session, run.id, track, "adjudication"
-            )
-            if adjudication is None:
-                return _error(
-                    404,
-                    error="未找到",
-                    code="DISCOVERY_STAGE_NOT_FOUND",
-                    detail="裁决阶段不存在",
-                )
-            parent = _exact_parent(session, adjudication)
-            if not isinstance(parent, DiscoveryStage):
-                return _lineage_rejection(adjudication)
-            normalized_reason = (
-                reason.strip() if decision == "exclude" else None
-            )
-            normalized_note = note if decision == "keep" else None
-            row = session.scalar(
-                select(DiscoveryDecision).where(
-                    DiscoveryDecision.run_id == run.id,
-                    DiscoveryDecision.track == track,
-                    DiscoveryDecision.competition_stage_id == parent.id,
-                    DiscoveryDecision.competition_attempt == parent.attempt,
-                    DiscoveryDecision.code == code,
-                )
-            )
-            if (
-                row is not None
-                and row.decision == decision
-                and row.exclusion_reason == normalized_reason
-                and row.keep_note == normalized_note
-            ):
-                return _decision_json(row)
-            stale = _stage_precondition_rejection(
-                session, payload, adjudication
-            )
-            if stale is not None:
-                return stale
-            if (
-                adjudication.status != "waiting_confirmation"
-                or adjudication.superseded_at is not None
-            ):
-                return _error(
-                    409,
-                    error="裁决不可编辑",
-                    code="DISCOVERY_DECISION_NOT_EDITABLE",
-                    detail="裁决仅可在最终阶段待确认时编辑",
-                )
-            entrants = {
-                row.code
-                for row in _researchable_competition_entrants(
-                    session, parent
-                )
-            }
-            if code not in entrants:
-                session.rollback()
-                return _error(
-                    409,
-                    error="非入围公司",
-                    code="DISCOVERY_NOT_AN_ENTRANT",
-                    detail="代码不是冻结覆盖后的竞争阶段入围公司",
-                )
-            parent_id = parent.id
-            adjudication_id = adjudication.id
-            run, commit_at, rejection = _fresh_mutation_checkpoint(
-                request.app,
-                session,
-                run.id,
-            )
-            if rejection is not None:
-                return rejection
-            assert run is not None
-            adjudication = session.get(DiscoveryStage, adjudication_id)
-            parent = session.get(DiscoveryStage, parent_id)
-            if adjudication is None or parent is None:
-                return _error(
-                    409,
-                    error="阶段谱系不可用",
-                    code="invalid_predecessor",
-                    detail="阶段缺少可验证的精确上游身份",
-                )
-            stale = _stage_precondition_rejection(
-                session, payload, adjudication
-            )
-            if stale is not None:
-                return stale
-            row = session.scalar(
-                select(DiscoveryDecision).where(
-                    DiscoveryDecision.run_id == run.id,
-                    DiscoveryDecision.track == track,
-                    DiscoveryDecision.competition_stage_id == parent.id,
-                    DiscoveryDecision.competition_attempt == parent.attempt,
-                    DiscoveryDecision.code == code,
-                )
-            )
-            if (
-                row is not None
-                and row.decision == decision
-                and row.exclusion_reason == normalized_reason
-                and row.keep_note == normalized_note
-            ):
-                return _decision_json(row)
-            expected_updated_at = adjudication.updated_at
-            changed = session.execute(
-                update(DiscoveryStage)
-                .where(
-                    DiscoveryStage.id == adjudication.id,
-                    DiscoveryStage.updated_at == expected_updated_at,
-                    DiscoveryStage.status == "waiting_confirmation",
-                    DiscoveryStage.superseded_at.is_(None),
-                )
-                .values(
-                    updated_at=_next_stage_updated_at(
-                        adjudication, commit_at
-                    )
-                )
-            )
-            if int(changed.rowcount or 0) != 1:
-                session.rollback()
-                session.expire_all()
-                adjudication = session.get(
-                    DiscoveryStage, adjudication_id
-                )
-                row = session.scalar(
-                    select(DiscoveryDecision).where(
-                        DiscoveryDecision.run_id == run_id,
-                        DiscoveryDecision.track == track,
-                        DiscoveryDecision.competition_stage_id == parent_id,
-                        DiscoveryDecision.code == code,
-                    )
-                )
-                if (
-                    row is not None
-                    and row.decision == decision
-                    and row.exclusion_reason == normalized_reason
-                    and row.keep_note == normalized_note
-                ):
-                    return _decision_json(row)
-                if adjudication is not None:
-                    stale = _stage_precondition_rejection(
-                        session, payload, adjudication
-                    )
-                    if stale is not None:
-                        return stale
-                return _stage_claim_conflict()
-            if row is None:
-                row = DiscoveryDecision(
-                    run_id=run.id,
-                    track=track,
-                    competition_attempt=parent.attempt,
-                    competition_stage_id=parent.id,
-                    stage="competition",
-                    code=code,
-                    decision=decision,
-                    exclusion_reason=normalized_reason,
-                    keep_note=normalized_note,
-                    created_at=commit_at,
-                )
-                session.add(row)
-            else:
-                row.decision = decision
-                row.exclusion_reason = normalized_reason
-                row.keep_note = normalized_note
-                row.created_at = commit_at
-            session.commit()
-            session.refresh(row)
-            return _decision_json(row)
-
     @router.post("/{run_id}/recompute")
     async def recompute_discovery(request: Request, run_id: int):
         payload, rejected = await _object_body(
@@ -4128,6 +3034,9 @@ def create_discovery_router() -> APIRouter:
         )
         if rejected is not None:
             return rejected
+        return await run_in_threadpool(recompute_blocking, request, run_id, payload)
+
+    def recompute_blocking(request: Request, run_id: int, payload: Mapping):
         sync = _truthy(payload.get("sync")) and bool(
             getattr(request.app.state, "allow_sync", False)
         )

@@ -190,7 +190,9 @@ def test_dropped_is_reported_only_for_the_first_absent_week() -> None:
     ) == ()
 
 
-def _finalized_history(tmp_path, *, current_status: str = "confirmed"):
+def _finalized_history(
+    tmp_path, *, current_status: str = "confirmed", extra_company: bool = False
+):
     from datetime import timedelta
 
     from app.db import create_session_factory, init_db
@@ -234,7 +236,8 @@ def _finalized_history(tmp_path, *, current_status: str = "confirmed"):
             freeze_inputs(
                 session,
                 run,
-                [company("600000.SH")],
+                [company("600000.SH")]
+                + ([company("600036.SH")] if extra_company else []),
                 versions(ruler_ids=rulers),
                 {"SH": ["2026-09-16", "2026-09-17"]},
                 snapshot_at=SNAPSHOT_AT + timedelta(days=index),
@@ -267,9 +270,9 @@ def _finalized_history(tmp_path, *, current_status: str = "confirmed"):
                 stage="track_gate",
                 attempt=1,
                 status="confirmed",
-                total_count=1,
+                total_count=2 if extra_company else 1,
                 pass_count=1,
-                drop_count=0,
+                drop_count=1 if extra_company else 0,
                 insufficient_count=0,
                 input_fingerprint=run.input_fingerprint,
                 ruler_version_id=rulers["quality_discount"],
@@ -354,6 +357,21 @@ def _finalized_history(tmp_path, *, current_status: str = "confirmed"):
                     created_at=SNAPSHOT_AT,
                 )
             )
+            if extra_company:
+                session.add(
+                    DiscoveryResult(
+                        run_id=run.id,
+                        track="quality_discount",
+                        stage="track_gate",
+                        attempt=1,
+                        code="600036.SH",
+                        verdict="drop",
+                        reason="gate-drop",
+                        metrics_json="{}",
+                        rank=None,
+                        created_at=SNAPSHOT_AT,
+                    )
+                )
             competition_result = DiscoveryResult(
                 run_id=run.id,
                 track="quality_discount",
@@ -418,10 +436,23 @@ def _finalized_history(tmp_path, *, current_status: str = "confirmed"):
     )
 
 
-def test_waiting_adjudication_is_not_comparable_or_dropped(tmp_path) -> None:
+def test_waiting_adjudication_is_not_comparable_or_dropped(
+    tmp_path, monkeypatch
+) -> None:
+    import discovery.diff as diff
+
     engine, factory, run_ids, *_ = _finalized_history(
         tmp_path,
         current_status="waiting_confirmation",
+    )
+    loaded: list[int] = []
+    original = diff.load_frozen_inputs
+    monkeypatch.setattr(
+        diff,
+        "load_frozen_inputs",
+        lambda session, run_id, **kwargs: (
+            loaded.append(run_id) or original(session, run_id, **kwargs)
+        ),
     )
     with factory() as session:
         assert load_weekly_changes(
@@ -430,6 +461,50 @@ def test_waiting_adjudication_is_not_comparable_or_dropped(tmp_path) -> None:
             track="quality_discount",
             stage="adjudication",
         ) == ()
+    assert loaded == []
+    engine.dispose()
+
+
+def test_weekly_changes_parse_only_selected_companies(
+    tmp_path, monkeypatch
+) -> None:
+    import discovery.diff as diff
+
+    engine, factory, run_ids, *_ = _finalized_history(
+        tmp_path, extra_company=True
+    )
+    requested: list[set[str]] = []
+    original_load = diff.load_frozen_inputs
+    monkeypatch.setattr(
+        diff,
+        "load_frozen_inputs",
+        lambda session, run_id, *, codes=None: (
+            requested.append(set(codes))
+            or original_load(session, run_id, codes=codes)
+        ),
+    )
+    def changes():
+        with factory() as session:
+            return load_weekly_changes(
+                session,
+                run_ids[-1],
+                track="quality_discount",
+                stage="track_gate",
+            )
+
+    filtered = changes()
+    assert requested == [{"600000.SH"}, {"600000.SH"}]
+    monkeypatch.setattr(
+        diff,
+        "_passing_codes",
+        lambda session, stage: {"600000.SH", "600036.SH"},
+    )
+    unfiltered = changes()
+    assert requested[2:] == [{"600036.SH"}, {"600036.SH"}]
+    cached = changes()
+    assert requested[4:] == []
+    assert filtered == unfiltered == cached
+    assert [row.code for row in filtered] == ["600000.SH"]
     engine.dispose()
 
 

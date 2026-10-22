@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import threading
+import time
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
 from decimal import Decimal
@@ -20,6 +21,7 @@ from app.discovery_routes import (
     cancel_discovery_research_worker,
     create_discovery_router,
     resume_discovery_queues,
+    warm_current_stage_summaries,
 )
 from app.envfile import (
     OPENAI_API_KEY,
@@ -33,6 +35,8 @@ from app.envfile import (
     write_env_value,
 )
 from app.models import (
+    DiscoveryDataFill,
+    IndexFundRun,
     PortfolioReview,
     Quote,
     ResearchArtifact,
@@ -50,21 +54,16 @@ from discovery.data_readiness import (
     discovery_data_readiness,
 )
 from discovery.snapshot import build_production_snapshot
-from jobs.cheap import (
-    begin_cheap_fill,
-    cheap_fill_running,
-    clear_cheap_fill,
-    execute_cheap_fill,
-    load_cheap_board,
-)
 from jobs.discovery_data import (
     DEFAULT_POLICY,
     discovery_data_status,
     execute_discovery_data_fill,
+    fill_resume_delay,
     start_discovery_data_fill,
 )
 from jobs.funnel import execute_funnel
 from jobs.discovery import builtin_track_executor
+from jobs.index_funds import execute as execute_index_funds
 from jobs.lock import (
     JOB_TYPE_DISCOVERY,
     JOB_TYPE_DISCOVERY_DATA,
@@ -76,7 +75,7 @@ from jobs.lock import (
     release,
     try_acquire,
 )
-from jobs.research import execute_research
+from jobs.research import execute_research, load_financials
 from jobs.review import execute_review
 from ledger.positions import LOCAL_USER_ID, load_positions
 from ledger.quotes import (
@@ -87,17 +86,21 @@ from ledger.quotes import (
     is_a_share_code,
     lookup_saved_instrument,
     project_book,
+    quote_targets,
     rebalance_alerts,
     save_instrument,
     set_manual_price,
+    suggest_instruments,
 )
 from ledger.rules import RuleError, RuleRow, delete_rule, list_rules, save_rule
 from ledger.targets import TargetError, reclaim_orphan_targets, save_targets, seed_targets_if_empty
 from ledger.trades import TradeError, record_trade, set_cash, set_position
 from market.eastmoney import EastMoneyClient, MarketClient
+from market.funds import FundClient
 from market.sentiment import load_sentiment
 from market.types import MarketError
 from market.quotes import QuoteClient, TencentQuoteClient
+from research.evaluate import _deducted_ttm_eps, _enrich_balance_sheet_traps, _ttm_eps
 from research.llm import OpenAICompatClient
 from screen.ruler import RulerError, activate as activate_ruler, require_matched, status as ruler_status
 from research.thesis import (
@@ -107,6 +110,7 @@ from research.thesis import (
     list_aftermath,
     load_by_names,
     parse_structured,
+    portfolio_optimization,
     price_usable,
     thesis_mark,
     utc_today,
@@ -221,6 +225,30 @@ def _readiness_json(report: ReadinessReport) -> dict[str, object]:
     }
 
 
+def _cached_readiness(request: Request, session, body: dict[str, object]) -> dict[str, object]:
+    cache = getattr(request.app.state, "discovery_readiness_cache", None)
+    if cache is None:
+        cache = {"key": None, "value": None, "lock": threading.Lock()}
+        request.app.state.discovery_readiness_cache = cache
+    key = (
+        body.get("id"),
+        body.get("status"),
+        body.get("snapshot_status"),
+        body.get("total"),
+        body.get("completed"),
+        body.get("failed"),
+    )
+    with cache["lock"]:
+        if cache["key"] == key and cache["value"] is not None:
+            return cache["value"]
+        value = _readiness_json(
+            discovery_data_readiness(session, as_of=date.today())
+        )
+        cache["key"] = key
+        cache["value"] = value
+        return value
+
+
 def _resolve_research_target(session, market, name: str, code: str, query: str) -> tuple[str, str]:
     if name and code:
         if not is_a_share_code(code):
@@ -238,9 +266,50 @@ def _positions_payload(
     session, rows, cash: Decimal
 ) -> dict[str, object]:
     book = project_book(session, rows, cash)
-    theses = load_by_names(session, LOCAL_USER_ID, [row.name for row in book.positions])
+    held_names = [row.name for row in book.positions]
+    theses = load_by_names(session, LOCAL_USER_ID, held_names)
+    pos_jsons = [
+        _position_json(
+            row,
+            theses.get(row.name),
+            financials=load_financials(session, row.code) if row.code else (),
+        )
+        for row in book.positions
+    ]
+    pass_theses = session.scalars(
+        select(Thesis).where(
+            Thesis.user_id == LOCAL_USER_ID,
+            Thesis.verdict == "pass",
+        )
+    ).all()
+    held_set = set(held_names)
+    unheld_theses = [t for t in pass_theses if t.name not in held_set]
+    quotes = _quote_map(session, [t.name for t in unheld_theses])
+    unheld_candidates: list[dict[str, object]] = []
+    for t in unheld_theses:
+        job = session.get(ResearchJob, t.research_job_id) if t.research_job_id else None
+        code = (job.code if job and job.code else None) or instrument_code_by_name(session, t.name)
+        q = quotes.get(t.name)
+        unheld_candidates.append({
+            "name": t.name,
+            "code": code,
+            "research_id": t.research_job_id,
+            "structured": parse_structured(t),
+            "price": q.price if q is not None else None,
+            "price_usable": price_usable(q.price, stale=q.stale) if q is not None else False,
+            "financials": load_financials(session, code) if code else (),
+        })
+    sent_row = session.get(Setting, "sentiment")
+    sent_payload: dict[str, object] | None = None
+    if sent_row is not None and sent_row.value:
+        try:
+            parsed_sent = json.loads(sent_row.value)
+            if isinstance(parsed_sent, dict):
+                sent_payload = parsed_sent
+        except json.JSONDecodeError:
+            sent_payload = None
     return {
-        "positions": [_position_json(row, theses.get(row.name)) for row in book.positions],
+        "positions": pos_jsons,
         "cash": {
             "balance": _json_number(book.cash_balance),
             "currency": "CNY",
@@ -250,16 +319,26 @@ def _positions_payload(
             "deviation": _json_optional(book.cash.deviation),
         },
         "rebalance": rebalance_alerts(book.positions, book.cash),
+        "optimization": portfolio_optimization(
+            pos_jsons, unheld_candidates, sentiment=sent_payload
+        ),
     }
 
 
-def _position_json(row: QuotedPosition, thesis: Thesis | None = None) -> dict[str, object]:
+def _position_json(
+    row: QuotedPosition,
+    thesis: Thesis | None = None,
+    *,
+    financials=(),
+) -> dict[str, object]:
     usable = price_usable(row.price, stale=row.stale)
     extra = api_fields(
         thesis,
         today=utc_today(),
         current_price=row.price,
         price_usable=usable,
+        actual_weight=row.weight,
+        financials=financials,
     )
     return {
         "name": row.name,
@@ -283,6 +362,8 @@ def _position_json(row: QuotedPosition, thesis: Thesis | None = None) -> dict[st
         "cheap_bound": extra["cheap_bound"],
         "rich_bound": extra["rich_bound"],
         "live_verdict": extra["live_verdict"],
+        "financial_drift": extra["financial_drift"],
+        "dynamic_sizing": extra["dynamic_sizing"],
     }
 
 
@@ -317,8 +398,7 @@ def _fetch_prices(client: QuoteClient, codes: list[str]) -> dict[str, Decimal]:
 
 def _bulk_refresh(session, client: QuoteClient) -> None:
     rows, _cash = load_positions(session)
-    mapping = instrument_code_by_name(session)
-    targets = [(row.name, mapping.get(row.name)) for row in rows]
+    targets = quote_targets(session, [row.name for row in rows])
     codes = [
         code
         for _n, code in targets
@@ -557,7 +637,34 @@ def _artifact_payload(session, job: ResearchJob) -> dict[str, object]:
         body["data_grade"] = structured.get("data_grade")
         body["as_of"] = structured.get("as_of")
         body["portfolio_fit"] = structured.get("portfolio_fit")
-        body["valuation"] = structured.get("valuation") or {}
+        val = dict(structured.get("valuation") or {}) if isinstance(structured.get("valuation"), dict) else {}
+        if ("pe_ttm" not in val or "pe_deducted_ttm" not in val) and job.code:
+            as_of_dict = structured.get("as_of") if isinstance(structured.get("as_of"), dict) else {}
+            raw_price = as_of_dict.get("price") if as_of_dict else None
+            if raw_price is None:
+                raw_price = val.get("price")
+            try:
+                dec_price = Decimal(str(raw_price)) if raw_price is not None else None
+            except Exception:
+                dec_price = None
+            if dec_price is not None and dec_price > 0:
+                fins = load_financials(session, job.code)
+                if "pe_ttm" not in val:
+                    ttm_eps, ttm_basis = _ttm_eps(fins)
+                    if ttm_eps is not None and ttm_eps > 0:
+                        val["eps_ttm"] = _json_optional(ttm_eps)
+                        val["pe_ttm"] = _json_optional(dec_price / ttm_eps)
+                        val["pe_ttm_basis"] = ttm_basis
+                if "pe_deducted_ttm" not in val:
+                    ded_eps, ded_basis = _deducted_ttm_eps(fins)
+                    if ded_eps is not None and ded_eps > 0:
+                        val["eps_deducted_ttm"] = _json_optional(ded_eps)
+                        val["pe_deducted_ttm"] = _json_optional(dec_price / ded_eps)
+                        val["pe_deducted_ttm_basis"] = ded_basis
+                _enrich_balance_sheet_traps(val, fins)
+        elif job.code and ("goodwill_pct" not in val and "net_cash_yi" not in val):
+            _enrich_balance_sheet_traps(val, load_financials(session, job.code))
+        body["valuation"] = val
     thesis = session.scalars(
         select(Thesis).where(Thesis.user_id == job.user_id, Thesis.name == job.name)
     ).first()
@@ -573,9 +680,47 @@ def _artifact_payload(session, job: ResearchJob) -> dict[str, object]:
             today=utc_today(),
             current_price=current_price,
             price_usable=usable,
+            financials=load_financials(session, job.code) if job.code else (),
         )
     )
     body["thesis_mark"] = thesis_mark(thesis, job.id)
+    siblings = session.scalars(
+        select(ResearchJob)
+        .where(
+            ResearchJob.user_id == job.user_id,
+            ResearchJob.name == job.name,
+            ResearchJob.status == "done",
+        )
+        .order_by(ResearchJob.id.desc())
+    ).all()
+    history: list[dict[str, object]] = []
+    for sib in siblings[:12]:
+        sib_art = session.scalars(
+            select(ResearchArtifact)
+            .where(ResearchArtifact.research_job_id == sib.id)
+            .order_by(ResearchArtifact.id.desc())
+        ).first()
+        sib_verdict = None
+        sib_date = sib.updated_at.strftime("%Y-%m-%d") if sib.updated_at else ""
+        if sib_art is not None:
+            try:
+                sib_parsed = json.loads(sib_art.structured_json)
+                if isinstance(sib_parsed, dict):
+                    sib_verdict = sib_parsed.get("verdict")
+                    as_of_obj = sib_parsed.get("as_of")
+                    if isinstance(as_of_obj, dict) and as_of_obj.get("date"):
+                        sib_date = str(as_of_obj.get("date"))
+            except json.JSONDecodeError:
+                pass
+        history.append(
+            {
+                "id": sib.id,
+                "date": sib_date,
+                "verdict": sib_verdict,
+                "is_thesis": thesis is not None and thesis.research_job_id == sib.id,
+            }
+        )
+    body["history"] = history
     return body
 
 
@@ -593,6 +738,9 @@ def _watchlist_json(
     row: Watchlist,
     thesis: Thesis | None = None,
     quote: Quote | None = None,
+    *,
+    held: bool = False,
+    financials=(),
 ) -> dict[str, object]:
     usable = False
     current_price = None
@@ -604,6 +752,7 @@ def _watchlist_json(
         today=utc_today(),
         current_price=current_price,
         price_usable=usable,
+        financials=financials,
     )
     return {
         "id": row.id,
@@ -613,6 +762,13 @@ def _watchlist_json(
         "thesis_status": extra["thesis_status"],
         "thesis_research_id": extra["thesis_research_id"],
         "thesis_verdict": extra["thesis_verdict"],
+        "current_price": _json_optional(current_price) if usable else None,
+        "cheap_bound": extra["cheap_bound"],
+        "rich_bound": extra["rich_bound"],
+        "overvalued": extra["overvalued"],
+        "financial_drift": extra["financial_drift"],
+        "dynamic_sizing": extra["dynamic_sizing"],
+        "held": held,
     }
 
 
@@ -776,8 +932,10 @@ def create_app(
     discovery_track_executor=None,
     discovery_snapshot_provider=None,
     discovery_clock=None,
+    fund_client=None,
 ) -> FastAPI:
     resolved_dist = dist_path if dist_path is not None else DEFAULT_DIST_PATH
+    resolved_fund_client = fund_client if fund_client is not None else FundClient()
     resolved_quote_client = quote_client if quote_client is not None else TencentQuoteClient()
     resolved_market_client = market_client if market_client is not None else EastMoneyClient()
     resolved_env = resolve_env_path(env_path)
@@ -797,6 +955,7 @@ def create_app(
         app.state.session_factory = session_factory
         app.state.quote_client = resolved_quote_client
         app.state.market_client = resolved_market_client
+        app.state.fund_client = resolved_fund_client
         app.state.llm_client = resolved_llm
         app.state.reports_dir = resolved_reports
         app.state.env_path = resolved_env
@@ -809,6 +968,11 @@ def create_app(
         )
         app.state.discovery_clock = discovery_clock or (
             lambda: datetime.now(timezone.utc)
+        )
+        app.state.discovery_offload_drain = (
+            os.environ.get("BERKSHIRE_DISCOVERY_OFFLOAD") == "1"
+            and discovery_track_executor is None
+            and discovery_clock is None
         )
         app.state.discovery_workers_lock = threading.Lock()
         app.state.discovery_workers = set()
@@ -847,7 +1011,6 @@ def create_app(
                     session,
                     now_provider=app.state.discovery_clock,
                 )
-                clear_cheap_fill(session)
                 session.commit()
             except Exception:
                 session.rollback()
@@ -856,6 +1019,12 @@ def create_app(
             resume_discovery_queues(app)
         except Exception:
             logger.exception("启动恢复发现队列失败")
+        try:
+            _resume_paused_fill()
+        except Exception:
+            logger.exception("启动恢复补数失败")
+        if app.state.discovery_offload_drain:
+            threading.Thread(target=_warm_stage_summaries, daemon=True).start()
         yield
         with app.state.discovery_workers_lock:
             app.state.discovery_shutting_down = True
@@ -919,32 +1088,82 @@ def create_app(
             session.commit()
             return body
 
-    def _run_cheap_fill() -> None:
+    def _run_discovery_data_fill(fill_id: int, *, keep_going: bool = True) -> None:
+        # One run stops at max_runtime_seconds; a full fill takes ~15 h, so
+        # keep resuming until it finishes or needs a person.
         factory = app.state.session_factory
         market = app.state.market_client
-        with factory() as session:
-            execute_cheap_fill(session, market)
+        current: int | None = fill_id
+        while current is not None:
+            with factory() as session:
+                execute_discovery_data_fill(
+                    session,
+                    market,
+                    current,
+                    policy=DEFAULT_POLICY,
+                )
+            if not keep_going:
+                return
+            with factory() as session:
+                delay = fill_resume_delay(
+                    session, current, datetime.now(timezone.utc)
+                )
+            current = None if delay is None else _resume_fill_after(delay)
 
-    def _run_discovery_data_fill(fill_id: int) -> None:
-        factory = app.state.session_factory
-        market = app.state.market_client
-        with factory() as session:
-            execute_discovery_data_fill(
-                session,
-                market,
-                fill_id,
-                policy=DEFAULT_POLICY,
+    def _resume_fill_after(delay: float) -> int | None:
+        deadline = time.monotonic() + delay
+        while not app.state.discovery_shutting_down:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                with app.state.session_factory() as session:
+                    fill, dispatch = start_discovery_data_fill(
+                        session, policy=DEFAULT_POLICY
+                    )
+                    return fill.id if fill is not None and dispatch else None
+            time.sleep(min(left, 1.0))
+        return None
+
+    def _resume_paused_fill() -> None:
+        with app.state.session_factory() as session:
+            paused = session.scalar(
+                select(DiscoveryDataFill.id)
+                .where(DiscoveryDataFill.status == "paused")
+                .order_by(DiscoveryDataFill.id.desc())
+                .limit(1)
             )
+            delay = (
+                None
+                if paused is None
+                else fill_resume_delay(session, paused, datetime.now(timezone.utc))
+            )
+        if delay is None:
+            return
+
+        def resume() -> None:
+            fill_id = _resume_fill_after(delay)
+            if fill_id is not None:
+                _run_discovery_data_fill(fill_id)
+
+        threading.Thread(target=resume, daemon=True).start()
+
+    def _warm_stage_summaries() -> None:
+        try:
+            warm_current_stage_summaries(app)
+            from types import SimpleNamespace
+
+            with app.state.session_factory() as session:
+                body = discovery_data_status(session, policy=DEFAULT_POLICY)
+                _cached_readiness(SimpleNamespace(app=app), session, body)
+        except Exception:
+            logger.exception("预热本周发现阶段汇总失败")
 
     @app.get("/api/discovery-data/status")
     def get_discovery_data_status(request: Request) -> dict[str, object]:
         factory = request.app.state.session_factory
         with factory() as session:
-            return discovery_data_status(session, policy=DEFAULT_POLICY) | {
-                "readiness": _readiness_json(
-                    discovery_data_readiness(session, as_of=date.today())
-                )
-            }
+            body = discovery_data_status(session, policy=DEFAULT_POLICY)
+            body["readiness"] = _cached_readiness(request, session, body)
+            return body
 
     @app.post("/api/discovery-data/fill")
     async def post_discovery_data_fill(request: Request):
@@ -991,7 +1210,7 @@ def create_app(
             fill_id = fill.id
         if dispatch:
             if sync:
-                _run_discovery_data_fill(fill_id)
+                _run_discovery_data_fill(fill_id, keep_going=False)
             else:
                 threading.Thread(
                     target=_run_discovery_data_fill,
@@ -1000,48 +1219,6 @@ def create_app(
                 ).start()
         with factory() as session:
             return discovery_data_status(session, policy=DEFAULT_POLICY)
-
-    @app.get("/api/cheap")
-    def cheap(request: Request, sort: str = Query("pe")):
-        wanted = (sort or "pe").strip().lower()
-        if wanted not in {"pe", "pb"}:
-            return _error_json(
-                400,
-                error="请求无效",
-                code="INVALID_CHEAP",
-                detail="sort 只能是 pe 或 pb",
-            )
-        fill = _as_bool(request.query_params.get("sync")) and bool(
-            getattr(request.app.state, "allow_sync", False)
-        )
-        started = False
-        factory = request.app.state.session_factory
-        with factory() as session:
-            try:
-                body = load_cheap_board(
-                    session,
-                    request.app.state.market_client,
-                    sort=wanted,
-                    fill=fill,
-                )
-            except MarketError as exc:
-                return _error_json(
-                    502,
-                    error="行情失败",
-                    code="CHEAP_UNAVAILABLE",
-                    detail=exc.message,
-                )
-            pending = int(body.get("pending") or 0)
-            filling = cheap_fill_running(session)
-            if pending and not fill and not filling:
-                if begin_cheap_fill(session):
-                    started = True
-                    filling = True
-            session.commit()
-            body["filling"] = filling
-        if started:
-            threading.Thread(target=_run_cheap_fill, daemon=True).start()
-        return body
 
     @app.get("/api/positions")
     def positions(request: Request) -> dict[str, object]:
@@ -1254,7 +1431,7 @@ def create_app(
             targets = (
                 [(name, mapping.get(name))]
                 if name is not None
-                else [(row.name, mapping.get(row.name)) for row in rows]
+                else quote_targets(session, list(held))
             )
             codes = [
                 code
@@ -1269,6 +1446,7 @@ def create_app(
                     targets=targets,
                     single=name is not None,
                 )
+                errors = [item for item in errors if item.name in held]
             except QuoteError as exc:
                 return _error_json(
                     400,
@@ -1300,6 +1478,12 @@ def create_app(
         if migrate_error:
             body.update(migrate_error)
         return body
+
+    @app.get("/api/instruments/suggest")
+    def get_instrument_suggestions(request: Request, q: str = "") -> dict[str, object]:
+        factory = request.app.state.session_factory
+        with factory() as session:
+            return {"items": suggest_instruments(session, q)}
 
     @app.post("/api/instruments")
     async def create_instrument(request: Request):
@@ -2033,9 +2217,17 @@ def create_app(
             names = [row.name for row in rows]
             theses = load_by_names(session, LOCAL_USER_ID, names)
             quotes = _quote_map(session, names)
+            positions, _cash = load_positions(session)
+            held_names = {pos.name for pos in positions if pos.shares > 0}
             return {
                 "items": [
-                    _watchlist_json(row, theses.get(row.name), quotes.get(row.name))
+                    _watchlist_json(
+                        row,
+                        theses.get(row.name),
+                        quotes.get(row.name),
+                        held=row.name in held_names,
+                        financials=load_financials(session, row.code) if row.code else (),
+                    )
                     for row in rows
                 ]
             }
@@ -2118,7 +2310,12 @@ def create_app(
             session.refresh(row)
             theses = load_by_names(session, LOCAL_USER_ID, [row.name])
             quotes = _quote_map(session, [row.name])
-            return _watchlist_json(row, theses.get(row.name), quotes.get(row.name))
+            return _watchlist_json(
+                row,
+                theses.get(row.name),
+                quotes.get(row.name),
+                financials=load_financials(session, row.code) if row.code else (),
+            )
 
     @app.delete("/api/watchlist/{item_id}")
     def delete_watchlist(request: Request, item_id: int):
@@ -2244,6 +2441,67 @@ def create_app(
                     detail=f"没有审视 {review_id}",
                 )
             return _review_payload(row)
+
+    @app.post("/api/index-funds/refresh")
+    async def refresh_index_funds(request: Request):
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+        sync = (
+            isinstance(payload, dict)
+            and _as_bool(payload.get("sync"))
+            and bool(getattr(request.app.state, "allow_sync", False))
+        )
+        factory = request.app.state.session_factory
+        with factory() as session:
+            busy = session.scalar(
+                select(IndexFundRun.id)
+                .where(IndexFundRun.status.in_(("queued", "running")))
+                .limit(1)
+            )
+            if busy is not None:
+                return _error_json(
+                    409,
+                    error="正在刷新",
+                    code="INDEX_FUNDS_BUSY",
+                    detail=f"刷新 {busy} 尚未结束",
+                )
+            now = datetime.now(timezone.utc)
+            row = IndexFundRun(status="queued", created_at=now, updated_at=now)
+            session.add(row)
+            session.commit()
+            run_id = row.id
+        args = (factory, run_id, request.app.state.fund_client)
+        if sync:
+            execute_index_funds(*args)
+        else:
+            threading.Thread(target=execute_index_funds, args=args, daemon=True).start()
+        return {"id": run_id}
+
+    @app.get("/api/index-funds/latest")
+    def latest_index_funds(request: Request) -> dict[str, object]:
+        factory = request.app.state.session_factory
+        with factory() as session:
+            latest = session.scalars(
+                select(IndexFundRun).order_by(IndexFundRun.id.desc())
+            ).first()
+            done = session.scalars(
+                select(IndexFundRun)
+                .where(IndexFundRun.status == "done")
+                .order_by(IndexFundRun.id.desc())
+            ).first()
+            return {
+                "run": None
+                if latest is None
+                else {
+                    "id": latest.id,
+                    "status": latest.status,
+                    "progress": latest.progress,
+                    "error": latest.error,
+                },
+                "result": None if done is None else json.loads(done.payload_json or "null"),
+            }
 
     def _spa_index() -> Path | None:
         index = resolved_dist / "index.html"

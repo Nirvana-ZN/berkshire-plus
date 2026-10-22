@@ -64,7 +64,13 @@ def _is_a_share(code: str) -> bool:
     text = (code or "").strip().upper()
     if len(text) != 9 or text[6] != ".":
         return False
-    return text[:6].isdigit() and text.endswith(A_SHARE_SUFFIXES)
+    if not (text[:6].isdigit() and text.endswith(A_SHARE_SUFFIXES)):
+        return False
+    if (text.endswith(".SH") and text.startswith("900")) or (
+        text.endswith(".SZ") and text.startswith("200")
+    ):
+        return False
+    return True
 
 
 def _dec(value: Decimal | None) -> Decimal | None:
@@ -88,6 +94,43 @@ def _annual_for(code: str, rows: Iterable[FinancialRow]) -> list[FinancialRow]:
     ]
     annual.sort(key=lambda row: int(row.period), reverse=True)
     return annual
+
+
+def _interims_for(code: str, rows: Iterable[FinancialRow]) -> dict[str, FinancialRow]:
+    out: dict[str, FinancialRow] = {}
+    for row in rows:
+        if row.code == code and row.period_type != "annual":
+            p = str(row.period or "").strip().upper()
+            if len(p) >= 6 and p[:4].isdigit():
+                out[p] = row
+    return out
+
+
+def _interim_deterioration_reason(
+    interims: dict[str, FinancialRow], *, finance: bool
+) -> str | None:
+    if not interims:
+        return None
+    for period in sorted(interims.keys(), reverse=True):
+        prev_period = f"{int(period[:4]) - 1}{period[4:]}"
+        if prev_period not in interims:
+            continue
+        cur = interims[period]
+        prev = interims[prev_period]
+        cur_dni, prev_dni = _dec(cur.deducted_net_income), _dec(prev.deducted_net_income)
+        if cur_dni is not None and prev_dni is not None and prev_dni > 0:
+            if (cur_dni - prev_dni) / prev_dni <= Decimal("-0.20"):
+                return f"最新期（{period}）扣非净利润同比下滑超20%"
+        cur_ni, prev_ni = _dec(cur.net_income), _dec(prev.net_income)
+        if cur_ni is not None and prev_ni is not None and prev_ni > 0:
+            if (cur_ni - prev_ni) / prev_ni <= Decimal("-0.20"):
+                return f"最新期（{period}）净利润同比下滑超20%"
+        if not finance:
+            cur_ocf, prev_ocf = _dec(cur.ocf), _dec(prev.ocf)
+            if cur_ocf is not None and cur_ocf < 0 and prev_ocf is not None and prev_ocf > 0:
+                return f"最新期（{period}）经营现金流由正转负"
+        return None
+    return None
 
 
 def _values(rows: Sequence[FinancialRow], attr: str, n: int) -> list[Decimal]:
@@ -205,6 +248,7 @@ def _classify(
     listed_year: int | None,
     *,
     as_of_year: int,
+    interims: dict[str, FinancialRow] | None = None,
 ) -> ScreenRow:
     roe_all = _values(annual, "roe", 99)
     ni_all = _values(annual, "net_income", 99)
@@ -287,6 +331,27 @@ def _classify(
         base.verdict = VERDICT_DROP
         base.reason = "5年均值经营现金流/净利润低于0.7"
         return base
+    if not finance and len(annual) >= 3:
+        latest_ann = annual[0]
+        l_ni = _dec(latest_ann.net_income)
+        l_ocf = _dec(latest_ann.ocf)
+        if l_ni is not None and l_ni > 0 and l_ocf is not None and (l_ocf / l_ni) < Decimal("0.40"):
+            base.verdict = VERDICT_DROP
+            base.reason = f"最新年报（{latest_ann.period}）经营现金流/净利润低于0.4（近期现金流骤降）"
+            return base
+        f0_ocf, f0_cap = _dec(annual[0].ocf), _dec(annual[0].capex)
+        f1_ocf, f1_cap = _dec(annual[1].ocf), _dec(annual[1].capex)
+        if (
+            f0_ocf is not None
+            and f0_cap is not None
+            and f1_ocf is not None
+            and f1_cap is not None
+            and (f0_ocf - f0_cap) < 0
+            and (f1_ocf - f1_cap) < 0
+        ):
+            base.verdict = VERDICT_DROP
+            base.reason = "近2年自由现金流连续为负"
+            return base
     if nm10 is not None and nm10 < NET_MARGIN_FLOOR and not exempt_b and not exempt_c:
         base.verdict = VERDICT_DROP
         base.reason = "近10年平均净利率低于5%"
@@ -294,6 +359,26 @@ def _classify(
     if share_growth is not None and share_growth > SHARE_GROWTH_MAX and share_ma is False:
         base.verdict = VERDICT_DROP
         base.reason = "5年总股本膨胀超过20%"
+        return base
+    if annual:
+        latest_ann = annual[0]
+        ann_ni = _dec(latest_ann.net_income)
+        ann_dni = _dec(latest_ann.deducted_net_income)
+        if ann_ni is not None and ann_ni > 0 and ann_dni is not None:
+            if ann_dni <= 0:
+                base.verdict = VERDICT_DROP
+                base.reason = f"最新年报（{latest_ann.period}）扣非净利润为负（靠非经常性损益扭亏）"
+                return base
+            if ann_dni / ann_ni < Decimal("0.65") and len(annual) >= 2:
+                prev_dni = _dec(annual[1].deducted_net_income)
+                if prev_dni is not None and prev_dni > 0 and (ann_dni - prev_dni) / prev_dni <= Decimal("-0.15"):
+                    base.verdict = VERDICT_DROP
+                    base.reason = f"最新年报（{latest_ann.period}）扣非占归母不足65%且扣非同比下滑超15%"
+                    return base
+    interim_drop = _interim_deterioration_reason(interims or {}, finance=finance)
+    if interim_drop is not None:
+        base.verdict = VERDICT_DROP
+        base.reason = interim_drop
         return base
 
     gaps: list[str] = []
@@ -357,11 +442,24 @@ def _assign_roles(keep: list[ScreenRow]) -> None:
         row.role = ROLE_HIGH_ELASTICITY if high_elas else ROLE_MID_ELASTICITY
 
 
+def _quality_value_score(row: ScreenRow) -> Decimal:
+    if row.roe_mean is None or row.pe is None or row.pe <= 0:
+        return Decimal("-Infinity")
+    eff_roe = min(row.roe_mean, Decimal("30"))
+    ocf_factor = (
+        min(max(row.ocf_ni, Decimal("0.7")), Decimal("1.3"))
+        if row.ocf_ni is not None
+        else Decimal("1")
+    )
+    return (eff_roe * ocf_factor / row.pe).quantize(Decimal("0.0001"))
+
+
 def _full_order_key(row: ScreenRow, held: set[str]) -> tuple:
+    qv = _quality_value_score(row)
     mcap = row.mcap if row.mcap is not None else Decimal("-Infinity")
     roe = row.roe_mean if row.roe_mean is not None else Decimal("-Infinity")
     ocf_ni = row.ocf_ni if row.ocf_ni is not None else Decimal("-Infinity")
-    return (-mcap, -roe, -ocf_ni, 1 if row.industry in held else 0, row.name)
+    return (-qv, -mcap, -roe, -ocf_ni, 1 if row.industry in held else 0, row.name)
 
 
 def _pick_finalists(
@@ -435,12 +533,14 @@ def _classify_all(
         if snap.code in seen_codes:
             continue
         seen_codes.add(snap.code)
+        code_rows = by_code.get(snap.code, [])
         classified.append(
             _classify(
                 snap,
-                _annual_for(snap.code, by_code.get(snap.code, [])),
+                _annual_for(snap.code, code_rows),
                 listed.get(snap.code),
                 as_of_year=year,
+                interims=_interims_for(snap.code, code_rows),
             )
         )
     return classified

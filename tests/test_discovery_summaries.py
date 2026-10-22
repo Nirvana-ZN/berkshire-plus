@@ -492,6 +492,38 @@ def test_ruler_decimal_exponent_bombs_fail_before_formatting() -> None:
         validate_ruler_version(row, allow_retired_algorithm=True)
 
 
+def test_retired_v2_ruler_stays_readable_after_schema_change() -> None:
+    import hashlib
+
+    from app.models import RulerVersion
+    from discovery.rulers import (
+        TrackRuler,
+        _canonical_ruler_payload,
+        validate_ruler_version,
+    )
+    from tests.test_discovery_tracks_quality import quality_payload
+
+    payload = quality_payload()
+    payload["algorithm_version"] = "discovery-v2"
+    payload["sector_branches"]["nonfinancial"]["gate_order"].remove("roe_trend")
+    payload_json = _canonical_ruler_payload(
+        TrackRuler.from_payload(payload, allow_retired_algorithm=True)
+    )
+    row = RulerVersion(
+        id=89,
+        user_id=1,
+        scope="discovery:quality_discount",
+        digest=hashlib.sha256(payload_json.encode()).hexdigest(),
+        reason="v2",
+        payload_json=payload_json,
+        activated_at=SNAPSHOT_AT,
+    )
+    ruler = validate_ruler_version(row, allow_retired_algorithm=True)
+    assert ruler.algorithm_version == "discovery-v2"
+    with pytest.raises(ValueError):
+        validate_ruler_version(row)
+
+
 def test_summary_metric_exponent_bomb_is_corruption() -> None:
     from discovery.summaries import DiscoverySummaryError, build_stage_summary
 
@@ -992,7 +1024,7 @@ def test_routes_attach_attempt_local_summaries_without_market_queries(
                 track="quality_discount",
                 stage="track_gate",
                 attempt=2,
-                status="waiting_confirmation",
+                status="confirmed",
                 total_count=1,
                 pass_count=1,
                 drop_count=0,
@@ -1003,6 +1035,7 @@ def test_routes_attach_attempt_local_summaries_without_market_queries(
                 common_stage_id=common.id,
                 predecessor_stage_id=None,
                 predecessor_stage=None,
+                confirmed_at=SNAPSHOT_AT + timedelta(seconds=1),
                 created_at=SNAPSHOT_AT + timedelta(seconds=1),
                 updated_at=SNAPSHOT_AT + timedelta(seconds=1),
             ),
@@ -1011,7 +1044,7 @@ def test_routes_attach_attempt_local_summaries_without_market_queries(
                 track="deep_value",
                 stage="track_gate",
                 attempt=1,
-                status="waiting_confirmation",
+                status="confirmed",
                 total_count=1,
                 pass_count=1,
                 drop_count=0,
@@ -1022,6 +1055,7 @@ def test_routes_attach_attempt_local_summaries_without_market_queries(
                 common_stage_id=common.id,
                 predecessor_stage_id=None,
                 predecessor_stage=None,
+                confirmed_at=SNAPSHOT_AT,
                 created_at=SNAPSHOT_AT,
                 updated_at=SNAPSHOT_AT,
             ),
@@ -1185,8 +1219,10 @@ def test_routes_attach_attempt_local_summaries_without_market_queries(
         assert corrupt.status_code == 500
         assert corrupt.json()["code"] == "DISCOVERY_RESULT_CORRUPT"
 
+        from app import discovery_routes
         from discovery import summaries
 
+        monkeypatch.setattr(discovery_routes, "_STAGE_SUMMARIES", {})
         monkeypatch.setattr(
             summaries, "SUMMARY_ATTEMPT_METRICS_JSON_BYTE_LIMIT", 1
         )
@@ -1200,3 +1236,70 @@ def test_routes_attach_attempt_local_summaries_without_market_queries(
         )
 
     engine.dispose()
+
+
+def test_finished_stage_summary_is_computed_once(monkeypatch) -> None:
+    from app import discovery_routes
+
+    real = discovery_routes.build_stage_summary
+    calls: list[object] = []
+
+    def counting(*args):
+        calls.append(args[0])
+        return real(*args)
+
+    monkeypatch.setattr(discovery_routes, "build_stage_summary", counting)
+    monkeypatch.setattr(discovery_routes, "_STAGE_SUMMARIES", {})
+    session = SimpleNamespace(
+        get_bind=lambda: SimpleNamespace(url="sqlite:///summary-cache.db")
+    )
+    stage = _stage(counts=(1, 1, 0, 0))
+    stage.updated_at = SNAPSHOT_AT
+    rows = [_result("600000.SH", {"price": "1"})]
+
+    first = discovery_routes._stage_summary(session, stage, rows)
+    assert discovery_routes._stage_summary(session, stage, rows) is first
+    assert calls == [stage]
+    stage.updated_at = SNAPSHOT_AT + timedelta(seconds=1)
+    discovery_routes._stage_summary(session, stage, rows)
+    assert len(calls) == 2
+
+    running = _stage(status="running")
+    running.updated_at = SNAPSHOT_AT
+    discovery_routes._stage_summary(session, running, [])
+    discovery_routes._stage_summary(session, running, [])
+    assert len(calls) == 4
+
+
+def test_startup_warmup_reads_every_stage_past_a_corrupt_one(monkeypatch) -> None:
+    from contextlib import nullcontext
+
+    from app import discovery_routes
+
+    run = SimpleNamespace(id=7)
+    read: list[tuple[str, ...]] = []
+
+    def track_payload(_session, _run, track, stage):
+        read.append((track, stage))
+        if track == "deep_value":
+            raise discovery_routes.CorruptDiscoveryResult("bad")
+
+    monkeypatch.setattr(
+        discovery_routes, "_common_payload", lambda *_: read.append(("common",))
+    )
+    monkeypatch.setattr(discovery_routes, "_track_payload", track_payload)
+    session = SimpleNamespace(scalar=lambda _query: run)
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            session_factory=lambda: nullcontext(session),
+            discovery_clock=lambda: SNAPSHOT_AT,
+        )
+    )
+
+    discovery_routes.warm_current_stage_summaries(app)
+
+    assert read == [("common",)] + [
+        (track, stage)
+        for track in discovery_routes.TRACKS
+        for stage in discovery_routes.TRACK_STAGES
+    ]

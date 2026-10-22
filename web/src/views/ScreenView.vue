@@ -30,6 +30,8 @@ interface ResearchJobRow {
   error?: string | null
 }
 
+type ScreenTab = 'finalists' | 'keep' | 'drop' | 'insufficient' | 'all'
+
 const ROLE_LABEL: Record<string, string> = {
   high_certainty: '高确定性',
   high_elasticity: '高弹性',
@@ -66,6 +68,7 @@ const rulerMatched = ref(true)
 const rulerReason = ref('')
 const rulerHint = ref('')
 const rulerBusy = ref(false)
+const activeTab = ref<ScreenTab>('finalists')
 const sentiment = ref<{
   score: number | null
   zone?: string
@@ -97,6 +100,12 @@ function roleLabel(role?: string | null): string {
   return ROLE_LABEL[role] || role
 }
 
+function roleBadgeClass(role?: string | null): string {
+  if (role === 'high_certainty') return 'badge badge-pass'
+  if (role === 'high_elasticity') return 'badge badge-info'
+  return 'badge badge-neutral'
+}
+
 function applyScreen(data: {
   status?: string
   error?: string | null
@@ -114,6 +123,11 @@ function applyScreen(data: {
   insufficient.value = data.insufficient ?? []
   finalists.value = data.finalists ?? []
   jobs.value = data.jobs ?? []
+  if (!finalists.value.length && keep.value.length) {
+    activeTab.value = 'keep'
+  } else if (finalists.value.length) {
+    activeTab.value = 'finalists'
+  }
   const previousType = scopeType.value
   if (data.scope_type) {
     scopeType.value = data.scope_type
@@ -431,225 +445,396 @@ onBeforeUnmount(stopPoll)
 </script>
 
 <template>
-  <section>
+  <section class="screen-page">
     <div class="toolbar">
       <h1>选股</h1>
-      <p v-if="status" class="muted">{{ scopeType }}　{{ scopeText }}</p>
+      <div v-if="status" class="scope-meta">
+        <span class="badge badge-neutral">{{ scopeType }}　{{ scopeText }}</span>
+        <span
+          class="badge"
+          :class="status === 'failed' ? 'badge-fail' : status === 'done' ? 'badge-pass' : 'badge-warn'"
+        >
+          状态：{{ JOB_STATUS[status] || status }}
+        </span>
+      </div>
     </div>
-    <SentimentPanel :sentiment="sentiment" />
-    <form class="inline-form" @submit.prevent="submitScope">
-      <label>
-        范围类型
-        <select v-model="scopeType" @change="onScopeTypeChange">
-          <option value="行业">行业</option>
-          <option value="指数">指数</option>
-          <option value="主题">主题</option>
-        </select>
-      </label>
-      <label class="combo">
-        范围
-        <input
-          v-model="scopeText"
-          type="text"
-          name="scope_text"
-          autocomplete="off"
-          placeholder="输入检索或点选"
-          @focus="openSuggest"
-          @input="onScopeInput"
-          @blur="closeSuggest"
-          @keydown.down.prevent="moveSuggest(1)"
-          @keydown.up.prevent="moveSuggest(-1)"
-          @keydown.enter="pickHighlighted"
-          @keydown.escape="suggestOpen = false"
-        />
-        <ul v-if="suggestOpen && filteredBoards.length" class="suggest" role="listbox">
-          <li
-            v-for="(row, index) in filteredBoards"
-            :key="row.code + row.name"
-            :class="{ active: index === suggestIndex }"
-            role="option"
-            @mousedown.prevent="pickBoard(row)"
-          >
-            {{ row.name }}
-          </li>
-        </ul>
-      </label>
-      <label class="check-inline">
-        <input v-model="evaluate" type="checkbox" />
-        评估终选
-      </label>
-      <button type="submit" :disabled="submitting || busy || !rulerMatched">开始筛选</button>
-    </form>
-    <form v-if="!rulerMatched" class="inline-form" @submit.prevent="activateRuler">
-      <label>
-        改因
-        <input v-model="rulerReason" type="text" name="ruler_reason" placeholder="为何接受当前尺子" />
-      </label>
-      <button type="submit" :disabled="rulerBusy">生效尺子</button>
-    </form>
-    <p v-if="rulerHint">{{ rulerHint }}</p>
-    <p v-if="gateOpen">可信度闸已开：新评估不得写成通过，终选不得放宽。</p>
-    <table v-if="replayRows.length">
-      <thead>
-        <tr>
-          <th>名称</th>
-          <th>原状态</th>
-          <th>回放</th>
-          <th>归因</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr v-for="row in replayRows" :key="row.name">
-          <td>{{ row.name }}</td>
-          <td>{{ row.was || '' }}</td>
-          <td>{{ row.now || '' }}</td>
-          <td>{{ { ruler: '尺子偏了', data: '数据变了', noise: '模型噪声', gap: '无法对质' }[row.cause] || row.cause }}</td>
-        </tr>
-      </tbody>
-    </table>
-    <form class="inline-form" @submit.prevent="startSingle">
-      <label>
-        个股
-        <input
-          v-model="singleQuery"
-          type="text"
-          name="single_query"
-          placeholder="名称或代码，如 招商银行 / 600036.SH"
-        />
-      </label>
-      <button type="submit" :disabled="singleBusy || busy">评估 Checklist</button>
-    </form>
-    <p v-if="singleError">{{ singleError }}</p>
-    <p v-if="boardError" class="muted">{{ boardError }}</p>
-    <p v-if="status">状态：{{ JOB_STATUS[status] || status }}</p>
-    <p v-if="errorText">{{ errorText }}</p>
-    <p v-if="!status && !errorText">{{ emptyHint }}</p>
 
-    <template v-if="jobs.length && status !== 'done'">
+    <SentimentPanel :sentiment="sentiment" />
+
+    <div class="screen-forms-grid">
+      <div class="panel form-card">
+        <h2>板块漏斗筛选</h2>
+        <form class="inline-form" @submit.prevent="submitScope">
+          <label>
+            范围类型
+            <select v-model="scopeType" @change="onScopeTypeChange">
+              <option value="行业">行业</option>
+              <option value="指数">指数</option>
+              <option value="主题">主题</option>
+            </select>
+          </label>
+          <label class="combo">
+            范围
+            <input
+              v-model="scopeText"
+              type="text"
+              name="scope_text"
+              autocomplete="off"
+              placeholder="输入检索或点选"
+              @focus="openSuggest"
+              @input="onScopeInput"
+              @blur="closeSuggest"
+              @keydown.down.prevent="moveSuggest(1)"
+              @keydown.up.prevent="moveSuggest(-1)"
+              @keydown.enter="pickHighlighted"
+              @keydown.escape="suggestOpen = false"
+            />
+            <ul v-if="suggestOpen && filteredBoards.length" class="suggest" role="listbox">
+              <li
+                v-for="(row, index) in filteredBoards"
+                :key="row.code + row.name"
+                :class="{ active: index === suggestIndex }"
+                role="option"
+                @mousedown.prevent="pickBoard(row)"
+              >
+                {{ row.name }}
+              </li>
+            </ul>
+          </label>
+          <label class="check-inline">
+            <input v-model="evaluate" type="checkbox" />
+            评估终选
+          </label>
+          <button type="submit" class="btn-primary" :disabled="submitting || busy || !rulerMatched">
+            {{ submitting ? '筛选中…' : '开始筛选' }}
+          </button>
+        </form>
+        <p v-if="boardError" class="muted">{{ boardError }}</p>
+      </div>
+
+      <div class="panel form-card">
+        <h2>个股直接评估</h2>
+        <form class="inline-form" @submit.prevent="startSingle">
+          <label class="single-input-label">
+            个股
+            <input
+              v-model="singleQuery"
+              type="text"
+              name="single_query"
+              placeholder="名称或代码，如 招商银行 / 600036.SH"
+            />
+          </label>
+          <button type="submit" class="btn-primary" :disabled="singleBusy || busy">
+            {{ singleBusy ? '提交中…' : '评估 Checklist' }}
+          </button>
+        </form>
+        <p v-if="singleError" class="alert-error">{{ singleError }}</p>
+      </div>
+    </div>
+
+    <div v-if="!rulerMatched || rulerHint || gateOpen || replayRows.length" class="panel ruler-panel">
+      <form v-if="!rulerMatched" class="inline-form" @submit.prevent="activateRuler">
+        <label>
+          改因
+          <input v-model="rulerReason" type="text" name="ruler_reason" placeholder="为何接受当前尺子" />
+        </label>
+        <button type="submit" class="btn-primary" :disabled="rulerBusy">生效尺子</button>
+      </form>
+      <p v-if="rulerHint" class="alert-warn">{{ rulerHint }}</p>
+      <p v-if="gateOpen" class="alert-warn">可信度闸已开：新评估不得写成通过，终选不得放宽。</p>
+      <table v-if="replayRows.length">
+        <thead>
+          <tr>
+            <th>名称</th>
+            <th>原状态</th>
+            <th>回放</th>
+            <th>归因</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="row in replayRows" :key="row.name">
+            <td><strong>{{ row.name }}</strong></td>
+            <td>{{ row.was || '' }}</td>
+            <td>{{ row.now || '' }}</td>
+            <td>{{ { ruler: '尺子偏了', data: '数据变了', noise: '模型噪声', gap: '无法对质' }[row.cause] || row.cause }}</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p v-if="errorText" class="alert-error">{{ errorText }}</p>
+    <p v-if="!status && !errorText" class="panel muted">{{ emptyHint }}</p>
+
+    <section v-if="jobs.length && status !== 'done'" class="panel">
       <h2>评估子任务</h2>
       <table>
         <thead>
           <tr>
             <th>名称</th>
             <th>状态</th>
-            <th>入口</th>
+            <th class="num">入口</th>
           </tr>
         </thead>
         <tbody>
           <tr v-for="row in jobs" :key="'j-' + row.id">
-            <td>{{ row.name }}</td>
-            <td>{{ JOB_STATUS[row.status] || row.status }}</td>
+            <td><strong>{{ row.name }}</strong></td>
             <td>
-              <router-link :to="'/research/' + row.id">查看评估</router-link>
+              <span
+                class="badge"
+                :class="row.status === 'failed' ? 'badge-fail' : row.status === 'done' ? 'badge-pass' : 'badge-warn'"
+              >
+                {{ JOB_STATUS[row.status] || row.status }}
+              </span>
+            </td>
+            <td class="num">
+              <router-link class="btn-link btn-sm" :to="'/research/' + row.id">查看评估</router-link>
             </td>
           </tr>
         </tbody>
       </table>
-    </template>
+    </section>
 
     <template v-if="keep.length || drop.length || insufficient.length || finalists.length">
-      <h2>终选</h2>
-      <p v-if="finalists.length === 0">本轮无终选</p>
-      <table v-else>
-        <thead>
-          <tr>
-            <th>名称</th>
-            <th>角色</th>
-            <th>现价</th>
-            <th>预期价格</th>
-            <th>差距</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr v-for="row in finalists" :key="'f-' + row.code">
-            <td>{{ row.name }}</td>
-            <td>{{ roleLabel(row.role) }}</td>
-            <td>{{ row.price ?? '' }}</td>
-            <td>{{ row.expected_price ?? '' }}</td>
-            <td>{{ formatGap(row.gap_pct) }}</td>
-          </tr>
-        </tbody>
-      </table>
+      <div class="pill-bar">
+        <button
+          type="button"
+          class="pill"
+          :class="{ 'active pill-pass': activeTab === 'finalists' }"
+          @click="activeTab = 'finalists'"
+        >
+          终选 <span class="pill-count">{{ finalists.length }}</span>
+        </button>
+        <button
+          type="button"
+          class="pill"
+          :class="{ 'active pill-pass': activeTab === 'keep' }"
+          @click="activeTab = 'keep'"
+        >
+          保留 <span class="pill-count">{{ keep.length }}</span>
+        </button>
+        <button
+          type="button"
+          class="pill"
+          :class="{ active: activeTab === 'drop' }"
+          @click="activeTab = 'drop'"
+        >
+          淘汰 <span class="pill-count">{{ drop.length }}</span>
+        </button>
+        <button
+          type="button"
+          class="pill"
+          :class="{ active: activeTab === 'insufficient' }"
+          @click="activeTab = 'insufficient'"
+        >
+          数据不足 <span class="pill-count">{{ insufficient.length }}</span>
+        </button>
+        <button
+          type="button"
+          class="pill"
+          :class="{ active: activeTab === 'all' }"
+          @click="activeTab = 'all'"
+        >
+          全部展开
+        </button>
+      </div>
 
-      <template v-if="jobs.length && status === 'done'">
+      <section v-if="activeTab === 'finalists' || activeTab === 'all'" class="panel">
+        <h2>终选</h2>
+        <p v-if="finalists.length === 0" class="muted">本轮无终选</p>
+        <table v-else>
+          <thead>
+            <tr>
+              <th>名称</th>
+              <th>角色</th>
+              <th class="num">现价</th>
+              <th class="num">预期价格</th>
+              <th class="num">差距</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="row in finalists" :key="'f-' + row.code">
+              <td><strong>{{ row.name }}</strong></td>
+              <td><span :class="roleBadgeClass(row.role)">{{ roleLabel(row.role) }}</span></td>
+              <td class="num">{{ row.price ?? '—' }}</td>
+              <td class="num">{{ row.expected_price ?? '—' }}</td>
+              <td class="num" :class="(row.gap_pct ?? 0) > 0 ? 'num-pos' : ''">
+                {{ formatGap(row.gap_pct) }}
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section v-if="jobs.length && status === 'done'" class="panel">
         <h2>评估子任务</h2>
         <table>
           <thead>
             <tr>
               <th>名称</th>
               <th>状态</th>
-              <th>入口</th>
+              <th class="num">入口</th>
             </tr>
           </thead>
           <tbody>
             <tr v-for="row in jobs" :key="'jd-' + row.id">
-              <td>{{ row.name }}</td>
-              <td>{{ JOB_STATUS[row.status] || row.status }}</td>
+              <td><strong>{{ row.name }}</strong></td>
               <td>
-                <router-link :to="'/research/' + row.id">查看评估</router-link>
+                <span
+                  class="badge"
+                  :class="row.status === 'failed' ? 'badge-fail' : row.status === 'done' ? 'badge-pass' : 'badge-warn'"
+                >
+                  {{ JOB_STATUS[row.status] || row.status }}
+                </span>
+              </td>
+              <td class="num">
+                <router-link class="btn-link btn-sm" :to="'/research/' + row.id">查看评估</router-link>
               </td>
             </tr>
           </tbody>
         </table>
-      </template>
+      </section>
 
-      <h2>保留</h2>
-      <table>
-        <thead>
-          <tr>
-            <th>名称</th>
-            <th>代码</th>
-            <th>角色</th>
-            <th>终选</th>
-            <th>现价</th>
-            <th>预期价格</th>
-            <th>差距</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr v-for="row in keep" :key="'k-' + row.code">
-            <td>{{ row.name }}</td>
-            <td>{{ row.code }}</td>
-            <td>{{ roleLabel(row.role) }}</td>
-            <td>{{ row.finalist ? '是' : '' }}</td>
-            <td>{{ row.price ?? '' }}</td>
-            <td>{{ row.expected_price ?? '' }}</td>
-            <td>{{ formatGap(row.gap_pct) }}</td>
-          </tr>
-        </tbody>
-      </table>
+      <section v-if="activeTab === 'keep' || activeTab === 'all'" class="panel">
+        <h2>保留</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>名称</th>
+              <th>代码</th>
+              <th>角色</th>
+              <th>终选</th>
+              <th class="num">现价</th>
+              <th class="num">预期价格</th>
+              <th class="num">差距</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="row in keep" :key="'k-' + row.code">
+              <td><strong>{{ row.name }}</strong></td>
+              <td class="muted">{{ row.code }}</td>
+              <td><span v-if="row.role" :class="roleBadgeClass(row.role)">{{ roleLabel(row.role) }}</span></td>
+              <td><span v-if="row.finalist" class="badge badge-pass">是</span></td>
+              <td class="num">{{ row.price ?? '—' }}</td>
+              <td class="num">{{ row.expected_price ?? '—' }}</td>
+              <td class="num">{{ formatGap(row.gap_pct) }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
 
-      <h2>淘汰</h2>
-      <table>
-        <thead>
-          <tr>
-            <th>名称</th>
-            <th>理由</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr v-for="row in drop" :key="'d-' + row.code">
-            <td>{{ row.name }}</td>
-            <td>{{ row.reason }}</td>
-          </tr>
-        </tbody>
-      </table>
+      <section v-if="activeTab === 'drop' || activeTab === 'all'" class="panel">
+        <h2>淘汰</h2>
+        <table>
+          <thead>
+            <tr>
+              <th class="col-nowrap">名称</th>
+              <th>理由</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="row in drop" :key="'d-' + row.code">
+              <td class="col-nowrap"><strong>{{ row.name }}</strong></td>
+              <td class="muted">{{ row.reason }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
 
-      <h2>数据不足</h2>
-      <table>
-        <thead>
-          <tr>
-            <th>名称</th>
-            <th>理由</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr v-for="row in insufficient" :key="'i-' + row.code">
-            <td>{{ row.name }}</td>
-            <td>{{ row.reason }}</td>
-          </tr>
-        </tbody>
-      </table>
+      <section v-if="activeTab === 'insufficient' || activeTab === 'all'" class="panel">
+        <h2>数据不足</h2>
+        <table>
+          <thead>
+            <tr>
+              <th class="col-nowrap">名称</th>
+              <th>理由</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="row in insufficient" :key="'i-' + row.code">
+              <td class="col-nowrap"><strong>{{ row.name }}</strong></td>
+              <td class="muted">{{ row.reason }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
     </template>
   </section>
 </template>
+
+<style scoped>
+.scope-meta {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.screen-forms-grid {
+  display: grid;
+  grid-template-columns: 1.55fr 1fr;
+  gap: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+
+.form-card {
+  margin: 0;
+}
+
+.single-input-label {
+  flex: 1 1 13rem;
+}
+
+.single-input-label input {
+  width: 100%;
+}
+
+.pill-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin: 0.5rem 0;
+}
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.32rem 0.7rem;
+  border-radius: 3px;
+  border: 1px solid #d0c8b8;
+  background: #fff;
+  color: #3b3730;
+  font-size: 0.88rem;
+}
+
+.pill-count {
+  font-variant-numeric: tabular-nums;
+  font-size: 0.78rem;
+  color: #6e675b;
+  background: #f1ece2;
+  padding: 0.05rem 0.35rem;
+  border-radius: 2px;
+}
+
+.pill.active {
+  background: #2c2925;
+  border-color: #2c2925;
+  color: #fff;
+  font-weight: 600;
+}
+
+.pill.active .pill-count {
+  background: rgba(255, 255, 255, 0.18);
+  color: #fff;
+}
+
+.pill-pass.active {
+  background: #1b5e4a;
+  border-color: #1b5e4a;
+}
+
+@media (max-width: 860px) {
+  .screen-forms-grid {
+    grid-template-columns: 1fr;
+  }
+}
+</style>

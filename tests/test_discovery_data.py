@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from app.db import create_session_factory, init_db
 from app.main import create_app
+from discovery.company_payload import SCHEMA_VERSION
 from app.models import (
     DiscoveryDataCheckpoint,
     DiscoveryDataFill,
@@ -28,15 +29,10 @@ from app.models import (
     Setting,
     ValuationHistory,
 )
-from market.cheap import (
-    CACHE_KEY,
+from market.universe import (
     DELISTING_NAME_METHOD,
-    METHOD,
-    CheapRow,
-    _cached,
-    eligible_cheap,
+    UniverseRow,
     is_st_name,
-    load_cheap_universe,
     security_state_eligible,
 )
 from market.eastmoney import BOARD_LIST_URL, EastMoneyClient, FakeMarketClient
@@ -224,7 +220,6 @@ def test_init_db_adds_discovery_tables_and_migrates_old_financial_schema(
 
 
 def test_financial_new_fields_round_trip_through_db_and_snapshot(tmp_path) -> None:
-    from jobs.cheap import _rows_from_db
     from jobs.discovery_data import persist_discovery_financials
     from screen.replay import _to_financial, dump_snapshot
 
@@ -238,7 +233,7 @@ def test_financial_new_fields_round_trip_through_db_and_snapshot(tmp_path) -> No
     with Session(engine) as session:
         persist_discovery_financials(session, [row])
         session.commit()
-        loaded = _rows_from_db(session, [row.code])[0]
+        loaded = session.get(Financial, (row.code, row.period, row.period_type))
         coverage_source = session.get(
             FinancialFieldProvenance,
             (row.code, row.period, row.period_type, "interest_coverage", "discovery"),
@@ -527,51 +522,9 @@ def test_strict_value_and_provenance_rollback_together(tmp_path) -> None:
     engine.dispose()
 
 
-def test_strict_only_rows_do_not_suppress_legacy_cheap_fetch(tmp_path) -> None:
-    from jobs.cheap import _codes_with_financials, execute_cheap_fill
-    from jobs.discovery_data import persist_discovery_financials
-
-    engine = init_db(tmp_path / "strict-then-cheap.db")
-    code = "600036.SH"
-    strict = FinancialRow(
-        code=code,
-        period="2025",
-        period_type="annual",
-        revenue=Decimal("337532000000.12"),
-        net_income=None,
-    )
-    legacy = replace(strict, revenue=None, net_income=Decimal("82320067101.68"))
-    market = FakeMarketClient(
-        cheap_universe=[
-            CheapRow(
-                code=code,
-                name="招商银行",
-                price=Decimal("40"),
-                pe=Decimal("6"),
-                pb=Decimal("1"),
-                mcap=Decimal("100"),
-                industry="银行",
-            )
-        ],
-        financials=[legacy],
-    )
-    with Session(engine) as session:
-        persist_discovery_financials(session, [strict])
-        session.commit()
-        assert _codes_with_financials(session, [code]) == set()
-        execute_cheap_fill(session, market)
-        assert _codes_with_financials(session, [code]) == {code}
-        stored = session.get(Financial, (code, "2025", "annual"))
-        assert stored is not None
-        assert stored.net_income == legacy.net_income
-        assert stored.revenue == strict.revenue
-    assert ("financials", code) in market.calls
-    engine.dispose()
 
 
 def test_existing_financial_rows_infer_only_safe_legacy_completeness(tmp_path) -> None:
-    from jobs.cheap import _codes_with_financials
-
     db_path = tmp_path / "legacy-completeness.db"
     old_engine = create_engine(f"sqlite:///{db_path.resolve().as_posix()}")
     with old_engine.begin() as conn:
@@ -622,8 +575,12 @@ def test_existing_financial_rows_infer_only_safe_legacy_completeness(tmp_path) -
 
     engine = init_db(db_path)
     with Session(engine) as session:
-        assert _codes_with_financials(
-            session, ["000001.SZ", "600036.SH"]
+        assert set(
+            session.scalars(
+                select(FinancialFetchCompleteness.code).where(
+                    FinancialFetchCompleteness.mode == "legacy"
+                )
+            )
         ) == {"000001.SZ"}
     engine.dispose()
 
@@ -1094,6 +1051,54 @@ def test_fetch_valuation_history_maps_monthly_pe_pb() -> None:
     assert rows[0].ratio_method == "PE_TTM/PB_MRQ"
 
 
+def test_discovery_prices_stop_at_the_security_snapshot_day() -> None:
+    rows = [
+        {"TRADE_DATE": f"2026-09-{day} 00:00:00", "PE_TTM": "10", "PB_MRQ": "2",
+         "CLOSE_PRICE": price}
+        for day, price in (("29", "12"), ("28", "11"))
+    ] + [
+        {"TRADE_DATE": day, "PE_TTM": "10", "PB_MRQ": "2", "CLOSE_PRICE": "9"}
+        for day in reversed(_month_starts())
+    ]
+    through: list[str | None] = []
+
+    class Stub(EastMoneyClient):
+        def _get_json(self, url: str) -> dict:
+            return {"success": True, "result": {"pages": 1, "data": rows}}
+
+        def _security_state_for(self, _code: str) -> SecurityState:
+            return SecurityState(
+                code="600519.SH",
+                name="贵州茅台",
+                exchange="SH",
+                listing_date="2001-08-27",
+                is_st=False,
+                is_delisting=False,
+                trading_status="trading",
+                last_trade_date="2026-09-28",
+                industry="白酒Ⅱ",
+                industry_version="eastmoney:push2delay:clist:f100:v1",
+                industry_as_of="2026-09-28",
+                source="eastmoney:stock/get:f57,f58,f107,f127,f189,f292",
+            )
+
+        def _discovery_financials_for(self, _code: str, **_kwargs) -> list:
+            return []
+
+    latest = Stub().fetch_valuation_history("600519.SH", through="2026-09-28")[0]
+    assert (latest.trade_date, latest.price) == ("2026-09-28", Decimal("11"))
+    assert Stub().fetch_valuation_history("600519.SH")[0].trade_date > "2026-09-28"
+
+    class Recording(Stub):
+        def fetch_valuation_history(self, _code: str, **kwargs) -> list:
+            through.append(kwargs.get("through"))
+            raise MarketError("stop after recording")
+
+    with pytest.raises(DiscoveryCompanyError):
+        Recording().fetch_discovery_data("600519.SH")
+    assert through == ["2026-09-28"]
+
+
 def _month_starts() -> list[str]:
     today = date.today()
     year, month = today.year - 5, today.month
@@ -1304,7 +1309,7 @@ def test_fetch_trading_dates_reuses_existing_index_kline_parser() -> None:
     ]
 
 
-def test_cheap_universe_freezes_fields_and_live_row_is_eligible() -> None:
+def test_universe_freezes_fields_and_live_row_is_eligible() -> None:
     class Stub(EastMoneyClient):
         def _get_json(self, _url: str) -> dict:
             return {
@@ -1450,7 +1455,7 @@ def test_cheap_universe_freezes_fields_and_live_row_is_eligible() -> None:
             assert "secid=1.605303" in url
             return {"data": {"klines": ["2026-09-10,23,24,25,26,27,28"]}}
 
-    by_code = {row.code: row for row in Stub().fetch_cheap_universe()}
+    by_code = {row.code: row for row in Stub().fetch_universe()}
     frozen_dates = [
         "2026-09-09",
         "2026-09-10",
@@ -1571,7 +1576,7 @@ def test_priced_suspension_candidates_are_probed_and_request_gated(
     client = EastMoneyClient()
     rows = {
         row.code: row
-        for row in client.fetch_cheap_universe(
+        for row in client.fetch_universe(
             as_of=date(2026, 9, 20),
             before_request=before_request,
         )
@@ -1605,7 +1610,7 @@ def test_suspended_security_uses_latest_five_frozen_exchange_dates() -> None:
         "2026-09-14",
         "2026-09-15",
     ]
-    row = CheapRow(
+    row = UniverseRow(
         code="600036.SH",
         name="招商银行",
         price=None,
@@ -1644,24 +1649,11 @@ def test_suspended_security_uses_latest_five_frozen_exchange_dates() -> None:
         ("FIRST服务", False),
     ],
 )
-def test_st_classifier_is_shared_without_false_positives(
-    name: str, expected: bool
-) -> None:
-    row = CheapRow(
-        code="600000.SH",
-        name=name,
-        price=Decimal("10"),
-        pe=Decimal("5"),
-        pb=Decimal("1"),
-        mcap=Decimal("100"),
-        industry="化工",
-    )
-
+def test_st_classifier_has_no_false_positives(name: str, expected: bool) -> None:
     assert is_st_name(name) is expected
-    assert (eligible_cheap([row]) == []) is expected
 
 
-def test_calendar_failure_does_not_store_degraded_universe() -> None:
+def test_calendar_failure_fails_the_universe_without_leaking_urls() -> None:
     class Stub(EastMoneyClient):
         def _get_json(self, _url: str) -> dict:
             return {
@@ -1686,46 +1678,11 @@ def test_calendar_failure_does_not_store_degraded_universe() -> None:
         def _get_json_direct(self, _url: str) -> dict:
             raise RuntimeError("GET https://secret.example/calendar unavailable")
 
-    engine = create_engine("sqlite://")
-    Setting.__table__.create(engine)
-    with Session(engine) as session:
-        with pytest.raises(MarketError, match="calendar fetch failed") as caught:
-            load_cheap_universe(session, Stub())
-        assert "https://" not in str(caught.value)
-        assert session.get(Setting, CACHE_KEY) is None
+    with pytest.raises(MarketError, match="calendar fetch failed") as caught:
+        Stub().fetch_universe()
+    assert "https://" not in str(caught.value)
 
 
-def test_old_cached_universe_without_security_metadata_is_rejected() -> None:
-    engine = create_engine("sqlite://")
-    Setting.__table__.create(engine)
-    old_row = {
-        "code": "600036.SH",
-        "name": "招商银行",
-        "price": 42,
-        "pe": 6,
-        "pb": 0.8,
-        "mcap": 100,
-        "industry": "银行",
-    }
-    with Session(engine) as session:
-        session.add(
-            Setting(
-                key="cheap_universe",
-                value=json.dumps(
-                    {"method": "v4", "fetched_at": 1000.0, "rows": [old_row]}
-                ),
-            )
-        )
-        session.commit()
-        assert METHOD == "v5"
-        assert _cached(session, 1001.0) is None
-        setting = session.get(Setting, "cheap_universe")
-        assert setting is not None
-        setting.value = json.dumps(
-            {"method": METHOD, "fetched_at": 1000.0, "rows": [old_row]}
-        )
-        session.commit()
-        assert _cached(session, 1001.0) is None
 
 
 def test_field_dictionary_is_immutable_and_marks_unavailable_sources() -> None:
@@ -1985,7 +1942,7 @@ def test_discovery_detail_source_failure_is_typed_without_partial_success(
                 },
             }
 
-        def fetch_valuation_history(self, _code: str) -> list[ValuationPoint]:
+        def fetch_valuation_history(self, _code: str, **_kwargs) -> list[ValuationPoint]:
             raise AssertionError("partial company bundle must not continue")
 
     with pytest.raises(
@@ -2067,7 +2024,7 @@ def test_bank_discovery_bundle_skips_rejected_industrial_details() -> None:
                 }
             return {"success": True, "result": {"data": []}}
 
-        def fetch_valuation_history(self, _code: str) -> list[ValuationPoint]:
+        def fetch_valuation_history(self, _code: str, **_kwargs) -> list[ValuationPoint]:
             return []
 
     result = Stub().fetch_discovery_data("600036.SH")
@@ -2127,7 +2084,7 @@ def test_bank_applicable_income_detail_failure_is_typed() -> None:
                 }
             return {"success": True, "result": {"data": []}}
 
-        def fetch_valuation_history(self, _code: str) -> list[ValuationPoint]:
+        def fetch_valuation_history(self, _code: str, **_kwargs) -> list[ValuationPoint]:
             raise AssertionError("failed bank source must stop the bundle")
 
     with pytest.raises(
@@ -2802,7 +2759,7 @@ def test_live_universe_retries_calendar_without_refetching_56_pages(
 
     _install_http_transport(monkeypatch, get)
     client = EastMoneyClient()
-    rows = client.fetch_cheap_universe(as_of=date(2026, 9, 16))
+    rows = client.fetch_universe(as_of=date(2026, 9, 16))
 
     assert len(rows) == 5501
     assert page_calls == {page: 1 for page in range(1, 57)}
@@ -3198,7 +3155,7 @@ def test_suspended_kline_transient_uses_same_stock_valuation_date(
 
     _install_http_transport(monkeypatch, get)
     client = EastMoneyClient()
-    rows = client.fetch_cheap_universe(as_of=date(2026, 9, 16))
+    rows = client.fetch_universe(as_of=date(2026, 9, 16))
     assert [(row.trading_status, row.last_trade_date) for row in rows] == [
         ("suspended", "2026-09-15")
     ]
@@ -3487,7 +3444,7 @@ def test_universe_crash_after_second_transport_keeps_exact_accounting(
     engine.dispose()
 
 
-def test_legacy_cheap_universe_without_gate_keeps_old_override_contract() -> None:
+def test_universe_without_gate_keeps_old_override_contract() -> None:
     calls = 0
 
     class LegacyStub(EastMoneyClient):
@@ -3506,7 +3463,7 @@ def test_legacy_cheap_universe_without_gate_keeps_old_override_contract() -> Non
                 }
             }
 
-    rows = LegacyStub().fetch_cheap_universe()
+    rows = LegacyStub().fetch_universe()
     assert [row.code for row in rows] == ["600000.SH"]
     assert calls == 1
 
@@ -3528,9 +3485,9 @@ def _security(code: str) -> SecurityState:
     )
 
 
-def _complete_cheap_row(code: str) -> CheapRow:
+def _complete_universe_row(code: str) -> UniverseRow:
     state = _security(code)
-    return CheapRow(
+    return UniverseRow(
         code=code,
         name=state.name,
         price=Decimal("10"),
@@ -3696,7 +3653,7 @@ def test_discovery_company_payload_round_trips_exact_strict_bundle() -> None:
     from discovery.company_payload import company_payload_digest
 
     assert company_payload_digest(encoded) == (
-        "574ae1f6544473bb8db816782bdd11841e06908356e5e5201a1945af5b1bf720"
+        "360375e659a0b75374bf2daec37a170fe8bd9f37ae9c4f217ce01c3ca9e019d7"
     )
     row = parsed["financial_rows"][0]
     assert row["values"]["revenue"] == "337532000000.123456789012345678"
@@ -4266,7 +4223,7 @@ def test_discovery_fill_resume_skips_completed_and_retries_due_checkpoint(
             now=now,
             status="paused",
         )
-        assert fill.payload_schema_version == 2
+        assert fill.payload_schema_version == SCHEMA_VERSION
         fill_id = fill.id
         done = session.get(DiscoveryDataCheckpoint, (fill_id, done_code))
         retry = session.get(DiscoveryDataCheckpoint, (fill_id, retry_code))
@@ -4301,7 +4258,7 @@ def test_discovery_fill_resume_skips_completed_and_retries_due_checkpoint(
     with factory() as session:
         fill = session.get(DiscoveryDataFill, fill_id)
         assert fill is not None
-        assert fill.payload_schema_version == 2
+        assert fill.payload_schema_version == SCHEMA_VERSION
         assert (fill.status, fill.completed, fill.failed) == ("done", 3, 0)
     engine.dispose()
 
@@ -4367,7 +4324,7 @@ def test_resumable_fill_rejects_checkpoint_snapshot_mismatch(
         session.commit()
 
     market = FakeMarketClient(
-        cheap_universe=[_readiness_row(code) for code in snapshot_codes],
+        universe=[_readiness_row(code) for code in snapshot_codes],
         trading_dates=["2026-09-15", "2026-09-16"],
     )
     with factory() as session:
@@ -4612,11 +4569,11 @@ def _discovery_client(
 
 
 def test_discovery_data_api_start_status_and_get_is_read_only(tmp_path) -> None:
-    from market.cheap import CheapRow
+    from market.universe import UniverseRow
 
     code = "000001.SZ"
     market = FakeMarketClient(
-        cheap_universe=[_complete_cheap_row(code)],
+        universe=[_complete_universe_row(code)],
         trading_dates=["2026-09-15", "2026-09-16"],
         discovery_data={code: _bundle(code)},
     )
@@ -4637,7 +4594,7 @@ def test_discovery_data_api_start_status_and_get_is_read_only(tmp_path) -> None:
 def test_discovery_data_duplicate_start_is_idempotent_and_lock_conflicts(
     tmp_path,
 ) -> None:
-    from market.cheap import CheapRow
+    from market.universe import UniverseRow
 
     code = "000001.SZ"
     entered = Event()
@@ -4653,7 +4610,7 @@ def test_discovery_data_duplicate_start_is_idempotent_and_lock_conflicts(
             )
 
     market = BlockingMarket(
-        cheap_universe=[_complete_cheap_row(code)],
+        universe=[_complete_universe_row(code)],
         trading_dates=["2026-09-15", "2026-09-16"],
         discovery_data={code: _bundle(code)},
     )
@@ -4690,9 +4647,10 @@ def test_discovery_data_duplicate_start_is_idempotent_and_lock_conflicts(
         assert blocked.json()["job_type"] == "review"
 
 
-def test_startup_pauses_interrupted_discovery_fill_and_preserves_done(
+def test_startup_resumes_interrupted_discovery_fill_and_preserves_done(
     tmp_path,
 ) -> None:
+    import time
     db_path = tmp_path / "app.db"
     engine = init_db(db_path)
     now = datetime(2026, 9, 16, 12, tzinfo=timezone.utc)
@@ -4728,27 +4686,52 @@ def test_startup_pauses_interrupted_discovery_fill_and_preserves_done(
         discovery_data={"000001.SZ": _bundle("000001.SZ")}
     )
     with _discovery_client(tmp_path, market) as client:
+        deadline = time.monotonic() + 10
         status = client.get("/api/discovery-data/status").json()
+        while status["status"] != "done" and time.monotonic() < deadline:
+            time.sleep(0.05)
+            status = client.get("/api/discovery-data/status").json()
         assert status["id"] == fill_id
-        assert status["status"] == "paused"
-        assert status["completed"] == 1
+        assert (status["status"], status["completed"]) == ("done", 2)
         with client.app.state.session_factory() as session:
-            pending = session.get(
-                DiscoveryDataCheckpoint, (fill_id, "000001.SZ")
-            )
-            done = session.get(
-                DiscoveryDataCheckpoint, (fill_id, "000002.SZ")
-            )
-            assert pending is not None and pending.status == "pending"
-            assert done is not None and done.status == "done"
             assert session.get(JobLock, 1).job_id is None
-        resumed = client.post(
-            "/api/discovery-data/fill", json={"sync": True}
-        ).json()
-        assert (resumed["status"], resumed["completed"]) == ("done", 2)
         assert [
             call for call in market.calls if call[0] == "discovery_data"
         ] == [("discovery_data", "000001.SZ")]
+
+
+def test_paused_fill_resumes_only_when_it_can_progress_unattended(
+    tmp_path,
+) -> None:
+    from jobs.discovery_data import fill_resume_delay
+
+    engine = init_db(tmp_path / "resume.db")
+    now = datetime(2026, 9, 16, 12, tzinfo=timezone.utc)
+    with Session(engine) as session:
+        fill = _fill(session, ["000001.SZ"], now=now, status="paused")
+        checkpoint = session.get(DiscoveryDataCheckpoint, (fill.id, "000001.SZ"))
+        assert checkpoint is not None
+
+        def delay(error: str | None) -> float | None:
+            fill.last_error = error
+            session.flush()
+            return fill_resume_delay(session, fill.id, now)
+
+        assert delay("maximum run time reached") == 0.0
+        assert delay("进程重启，任务已暂停") == 0.0
+        assert delay("universe: boom") is None
+        fill.daily_requests = fill.daily_budget
+        assert delay("maximum run time reached") is None
+        fill.daily_requests = 0
+
+        checkpoint.status = "retryable"
+        checkpoint.next_retry_at = now + timedelta(minutes=5)
+        assert delay("000001.SZ financials: timeout") == 300.0
+        checkpoint.status = "failed"
+        assert delay("000001.SZ financials: timeout") is None
+        fill.status = "done"
+        assert delay("maximum run time reached") is None
+    engine.dispose()
 
 
 def test_startup_resets_running_checkpoint_when_fill_already_paused(
@@ -5604,6 +5587,24 @@ def test_legacy_client_security_mismatch_is_permanent_and_not_persisted(
     engine.dispose()
 
 
+def test_fill_boundary_is_the_last_session_with_published_valuations() -> None:
+    from jobs.discovery_data import _completed_session_date
+
+    beijing = timezone(timedelta(hours=8))
+    assert _completed_session_date(
+        datetime(2026, 9, 22, 10, 17, tzinfo=beijing)
+    ) == date(2026, 9, 21)
+    assert _completed_session_date(
+        datetime(2026, 9, 22, 15, 59, tzinfo=beijing)
+    ) == date(2026, 9, 21)
+    assert _completed_session_date(
+        datetime(2026, 9, 22, 16, 0, tzinfo=beijing)
+    ) == date(2026, 9, 22)
+    assert _completed_session_date(
+        datetime(2026, 9, 22, 23, 59, tzinfo=beijing)
+    ) == date(2026, 9, 22)
+
+
 def test_china_market_date_drives_universe_and_snapshot_cutoff(tmp_path) -> None:
     from discovery.constants import china_market_date
     from jobs.discovery_data import RequestPolicy, execute_discovery_data_fill
@@ -5624,8 +5625,8 @@ def test_china_market_date_drives_universe_and_snapshot_cutoff(tmp_path) -> None
         industry_as_of="2026-09-20",
     )
     market = FakeMarketClient(
-        cheap_universe=[
-            CheapRow(
+        universe=[
+            UniverseRow(
                 code=code,
                 name=state.name,
                 price=Decimal("10"),
@@ -5669,7 +5670,7 @@ def test_china_market_date_drives_universe_and_snapshot_cutoff(tmp_path) -> None
             ),
             clock=FakeClock(midnight),
         )
-    assert market.cheap_as_of == [date(2026, 9, 20)]
+    assert market.universe_as_of == [date(2026, 9, 19)]
     with factory() as session:
         checkpoint = session.get(DiscoveryDataCheckpoint, (fill_id, code))
         assert checkpoint is not None and checkpoint.status == "done"
@@ -5733,17 +5734,17 @@ def test_legacy_universe_client_without_as_of_remains_compatible(
     class LegacyUniverse(FakeMarketClient):
         def __init__(self) -> None:
             super().__init__(
-                cheap_universe=[_complete_cheap_row(code)],
+                universe=[_complete_universe_row(code)],
                 trading_dates=["2026-09-16"],
                 discovery_data={code: _bundle(code)},
             )
             self.legacy_calls = 0
 
-        def fetch_cheap_universe(
+        def fetch_universe(
             self, *, before_request=None
-        ) -> list[CheapRow]:
+        ) -> list[UniverseRow]:
             self.legacy_calls += 1
-            return super().fetch_cheap_universe(
+            return super().fetch_universe(
                 before_request=before_request,
                 as_of=date(2026, 9, 16),
             )
@@ -6239,7 +6240,7 @@ def test_init_db_preserves_completed_presnapshot_fill_but_requires_restart(
         )
         assert replacement is not None and dispatch
         assert replacement.id != legacy.id
-        assert replacement.payload_schema_version == 2
+        assert replacement.payload_schema_version == SCHEMA_VERSION
     engine.dispose()
 
 
@@ -6322,8 +6323,8 @@ def _readiness_row(
     *,
     listing_date: str = "2000-01-01",
     industry: str = "白色家电",
-) -> CheapRow:
-    return CheapRow(
+) -> UniverseRow:
+    return UniverseRow(
         code=code,
         name=code,
         price=Decimal("10"),
@@ -6346,7 +6347,7 @@ def _readiness_row(
 
 def _store_readiness_universe(
     session: Session,
-    rows: list[CheapRow],
+    rows: list[UniverseRow],
     *,
     fetched_at: float = 1789560000.0,
     trading_dates: tuple[str, ...] = (
@@ -6500,14 +6501,13 @@ def _store_readiness_valuations(
     )
 
 
-def test_backfill_snapshot_drives_readiness_without_cheap_cache(tmp_path) -> None:
+def test_backfill_snapshot_drives_readiness(tmp_path) -> None:
     from discovery.data_readiness import discovery_data_readiness
     from jobs.discovery_data import (
         RequestPolicy,
         execute_discovery_data_fill,
         start_discovery_data_fill,
     )
-    from market.cheap import _store
 
     engine = init_db(tmp_path / "fill-readiness.db")
     now = datetime(2026, 9, 16, 12, tzinfo=timezone.utc)
@@ -6521,7 +6521,7 @@ def test_backfill_snapshot_drives_readiness_without_cheap_cache(tmp_path) -> Non
         "2026-09-16",
     ]
     market = FakeMarketClient(
-        cheap_universe=[_readiness_row(code)],
+        universe=[_readiness_row(code)],
         trading_dates=frozen_dates,
         discovery_data={code: _bundle(code, request_count=1)},
     )
@@ -6544,9 +6544,6 @@ def test_backfill_snapshot_drives_readiness_without_cheap_cache(tmp_path) -> Non
             policy=policy,
             clock=FakeClock(now),
         )
-        # An unrelated cheap-board cache must never replace the fill snapshot.
-        _store(session, [], now.timestamp())
-        session.commit()
         report = discovery_data_readiness(session, as_of=now.date())
         assert all(track.eligible == 1 for track in report.tracks.values())
         snapshot = session.get(DiscoveryUniverseSecurity, (fill_id, code))
@@ -7015,10 +7012,18 @@ def test_readiness_ratio_is_exact_and_context_isolated(
 
 
 def test_discovery_status_serializes_decimal_readiness_without_dispatch(
-    tmp_path,
+    tmp_path, monkeypatch
 ) -> None:
     from sqlalchemy import event
 
+    class FixtureDay(date):
+        @classmethod
+        def today(cls) -> date:
+            return cls(2026, 9, 16)
+
+    # The fixture's 60 monthly valuations fit the five-year window only up to
+    # 2026-10-01; the endpoint reads the wall clock.
+    monkeypatch.setattr("app.main.date", FixtureDay)
     market = FakeMarketClient()
     with _discovery_client(tmp_path, market) as client:
         first, second = "000001.SZ", "000002.SZ"
@@ -7067,7 +7072,7 @@ def test_discovery_status_serializes_decimal_readiness_without_dispatch(
         body = response.json()
         assert body["status"] == "done"
         assert body["readiness"]["status"] == "not_activated"
-        assert body["readiness"]["evaluated_as_of"] == date.today().isoformat()
+        assert body["readiness"]["evaluated_as_of"] == "2026-09-16"
         assert body["readiness"]["tracks"]["quality_discount"]["coverage"] == 0.5
         assert body["readiness"]["tracks"]["quality_discount"]["ready"] is False
         assert all(
@@ -7081,7 +7086,7 @@ def test_discovery_status_serializes_decimal_readiness_without_dispatch(
             "valuation": "2026-09-01",
             "valuation_fetched_at": "2026-09-16T12:00:00+00:00",
         }
-        assert len(selects) <= 5
+        assert len(selects) <= 6
         assert market.calls == before
 
 

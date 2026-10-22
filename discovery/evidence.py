@@ -22,8 +22,12 @@ ALLOWED_RISK_CATEGORIES = frozenset(
         "metric_near_threshold",
         "worsening_trend",
         "sector_specific_risk",
+        "balance_sheet_risk",
         "missing_non_gating_evidence",
     }
+)
+_EXPLICIT_RISK_CATEGORIES = MappingProxyType(
+    {"cash_debt_double_high": "balance_sheet_risk"}
 )
 FALLBACK_RISK_TEXT = "尚无结构化反方证据"
 _OBSERVATION_REQUIREMENTS = MappingProxyType(
@@ -33,7 +37,7 @@ _OBSERVATION_REQUIREMENTS = MappingProxyType(
         "pb_percentile": ("valuation_pb", "valuation_pb_observations"),
         "pb_median_ratio": ("valuation_pb", "valuation_pb_observations"),
         "roe_mean": ("roe", "roe_observations"),
-        "roe_cv": ("roe", "roe_observations"),
+        "roe_downside_volatility": ("roe", "roe_observations"),
         "cash_conversion": (
             "cash_conversion",
             "cash_conversion_observations",
@@ -63,6 +67,10 @@ _OBSERVATION_REQUIREMENTS = MappingProxyType(
         "npl_change": ("bank_npl", "bank_npl_observations"),
         "dilution_rate": ("dilution", "dilution_observations"),
         "revenue_decline": ("revenue", "revenue_observations"),
+        "earnings_decline": (
+            "normalized_earnings",
+            "normalized_earnings_observations",
+        ),
         "one_time_profit_share": (
             "one_time_profit",
             "one_time_profit_observations",
@@ -448,6 +456,7 @@ def _risk_specs(
             ),
             ("dilution_rate", "dilution_rate_max", "max"),
             ("revenue_decline", "revenue_decline_max", "max"),
+            ("earnings_decline", "earnings_decline_max", "max"),
             (
                 "one_time_profit_share",
                 "one_time_profit_share_max",
@@ -799,7 +808,7 @@ def _flag_risk(
         if type(flag) is not str or not flag:
             raise ValueError("risk flags must be nonblank strings")
         lowered = flag.casefold()
-        category = (
+        category = _EXPLICIT_RISK_CATEGORIES.get(flag) or (
             "worsening_trend"
             if any(word in lowered for word in ("deterioration", "worsening", "trend"))
             else (

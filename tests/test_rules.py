@@ -451,3 +451,46 @@ def test_delete_rule_updates_light_and_leaves_book(tmp_path: Path) -> None:
     assert _scalar(db_path, "SELECT COUNT(*) FROM trades") == trade_count == TRADE_COUNT
     assert _as_decimal(_scalar(db_path, "SELECT balance FROM cash")) == cash_before
     assert _scalar(db_path, "SELECT COUNT(*) FROM rules") == 1
+
+
+def test_sync_thesis_ceiling_rule_preserves_manual_and_upserts_auto(tmp_path: Path) -> None:
+    from ledger.rules import list_rules, sync_thesis_ceiling_rule
+
+    with _client(tmp_path, yaml_dir=FIXTURES) as client:
+        factory = client.app.state.session_factory
+        with factory() as session:
+            # Manual rule on 招商银行 (price=32) is preserved and not overwritten
+            assert (
+                sync_thesis_ceiling_rule(
+                    session,
+                    name="招商银行",
+                    ceiling_price=Decimal("45"),
+                    research_job_id=10,
+                )
+                is None
+            )
+            # New stock without manual rule gets an auto-synced rule
+            created = sync_thesis_ceiling_rule(
+                session,
+                name="宁德时代",
+                ceiling_price=Decimal("260"),
+                research_job_id=11,
+            )
+            assert created is not None
+            assert created.price == Decimal("260")
+            assert "论文自动同步" in (created.note or "")
+            # Subsequent thesis update updates the existing auto-synced rule in place
+            updated = sync_thesis_ceiling_rule(
+                session,
+                name="宁德时代",
+                ceiling_price=Decimal("280"),
+                research_job_id=12,
+            )
+            session.commit()
+            assert updated is not None
+            assert updated.id == created.id
+            assert updated.price == Decimal("280")
+            all_rules = {r.name: r for r in list_rules(session)}
+            assert all_rules["招商银行"].price == Decimal("32")
+            assert all_rules["宁德时代"].price == Decimal("280")
+

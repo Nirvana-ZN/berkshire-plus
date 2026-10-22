@@ -200,11 +200,21 @@ def test_inverted_bands_are_not_an_expensive_line() -> None:
         "conservative": "21.0",
         "overvalued": "",
     }
-    assert expensive_line(bands, Decimal("24.61")) is None
+    assert expensive_line(bands, Decimal("24.61")) == Decimal("26.5")
     paper = _structured(as_of_price=24.61)
     paper["price_bands"] = bands
     assert not is_overvalued(paper, current_price=Decimal("24.61"), price_usable=True)
     assert live_verdict(paper, current_price=Decimal("24.61"), price_usable=True) == "pass"
+    assert live_verdict(paper, current_price=Decimal("27"), price_usable=True) == "fail"
+    assert live_verdict(paper, current_price=None, price_usable=False) is None
+    # 区间写法取带内最高价；倍数、年份、仓位比例不算价格
+    worded = {
+        "mode": "steady",
+        "aggressive": "≤20.60（PE 10x，2025年EPS 2.06元）加仓区",
+        "steady": "20.60–26.78（PE 10-13x），维持7.5%仓位",
+        "conservative": "≤17.51（PE 8.5x）",
+    }
+    assert expensive_line(worded, Decimal("24.19")) == Decimal("26.78")
 
 
 def test_aftermath_compares_old_paper_to_now(tmp_path: Path) -> None:
@@ -761,3 +771,155 @@ def test_positions_and_watchlist_return_stale_thesis_status(tmp_path: Path) -> N
         item = next(row for row in listed if row["name"] == "优质大盘")
         assert item["thesis_status"] == "stale"
         assert item["thesis_research_id"] == watch_job
+
+
+def test_financial_drift_marks_thesis_stale_before_90_days() -> None:
+    from research.thesis import financial_drift
+
+    paper = _structured(as_of_date="2026-08-01", as_of_price=35)
+    paper["valuation"] = {"period": "2025", "eps_period": "2025"}
+    healthy_h1 = (
+        {"period": "2025H1", "net_income": 100, "ocf": 110},
+        {"period": "2026H1", "net_income": 108, "ocf": 120},
+    )
+    assert financial_drift(paper, healthy_h1) is None
+    assert status(paper, today=date(2026, 9, 1), financials=healthy_h1) == "current"
+
+    deteriorated_h1 = (
+        {"period": "2025H1", "net_income": 100, "ocf": 110},
+        {"period": "2026H1", "net_income": 75, "ocf": -20},
+    )
+    drift = financial_drift(paper, deteriorated_h1)
+    assert drift is not None
+    assert drift["period"] == "2026H1"
+    assert set(drift["reasons"]) == {"profit_drop", "ocf_turned_negative"}
+    assert status(paper, today=date(2026, 9, 1), financials=deteriorated_h1) == "stale"
+
+    masked_by_non_recurring = (
+        {"period": "2025H1", "net_income": 271, "deducted_net_income": 268, "ocf": 580},
+        {"period": "2026H1", "net_income": 390, "deducted_net_income": 215, "ocf": 407},
+    )
+    masked_drift = financial_drift(paper, masked_by_non_recurring)
+    assert masked_drift is not None
+    assert "deducted_profit_drop" in masked_drift["reasons"]
+    assert masked_drift["deducted_net_income_yoy"] < -0.19
+    assert status(paper, today=date(2026, 9, 1), financials=masked_by_non_recurring) == "stale"
+
+
+def test_dynamic_sizing_evaluates_role_band_and_drift() -> None:
+    from research.thesis import dynamic_sizing
+
+    core = _structured(mode="steady", conservative="48", as_of_price=42)
+    core["price_bands"]["aggressive"] = "36"
+    core["price_bands"]["steady"] = "42"
+    core["memo"] = {"role": "core"}
+    hold_res = dynamic_sizing(
+        core, current_price=Decimal("42.26"), price_usable=True, actual_weight=Decimal("0.1636")
+    )
+    assert hold_res is not None
+    assert hold_res["zone"] == "hold_corridor"
+    assert hold_res["label"] == "核心仓·持有观察区（不追高补仓）"
+
+    sat = _structured(mode="steady", conservative="8.9", as_of_price=8.4)
+    sat["price_bands"]["aggressive"] = "7.0"
+    sat["price_bands"]["steady"] = "7.9"
+    sat["memo"] = {"role": "satellite"}
+    sat["valuation"] = {"period": "2025", "eps_period": "2025"}
+    agg_res = dynamic_sizing(
+        sat, current_price=Decimal("6.8"), price_usable=True, actual_weight=Decimal("0.04")
+    )
+    assert agg_res is not None
+    assert agg_res["zone"] == "aggressive"
+    assert agg_res["label"] == "卫星仓·击球加仓区（5%-8%）"
+
+    deteriorated_h1 = (
+        {"period": "2025H1", "net_income": 100, "ocf": 110},
+        {"period": "2026H1", "net_income": 79.6, "ocf": 95},
+    )
+    frozen_res = dynamic_sizing(
+        sat,
+        current_price=Decimal("8.4"),
+        price_usable=True,
+        actual_weight=Decimal("0.0733"),
+        financials=deteriorated_h1,
+    )
+    assert frozen_res is not None
+    assert frozen_res["zone"] == "drift_freeze"
+    assert frozen_res["action"] == "freeze"
+    assert frozen_res["label"] == "卫星仓·冻结加仓（2026H1同比恶化）"
+
+    from research.thesis import portfolio_optimization
+
+    opt = portfolio_optimization(
+        [
+            {
+                "name": "国光股份",
+                "code": "002749.SZ",
+                "thesis_research_id": 101,
+                "weight": 0.0733,
+                "price": 8.4,
+                "cheap_bound": 7.0,
+                "rich_bound": 8.9,
+                "dynamic_sizing": frozen_res,
+            },
+            {
+                "name": "招商银行",
+                "code": "600036.SH",
+                "thesis_research_id": 82,
+                "weight": 0.1636,
+                "price": 42.26,
+                "cheap_bound": 36.0,
+                "rich_bound": 48.0,
+                "rule_light": "hit",
+                "dynamic_sizing": hold_res,
+            },
+            {
+                "name": "华润三九",
+                "code": "000999.SZ",
+                "thesis_research_id": 102,
+                "weight": 0.04,
+                "price": 6.8,
+                "cheap_bound": 7.0,
+                "rich_bound": 8.9,
+                "dynamic_sizing": agg_res,
+            },
+        ],
+        [
+            {
+                "name": "宁德时代",
+                "code": "300750.SZ",
+                "research_id": 88,
+                "structured": core,
+                "price": Decimal("40"),
+                "price_usable": True,
+                "financials": (),
+            }
+        ],
+    )
+    assert [row["name"] for row in opt["reduce"]] == ["国光股份", "招商银行"]
+    assert [row["name"] for row in opt["add"]] == ["华润三九"]
+    assert opt["add"][0]["ready"] is True
+    assert [row["name"] for row in opt["build"]] == ["宁德时代"]
+    assert opt["build"][0]["ready"] is True
+
+    steady_core = dict(core)
+    opt_greed = portfolio_optimization(
+        [],
+        [
+            {
+                "name": "宁德时代",
+                "code": "300750.SZ",
+                "research_id": 88,
+                "structured": steady_core,
+                "price": Decimal("40"),
+                "price_usable": True,
+                "financials": (),
+            }
+        ],
+        sentiment={"score": 82, "zone": "greed", "label": "极端贪婪"},
+    )
+    assert opt_greed["sentiment_regime"]["zone"] == "greed"
+    assert opt_greed["build"][0]["ready"] is False
+    assert "贪婪期暂缓" in opt_greed["build"][0]["tag"]
+
+

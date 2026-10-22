@@ -180,9 +180,11 @@ def cagr(values: DecimalValues, years: int) -> Decimal | None:
     return result if result.is_finite() else None
 
 
-def coefficient_of_variation(values: DecimalValues) -> Decimal | None:
-    """Return population standard deviation divided by the absolute mean.
+def downside_volatility(values: DecimalValues) -> Decimal | None:
+    """Return the root-mean-square step-to-step decline over the absolute mean.
 
+    Rises count as zero, so a steadily improving series scores 0; for
+    trendless noise the result is close to the coefficient of variation.
     At least two finite observations and a non-zero mean are required.
     """
 
@@ -208,18 +210,19 @@ def coefficient_of_variation(values: DecimalValues) -> Decimal | None:
             average = context.divide(total, count)
             if average.is_zero():
                 return None
-            squared_deviations = zero
-            for value in scaled:
-                deviation = context.subtract(value, average)
-                squared_deviations = context.add(
-                    squared_deviations,
-                    context.multiply(deviation, deviation),
-                )
-            variance = context.divide(squared_deviations, count)
-            if variance.is_zero():
+            squared_declines = zero
+            for previous, value in zip(scaled, scaled[1:]):
+                change = context.subtract(value, previous)
+                if change < zero:
+                    squared_declines = context.add(
+                        squared_declines,
+                        context.multiply(change, change),
+                    )
+            if squared_declines.is_zero():
                 return zero
+            steps = context.create_decimal(len(usable) - 1)
             result = context.divide(
-                context.sqrt(variance),
+                context.sqrt(context.divide(squared_declines, steps)),
                 average.copy_abs(),
             )
     except DecimalException:
@@ -232,10 +235,11 @@ def cash_conversion(
     net_income: DecimalValues,
     min_observations: int,
 ) -> Decimal | None:
-    """Average aligned OCF/net-income ratios with enough valid periods.
+    """Return summed OCF over summed net income across enough valid periods.
 
     A pair is omitted when either side is missing or non-finite, or when net
-    income is zero. Negative net income remains a valid denominator.
+    income is zero. Summing keeps one thin-profit year from inflating the
+    ratio the way an average of yearly ratios would.
     """
 
     minimum = _minimum(min_observations)
@@ -254,25 +258,23 @@ def cash_conversion(
     )
     if len(pairs) < minimum:
         return None
-    ratio_precision = max(
-        40,
-        max(
-            len(cash.as_tuple().digits) + len(earnings.as_tuple().digits) + 32
-            for cash, earnings in pairs
-        ),
+    precision = _working_precision(
+        (value for pair in pairs for value in pair), extra=40
     )
-    if ratio_precision > FINANCIAL_PRECISION_CEILING:
+    if precision is None:
         return None
     try:
-        with localcontext(_context(ratio_precision)) as context:
-            ratios = tuple(
-                context.divide(cash, earnings) for cash, earnings in pairs
-            )
+        with localcontext(_context(precision)) as context:
+            cash_total = income_total = context.create_decimal(0)
+            for cash, earnings in pairs:
+                cash_total = context.add(cash_total, cash)
+                income_total = context.add(income_total, earnings)
+            if income_total.is_zero():
+                return None
+            result = context.divide(cash_total, income_total)
     except DecimalException:
         return None
-    if any(not ratio.is_finite() for ratio in ratios):
-        return None
-    return _mean(ratios)
+    return result if result.is_finite() else None
 
 
 def normalized_earnings(

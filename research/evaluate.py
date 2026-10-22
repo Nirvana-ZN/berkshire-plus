@@ -29,7 +29,32 @@ BAND_MODES = frozenset({"aggressive", "steady", "conservative", "watch"})
 MEMO_ROLES = frozenset({"core", "satellite", "skip"})
 GRADES = frozenset({"A", "B", "C"})
 MIRROR_MIN = 5
-CYCLE_TOKENS = ("有色", "煤炭", "航运", "证券", "锂", "钢", "铝", "化工", "铜", "锌", "镍", "煤")
+CYCLE_TOKENS = (
+    "有色",
+    "煤炭",
+    "航运",
+    "证券",
+    "东方财富",
+    "锂",
+    "钢",
+    "铝",
+    "化工",
+    "铜",
+    "锌",
+    "镍",
+    "煤",
+    "工程机械",
+    "阀门",
+    "纽威",
+    "油服",
+    "杰瑞",
+    "水泥",
+    "玻璃",
+    "化纤",
+    "造纸",
+    "氨基酸",
+    "梅花生物",
+)
 
 
 @dataclass(frozen=True)
@@ -47,6 +72,8 @@ class EvalInput:
     industry: str = ""
     search_hits: tuple[dict[str, Any], ...] = ()
     notices: tuple[dict[str, Any], ...] = ()
+    precedents: tuple[dict[str, Any], ...] = ()
+    risk_flags: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -145,6 +172,10 @@ def normalize_structured(raw: object, payload: EvalInput) -> dict[str, Any]:
         ceiling = expensive_line(bands, payload.price)
         if ceiling is not None and payload.price > ceiling:
             verdict = "fail"
+    if verdict == "pass" and _fit_blocks_pass(fit, memo, payload):
+        verdict = "gray"
+    if verdict == "pass" and _deducted_trap_blocks_pass(payload):
+        verdict = "gray"
     return {
         "verdict": verdict,
         "gates": gates,
@@ -271,6 +302,7 @@ def _enrich_valuation(payload: EvalInput) -> dict[str, Any]:
         raw["eps"] = _json_optional(annual_eps)
         if annual_period:
             raw["eps_period"] = annual_period
+    ttm_eps, ttm_basis = _ttm_eps(payload.financials)
     price = payload.price
     if price is not None:
         raw.setdefault("price", _json_optional(price))
@@ -278,6 +310,23 @@ def _enrich_valuation(payload: EvalInput) -> dict[str, Any]:
     eps = _as_decimal(raw.get("eps"))
     if raw.get("pb") is None and price is not None and bps is not None and bps > 0:
         raw["pb"] = _json_optional(price / bps)
+    if price is not None and ttm_eps is not None and ttm_eps > 0:
+        raw["eps_ttm"] = _json_optional(ttm_eps)
+        raw["pe_ttm"] = _json_optional(price / ttm_eps)
+        raw["pe_ttm_basis"] = ttm_basis
+    elif raw.get("pe_ttm") is None:
+        raw.pop("eps_ttm", None)
+        raw.pop("pe_ttm", None)
+        raw.pop("pe_ttm_basis", None)
+    ded_ttm_eps, ded_ttm_basis = _deducted_ttm_eps(payload.financials)
+    if price is not None and ded_ttm_eps is not None and ded_ttm_eps > 0:
+        raw["eps_deducted_ttm"] = _json_optional(ded_ttm_eps)
+        raw["pe_deducted_ttm"] = _json_optional(price / ded_ttm_eps)
+        raw["pe_deducted_ttm_basis"] = ded_ttm_basis
+    elif raw.get("pe_deducted_ttm") is None:
+        raw.pop("eps_deducted_ttm", None)
+        raw.pop("pe_deducted_ttm", None)
+        raw.pop("pe_deducted_ttm_basis", None)
     if price is not None and eps is not None and eps > 0:
         raw["pe"] = _json_optional(price / eps)
         basis = raw.get("eps_period") or ""
@@ -294,7 +343,125 @@ def _enrich_valuation(payload: EvalInput) -> dict[str, Any]:
             raw["eps_mid"] = _json_optional(mid_eps)
             raw["pe_mid"] = _json_optional(price / mid_eps)
             raw["pe_mid_basis"] = f"中周期对照（现价/{mid_years}年年报EPS中位数）"
+    _enrich_balance_sheet_traps(raw, payload.financials)
     return raw
+
+
+def _enrich_balance_sheet_traps(
+    raw: dict[str, Any],
+    rows: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+) -> None:
+    best_bs: dict[str, Any] | None = None
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if (
+            row.get("goodwill") is None
+            and row.get("net_assets") is None
+            and row.get("cash") is None
+            and row.get("interest_debt") is None
+        ):
+            continue
+        p = str(row.get("period") or "").strip().upper()
+        if _period_order(p) is None:
+            continue
+        if best_bs is None or (_period_order(p) or (0, 0)) > (
+            _period_order(str(best_bs.get("period") or "")) or (0, 0)
+        ):
+            best_bs = row
+    if best_bs is None:
+        return
+    gw = _as_decimal(best_bs.get("goodwill"))
+    na = _as_decimal(best_bs.get("net_assets"))
+    pb = _as_decimal(raw.get("pb"))
+    if gw is not None and gw > 0 and na is not None and na > 0:
+        gw_ratio = gw / na
+        raw["goodwill_pct"] = _json_optional((gw_ratio * Decimal("100")).quantize(Decimal("0.01")))
+        if pb is not None and pb > 0 and gw_ratio < Decimal("0.9"):
+            tangible_pb = pb / (Decimal("1") - gw_ratio)
+            raw["pb_tangible"] = _json_optional(tangible_pb.quantize(Decimal("0.01")))
+    cash = _as_decimal(best_bs.get("cash"))
+    debt = _as_decimal(best_bs.get("interest_debt"))
+    if cash is not None or debt is not None:
+        net_cash = (cash or Decimal("0")) - (debt or Decimal("0"))
+        raw["net_cash_yi"] = _json_optional((net_cash / Decimal("100000000")).quantize(Decimal("0.01")))
+
+
+def _period_order(period: str) -> tuple[int, int] | None:
+    text = period.strip().upper()
+    if len(text) == 4 and text.isdigit():
+        return int(text), 4
+    if len(text) == 6 and text[:4].isdigit() and text[4:] in {"Q1", "H1", "Q3"}:
+        return int(text[:4]), {"Q1": 1, "H1": 2, "Q3": 3}[text[4:]]
+    return None
+
+
+def _ttm_eps(
+    rows: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+) -> tuple[Decimal | None, str]:
+    by_period: dict[str, Decimal] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        period = str(row.get("period") or "").strip().upper()
+        if _period_order(period) is None:
+            continue
+        eps = _as_decimal(row.get("eps"))
+        if eps is not None:
+            by_period[period] = eps
+    annuals = sorted((p for p in by_period if len(p) == 4), key=int)
+    if not annuals:
+        return None, ""
+    latest_ann = annuals[-1]
+    interims = sorted(
+        (p for p in by_period if len(p) == 6 and int(p[:4]) > int(latest_ann)),
+        key=lambda p: _period_order(p) or (0, 0),
+    )
+    if interims:
+        latest_int = interims[-1]
+        prev_int = f"{latest_ann}{latest_int[4:]}"
+        if prev_int in by_period:
+            ttm = by_period[latest_ann] + by_period[latest_int] - by_period[prev_int]
+            return ttm, f"滚动TTM（{latest_ann}年报+{latest_int}-{prev_int}）"
+    return None, ""
+
+
+def _deducted_ttm_eps(
+    rows: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+) -> tuple[Decimal | None, str]:
+    by_period: dict[str, Decimal] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        period = str(row.get("period") or "").strip().upper()
+        if _period_order(period) is None:
+            continue
+        dni = _as_decimal(row.get("deducted_net_income"))
+        if dni is None:
+            continue
+        shares = _as_decimal(row.get("shares"))
+        if shares is not None and shares > 0:
+            by_period[period] = (dni / shares).quantize(Decimal("0.0001"))
+            continue
+        ni = _as_decimal(row.get("net_income"))
+        eps = _as_decimal(row.get("eps"))
+        if ni is not None and ni != 0 and eps is not None:
+            by_period[period] = (eps * dni / ni).quantize(Decimal("0.0001"))
+    annuals = sorted((p for p in by_period if len(p) == 4), key=int)
+    if not annuals:
+        return None, ""
+    latest_ann = annuals[-1]
+    interims = sorted(
+        (p for p in by_period if len(p) == 6 and int(p[:4]) > int(latest_ann)),
+        key=lambda p: _period_order(p) or (0, 0),
+    )
+    if interims:
+        latest_int = interims[-1]
+        prev_int = f"{latest_ann}{latest_int[4:]}"
+        if prev_int in by_period:
+            ttm = by_period[latest_ann] + by_period[latest_int] - by_period[prev_int]
+            return ttm, f"扣非滚动TTM（{latest_ann}年报+{latest_int}-{prev_int}）"
+    return None, ""
 
 
 def _latest_annual_eps(rows: tuple[dict[str, Any], ...] | list[dict[str, Any]]) -> tuple[Decimal | None, str]:
@@ -347,16 +514,25 @@ def _is_cyclical(name: str, industry: str = "") -> bool:
 
 _VALUATION_ZH = {
     "price": "现价",
-    "bps": "每股净资产",
-    "pb": "市净率",
+    "pe_ttm": "滚动市盈率（TTM）",
+    "pe_ttm_basis": "滚动市盈率口径",
+    "eps_ttm": "滚动每股收益（TTM）",
+    "pe_deducted_ttm": "扣非滚动市盈率（TTM）",
+    "pe_deducted_ttm_basis": "扣非滚动市盈率口径",
+    "eps_deducted_ttm": "扣非滚动每股收益（TTM）",
     "pe": "静态市盈率",
     "pe_basis": "市盈率口径",
+    "pb": "市净率",
+    "pb_tangible": "扣除商誉有形市净率",
+    "goodwill_pct": "商誉占净资产比（%）",
+    "net_cash_yi": "账面净现金（亿元，负为净负债）",
+    "bps": "每股净资产",
+    "eps": "每股收益",
+    "eps_period": "每股收益报告期",
     "eps_mid": "中周期每股收益",
     "pe_mid": "中周期对照市盈率",
     "pe_mid_basis": "中周期市盈率口径",
     "npl_pct": "不良率",
-    "eps": "每股收益",
-    "eps_period": "每股收益报告期",
     "period": "报告期",
 }
 
@@ -409,6 +585,26 @@ def _notices_prompt_block(payload: EvalInput) -> str:
     )
 
 
+def _precedents_prompt_block(payload: EvalInput) -> str:
+    if not payload.precedents:
+        return ""
+    blob = json.dumps([dict(row) for row in payload.precedents], ensure_ascii=False)
+    return (
+        f"同业历史深研判例：{blob}。"
+        "判例仅供横向对齐同行业护城河与安全边际估值尺度，禁止将同业数字写成当前公司财务或估值数字。"
+    )
+
+
+def _risk_flags_prompt_block(payload: EvalInput) -> str:
+    if not payload.risk_flags:
+        return ""
+    blob = json.dumps(list(payload.risk_flags), ensure_ascii=False)
+    return (
+        f"初筛量化风险提示：{blob}。"
+        "请在对应关卡（好生意/护城河/管理层/安全边际）逐一核查上述风险指标在已抓取财务中的具体表现。"
+    )
+
+
 def _search_prompt_block(payload: EvalInput) -> str:
     if not payload.web_search:
         return "网页搜索：未开启（这不代表没有财务）。"
@@ -429,6 +625,7 @@ def _cycle_prompt_lock(snap: dict[str, Any]) -> str:
         "周期股可讨论周期位置、资本开支与库存，但市盈率结论与价格带必须仍用静态市盈率。"
         "禁止用中周期对照市盈率替代静态市盈率，禁止用景气高峰年份EPS压低市盈率，"
         "禁止把中周期对照市盈率写入保守带上沿。"
+        "若当前静态或滚动市盈率显著低于中周期对照市盈率（说明当前处于景气高峰、EPS高于历史中枢），必须警惕周期顶部低PE陷阱，安全边际与总结论不得因高峰期表观低PE而给 pass。"
     )
 
 
@@ -447,18 +644,26 @@ def _build_prompt(payload: EvalInput) -> str:
         f"name 覆盖：{'、'.join(GATE_NAMES)}，status 为 pass/fail/gray。"
         f"mirror_test 必须是五句。"
         f"给出价格带：激进 / 稳健 / 保守，或观望。"
+        f"三档必须满足 激进价 < 稳健价 < 保守价：激进价是便宜时加大买入的价，稳健价是正常买入的价，"
+        f"保守价是停止加仓的上限，现价高于保守价就是太贵。"
         f"price_bands.mode 为 aggressive/steady/conservative/watch。"
         f"mode 不是 watch 时，aggressive、steady、conservative 各写一个现价数字，不要空着，不要写 PE/PB。"
         f"watch 时这三项留空。"
         f"memo 为对象，含 essence、risks、role；role 只能是 core/satellite/skip。"
-        f"portfolio_fit 必须对照当前仓回答 should_enter、funding、overlap。"
+        f"portfolio_fit 必须对照当前仓回答 should_enter、funding、overlap；"
+        f"若当前仓 cash.target 为 null（无现金目标），说明现金是可随时动用的机动资金，不设强制保留比例底线；"
+        f"若当前仓中某持仓的 target 为 null（no_target 为 true，即未设固定目标仓位），严禁编造或引用任何『目标X%』『补至目标仓位』『略低于/高于目标』等表述，"
+        f"应依据仓位角色（core 核心仓/satellite 卫星仓）、现价所处价格带位置（激进价以下可积极加仓、稳健至保守价之间仅持有观察不追高、高于保守价停止加仓）及最新财报同比趋势动态评估仓位动作。"
         f"研究日期 {payload.as_of_date}，现价 {price}。"
-        f"{search}{_notices_prompt_block(payload)}已抓取财务：{financials}。估值快照：{valuation}。当前仓：{book}。"
+        f"{search}{_notices_prompt_block(payload)}{_precedents_prompt_block(payload)}{_risk_flags_prompt_block(payload)}已抓取财务：{financials}。估值快照：{valuation}。当前仓：{book}。"
         f"必须用估值快照与已抓取财务核验，禁止编造数字。"
         f"银行优先用市净率、每股净资产、不良率；缺毛利率、EBIT、分红率不得把安全边际或总结论标为 gray。"
-        f"市盈率一律用估值快照里的静态市盈率（现价/最新年报每股收益）。"
-        f"禁止改用动态、TTM、滚动市盈率，禁止用中报或季报EPS重算市盈率，禁止把两种口径写进同一份结论。"
-        f"中报与季报只用于看趋势（收入、利润、ROE是否在掉），不得改写年报每股收益。"
+        f"市盈率优先用估值快照里的滚动市盈率（TTM），并对照静态市盈率（现价/最新年报每股收益）；若快照无滚动市盈率则用静态市盈率。"
+        f"必须同时核对归母净利润（net_income）与扣非净利润（deducted_net_income）：若归母净利润增长但扣非净利润同比下滑，或扣非占归母比例显著偏低（<75%），说明账面增长来自非经常性损益（投资收益、政府补助或资产处置），严禁将其定性为经营拐点或业绩回升，安全边际与价格带必须按更保守的扣非滚动市盈率（pe_deducted_ttm）把关，好生意或总结论不得因归母虚增而给 pass。"
+        f"必须核查资产负债表质量（商誉占净资产比 goodwill_pct、扣除商誉有形市净率 pb_tangible、账面净现金 net_cash_yi）：若商誉占净资产比>20%，市净率须以有形市净率为准并提示商誉减值风险；若净现金大幅为负或由正转负，须警惕债务扩张与资本开支吞噬自由现金流；若因分红耗尽净资产导致PB>8倍且ROE畸高（>50%），不得将其高ROE视为低估理由。"
+        f"若滚动市盈率高于静态市盈率（近期盈利下滑），安全边际与价格带按更保守的滚动市盈率把关；若滚动市盈率显著低于静态市盈率，需核查是否含单季非经常性损益。"
+        f"禁止改用动态市盈率，禁止用中报或季报EPS自行重算市盈率。"
+        f"中报与季报只用于看趋势（收入、利润、ROE是否在掉）及核验快照已算好的滚动TTM，不得改写年报每股收益。"
         f"{_cycle_prompt_lock(snap)}"
         f"任一关失败则 verdict 必须是 fail，不得改成 gray 或 pass。"
         f"中报趋势恶化或说不清还是不是好生意时，好生意或护城河可以为 gray，总结论也可以是 gray。"
@@ -767,11 +972,18 @@ def _normalize_bands(raw: object) -> dict[str, str]:
     mode = str(raw.get("mode") or "").strip()
     if mode not in BAND_MODES:
         raise EvalError("价格带必须是激进/稳健/保守或观望")
+    agg = str(raw.get("aggressive") or "").strip()
+    std = str(raw.get("steady") or "").strip()
+    con = str(raw.get("conservative") or "").strip()
+    a_num = _as_decimal(agg)
+    c_num = _as_decimal(con)
+    if a_num is not None and c_num is not None and a_num > c_num:
+        agg, con = con, agg
     return {
         "mode": mode,
-        "aggressive": str(raw.get("aggressive") or "").strip(),
-        "steady": str(raw.get("steady") or "").strip(),
-        "conservative": str(raw.get("conservative") or "").strip(),
+        "aggressive": agg,
+        "steady": std,
+        "conservative": con,
         "overvalued": str(raw.get("overvalued") or "").strip(),
     }
 
@@ -823,6 +1035,75 @@ def _normalize_fit(raw: object, book: dict[str, Any]) -> dict[str, str]:
     if not mapped["should_enter"] or not mapped["funding"] or not mapped["overlap"]:
         raise EvalError("portfolio_fit 三问不完整")
     return mapped
+
+
+def _fit_blocks_pass(
+    fit: dict[str, str], memo: dict[str, str], payload: EvalInput
+) -> bool:
+    if memo.get("role") == "skip":
+        return True
+    positions = payload.book.get("positions") if isinstance(payload.book, dict) else None
+    held = {
+        str(row.get("name") or "").strip()
+        for row in (positions or [])
+        if isinstance(row, dict) and str(row.get("name") or "").strip()
+    }
+    if not held or payload.name in held:
+        return False
+    answer = (fit.get("should_enter") or "").strip()
+    return bool(re.match(r"^(?:否|不进|不该进|不建议进|暂不纳入|不纳入)", answer))
+
+
+def _deducted_trap_blocks_pass(payload: EvalInput) -> bool:
+    """Hard guardrail: block 'pass' if latest financials have a non-recurring profit trap."""
+
+    by_period: dict[str, dict[str, Any]] = {}
+    for row in payload.financials:
+        if not isinstance(row, dict):
+            continue
+        p = str(row.get("period") or "").strip().upper()
+        if _period_order(p) is not None:
+            by_period[p] = row
+    if not by_period:
+        return False
+
+    # 1. Check latest annual and latest interim for fake profit (NI > 0 but Deducted NI <= 0)
+    #    or severe non-recurring bloat (Deducted / NI < 65% while Deducted YoY < 0)
+    ordered = sorted(by_period.keys(), key=lambda p: _period_order(p) or (0, 0))
+    latest_p = ordered[-1]
+    latest_row = by_period[latest_p]
+    cur_ni = _as_decimal(latest_row.get("net_income"))
+    cur_dni = _as_decimal(latest_row.get("deducted_net_income"))
+    if cur_ni is not None and cur_ni > 0 and cur_dni is not None and cur_dni <= 0:
+        return True
+
+    # 2. Check latest YoY comparison (e.g. 2026H1 vs 2025H1, or 2025 vs 2024)
+    for period in reversed(ordered):
+        prev_period = f"{int(period[:4]) - 1}{period[4:]}"
+        if prev_period not in by_period:
+            continue
+        c = by_period[period]
+        p = by_period[prev_period]
+        c_dni = _as_decimal(c.get("deducted_net_income"))
+        p_dni = _as_decimal(p.get("deducted_net_income"))
+        c_ni = _as_decimal(c.get("net_income"))
+        if c_dni is not None and c_ni is not None and c_ni > 0 and c_dni <= 0:
+            return True
+        if c_dni is not None and p_dni is not None and p_dni > 0:
+            dni_yoy = (c_dni - p_dni) / p_dni
+            if dni_yoy <= Decimal("-0.15"):
+                return True
+            if dni_yoy < 0 and c_ni is not None and c_ni > 0 and (c_dni / c_ni) < Decimal("0.70"):
+                return True
+        break
+    # 3. Cyclical peak earnings trap: if cyclical and mid-cycle PE >= 30 while current PE/PE_TTM is compressed by >=30% due to peak EPS
+    if _is_cyclical(payload.name, payload.industry):
+        snap = _enrich_valuation(payload)
+        pe_mid = _as_decimal(snap.get("pe_mid"))
+        cur_pe = _as_decimal(snap.get("pe_ttm")) or _as_decimal(snap.get("pe"))
+        if pe_mid is not None and cur_pe is not None and pe_mid >= Decimal("30") and cur_pe <= pe_mid * Decimal("0.70"):
+            return True
+    return False
 
 
 def _fit_from_book(book: dict[str, Any]) -> dict[str, str]:

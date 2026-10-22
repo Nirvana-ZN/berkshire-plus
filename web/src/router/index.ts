@@ -4,7 +4,7 @@ import PositionsView from '../views/PositionsView.vue'
 import ScreenView from '../views/ScreenView.vue'
 import ResearchView from '../views/ResearchView.vue'
 import DiscoveryView from '../views/DiscoveryView.vue'
-import CheapView from '../views/CheapView.vue'
+import IndexFundsView from '../views/IndexFundsView.vue'
 import SettingsView from '../views/SettingsView.vue'
 import NotFoundView from '../views/NotFoundView.vue'
 
@@ -32,10 +32,9 @@ const router = createRouter({
       component: DiscoveryView,
     },
     {
-      path: '/cheap',
-      name: 'cheap',
-      component: CheapView,
-      meta: { legacy: true },
+      path: '/index-funds',
+      name: 'index-funds',
+      component: IndexFundsView,
     },
     {
       path: '/research/:id',

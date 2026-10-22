@@ -11,6 +11,7 @@ from app.models import Rule
 from ledger.positions import LOCAL_USER_ID
 
 ADD_CEILING_TYPE = "加仓上限价"
+AUTO_THESIS_NOTE_PREFIX = "论文自动同步"
 LIGHT_HIT = "hit"
 LIGHT_CLEAR = "clear"
 LIGHT_NONE = "none"
@@ -97,6 +98,61 @@ def save_rule(
         rule_type=parsed_type,
         price=parsed_price,
         note=parsed_note,
+    )
+
+
+def sync_thesis_ceiling_rule(
+    session: Session,
+    *,
+    name: str,
+    ceiling_price: Decimal | None,
+    research_job_id: int,
+    user_id: int = LOCAL_USER_ID,
+) -> RuleRow | None:
+    """Upsert an auto-synced add-ceiling rule from thesis conservative price, preserving manual rules."""
+
+    cleaned_name = str(name or "").strip()
+    if not cleaned_name or ceiling_price is None or not ceiling_price.is_finite() or ceiling_price <= 0:
+        return None
+    existing_rows = session.scalars(
+        select(Rule)
+        .where(
+            Rule.user_id == user_id,
+            Rule.name == cleaned_name,
+            Rule.rule_type == ADD_CEILING_TYPE,
+        )
+        .order_by(Rule.id)
+    ).all()
+    if any(not str(r.note or "").startswith(AUTO_THESIS_NOTE_PREFIX) for r in existing_rows):
+        return None
+    note_text = f"{AUTO_THESIS_NOTE_PREFIX}（评估 #{research_job_id}）"
+    if existing_rows:
+        target = existing_rows[0]
+        target.price = ceiling_price
+        target.note = note_text
+        session.flush()
+        return RuleRow(
+            id=int(target.id),
+            name=cleaned_name,
+            rule_type=ADD_CEILING_TYPE,
+            price=ceiling_price,
+            note=note_text,
+        )
+    row = Rule(
+        user_id=user_id,
+        name=cleaned_name,
+        rule_type=ADD_CEILING_TYPE,
+        price=ceiling_price,
+        note=note_text,
+    )
+    session.add(row)
+    session.flush()
+    return RuleRow(
+        id=int(row.id),
+        name=cleaned_name,
+        rule_type=ADD_CEILING_TYPE,
+        price=ceiling_price,
+        note=note_text,
     )
 
 

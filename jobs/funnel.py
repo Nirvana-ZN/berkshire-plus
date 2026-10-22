@@ -28,7 +28,9 @@ logger = logging.getLogger(__name__)
 
 _LEGACY_FINANCIAL_FIELDS = (
     "roe",
+    "revenue",
     "net_income",
+    "deducted_net_income",
     "ocf",
     "capex",
     "ebit",
@@ -45,7 +47,9 @@ _LEGACY_FINANCIAL_FIELDS = (
 _STRICT_SHARED_FINANCIAL_FIELDS = frozenset(
     {
         "roe",
+        "revenue",
         "net_income",
+        "deducted_net_income",
         "ocf",
         "capex",
         "interest_coverage",
@@ -211,6 +215,27 @@ def execute_funnel(
         codes = [item.code for item in snapshots]
         rows = market.fetch_financials(codes)
         persist_financials(session, rows)
+        seen_periods = {(r.code, r.period) for r in rows}
+        if codes:
+            for db_fin in session.scalars(
+                select(Financial).where(
+                    Financial.code.in_(codes),
+                    Financial.period_type != "annual",
+                )
+            ).all():
+                if (db_fin.code, db_fin.period) not in seen_periods:
+                    rows.append(
+                        FinancialRow(
+                            code=db_fin.code,
+                            period=db_fin.period,
+                            period_type=db_fin.period_type,
+                            roe=db_fin.roe,
+                            revenue=db_fin.revenue,
+                            net_income=db_fin.net_income,
+                            deducted_net_income=db_fin.deducted_net_income,
+                            ocf=db_fin.ocf,
+                        )
+                    )
         years = {}
         if hasattr(market, "fetch_listed_years"):
             years = market.fetch_listed_years(codes) or {}

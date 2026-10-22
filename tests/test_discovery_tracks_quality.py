@@ -34,13 +34,16 @@ FINANCIAL_FIELDS = tuple(
 METRIC_FIELDS = [
     "listing_years",
     "roe_mean",
-    "roe_cv",
+    "roe_downside_volatility",
+    "roe_recent_ratio",
     "positive_net_income_observations",
     "latest_net_income",
     "latest_net_assets",
     "cash_conversion",
     "dilution_rate",
     "debt_to_equity",
+    "cash_to_assets",
+    "interest_debt_to_assets",
     "interest_coverage",
     "margin_change",
     "pe_percentile",
@@ -49,6 +52,9 @@ METRIC_FIELDS = [
     "pb_median_ratio",
     "normalized_earnings",
     "normalized_pe",
+    "earnings_yield",
+    "deducted_profit_cagr",
+    "peg",
     "bank_capital_adequacy",
     "bank_core_tier1_capital_adequacy",
     "bank_npl",
@@ -56,13 +62,18 @@ METRIC_FIELDS = [
 ]
 FORMULAS = {
     "roe_mean": "mean(annual.roe)",
-    "roe_cv": "coefficient_of_variation(annual.roe)",
+    "roe_downside_volatility": "downside_volatility(annual.roe)",
+    "roe_recent_ratio": "mean(recent.roe)/mean(annual.roe)",
     "positive_net_income_observations": "count(annual.net_income>0)",
     "latest_net_income": "latest(annual.net_income)",
     "latest_net_assets": "latest(annual.net_assets)",
-    "cash_conversion": "cash_conversion(annual.ocf,annual.net_income>0)",
+    "cash_conversion": "sum(annual.ocf)/sum(annual.net_income)|annual.net_income>0",
     "dilution_rate": "latest(annual.shares)/earliest(annual.shares)-1",
     "debt_to_equity": "latest(annual.interest_debt)/latest(annual.net_assets)",
+    "cash_to_assets": "latest(annual.cash)/latest(annual.total_assets)",
+    "interest_debt_to_assets": (
+        "latest(annual.interest_debt)/latest(annual.total_assets)"
+    ),
     "interest_coverage": "latest(annual.interest_coverage)",
     "margin_change": "latest(annual.gross_margin)-earliest(annual.gross_margin)",
     "pe_percentile": "percentile_rank(current.pe,monthly.pe)",
@@ -71,6 +82,9 @@ FORMULAS = {
     "pb_median_ratio": "current.pb/median(monthly.pb)",
     "normalized_earnings": "normalized_earnings(annual.deducted_net_income)",
     "normalized_pe": "current.price*latest(annual.shares)/normalized_earnings",
+    "earnings_yield": "100/current.pe",
+    "deducted_profit_cagr": "cagr(annual.deducted_net_income,growth)",
+    "peg": "current.pe/(min(deducted_profit_cagr,peg_growth_cap)*100)",
     "bank_capital_adequacy": "latest(annual.capital_adequacy)",
     "bank_core_tier1_capital_adequacy": (
         "latest(annual.core_tier1_capital_adequacy)"
@@ -83,7 +97,10 @@ def quality_payload(**threshold_overrides: str) -> dict[str, object]:
     thresholds = {
         "listing_years_min": "5",
         "roe_mean_min": "12",
-        "roe_cv_max": "0.25",
+        "roe_downside_volatility_max": "0.25",
+        "roe_recent_ratio_min": "0.8",
+        "cash_to_assets_min": "0.2",
+        "interest_debt_to_assets_min": "0.2",
         "net_income_positive_min": "0",
         "net_assets_positive_min": "0",
         "cash_conversion_min": "1",
@@ -97,6 +114,10 @@ def quality_payload(**threshold_overrides: str) -> dict[str, object]:
         "pb_median_ratio_max": "0.8",
         "normalized_pe_max": "15",
         "normalized_earnings_min": "0",
+        "treasury_yield": "1.69",
+        "earnings_yield_spread_min": "3",
+        "peg_growth_cap": "0.25",
+        "peg_release_max": "1.5",
         "bank_roe_min": "10",
         "bank_capital_adequacy_min": "12",
         "bank_core_tier1_min": "9",
@@ -112,6 +133,7 @@ def quality_payload(**threshold_overrides: str) -> dict[str, object]:
         "thresholds": thresholds,
         "min_observations": {
             "roe": 5,
+            "roe_recent": 3,
             "positive_net_income": 5,
             "net_assets": 1,
             "cash_conversion": 5,
@@ -122,6 +144,7 @@ def quality_payload(**threshold_overrides: str) -> dict[str, object]:
             "valuation_pe": 60,
             "valuation_pb": 60,
             "normalized_earnings": 5,
+            "growth": 5,
             "bank_roe": 5,
             "bank_capital": 1,
             "bank_npl": 1,
@@ -135,6 +158,7 @@ def quality_payload(**threshold_overrides: str) -> dict[str, object]:
                 "field_domain_policy": "quality-domain-v1",
                 "lookback_windows": {
                     "roe": 10,
+                    "roe_recent": 3,
                     "profitability": 5,
                     "cash_conversion": 5,
                     "dilution": 5,
@@ -143,6 +167,7 @@ def quality_payload(**threshold_overrides: str) -> dict[str, object]:
                     "interest_coverage": 1,
                     "margin": 5,
                     "normalized_earnings": 5,
+                    "growth": 5,
                     "bank_capital": 5,
                     "bank_npl": 5,
                 },
@@ -165,14 +190,17 @@ def quality_payload(**threshold_overrides: str) -> dict[str, object]:
                     "listing_age",
                     "roe_mean",
                     "roe_stability",
+                    "roe_trend",
                     "profitability",
                     "positive_equity",
                     "cash_conversion",
                     "dilution",
                     "leverage",
                     "interest_coverage",
+                    "cash_debt",
                     "margin",
                     "valuation",
+                    "absolute_valuation",
                 ],
                 "valuation_policy": "both",
                 "margin_deterioration_policy": "evidence",
@@ -189,6 +217,7 @@ def quality_payload(**threshold_overrides: str) -> dict[str, object]:
                     "dilution",
                     "leverage",
                     "interest_coverage",
+                    "cash_debt",
                     "margin",
                     "normalized_earnings_positive",
                     "cyclical_valuation",
@@ -213,7 +242,7 @@ def quality_payload(**threshold_overrides: str) -> dict[str, object]:
         },
         "order": [
             ["pe_percentile", "asc", "nulls_last"],
-            ["roe_cv", "asc", "nulls_last"],
+            ["roe_downside_volatility", "asc", "nulls_last"],
             ["cash_conversion", "desc", "nulls_last"],
             ["code", "asc", "nulls_last"],
         ],
@@ -258,8 +287,10 @@ def _annual(
     core_tier1_capital_adequacy: str = "10",
     npl: str = "1",
     nonperforming_loan_balance: str | None = None,
+    total_assets: str | None = None,
 ) -> dict[str, object]:
     supplied = {
+        "total_assets": total_assets,
         "roe": roe,
         "net_income": net_income,
         "ocf": ocf,
@@ -330,6 +361,7 @@ def frozen_company(
     industry: str = "制造业",
     annual: tuple[dict[str, object], ...] | None = None,
     valuations: tuple[dict[str, object], ...] | None = None,
+    listing_date: str = "2000-01-01",
 ) -> FrozenCompanyInput:
     annual = annual or tuple(_annual(year) for year in range(2021, 2026))
     valuations = valuations or _valuations()
@@ -341,7 +373,7 @@ def frozen_company(
         security_status=MappingProxyType(
             {
                 "exchange": "SH",
-                "listing_date": "2000-01-01",
+                "listing_date": listing_date,
                 "is_st": False,
                 "is_delisting": False,
                 "trading_status": "trading",
@@ -359,7 +391,7 @@ def frozen_company(
                 "price": latest["price"],
                 "pe": latest["pe"],
                 "pb": latest["pb"],
-                "listing_date": "2000-01-01",
+                "listing_date": listing_date,
                 "financial_history": annual,
                 "valuation_history": valuations,
             }
@@ -411,7 +443,7 @@ def test_quality_ruler_has_strict_semantic_schema() -> None:
     assert ruler.track == "quality_discount"
     assert ruler.order == (
         ("pe_percentile", "asc", "nulls_last"),
-        ("roe_cv", "asc", "nulls_last"),
+        ("roe_downside_volatility", "asc", "nulls_last"),
         ("cash_conversion", "desc", "nulls_last"),
         ("code", "asc", "nulls_last"),
     )
@@ -451,6 +483,13 @@ def test_quality_ruler_has_strict_semantic_schema() -> None:
         ].reverse(),
         lambda value: value["formulas"].__setitem__("roe_mean", "vendor_roe"),
         lambda value: value["order"].pop(2),
+        lambda value: value["thresholds"].pop("roe_recent_ratio_min"),
+        lambda value: value["thresholds"].pop("cash_to_assets_min"),
+        lambda value: value["min_observations"].pop("roe_recent"),
+        lambda value: value["sector_branches"]["nonfinancial"][
+            "gate_order"
+        ].remove("roe_trend"),
+        lambda value: value.__setitem__("algorithm_version", "discovery-v2"),
     ):
         value = json.loads(json.dumps(quality_payload()))
         mutation(value)
@@ -740,7 +779,114 @@ def test_roe_level_and_stability_are_separate_ordered_gates() -> None:
     verdict = _classify(frozen_company(annual=annual))
     assert verdict.primary_reason == "roe_stability_above_max"
     assert verdict.metrics["roe_mean"] == "13"
-    assert verdict.metrics["roe_cv"] is not None
+    assert verdict.metrics["roe_downside_volatility"] is not None
+
+
+def test_roe_stability_ignores_rises_and_pre_listing_years() -> None:
+    rising = tuple(
+        _annual(year, roe=str(10 + 2 * (year - 2021))) for year in range(2021, 2026)
+    )
+    verdict = _classify(frozen_company(annual=rising))
+    assert verdict.verdict == "pass"
+    assert Decimal(verdict.metrics["roe_downside_volatility"]) == 0
+
+    # A pre-IPO ROE of 70 followed by 15s is one steep decline.
+    annual = (_annual(2016, roe="70"),) + tuple(
+        _annual(year) for year in range(2017, 2026)
+    )
+    assert _classify(frozen_company(annual=annual)).primary_reason == (
+        "roe_stability_above_max"
+    )
+    listed = _classify(frozen_company(annual=annual, listing_date="2017-06-01"))
+    assert listed.verdict == "pass"
+    assert listed.metrics["roe_window_start_year"] == "2017"
+
+
+def test_zero_interest_debt_skips_interest_coverage() -> None:
+    def verdict_for(debt: str):
+        annual = tuple(
+            _annual(year, interest_debt=debt, interest_coverage="1", total_assets="100")
+            for year in range(2021, 2026)
+        )
+        return _classify(frozen_company(annual=annual))
+
+    assert verdict_for("40").primary_reason == "interest_coverage_below_min"
+    assert verdict_for("0").verdict == "pass"
+
+
+def test_roe_trend_drops_recent_decline_only_in_nonfinancial_branch() -> None:
+    years = range(2016, 2026)
+    roes = ("18",) * 7 + ("13",) * 3
+    annual = tuple(
+        _annual(year, roe=value) for year, value in zip(years, roes, strict=True)
+    )
+    verdict = _classify(frozen_company(annual=annual))
+    assert (verdict.verdict, verdict.primary_reason) == (
+        "drop",
+        "roe_recent_ratio_below_min",
+    )
+    assert Decimal(verdict.metrics["roe_recent_ratio"]) < Decimal("0.8")
+
+    cyclical = _classify(frozen_company(industry="煤炭", annual=annual))
+    assert "quality.roe_recent_ratio_below_min" not in cyclical.evidence_rule_ids
+
+    steady = _classify()
+    assert steady.verdict == "pass"
+    assert Decimal(steady.metrics["roe_recent_ratio"]) == 1
+
+
+def test_cash_debt_double_high_drops_nonfinancial_branches() -> None:
+    def verdict_for(cash: str | None, debt: str, assets: str | None, industry="制造业"):
+        annual = tuple(
+            _annual(year, cash=cash, interest_debt=debt, total_assets=assets)
+            for year in range(2021, 2026)
+        )
+        return _classify(frozen_company(industry=industry, annual=annual))
+
+    for industry in ("制造业", "煤炭"):
+        dropped = verdict_for("20", "20", "100", industry)
+        assert (dropped.verdict, dropped.primary_reason) == (
+            "drop",
+            "cash_debt_double_high",
+        )
+        assert "quality.cash_debt_double_high" in dropped.evidence_rule_ids
+    for cash, debt, assets in (("30", "19", "100"), ("30", "30", None)):
+        assert verdict_for(cash, debt, assets).verdict == "pass"
+    assert verdict_for("30", "30", "100", "银行").primary_reason != (
+        "cash_debt_double_high"
+    )
+
+
+def test_absolute_valuation_needs_bond_spread_or_cheap_growth() -> None:
+    def verdict_for(latest_pe: str, deducted: tuple[str, ...] = ("100",) * 5):
+        valuations = tuple(
+            {**row, "pe": str(int(row["pe"]) * 5)}
+            for row in _valuations(latest_pe=latest_pe)[:-1]
+        ) + _valuations(latest_pe=latest_pe)[-1:]
+        annual = tuple(
+            _annual(year, deducted_net_income=value)
+            for year, value in zip(range(2021, 2026), deducted, strict=True)
+        )
+        return _classify(frozen_company(annual=annual, valuations=valuations))
+
+    # Yield 1/21 = 4.76% clears 1.69% + 3pp; 1/25 = 4% does not.
+    assert verdict_for("21").verdict == "pass"
+    flat = verdict_for("25")
+    assert (flat.verdict, flat.primary_reason) == ("drop", "earnings_yield_below_min")
+    assert Decimal(flat.metrics["earnings_yield"]) == 4
+    # Doubling over four years is 18.9% a year: PEG 25/18.9 = 1.32.
+    released = verdict_for("25", ("100", "120", "140", "170", "200"))
+    assert released.verdict == "pass"
+    assert "quality.peg_release" in released.evidence_rule_ids
+    assert Decimal("1.3") < Decimal(released.metrics["peg"]) < Decimal("1.35")
+    # Growth above the 25% cap is not credited: 40 / 25 = 1.6.
+    capped = verdict_for("40", ("100", "150", "250", "350", "500"))
+    assert capped.primary_reason == "earnings_yield_below_min"
+    assert Decimal(capped.metrics["peg"]) == Decimal("1.6")
+    assert "earnings_yield" not in {
+        key for key, value in verdict_for("8").metrics.items() if value is None
+    }
+    assert _classify(frozen_company(industry="煤炭")).metrics["earnings_yield"] is None
 
 
 def test_margin_risk_is_evidence_only_unless_branch_policy_drops() -> None:
@@ -1466,6 +1612,24 @@ def test_quality_and_other_track_concepts_remain_independent() -> None:
     assert other_track_fixture_gate(company) == "drop"
 
 
+def test_listing_age_screen_does_not_veto_the_track() -> None:
+    from jobs.discovery import _verdict_is_scored
+
+    class Verdict:
+        def __init__(self, verdict: str, reason: str | None) -> None:
+            self.verdict = verdict
+            self.primary_reason = reason
+
+    assert _verdict_is_scored(
+        Verdict("insufficient", "listing_history_insufficient")
+    )
+    assert _verdict_is_scored(Verdict("drop", "roe_mean_below_min"))
+    assert _verdict_is_scored(Verdict("pass", None))
+    assert not _verdict_is_scored(
+        Verdict("insufficient", "industry_branch_unknown")
+    )
+
+
 def test_builtin_dispatcher_enforces_overall_coverage_without_artifacts() -> None:
     from discovery.rulers import quality_discount_ruler
     from jobs.discovery import (
@@ -1581,9 +1745,12 @@ def _calibration_preflight_db(
             CREATE TABLE ruler_versions (id INTEGER PRIMARY KEY);
             """
         )
+        from discovery.company_payload import SCHEMA_VERSION
+
         connection.execute(
             "INSERT INTO discovery_data_fills "
-            "VALUES (7, 'done', 'ready', 1, 2)"
+            "VALUES (7, 'done', 'ready', 1, ?)",
+            (SCHEMA_VERSION,),
         )
         connection.execute(
             "INSERT INTO discovery_data_checkpoints VALUES "
@@ -1653,6 +1820,79 @@ def test_calibrator_blocks_incomplete_and_corrupt_current_fills(
     assert calibrate(
         corrupt, track="quality_discount"
     )["blocked_reasons"] == ["database_corrupt"]
+
+
+def test_finished_fill_keeps_failed_companies_out_of_the_incomplete_check() -> None:
+    from scripts.calibrate_discovery import _preflight_incomplete
+
+    finished = {
+        "declared_companies": 2,
+        "security_count": 2,
+        "checkpoint_count": 2,
+        "done_checkpoint_count": 1,
+        "open_checkpoint_count": 0,
+        "trading_dates": 1,
+    }
+    still_open = {**finished, "open_checkpoint_count": 1}
+    assert _preflight_incomplete(finished) is False
+    assert _preflight_incomplete(still_open) is True
+
+
+def test_calibration_scores_done_companies_and_drops_failed_payloads() -> None:
+    from scripts.calibrate_discovery import _scoreable_companies
+
+    class Company:
+        def __init__(self, captured: str | None) -> None:
+            self.as_of = {"valuation_fetched_at": captured}
+
+    class Snapshot:
+        companies = (Company("2026-09-22T00:00:00Z"), Company(None))
+
+    finished = {"checkpoint_count": 2, "done_checkpoint_count": 1}
+    scored = _scoreable_companies(Snapshot(), finished)
+    assert scored is not None and len(scored) == 1
+    assert (
+        _scoreable_companies(
+            Snapshot(),
+            {"checkpoint_count": 2, "done_checkpoint_count": 2},
+        )
+        is None
+    )
+
+
+def test_one_unreadable_company_does_not_reject_the_rest() -> None:
+    from dataclasses import dataclass
+
+    from scripts.calibrate_discovery import _without_corrupt_verdicts
+
+    class Verdict:
+        def __init__(self, reason: str | None) -> None:
+            self.primary_reason = reason
+
+    @dataclass
+    class Snapshot:
+        companies: tuple
+
+    companies = ("ok", "bad")
+    frozen = ("f-ok", "f-bad")
+    verdicts = {
+        "base": (Verdict(None), Verdict("snapshot_schema_invalid")),
+        "relaxed": (Verdict(None), Verdict("snapshot_schema_invalid")),
+    }
+    kept = _without_corrupt_verdicts(Snapshot(companies), frozen, verdicts)
+    assert kept is not None
+    snapshot, kept_frozen, kept_verdicts = kept
+    assert snapshot.companies == ("ok",)
+    assert kept_frozen == ("f-ok",)
+    assert kept_verdicts["base"][0].primary_reason is None
+    assert (
+        _without_corrupt_verdicts(
+            Snapshot(("bad",)),
+            ("f-bad",),
+            {"base": (Verdict("financial_history_invalid"),)},
+        )
+        is None
+    )
 
 
 def test_calibrator_blocks_noncurrent_algorithm_build(
@@ -1754,7 +1994,7 @@ def test_calibrator_ready_full_market_proposal_is_deterministic_and_read_only(
         fill_id=7,
         companies=(
             recode("制造业", "600000.SH"),
-            recode("煤炭", "600001.SH"),
+            recode("煤炭开采", "600001.SH"),
             recode("银行", "600002.SH"),
         ),
         versions=SnapshotVersions(
@@ -1793,6 +2033,7 @@ def test_calibrator_ready_full_market_proposal_is_deterministic_and_read_only(
         "field_domain_policy": "quality-domain-v1",
         "lookback_windows": {
             "roe": 10,
+            "roe_recent": 3,
             "profitability": 5,
             "cash_conversion": 5,
             "dilution": 5,
@@ -1801,6 +2042,7 @@ def test_calibrator_ready_full_market_proposal_is_deterministic_and_read_only(
             "interest_coverage": 1,
             "margin": 5,
             "normalized_earnings": 5,
+            "growth": 5,
             "bank_capital": 5,
             "bank_npl": 5,
         },
@@ -1904,12 +2146,52 @@ def test_calibrator_declares_every_required_supported_branch() -> None:
     assert _required_supported_branches("garp") == {"nonfinancial"}
 
 
+def test_calibrator_quality_cyclical_map_uses_exact_level_two_labels() -> None:
+    from scripts.calibrate_discovery import (
+        QUALITY_CYCLICAL_INDUSTRIES,
+        _branch_map,
+        _ruler_branch,
+    )
+
+    labels = (
+        "工业金属", "小金属", "能源金属", "贵金属", "化学原料", "养殖业", "光伏设备"
+    )
+    others = ("金属新材料", "化学制品", "焦炭Ⅱ", "白酒Ⅱ")
+    mapping = _branch_map((*labels, "煤炭开采", *others, "银行Ⅱ", "-", None))
+
+    assert set(labels) <= QUALITY_CYCLICAL_INDUSTRIES
+    assert mapping == {
+        "nonfinancial": sorted(others),
+        "cyclical": sorted((*labels, "煤炭开采")),
+        "bank": ["银行Ⅱ"],
+    }
+    assert all(
+        _ruler_branch("quality_discount", label) == branch
+        for branch, values in mapping.items()
+        for label in values
+    )
+
+
 def test_calibrator_domain_validity_is_an_approval_gate_with_diagnostics() -> None:
-    from scripts.calibrate_discovery import _domain_readiness
+    from scripts.calibrate_discovery import (
+        _domain_readiness,
+        _domain_valid,
+        _readiness_covered,
+    )
 
     assert _domain_readiness(4, 5, Decimal("0.8")) == (True, 1)
     assert _domain_readiness(3, 5, Decimal("0.8")) == (False, 2)
     assert _domain_readiness(0, 0, Decimal("0.8")) == (False, 0)
+    assert _domain_valid("deep_value", "cumulative_fcf_not_positive")
+    assert _domain_valid("deep_value", "normalized_earnings_not_positive")
+    assert not _domain_valid("deep_value", "revenue_negative")
+    assert not _domain_valid("deep_value", "shares_not_positive")
+    assert not _domain_valid("deep_value", "annual_fiscal_year_duplicate")
+    assert not _domain_valid("garp", "revenue_negative")
+    assert not _domain_valid("quality_discount", "price_not_positive")
+    captured = {"present": 8, "trusted": 3, "total": 10}
+    assert _readiness_covered("valuation_pe", captured, Decimal("0.8"))
+    assert not _readiness_covered("revenue", captured, Decimal("0.8"))
 
 
 @pytest.mark.parametrize("alias_kind", ["same", "hardlink", "symlink"])
@@ -2012,19 +2294,13 @@ def test_api_uses_builtin_quality_gate_and_keeps_other_tracks_independent(
             "deep_value": "ruler_not_ready",
             "garp": "ruler_not_ready",
         }
-        response = client.post(
-            f"/api/discoveries/{run_id}/stages/safety/confirm",
-            json={"sync": True},
-        )
-        assert response.status_code == 200
         quality = client.get(
             f"/api/discoveries/{run_id}/tracks/quality_discount"
             "/stages/track_gate"
         ).json()
-        assert quality["current"]["status"] == "waiting_confirmation"
+        assert quality["current"]["status"] == "confirmed"
         assert [row["code"] for row in quality["pass"]] == ["600000.SH"]
         assert quality["pass"][0]["metrics"]["roe_mean"] == "15"
-        assert quality["evidence"] == []
         for track in ("deep_value", "garp"):
             stage = client.get(
                 f"/api/discoveries/{run_id}/tracks/{track}"

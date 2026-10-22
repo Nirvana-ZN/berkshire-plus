@@ -28,44 +28,8 @@ def seed_targets_if_empty(
     *,
     user_id: int = LOCAL_USER_ID,
 ) -> bool:
-    if _target_count(session, user_id=user_id) > 0:
-        return False
-    quoted = project_positions(session, rows, cash, user_id=user_id)
-    priced_rows = [row for row in quoted if row.weight is not None]
-    if not priced_rows:
-        return False
-    priced_total = sum(
-        (row.market_value for row in priced_rows if row.market_value is not None),
-        Decimal("0"),
-    )
-    cash_dec = max(Decimal(cash), Decimal("0"))
-    denominator = priced_total + cash_dec
-    if denominator <= 0:
-        return False
-    cash_weight = cash_dec / denominator
-    if not cash_weight.is_finite() or cash_weight < 0 or cash_weight > 1:
-        return False
-    to_write: dict[str, Decimal] = {}
-    for row in quoted:
-        if row.weight is None:
-            continue
-        if not row.weight.is_finite() or row.weight < 0 or row.weight > 1:
-            return False
-        to_write[row.name] = row.weight
-    to_write[CASH_NAME] = cash_weight
-    total = sum(to_write.values(), Decimal("0"))
-    if abs(total - 1) > SUM_TOLERANCE:
-        return False
-    for name, weight in to_write.items():
-        session.add(
-            PositionTarget(user_id=user_id, name=name, target_weight=weight)
-        )
-    try:
-        session.commit()
-    except Exception:
-        session.rollback()
-        raise
-    return True
+    """Do not auto-seed actual holding weights as fake target weights; positions default to no_target."""
+    return False
 
 
 def reclaim_orphan_targets(
@@ -88,11 +52,7 @@ def reclaim_orphan_targets(
         return False
     moved = sum((Decimal(row.target_weight) for row in orphans), Decimal("0"))
     cash_row = next((row for row in existing if row.name == CASH_NAME), None)
-    if cash_row is None:
-        session.add(
-            PositionTarget(user_id=user_id, name=CASH_NAME, target_weight=moved)
-        )
-    else:
+    if cash_row is not None:
         cash_row.target_weight = Decimal(cash_row.target_weight) + moved
     for row in orphans:
         session.delete(row)
@@ -111,18 +71,19 @@ def save_targets(
     user_id: int = LOCAL_USER_ID,
 ) -> None:
     parsed = _parse_targets(targets)
-    if CASH_NAME not in parsed:
-        raise TargetError(
-            error="目标合计无效",
-            code="INVALID_TARGETS",
-            detail="必须包含 __CASH__",
-        )
     total = sum(parsed.values(), Decimal("0"))
-    if abs(total - 1) > SUM_TOLERANCE:
+    if CASH_NAME in parsed:
+        if abs(total - 1) > SUM_TOLERANCE:
+            raise TargetError(
+                error="目标合计无效",
+                code="INVALID_TARGETS",
+                detail=f"含现金合计必须为 1（容差 {SUM_TOLERANCE}），当前为 {total}",
+            )
+    elif total > Decimal("1") + SUM_TOLERANCE:
         raise TargetError(
             error="目标合计无效",
             code="INVALID_TARGETS",
-            detail=f"含现金合计必须为 1（容差 {SUM_TOLERANCE}），当前为 {total}",
+            detail=f"个股目标合计不能超过 1（容差 {SUM_TOLERANCE}），当前为 {total}",
         )
     existing = session.scalars(
         select(PositionTarget).where(PositionTarget.user_id == user_id)

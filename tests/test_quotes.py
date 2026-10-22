@@ -121,6 +121,40 @@ def test_refresh_success_writes_quote_and_computes_book(tmp_path: Path) -> None:
     assert "httpx" not in Path(ROOT / "ledger" / "quotes.py").read_text(encoding="utf-8")
 
 
+def test_bulk_refresh_also_prices_researched_names(tmp_path: Path) -> None:
+    fake = FakeQuoteClient({"600036.SH": "40", "600519.SH": "1500", "600900.SH": "27.3"})
+    db_path = tmp_path / "app.db"
+    with _client(tmp_path, fake=fake, yaml_dir=FIXTURES) as client:
+        with _engine(db_path).begin() as conn:
+            for name, code in (("长江电力", "600900.SH"), ("取价失败", "000001.SZ")):
+                conn.execute(
+                    text(
+                        "INSERT INTO research_jobs (user_id, name, code, status, "
+                        "created_at, updated_at) VALUES (1, :name, :code, 'done', "
+                        "'2026-10-01', '2026-10-01')"
+                    ),
+                    {"name": name, "code": code},
+                )
+        response = client.post("/api/quotes/refresh", json={})
+        assert response.status_code == 200
+        assert not response.json().get("errors")
+        assert "长江电力" not in {row["name"] for row in response.json()["positions"]}
+        assert (
+            client.post(
+                "/api/trades",
+                json=_trade_payload(name="长江电力", shares=100, price=27),
+            ).status_code
+            == 200
+        )
+        again = client.post("/api/quotes/refresh", json={})
+        assert again.status_code == 200
+        cjdl = {row["name"]: row for row in again.json()["positions"]}["长江电力"]
+        assert cjdl["stale"] is False
+        assert cjdl["code"] == "600900.SH"
+        assert _as_decimal(cjdl["price"]) == Decimal("27.3")
+    assert _scalar(db_path, "SELECT price FROM quotes WHERE name = '长江电力'") is not None
+
+
 def test_refresh_failure_keeps_old_price_and_marks_stale(tmp_path: Path) -> None:
     db_path = tmp_path / "app.db"
     first = FakeQuoteClient({"600036.SH": "40", "600519.SH": "1500"})

@@ -411,6 +411,7 @@ def _position_prompt(
     *,
     short_exam: bool,
 ) -> str:
+    sizing = (evaluation or {}).get("dynamic_sizing") if isinstance(evaluation, dict) else None
     facts = json.dumps(
         {
             "name": row.get("name"),
@@ -423,6 +424,7 @@ def _position_prompt(
             "no_target": row.get("no_target"),
             "rule_light": _rule_light(row),
             "deviation": row.get("deviation"),
+            "dynamic_sizing": sizing,
         },
         ensure_ascii=False,
     )
@@ -442,7 +444,15 @@ def _position_prompt(
             f"备忘：{json.dumps(evaluation.get('memo'), ensure_ascii=False)}。"
             f"论文正文：{body}。"
         )
-    target_note = "无目标，不参与偏差告警。" if row.get("no_target") else "对照目标仓位。"
+    if row.get("no_target"):
+        sizing_label = str(sizing.get("label") or "").strip() if isinstance(sizing, dict) else ""
+        target_note = (
+            f"无目标，不参与偏差告警。动态仓位评估：{sizing_label}。"
+            if sizing_label
+            else "无目标，不参与偏差告警。"
+        )
+    else:
+        target_note = "对照目标仓位。"
     return (
         f"请对持仓 {row.get('name')} 给出纸面单票动作。"
         f"只输出 JSON，键只有 action 与 reason。"
@@ -490,11 +500,16 @@ def _portfolio_prompt(
         }
         for row in tickets
     ]
+    cash_target_desc = (
+        "无目标（机动资金，不设保留底线）"
+        if cash.get("no_target") or cash.get("target") is None
+        else str(cash.get("target"))
+    )
     return (
         "请给出最多 3 条组合建议，必须落到本轮持仓、现金与目标仓位。"
         "只输出 JSON，键为 portfolio_actions，每项含 action、names、cash_or_target_link。"
         f"当前持仓：{held}。现金：{snapshot.get('cash_balance')}，"
-        f"现金占比 {cash.get('weight')}，现金目标 {cash.get('target')}。"
+        f"现金占比 {cash.get('weight')}，现金目标 {cash_target_desc}。"
         f"本轮单票动作：{json.dumps(ticket_lines, ensure_ascii=False)}。"
         f"再平衡提示名单：{rebalance}。"
         f"新票候选（最近漏斗 pass/gray）：{candidates}。"

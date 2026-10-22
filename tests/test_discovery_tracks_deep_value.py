@@ -23,12 +23,16 @@ FIELDS = [
     "listing_years",
     "normalized_earnings",
     "normalized_pe",
+    "normalized_pe_bucket",
     "cumulative_fcf",
     "normalized_fcf",
     "net_debt_to_normalized_fcf",
+    "cash_to_assets",
+    "interest_debt_to_assets",
     "interest_coverage",
     "dilution_rate",
     "revenue_decline",
+    "earnings_decline",
     "one_time_profit_share",
     "impairment_share",
     "non_core_income_proxy_share",
@@ -44,10 +48,15 @@ FIELDS = [
 FORMULAS = {
     "normalized_earnings": "median(annual.deducted_net_income)",
     "normalized_pe": "current.price*latest(annual.shares)/normalized_earnings",
+    "normalized_pe_bucket": "min(floor(normalized_pe*4/normalized_pe_max),3)",
     "cumulative_fcf": "sum(annual.ocf-annual.capex)",
     "normalized_fcf": "median(annual.ocf-annual.capex)",
     "net_debt_to_normalized_fcf": (
         "(latest(annual.interest_debt)-latest(annual.cash))/normalized_fcf"
+    ),
+    "cash_to_assets": "latest(annual.cash)/latest(annual.total_assets)",
+    "interest_debt_to_assets": (
+        "latest(annual.interest_debt)/latest(annual.total_assets)"
     ),
     "interest_coverage": "latest(annual.interest_coverage)",
     "dilution_rate": "latest(annual.shares)/earliest(annual.shares)-1",
@@ -55,17 +64,22 @@ FORMULAS = {
         "max(0,(earliest(annual.revenue)-latest(annual.revenue))/"
         "earliest(annual.revenue))"
     ),
+    "earnings_decline": (
+        "max(0,(normalized_earnings-latest(annual.deducted_net_income))/"
+        "normalized_earnings)"
+    ),
     "one_time_profit_share": (
-        "max(0,latest(annual.net_income)-latest(annual.deducted_net_income))/"
-        "copy_abs(normalized_earnings)"
+        "sum(max(0,annual.net_income-annual.deducted_net_income))/"
+        "(copy_abs(normalized_earnings)*count(annual))"
     ),
     "impairment_share": (
-        "copy_abs(latest(annual.impairment_loss))/copy_abs(normalized_earnings)"
+        "sum(copy_abs(annual.impairment_loss))/"
+        "(copy_abs(normalized_earnings)*count(annual))"
     ),
     "non_core_income_proxy_share": (
-        "(copy_abs(latest(annual.other_income))+"
-        "copy_abs(latest(annual.asset_disposal_gain)))/"
-        "copy_abs(normalized_earnings)"
+        "sum(copy_abs(annual.other_income)+"
+        "copy_abs(annual.asset_disposal_gain))/"
+        "(copy_abs(normalized_earnings)*count(annual))"
     ),
     "pb_percentile": "percentile_rank(current.pb,monthly.pb)",
     "pb_median_ratio": "current.pb/median(monthly.pb)",
@@ -86,9 +100,12 @@ def deep_value_payload(**threshold_overrides: str) -> dict[str, object]:
         "cumulative_fcf_min": "0",
         "normalized_fcf_min": "0",
         "net_debt_to_normalized_fcf_max": "3",
+        "cash_to_assets_min": "0.2",
+        "interest_debt_to_assets_min": "0.2",
         "interest_coverage_min": "2",
         "dilution_rate_max": "0.1",
         "revenue_decline_max": "0.2",
+        "earnings_decline_max": "0.3",
         "one_time_profit_share_max": "0.3",
         "impairment_share_max": "0.3",
         "non_core_income_proxy_share_max": "0.2",
@@ -158,8 +175,10 @@ def deep_value_payload(**threshold_overrides: str) -> dict[str, object]:
                     "positive_cumulative_fcf",
                     "net_debt",
                     "interest_coverage",
+                    "cash_debt",
                     "dilution",
                     "revenue_decline",
+                    "earnings_decline",
                     "one_time_profit",
                     "impairment",
                     "non_core_income_proxy",
@@ -188,9 +207,10 @@ def deep_value_payload(**threshold_overrides: str) -> dict[str, object]:
             },
         },
         "order": [
-            ["normalized_pe", "asc", "nulls_last"],
+            ["normalized_pe_bucket", "asc", "nulls_last"],
             ["pb_percentile", "asc", "nulls_last"],
             ["net_debt_to_normalized_fcf", "asc", "nulls_last"],
+            ["normalized_pe", "asc", "nulls_last"],
             ["code", "asc", "nulls_last"],
         ],
         "industry_version": "test-industry-v1",
@@ -264,11 +284,63 @@ def test_deep_value_ruler_is_complete_and_semantically_strict() -> None:
             "lookback_windows"
         ].pop("fcf"),
         lambda value: value["order"].pop(1),
+        lambda value: value["order"].pop(0),
+        lambda value: value["thresholds"].pop("interest_debt_to_assets_min"),
+        lambda value: value["thresholds"].__setitem__("normalized_pe_max", "0"),
+        lambda value: value.__setitem__("algorithm_version", "discovery-v2"),
     ):
         payload = json.loads(json.dumps(deep_value_payload()))
         mutation(payload)
         with pytest.raises((TypeError, ValueError)):
             deep_value_ruler(payload)
+
+
+@pytest.mark.parametrize(
+    ("shares", "deducted", "bucket"),
+    [("100", "200", "1"), ("100", "100", "3"), ("120", "100", "3")],
+)
+def test_normalized_pe_bucket_quarters_the_ceiling(
+    shares: str, deducted: str, bucket: str
+) -> None:
+    annual = tuple(
+        _deep_annual(year, shares=shares, deducted_net_income=deducted)
+        for year in range(2021, 2026)
+    )
+    verdict = _classify(_company(annual=annual))
+    assert verdict.verdict == "pass"
+    assert verdict.metrics["normalized_pe_bucket"] == bucket
+
+
+def test_deep_value_cash_debt_double_high_drops() -> None:
+    def verdict_for(debt: str):
+        annual = tuple(
+            _deep_annual(year, cash="30", interest_debt=debt, total_assets="100")
+            for year in range(2021, 2026)
+        )
+        return _classify(_company(annual=annual))
+
+    dropped = verdict_for("20")
+    assert (dropped.verdict, dropped.primary_reason) == (
+        "drop",
+        "cash_debt_double_high",
+    )
+    assert "deep_value.cash_debt_double_high" in dropped.evidence_rule_ids
+    assert verdict_for("19").verdict == "pass"
+    assert _classify().verdict == "pass"
+
+
+def test_deep_value_zero_interest_debt_skips_interest_coverage() -> None:
+    def verdict_for(debt: str):
+        annual = tuple(
+            _deep_annual(
+                year, interest_debt=debt, interest_coverage="0.5", total_assets="100"
+            )
+            for year in range(2021, 2026)
+        )
+        return _classify(_company(annual=annual))
+
+    assert verdict_for("10").primary_reason == "interest_coverage_below_min"
+    assert verdict_for("0").verdict == "pass"
 
 
 def test_nonfinancial_normalizes_deducted_profit_and_requires_positive_fcf() -> None:
@@ -299,6 +371,10 @@ def test_nonfinancial_normalizes_deducted_profit_and_requires_positive_fcf() -> 
         ({"interest_coverage": "1"}, "interest_coverage_below_min"),
         ({"shares": "120"}, "dilution_rate_above_max"),
         ({"revenue": "100"}, "revenue_decline_above_max"),
+        (
+            {"net_income": "60", "deducted_net_income": "60"},
+            "earnings_decline_above_max",
+        ),
         ({"net_income": "200", "deducted_net_income": "100"}, "one_time_profit_share_above_max"),
         ({"impairment_loss": "40"}, "impairment_share_above_max"),
         (
@@ -317,6 +393,30 @@ def test_nonfinancial_deep_value_gates(
     )
     verdict = _classify(_company(annual=annual))
     assert (verdict.verdict, verdict.primary_reason) == ("drop", reason)
+
+
+def test_purity_shares_average_the_configured_window() -> None:
+    payload = deep_value_payload()
+    for key in ("one_time_profit", "impairment", "non_core_income_proxy"):
+        payload["min_observations"][key] = 3
+        payload["sector_branches"]["common"]["lookback_windows"][key] = 3
+
+    def verdict_for(impairments: dict[int, str]):
+        annual = tuple(
+            _deep_annual(year, impairment_loss=impairments.get(year, "5"))
+            for year in range(2021, 2026)
+        )
+        return _classify(_company(annual=annual), payload)
+
+    smoothed = verdict_for({2025: "40"})
+    assert smoothed.verdict == "pass"
+    assert smoothed.metrics["impairment_share"].startswith("0.16666")
+    earlier = verdict_for({2023: "100"})
+    assert (earlier.verdict, earlier.primary_reason) == (
+        "drop",
+        "impairment_share_above_max",
+    )
+    assert verdict_for({2023: None}).primary_reason == "impairment_insufficient"
 
 
 def test_missing_required_nonfinancial_field_is_insufficient() -> None:
@@ -731,6 +831,12 @@ def test_builtin_dispatches_deep_value_gate_and_competition() -> None:
             "metric_near_threshold",
             ("revenue_decline_max", "0.2"),
         ),
+        (
+            {"net_income": "72", "deducted_net_income": "72"},
+            "deep_value.risk.metric_near_threshold.earnings_decline",
+            "metric_near_threshold",
+            ("earnings_decline_max", "0.3"),
+        ),
     ],
 )
 def test_passing_nonfinancial_competition_emits_threshold_risk(
@@ -801,6 +907,70 @@ def test_passing_bank_npl_worsening_emits_frozen_threshold_trend_risk() -> None:
         "worsening_trend",
         "0.1",
         "0.2",
+    )
+
+
+def test_boom_median_with_collapsed_latest_earnings_drops_while_moderate_dip_passes() -> None:
+    from discovery.evidence import build_evidence_card
+
+    collapsed_series = {
+        2021: "423",
+        2022: "449",
+        2023: "493",
+        2024: "163",
+        2025: "158",
+    }
+    collapsed_company = _company(
+        annual=tuple(
+            _deep_annual(
+                year,
+                net_income=collapsed_series[year],
+                deducted_net_income=collapsed_series[year],
+            )
+            for year in range(2021, 2026)
+        )
+    )
+    collapsed = _classify(collapsed_company)
+    assert (collapsed.verdict, collapsed.primary_reason) == (
+        "drop",
+        "earnings_decline_above_max",
+    )
+    assert collapsed.metrics["normalized_earnings"] == "423"
+    assert collapsed.metrics["earnings_decline"].startswith("0.62647")
+
+    moderate_series = {
+        2021: "423",
+        2022: "449",
+        2023: "493",
+        2024: "350",
+        2025: "340",
+    }
+    moderate_company = _company(
+        annual=tuple(
+            _deep_annual(
+                year,
+                net_income=moderate_series[year],
+                deducted_net_income=moderate_series[year],
+            )
+            for year in range(2021, 2026)
+        )
+    )
+    moderate = _classify(moderate_company)
+    assert moderate.verdict == "pass"
+    assert "earnings_decline_worsening" in moderate.risk_flags
+    card = build_evidence_card(
+        moderate_company.code,
+        moderate.metrics,
+        deep_value_payload(),
+        source_as_of={
+            key: moderate_company.as_of[key]
+            for key in ("security", "financial", "valuation")
+        },
+    )
+    risk = next(item for item in card.items if item.kind == "risk")
+    assert (risk.rule_id, risk.category) == (
+        "deep_value.risk.worsening_trend.earnings_decline_worsening",
+        "worsening_trend",
     )
 
 
@@ -969,9 +1139,9 @@ def test_calibrator_deep_value_emits_approval_ready_proxy_evidence(
     }
     assert artifact["proposal"]["track"] == "deep_value"
     assert artifact["proposal"]["formulas"]["non_core_income_proxy_share"] == (
-        "(copy_abs(latest(annual.other_income))+"
-        "copy_abs(latest(annual.asset_disposal_gain)))/"
-        "copy_abs(normalized_earnings)"
+        "sum(copy_abs(annual.other_income)+"
+        "copy_abs(annual.asset_disposal_gain))/"
+        "(copy_abs(normalized_earnings)*count(annual))"
     )
     assert artifact["provenance_coverage"]["other_income"]["trusted"] == 1
     assert "conservative non-core-income proxy" in artifact["note"]

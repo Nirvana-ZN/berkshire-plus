@@ -95,42 +95,16 @@ def test_startup_seeds_weights_including_cash(tmp_path: Path) -> None:
         assert health.json()["lock"] is None
         body = client.get("/api/positions").json()
         by_name = {row["name"]: row for row in body["positions"]}
-        denom = Decimal("24000") + Decimal("75000") + CASH_BALANCE
-        expected_cmb = Decimal("24000") / denom
-        expected_moutai = Decimal("75000") / denom
-        expected_cash = CASH_BALANCE / denom
-        assert by_name["招商银行"]["no_target"] is False
-        assert by_name["贵州茅台"]["no_target"] is False
-        assert abs(_as_decimal(by_name["招商银行"]["target"]) - expected_cmb) < Decimal(
-            "1e-6"
-        )
-        assert abs(_as_decimal(by_name["贵州茅台"]["target"]) - expected_moutai) < Decimal(
-            "1e-6"
-        )
-        assert body["cash"]["no_target"] is False
-        assert abs(_as_decimal(body["cash"]["target"]) - expected_cash) < Decimal("1e-6")
-        assert abs(
-            _as_decimal(by_name["招商银行"]["target"])
-            + _as_decimal(by_name["贵州茅台"]["target"])
-            + _as_decimal(body["cash"]["target"])
-            - 1
-        ) <= Decimal("1e-6")
-        assert abs(
-            _as_decimal(by_name["招商银行"]["deviation"])
-            - (_as_decimal(by_name["招商银行"]["weight"]) - _as_decimal(by_name["招商银行"]["target"]))
-        ) < Decimal("1e-6")
-        assert abs(
-            _as_decimal(body["cash"]["deviation"])
-            - (_as_decimal(body["cash"]["weight"]) - _as_decimal(body["cash"]["target"]))
-        ) < Decimal("1e-6")
+        assert by_name["招商银行"]["no_target"] is True
+        assert by_name["招商银行"]["target"] is None
+        assert by_name["贵州茅台"]["no_target"] is True
+        assert by_name["贵州茅台"]["target"] is None
+        assert body["cash"]["no_target"] is True
+        assert body["cash"]["target"] is None
+        assert body["cash"]["deviation"] is None
 
     names = {row["name"] for row in _rows(db_path, "SELECT name FROM position_targets")}
-    assert names == {"招商银行", "贵州茅台", "__CASH__"}
-    total = sum(
-        _as_decimal(row["target_weight"])
-        for row in _rows(db_path, "SELECT target_weight FROM position_targets")
-    )
-    assert abs(total - 1) <= Decimal("1e-6")
+    assert names == set()
     assert _scalar(db_path, "SELECT COUNT(*) FROM trades") == 5
     assert fake.calls
 
@@ -299,17 +273,10 @@ def test_unpriced_holding_has_no_seed_target(tmp_path: Path) -> None:
     with _client(tmp_path, fake=fake, yaml_dir=FIXTURES) as client:
         body = client.get("/api/positions").json()
         by_name = {row["name"]: row for row in body["positions"]}
-        assert by_name["招商银行"]["no_target"] is False
+        assert by_name["招商银行"]["no_target"] is True
+        assert by_name["招商银行"]["target"] is None
         assert by_name["贵州茅台"]["weight"] is None
-        denom = Decimal("24000") + CASH_BALANCE
-        assert abs(
-            _as_decimal(by_name["招商银行"]["target"])
-            + _as_decimal(body["cash"]["target"])
-            - 1
-        ) <= Decimal("1e-6")
-        assert abs(_as_decimal(by_name["招商银行"]["target"]) - Decimal("24000") / denom) < Decimal(
-            "1e-6"
-        )
+        assert body["cash"]["no_target"] is True
 
 
 def test_rebalance_alert_threshold_is_strictly_over_three_pp(tmp_path: Path) -> None:
@@ -399,12 +366,8 @@ def test_seed_uses_stale_weights_when_refresh_fails(tmp_path: Path) -> None:
         body = client.get("/api/positions").json()
         by_name = {row["name"]: row for row in body["positions"]}
         assert by_name["招商银行"]["stale"] is True
-        assert by_name["招商银行"]["no_target"] is False
-        assert by_name["招商银行"]["target"] is not None
-        denom = Decimal("24000") + Decimal("75000") + CASH_BALANCE
-        assert abs(_as_decimal(by_name["招商银行"]["target"]) - Decimal("24000") / denom) < Decimal(
-            "1e-6"
-        )
+        assert by_name["招商银行"]["no_target"] is True
+        assert by_name["招商银行"]["target"] is None
 
 
 def test_negative_cash_skips_seed(tmp_path: Path) -> None:
@@ -445,21 +408,26 @@ def test_seed_after_refresh_without_restart(tmp_path: Path) -> None:
         refreshed = client.post("/api/quotes/refresh", json={})
         assert refreshed.status_code == 200
         by_name = {row["name"]: row for row in refreshed.json()["positions"]}
-        assert by_name["招商银行"]["no_target"] is False
-        assert by_name["招商银行"]["target"] is not None
-        assert refreshed.json()["cash"]["no_target"] is False
+        assert by_name["招商银行"]["no_target"] is True
+        assert by_name["招商银行"]["target"] is None
+        assert refreshed.json()["cash"]["no_target"] is True
     names = {row["name"] for row in _rows(db_path, "SELECT name FROM position_targets")}
-    assert names == {"招商银行", "__CASH__"}
+    assert names == set()
 
 
 def test_sell_all_moves_orphan_target_to_cash(tmp_path: Path) -> None:
     db_path = tmp_path / "app.db"
     fake = _priced_fake()
     with _client(tmp_path, fake=fake, yaml_dir=FIXTURES) as client:
+        assert (
+            client.post(
+                "/api/targets",
+                json={"targets": {"招商银行": "0.15", "贵州茅台": "0.25"}},
+            ).status_code
+            == 200
+        )
         before = client.get("/api/positions").json()
         by_name = {row["name"]: row for row in before["positions"]}
-        cmb_target = _as_decimal(by_name["招商银行"]["target"])
-        cash_target = _as_decimal(before["cash"]["target"])
         sold = client.post(
             "/api/trades",
             json={
@@ -474,17 +442,33 @@ def test_sell_all_moves_orphan_target_to_cash(tmp_path: Path) -> None:
         after = sold.json()
         names = {row["name"] for row in after["positions"]}
         assert "招商银行" not in names
-        assert abs(_as_decimal(after["cash"]["target"]) - (cash_target + cmb_target)) < Decimal(
-            "1e-6"
-        )
-        remaining = [
-            _as_decimal(row["target"]) for row in after["positions"] if not row["no_target"]
-        ]
-        remaining.append(_as_decimal(after["cash"]["target"]))
-        assert abs(sum(remaining) - 1) <= Decimal("1e-6")
+        assert after["cash"]["no_target"] is True
+        assert after["cash"]["target"] is None
     leftover = {row["name"] for row in _rows(db_path, "SELECT name FROM position_targets")}
-    assert "招商银行" not in leftover
-    assert "__CASH__" in leftover
+    assert leftover == {"贵州茅台"}
+
+
+def test_save_targets_without_cash_allows_partial_sum(tmp_path: Path) -> None:
+    fake = _priced_fake()
+    with _client(tmp_path, fake=fake, yaml_dir=FIXTURES) as client:
+        saved = client.post(
+            "/api/targets",
+            json={"targets": {"招商银行": "0.15", "贵州茅台": "0.20"}},
+        )
+        assert saved.status_code == 200
+        body = saved.json()
+        assert body["cash"]["no_target"] is True
+        assert body["cash"]["target"] is None
+        by_name = {row["name"]: row for row in body["positions"]}
+        assert _as_decimal(by_name["招商银行"]["target"]) == Decimal("0.15")
+        assert _as_decimal(by_name["贵州茅台"]["target"]) == Decimal("0.20")
+
+        over_one = client.post(
+            "/api/targets",
+            json={"targets": {"招商银行": "0.60", "贵州茅台": "0.50"}},
+        )
+        assert over_one.status_code == 400
+        assert over_one.json()["code"] == "INVALID_TARGETS"
 
 
 def test_migrate_does_not_write_targets_and_ledger_has_no_http() -> None:

@@ -9,13 +9,16 @@ import {
   collectMetricKeys,
   CURRENT_FETCH_TIMEOUT_MS,
   discoveryChangeLabels,
+  formatEvidenceText,
   latestStagesNeedPolling,
   keeperRange,
   matchesStagePointer,
   parseMetricRecord,
   parseStageResponse,
+  preferredViewStage,
   renderMetricValue,
   reviewedStageActions,
+  stageIsReachable,
   RESULT_METRIC_KEYS_MAX,
   RESULT_OBSERVATIONS_MAX,
   stageActions,
@@ -41,8 +44,8 @@ test('stage cache keys include run, track, and stage', () => {
 
 test('only actionable stage states expose controls', () => {
   assert.deepEqual(stageActions('track_gate', 'waiting_confirmation', null), {
-    confirm: true,
-    override: true,
+    confirm: false,
+    override: false,
     retry: false,
   })
   assert.deepEqual(stageActions('adjudication', 'waiting_confirmation', null), {
@@ -89,6 +92,23 @@ test('review identity mismatch fails closed before mutation', () => {
     false,
   )
   assert.equal(sameStageReview(reviewed, { ...reviewed, fingerprint: 'payload-b' }), false)
+})
+
+test('preferred view stage stays on the layer that is still computing', () => {
+  assert.equal(preferredViewStage('track_gate', 'confirmed'), 'track_gate')
+  assert.equal(preferredViewStage('competition', 'confirmed'), 'competition')
+  assert.equal(preferredViewStage('competition', 'queued'), 'competition')
+  assert.equal(preferredViewStage('competition', 'running'), 'competition')
+  assert.equal(preferredViewStage('adjudication', 'confirmed'), 'competition')
+  assert.equal(preferredViewStage(null, null), 'track_gate')
+})
+
+test('stage reachability follows pointer depth', () => {
+  const pointer = { created: true, stage: 'competition' as const }
+  assert.equal(stageIsReachable('track_gate', pointer), true)
+  assert.equal(stageIsReachable('competition', pointer), true)
+  assert.equal(stageIsReachable('adjudication', pointer), false)
+  assert.equal(stageIsReachable('track_gate', { created: false, stage: 'competition' }), false)
 })
 
 test('polling and abandon follow backend mutability', () => {
@@ -407,4 +427,26 @@ test('current fetch timeout aborts on the bounded recovery deadline', () => {
   scheduled!()
   assert.equal(controller.signal.aborted, true)
   cancel()
+})
+
+test('evidence text is shown with Chinese labels and rounded units', () => {
+  assert.equal(
+    formatEvidenceText(
+      'deducted_profit_cagr=0.207066510664532046743299257836118915015455591736018；'
+      + 'peg=0.69581017006377247360144402219328296344001610726970634487856513468067626580579525373337904997513929349187361435780999123004764799；'
+      + 'return_on_capital=19.712 (ROE fallback)；revenue_cagr=0.14788376608509081705178923115691076141452674222493372',
+    ),
+    '扣非利润复合增速 20.71%；PEG 0.70；资本回报率 19.71%（以 ROE 代替）；营收复合增速 14.79%',
+  )
+  assert.equal(formatEvidenceText('cumulative_fcf=45277324085.54'), '累计自由现金流 452.77 亿元')
+  assert.equal(
+    formatEvidenceText('net_debt_to_normalized_fcf=-2.855793'),
+    '净负债/常态自由现金流 -2.86 倍（净现金）',
+  )
+  assert.equal(formatEvidenceText('normalized_pe接近阈值'), '常态市盈率接近阈值')
+  assert.equal(formatEvidenceText('revenue_decline_worsening'), '营收下滑持续恶化')
+  assert.equal(formatEvidenceText('earnings_decline_worsening'), '盈利较常态下滑持续恶化')
+  assert.equal(formatEvidenceText('margin_deterioration'), '利润率恶化')
+  assert.equal(formatEvidenceText('尚无结构化反方证据'), '尚无结构化反方证据')
+  assert.equal(formatEvidenceText('new_metric=1.23456'), 'new_metric 1.23')
 })

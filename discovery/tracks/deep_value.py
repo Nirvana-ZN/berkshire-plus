@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from decimal import Decimal
+from decimal import ROUND_FLOOR, Decimal
 from types import MappingProxyType
 from typing import TypeAlias
 
@@ -30,6 +30,7 @@ from discovery.tracks.quality_discount import (
     _AnnualPeriodDuplicate,
     _DomainInvalid,
     _SnapshotInvalid,
+    _balance_ratios,
     _complete_years,
     _date,
     _decimal,
@@ -41,6 +42,7 @@ from discovery.tracks.quality_discount import (
     _subtract,
     _timestamp,
     _valuation_history,
+    cash_debt_double_high,
 )
 
 JsonMetric: TypeAlias = None | str | tuple[str, ...]
@@ -51,6 +53,7 @@ _FIELDS = (
     "shares",
     "cash",
     "interest_debt",
+    "total_assets",
     "interest_coverage",
     "revenue",
     "net_income",
@@ -79,6 +82,7 @@ _DOMAINS = MappingProxyType(
         "shares": "positive",
         "cash": "nonnegative",
         "interest_debt": "nonnegative",
+        "total_assets": "signed",
         "interest_coverage": "signed",
         "revenue": "nonnegative",
         "net_income": "signed",
@@ -114,12 +118,16 @@ _NUMERIC_METRICS = (
     "listing_years",
     "normalized_earnings",
     "normalized_pe",
+    "normalized_pe_bucket",
     "cumulative_fcf",
     "normalized_fcf",
     "net_debt_to_normalized_fcf",
+    "cash_to_assets",
+    "interest_debt_to_assets",
     "interest_coverage",
     "dilution_rate",
     "revenue_decline",
+    "earnings_decline",
     "one_time_profit_share",
     "impairment_share",
     "non_core_income_proxy_share",
@@ -393,12 +401,33 @@ def _nonfinancial_metrics(
     earnings_rows = _available(
         windows.get("normalized_earnings"), "deducted_net_income"
     )
+    latest_earnings_row = _latest(
+        windows.get("normalized_earnings"), "deducted_net_income"
+    )
     earnings = tuple(row.values["deducted_net_income"] for row in earnings_rows)
     counts["normalized_earnings"] = len(earnings)
     metrics["normalized_earnings"] = normalized_earnings(
         earnings,
         ruler.min_observations["normalized_earnings"],
     )
+    if (
+        metrics["normalized_earnings"] is not None
+        and metrics["normalized_earnings"]
+        > Decimal(ruler.thresholds["normalized_earnings_min"])
+        and latest_earnings_row is not None
+    ):
+        earnings_decline = _divide(
+            _subtract(
+                metrics["normalized_earnings"],
+                latest_earnings_row.values["deducted_net_income"],
+            ),
+            metrics["normalized_earnings"],
+        )
+        metrics["earnings_decline"] = (
+            None
+            if earnings_decline is None
+            else max(Decimal(0), earnings_decline)
+        )
 
     fcf_rows = _available(windows.get("fcf"), "ocf", "capex")
     fcf = tuple(
@@ -445,6 +474,11 @@ def _nonfinancial_metrics(
         metrics["net_debt_to_normalized_fcf"] = _divide(
             net_debt, metrics["normalized_fcf"]
         )
+    metrics.update(
+        _balance_ratios(
+            _latest(windows.get("net_debt"), "interest_debt", "cash")
+        )
+    )
 
     interest_rows = _available(
         windows.get("interest_coverage"), "interest_coverage"
@@ -484,58 +518,45 @@ def _nonfinancial_metrics(
         if denominator is not None and not denominator.is_zero()
         else None
     )
-    one_time_rows = _available(
-        windows.get("one_time_profit"), "net_income", "deducted_net_income"
-    )
-    latest_one_time_row = _latest(
-        windows.get("one_time_profit"),
-        "net_income",
-        "deducted_net_income",
-    )
-    counts["one_time_profit"] = len(one_time_rows)
-    if latest_one_time_row is not None and denominator is not None:
-        excess = _subtract(
-            latest_one_time_row.values["net_income"],
-            latest_one_time_row.values["deducted_net_income"],
-        )
-        metrics["one_time_profit_share"] = _divide(
-            None if excess is None else max(Decimal(0), excess),
-            denominator,
+    def purity_share(
+        name: str,
+        fields: tuple[str, ...],
+        amount: Callable[[Mapping[str, Decimal | None]], Decimal | None],
+    ) -> Decimal | None:
+        rows = _available(windows.get(name), *fields)
+        counts[name] = len(rows)
+        if _latest(windows.get(name), *fields) is None or denominator is None:
+            return None
+        amounts = tuple(amount(row.values) for row in rows)
+        if any(value is None for value in amounts):
+            return None
+        return _divide(
+            _sum(amounts),  # type: ignore[arg-type]
+            _multiply(denominator, Decimal(len(rows))),
         )
 
-    impairment_rows = _available(
-        windows.get("impairment"), "impairment_loss"
-    )
-    latest_impairment_row = _latest(
-        windows.get("impairment"), "impairment_loss"
-    )
-    counts["impairment"] = len(impairment_rows)
-    if latest_impairment_row is not None and denominator is not None:
-        metrics["impairment_share"] = _divide(
-            latest_impairment_row.values["impairment_loss"].copy_abs(),  # type: ignore[union-attr]
-            denominator,
-        )
+    def one_time(values: Mapping[str, Decimal | None]) -> Decimal | None:
+        excess = _subtract(values["net_income"], values["deducted_net_income"])
+        return None if excess is None else max(Decimal(0), excess)
 
-    non_core_rows = _available(
-        windows.get("non_core_income_proxy"),
-        "other_income",
-        "asset_disposal_gain",
+    metrics["one_time_profit_share"] = purity_share(
+        "one_time_profit", ("net_income", "deducted_net_income"), one_time
     )
-    latest_non_core_row = _latest(
-        windows.get("non_core_income_proxy"),
-        "other_income",
-        "asset_disposal_gain",
+    metrics["impairment_share"] = purity_share(
+        "impairment",
+        ("impairment_loss",),
+        lambda values: values["impairment_loss"].copy_abs(),  # type: ignore[union-attr]
     )
-    counts["non_core_income_proxy"] = len(non_core_rows)
-    if latest_non_core_row is not None and denominator is not None:
-        latest = latest_non_core_row.values
-        total = _sum(
+    metrics["non_core_income_proxy_share"] = purity_share(
+        "non_core_income_proxy",
+        ("other_income", "asset_disposal_gain"),
+        lambda values: _sum(
             (
-                latest["other_income"].copy_abs(),  # type: ignore[union-attr]
-                latest["asset_disposal_gain"].copy_abs(),  # type: ignore[union-attr]
+                values["other_income"].copy_abs(),  # type: ignore[union-attr]
+                values["asset_disposal_gain"].copy_abs(),  # type: ignore[union-attr]
             )
-        )
-        metrics["non_core_income_proxy_share"] = _divide(total, denominator)
+        ),
+    )
 
     latest_shares = (
         latest_share_row.values["shares"]
@@ -551,6 +572,14 @@ def _nonfinancial_metrics(
     ):
         metrics["normalized_pe"] = _divide(
             market_value, metrics["normalized_earnings"]
+        )
+    bucket = _divide(
+        _multiply(metrics["normalized_pe"], Decimal(4)),
+        Decimal(ruler.thresholds["normalized_pe_max"]),
+    )
+    if bucket is not None:
+        metrics["normalized_pe_bucket"] = min(
+            Decimal(bucket.to_integral_value(ROUND_FLOOR)), Decimal(3)
         )
     return metrics, counts
 
@@ -696,6 +725,12 @@ def _gate_failures(
             "revenue_decline_max",
             "above",
         ),
+        "earnings_decline": (
+            "earnings_decline",
+            "normalized_earnings",
+            "earnings_decline_max",
+            "above",
+        ),
         "one_time_profit": (
             "one_time_profit_share",
             "one_time_profit",
@@ -727,6 +762,8 @@ def _gate_failures(
             "above",
         ),
     }
+    if gate == "interest_coverage" and metrics["interest_debt_to_assets"] == 0:
+        return []
     if gate in specs:
         metric, minimum, threshold, direction = specs[gate]
         value = metrics[metric]
@@ -736,6 +773,12 @@ def _gate_failures(
             <= Decimal(thresholds["normalized_fcf_min"])
         ):
             return [("drop", "normalized_fcf_not_positive")]
+        if gate == "earnings_decline" and (
+            metrics["normalized_earnings"] is not None
+            and metrics["normalized_earnings"]
+            <= Decimal(thresholds["normalized_earnings_min"])
+        ):
+            return [("drop", "normalized_earnings_not_positive")]
         if counts.get(minimum, 0) < ruler.min_observations[minimum] or value is None:
             reason = (
                 "normalized_pe_insufficient"
@@ -759,6 +802,13 @@ def _gate_failures(
             f"{metric}_{'above_max' if direction == 'above' else 'below_min'}",
         )
         return [("drop", reason)] if failed else []
+    if gate == "cash_debt":
+        # Missing balance ratios cannot show a double-high balance sheet.
+        return (
+            [("drop", "cash_debt_double_high")]
+            if cash_debt_double_high(metrics, thresholds)
+            else []
+        )
     if gate == "bank_valuation":
         failures = []
         for metric, suffix in (
@@ -970,6 +1020,7 @@ def classify(company: FrozenCompanyInput, ruler: TrackRuler) -> TrackVerdict:
         for metric in (
             "dilution_rate",
             "revenue_decline",
+            "earnings_decline",
             "npl_change",
         )
         if calculated[metric] is not None

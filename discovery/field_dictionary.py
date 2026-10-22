@@ -106,7 +106,10 @@ FIELD_DICTIONARY: Mapping[str, FieldSpec] = MappingProxyType(
             "SHORT_LOAN",
             derivation_formula=None,
             financial_sector_substitute=None,
-            missing_policy="None when the detailed balance report is unavailable.",
+            missing_policy=(
+                "None when the detailed balance report is unavailable; zero when "
+                "the period row is present and the line is null."
+            ),
             **_BALANCE,
         ),
         "long_loan": FieldSpec(
@@ -114,7 +117,10 @@ FIELD_DICTIONARY: Mapping[str, FieldSpec] = MappingProxyType(
             "LONG_LOAN",
             derivation_formula=None,
             financial_sector_substitute=None,
-            missing_policy="None when the detailed balance report is unavailable.",
+            missing_policy=(
+                "None when the detailed balance report is unavailable; zero when "
+                "the period row is present and the line is null."
+            ),
             **_BALANCE,
         ),
         "bond_payable": FieldSpec(
@@ -122,7 +128,10 @@ FIELD_DICTIONARY: Mapping[str, FieldSpec] = MappingProxyType(
             "BOND_PAYABLE",
             derivation_formula=None,
             financial_sector_substitute=None,
-            missing_policy="None when the detailed balance report is unavailable.",
+            missing_policy=(
+                "None when the detailed balance report is unavailable; zero when "
+                "the period row is present and the line is null."
+            ),
             **_BALANCE,
         ),
         "noncurrent_liab_1year": FieldSpec(
@@ -131,7 +140,9 @@ FIELD_DICTIONARY: Mapping[str, FieldSpec] = MappingProxyType(
             derivation_formula=None,
             financial_sector_substitute=None,
             missing_policy=(
-                "None when absent; retained separately because it can include "
+                "None when the detailed balance report is unavailable; zero when "
+                "the period row is present and the line is null. Retained "
+                "separately because it can include "
                 "non-interest-bearing items."
             ),
             **_BALANCE,
@@ -378,7 +389,10 @@ FIELD_DICTIONARY: Mapping[str, FieldSpec] = MappingProxyType(
             "GOODWILL",
             derivation_formula=None,
             financial_sector_substitute=None,
-            missing_policy="None when the detailed balance report is unavailable.",
+            missing_policy=(
+                "None when the detailed balance report is unavailable; zero when "
+                "the period row is present and the line is null."
+            ),
             **_BALANCE,
         ),
         "acquisition_cash_paid": FieldSpec(
@@ -387,7 +401,9 @@ FIELD_DICTIONARY: Mapping[str, FieldSpec] = MappingProxyType(
             derivation_formula=None,
             financial_sector_substitute=None,
             missing_policy=(
-                "None when net cash paid to obtain subsidiaries/other units is absent."
+                "None when the detailed cash-flow report is unavailable; zero when "
+                "the period row is present and the line is null. The line is a "
+                "net amount and can be negative."
             ),
             **_CNY,
         ),

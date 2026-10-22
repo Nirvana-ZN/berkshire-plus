@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from discovery.competition import CompetitionCandidate, rank_competition
+from discovery.competition import (
+    CompetitionCandidate,
+    rank_borda_competition,
+    rank_competition,
+)
 
 
 ORDER = (
@@ -102,3 +106,20 @@ def test_industry_and_total_caps_keep_exclusion_rank_and_reason() -> None:
         ("total_cap_exceeded", 17),
         ("total_cap_exceeded", 18),
     ]
+
+
+def test_borda_competition_breaks_single_metric_lexicographic_bottleneck() -> None:
+    # 000001 has slightly better valuation (9 vs 10), but worst stability and cash (ranks 1+3+3=7).
+    # 000002 is #2 on valuation, #1 on stability, #2 on cash (ranks 2+1+2=5).
+    # 000003 is #3 on valuation, #2 on stability, #1 on cash (ranks 3+2+1=6).
+    cands = (
+        candidate("000001.SZ", valuation="9", stability="0.9", cash="0.8"),
+        candidate("000002.SZ", valuation="10", stability="0.05", cash="1.4"),
+        candidate("000003.SZ", valuation="25", stability="0.2", cash="2.0"),
+    )
+    lex = rank_competition(cands, ORDER, industry_cap=10)
+    borda = rank_borda_competition(cands, ORDER, industry_cap=10)
+
+    assert [r.code for r in lex] == ["000001.SZ", "000002.SZ", "000003.SZ"]
+    assert [r.code for r in borda] == ["000002.SZ", "000003.SZ", "000001.SZ"]
+

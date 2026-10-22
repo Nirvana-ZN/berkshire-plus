@@ -19,8 +19,9 @@ from types import MappingProxyType
 from typing import TypeAlias
 
 from discovery.metrics import (
+    cagr,
     cash_conversion,
-    coefficient_of_variation,
+    downside_volatility,
     mean,
     median,
     normalized_earnings,
@@ -138,6 +139,9 @@ _FINANCIAL_FIELD_DOMAINS = MappingProxyType(
             "noncurrent_liab_1year_negative",
         ),
         "interest_debt": ("nonnegative", "interest_debt_negative"),
+        # Only feeds a non-gating risk flag, so bad values must not add a
+        # new insufficient verdict.
+        "total_assets": ("signed_economic", None),
         "net_assets": ("signed_economic", None),
         "interest_coverage": ("signed_economic", None),
         "gross_margin": ("signed_economic", None),
@@ -174,13 +178,16 @@ QUALITY_DOMAIN_INVALID_REASONS = frozenset(
 _NUMERIC_METRICS = (
     "listing_years",
     "roe_mean",
-    "roe_cv",
+    "roe_downside_volatility",
+    "roe_recent_ratio",
     "positive_net_income_observations",
     "latest_net_income",
     "latest_net_assets",
     "cash_conversion",
     "dilution_rate",
     "debt_to_equity",
+    "cash_to_assets",
+    "interest_debt_to_assets",
     "interest_coverage",
     "margin_change",
     "pe_percentile",
@@ -189,6 +196,9 @@ _NUMERIC_METRICS = (
     "pb_median_ratio",
     "normalized_earnings",
     "normalized_pe",
+    "earnings_yield",
+    "deducted_profit_cagr",
+    "peg",
     "bank_capital_adequacy",
     "bank_core_tier1_capital_adequacy",
     "bank_npl",
@@ -199,6 +209,7 @@ _NUMERIC_METRICS = (
 )
 _WINDOW_NAMES = (
     "roe",
+    "roe_recent",
     "profitability",
     "cash_conversion",
     "dilution",
@@ -207,6 +218,7 @@ _WINDOW_NAMES = (
     "interest_coverage",
     "margin",
     "normalized_earnings",
+    "growth",
     "bank_capital",
     "bank_npl",
 )
@@ -741,6 +753,45 @@ def _latest_pair(
     return None, None
 
 
+def _balance_ratios(
+    row: _FinancialPeriod | None,
+) -> dict[str, Decimal | None]:
+    values = {} if row is None else row.values
+    assets = values.get("total_assets")
+    if assets is None or assets <= 0:
+        return {"cash_to_assets": None, "interest_debt_to_assets": None}
+    return {
+        "cash_to_assets": _divide(values.get("cash"), assets),
+        "interest_debt_to_assets": _divide(values.get("interest_debt"), assets),
+    }
+
+
+def cash_debt_double_high(
+    metrics: Mapping[str, Decimal | None],
+    thresholds: Mapping[str, object],
+) -> bool:
+    cash = metrics["cash_to_assets"]
+    debt = metrics["interest_debt_to_assets"]
+    return (
+        cash is not None
+        and debt is not None
+        and cash >= Decimal(str(thresholds["cash_to_assets_min"]))
+        and debt >= Decimal(str(thresholds["interest_debt_to_assets_min"]))
+    )
+
+
+def _clears_bond_spread(
+    metrics: Mapping[str, Decimal | None],
+    thresholds: Mapping[str, object],
+) -> bool:
+    spread = _subtract(
+        metrics["earnings_yield"], Decimal(str(thresholds["treasury_yield"]))
+    )
+    return spread is not None and spread >= Decimal(
+        str(thresholds["earnings_yield_spread_min"])
+    )
+
+
 def _count_pairs(
     history: Sequence[_FinancialPeriod], left: str, right: str
 ) -> int:
@@ -764,6 +815,7 @@ def _available_window_rows(
 ) -> tuple[_FinancialPeriod, ...]:
     required_fields = {
         "roe": ("roe",),
+        "roe_recent": ("roe",),
         "profitability": ("net_income",),
         "cash_conversion": ("ocf", "net_income"),
         "dilution": ("shares",),
@@ -772,6 +824,7 @@ def _available_window_rows(
         "interest_coverage": ("interest_coverage",),
         "margin": ("gross_margin",),
         "normalized_earnings": ("deducted_net_income",),
+        "growth": ("deducted_net_income",),
         "bank_capital": (
             "capital_adequacy",
             "core_tier1_capital_adequacy",
@@ -797,6 +850,7 @@ def _financial_windows(
     history: Sequence[_FinancialPeriod],
     ruler: TrackRuler,
     snapshot_date: date,
+    listing_year: int,
 ) -> tuple[
     Mapping[str, _FinancialWindow],
     dict[str, JsonMetric],
@@ -820,6 +874,9 @@ def _financial_windows(
     for name in _WINDOW_NAMES:
         years = int(configured[name])
         start_year = latest_year - years + 1
+        if name in {"roe", "roe_recent"}:
+            # Pre-IPO equity is tiny, so those years inflate ROE.
+            start_year = max(start_year, listing_year)
         rows = tuple(
             row
             for row in history
@@ -863,8 +920,22 @@ def _metric_values(
     roe_history = () if roe_rows is None else roe_rows.rows
     roe = tuple(row.values["roe"] for row in roe_history)
     values["roe_mean"] = mean(roe)
-    values["roe_cv"] = coefficient_of_variation(roe)
+    values["roe_downside_volatility"] = downside_volatility(roe)
     counts["roe"] = sum(value is not None for value in roe)
+    recent_rows = windows.get("roe_recent")
+    recent = tuple(
+        row.values["roe"]
+        for row in (() if recent_rows is None else recent_rows.rows)
+        if row.values["roe"] is not None
+    )
+    counts["roe_recent"] = len(recent)
+    if (
+        branch != "bank"
+        and len(recent) >= ruler.min_observations["roe_recent"]
+        and values["roe_mean"] is not None
+        and values["roe_mean"] > 0
+    ):
+        values["roe_recent_ratio"] = _divide(mean(recent), values["roe_mean"])
 
     profitability_rows = windows.get("profitability")
     profitability_history = (
@@ -944,6 +1015,9 @@ def _metric_values(
             and equity > Decimal(ruler.thresholds["net_assets_positive_min"])
         ):
             values["debt_to_equity"] = _divide(debt, equity)
+        values.update(
+            _balance_ratios(leverage_history[-1] if leverage_history else None)
+        )
         interest_rows = windows.get("interest_coverage")
         interest_history = (
             () if interest_rows is None else interest_rows.rows
@@ -988,6 +1062,34 @@ def _metric_values(
     if current_pb is not None and current_pb > 0:
         values["pb_percentile"] = percentile_rank(current_pb, pb)
         values["pb_median_ratio"] = _divide(current_pb, median(pb))
+
+    if branch == "nonfinancial":
+        growth_rows = windows.get("growth")
+        growth_history = tuple(
+            row
+            for row in (() if growth_rows is None else growth_rows.rows)
+            if row.values["deducted_net_income"] is not None
+        )
+        counts["growth"] = len(growth_history)
+        if len(growth_history) >= ruler.min_observations["growth"]:
+            values["deducted_profit_cagr"] = cagr(
+                tuple(
+                    row.values["deducted_net_income"]
+                    for row in growth_history
+                ),
+                growth_history[-1].fiscal_year
+                - growth_history[0].fiscal_year,
+            )
+        growth = values["deducted_profit_cagr"]
+        if current_pe is not None and current_pe > 0:
+            values["earnings_yield"] = _divide(Decimal(100), current_pe)
+            if growth is not None and growth > 0:
+                capped = min(
+                    growth, Decimal(ruler.thresholds["peg_growth_cap"])
+                )
+                values["peg"] = _divide(
+                    current_pe, _multiply(capped, Decimal(100))
+                )
 
     if branch == "cyclical":
         normalized_rows = windows.get("normalized_earnings")
@@ -1156,14 +1258,31 @@ def _gate_failures(
             "bank_roe_min" if gate == "bank_roe" else "roe_mean_min"
         ]
         return [("drop", "roe_mean_below_min")] if value < Decimal(floor) else []
+    if gate == "roe_trend":
+        value = metrics["roe_recent_ratio"]
+        if (
+            counts["roe_recent"] < ruler.min_observations["roe_recent"]
+            or value is None
+        ):
+            missing = _missing(
+                ruler, "roe_recent_ratio", "roe_recent_insufficient"
+            )
+            return [] if missing is None else [missing]
+        return (
+            [("drop", "roe_recent_ratio_below_min")]
+            if value < Decimal(threshold["roe_recent_ratio_min"])
+            else []
+        )
     if gate == "roe_stability":
-        value = metrics["roe_cv"]
+        value = metrics["roe_downside_volatility"]
         if counts["roe"] < ruler.min_observations["roe"] or value is None:
-            missing = _missing(ruler, "roe_cv", "roe_stability_insufficient")
+            missing = _missing(
+                ruler, "roe_downside_volatility", "roe_stability_insufficient"
+            )
             return [] if missing is None else [missing]
         return (
             [("drop", "roe_stability_above_max")]
-            if value > Decimal(threshold["roe_cv_max"])
+            if value > Decimal(threshold["roe_downside_volatility_max"])
             else []
         )
     if gate == "profitability":
@@ -1245,6 +1364,8 @@ def _gate_failures(
             "below",
         ),
     }
+    if gate == "interest_coverage" and metrics["interest_debt_to_assets"] == 0:
+        return []
     if gate in simple:
         metric, minimum, threshold_name, direction = simple[gate]
         value = metrics[metric]
@@ -1275,6 +1396,25 @@ def _gate_failures(
         )
     if gate in {"valuation", "bank_valuation"}:
         return _valuation_failures(ruler, branch, metrics, counts)
+    if gate == "absolute_valuation":
+        if metrics["earnings_yield"] is None:
+            missing = _missing(
+                ruler, "earnings_yield", "earnings_yield_insufficient"
+            )
+            return [] if missing is None else [missing]
+        peg = metrics["peg"]
+        if _clears_bond_spread(metrics, threshold) or (
+            peg is not None and peg <= Decimal(threshold["peg_release_max"])
+        ):
+            return []
+        return [("drop", "earnings_yield_below_min")]
+    if gate == "cash_debt":
+        # Missing balance ratios cannot show a double-high balance sheet.
+        return (
+            [("drop", "cash_debt_double_high")]
+            if cash_debt_double_high(metrics, threshold)
+            else []
+        )
     if gate == "normalized_earnings_positive":
         value = metrics["normalized_earnings"]
         if value is None:
@@ -1448,6 +1588,7 @@ def classify(company: FrozenCompanyInput, ruler: TrackRuler) -> TrackVerdict:
             financial,
             ruler,
             company.snapshot_at.date(),
+            listing_date.year,
         )
         metrics.update(window_metrics)
         if stale:
@@ -1564,6 +1705,12 @@ def classify(company: FrozenCompanyInput, ruler: TrackRuler) -> TrackVerdict:
             decimal_metrics,
             counts,
         )
+        if (
+            gate == "absolute_valuation"
+            and not gate_failures
+            and not _clears_bond_spread(decimal_metrics, ruler.thresholds)
+        ):
+            evidence.append("quality.peg_release")
         for status, reason in gate_failures:
             failures.append((status, reason))
             rule_id = f"quality.{reason}"

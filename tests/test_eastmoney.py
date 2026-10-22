@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date
 from decimal import Decimal
 from urllib.parse import parse_qs, urlsplit
 
@@ -1164,3 +1165,126 @@ def test_discovery_sources_match_disclosed_annual_reports(
     if code == "600519.SH":
         assert row.goodwill is None
         assert row.acquisition_cash_paid is None
+
+
+def test_detail_null_line_in_present_row_is_zero_but_absent_row_stays_missing() -> None:
+    base = {
+        "RPT_DMSK_FN_INCOME": {
+            "REPORT_DATE": "2025-12-31",
+            "DATE_TYPE_CODE": "001",
+            "TOTAL_OPERATE_INCOME": "1000",
+        },
+    }
+    detail = {
+        "RPT_F10_FINANCE_GBALANCE": {
+            "REPORT_DATE": "2025-12-31",
+            "REPORT_TYPE": "年报",
+            "TOTAL_ASSETS": "5000",
+            "SHORT_LOAN": None,
+            "LONG_LOAN": None,
+            "BOND_PAYABLE": None,
+            "NONCURRENT_LIAB_1YEAR": None,
+            "GOODWILL": None,
+        },
+        "RPT_F10_FINANCE_GCASHFLOW": {
+            "REPORT_DATE": "2025-12-31",
+            "REPORT_TYPE": "年报",
+            "NETCASH_OPERATE": "100",
+            "OBTAIN_SUBSIDIARY_OTHER": None,
+        },
+    }
+    row = _crosscheck_row("600519.SH", {**base, **detail})
+    assert row.goodwill == Decimal(0)
+    assert row.acquisition_cash_paid == Decimal(0)
+    assert row.interest_debt == Decimal(0)
+
+    absent = _crosscheck_row("600519.SH", base)
+    assert absent.goodwill is None
+    assert absent.acquisition_cash_paid is None
+    assert absent.interest_debt is None
+
+
+def test_blocked_clist_falls_back_to_datacenter_universe() -> None:
+    def page(*rows: dict) -> dict:
+        return {"success": True, "code": 0, "result": {
+            "pages": 1, "count": len(rows), "data": list(rows)}}
+
+    class Stub(EastMoneyClient):
+        def _get_json(self, url: str, **_kwargs) -> dict:
+            if "clist" in url:
+                raise TransientMarketError("clist transport failed")
+            report = parse_qs(urlsplit(url).query)["reportName"][0]
+            return {
+                "RPT_VALUEANALYSIS_DET": page(
+                    {"SECUCODE": "600519.SH", "SECURITY_NAME_ABBR": "贵州茅台",
+                     "BOARD_NAME": "白酒Ⅱ", "CLOSE_PRICE": 1500, "PE_TTM": 20,
+                     "PB_MRQ": 7, "TOTAL_MARKET_CAP": 1.9e12},
+                    {"SECUCODE": "000016.SZ", "SECURITY_NAME_ABBR": "*ST康佳A",
+                     "BOARD_NAME": "消费电子", "CLOSE_PRICE": 3},
+                    {"SECUCODE": "301686.SZ", "SECURITY_NAME_ABBR": "中塑股份",
+                     "BOARD_NAME": "塑料", "CLOSE_PRICE": 30},
+                    {"SECUCODE": "920229.BJ", "SECURITY_NAME_ABBR": "世纪数码"},
+                ),
+                "RPT_F10_BASIC_ORGINFO": page(
+                    {"SECUCODE": "600519.SH", "LISTING_DATE": "2001-08-27 00:00:00"},
+                    {"SECUCODE": "000016.SZ", "LISTING_DATE": "1992-03-27 00:00:00"},
+                ),
+                "RPT_CUSTOM_SUSPEND_DATA_INTERFACE": page(
+                    {"SECUCODE": "000016.SZ", "SUSPEND_START_DATE": "2026-09-24 00:00:00",
+                     "SUSPEND_END_TIME": None, "SUSPEND_EXPIRE": "连续停牌"},
+                    {"SECUCODE": "301686.SZ", "SUSPEND_START_DATE": "2026-09-28 00:00:00",
+                     "SUSPEND_END_TIME": "2026-09-28 13:33:40",
+                     "SUSPEND_EXPIRE": "盘中停牌"},
+                ),
+            }[report]
+
+        def fetch_trading_dates(self, end: str, limit: int = 6, **_kwargs) -> list[str]:
+            return ["2026-09-21", "2026-09-22", "2026-09-23", "2026-09-24",
+                    "2026-09-28", "2026-09-29"][-limit:]
+
+    client = Stub()
+    rows = {row.code: row for row in client.fetch_universe(as_of=date(2026, 9, 29))}
+    assert set(rows) == {"600519.SH", "000016.SZ", "301686.SZ"}
+    moutai = rows["600519.SH"]
+    assert (moutai.industry, moutai.listing_date, moutai.pe, moutai.security_source) == (
+        "白酒Ⅱ", "2001-08-27", Decimal("20"), "eastmoney:datacenter")
+    assert (moutai.trading_status, moutai.last_trade_date) == ("trading", "2026-09-29")
+    assert (rows["000016.SZ"].trading_status, rows["000016.SZ"].last_trade_date) == (
+        "suspended", "2026-09-23")
+    assert rows["301686.SZ"].trading_status == "trading"
+    assert rows["301686.SZ"].listing_date is None
+    assert client._last_universe_trading_dates[-1] == "2026-09-29"
+
+
+def test_index_constituents_and_catalog_resolve_chinext_alias() -> None:
+    def page(*rows: dict) -> dict:
+        return {"success": True, "result": {
+            "pages": 1, "count": len(rows), "data": list(rows)}}
+
+    class Stub(EastMoneyClient):
+        def _get_json(self, url: str, **_kwargs) -> dict:
+            if "clist" in url:
+                raise TransientMarketError("clist transport failed")
+            report = parse_qs(urlsplit(url).query)["reportName"][0]
+            return {
+                "RPT_F10_CORETHEME_BOARDTYPE": page(
+                    {"SECUCODE": "300750.SZ", "SECURITY_NAME_ABBR": "宁德时代"},
+                ),
+                "RPT_VALUEANALYSIS_DET": page(
+                    {"SECUCODE": "300750.SZ", "SECURITY_NAME_ABBR": "宁德时代",
+                     "BOARD_NAME": "电池", "TOTAL_MARKET_CAP": 1.1e12,
+                     "PE_TTM": 18, "PEG_CAR": 0.9},
+                ),
+            }[report]
+
+        def _valuation_trade_dates(self, *_args, **_kwargs) -> list[str]:
+            return ["2026-10-19"]
+
+    stub = Stub()
+    boards = stub.list_boards("指数", "创业")
+    assert {b["name"] for b in boards} >= {"创业板指", "创业板指数"}
+    cons = stub.fetch_constituents("指数", "创业板指数")
+    assert len(cons) == 1
+    assert cons[0].code == "300750.SZ"
+    assert cons[0].industry == "电池"
+

@@ -11,6 +11,7 @@ from pathlib import Path
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
+from app.discovery_models import DiscoveryResult, DiscoveryRun
 from app.envfile import TAVILY_API_KEY
 from app.models import (
     Financial,
@@ -25,9 +26,19 @@ from app.models import (
 from jobs.lock import JOB_TYPE_RESEARCH, LOCK_ROW_ID, release
 from ledger.positions import LOCAL_USER_ID, load_positions
 from ledger.quotes import BookSnapshot, project_book
+from ledger.rules import sync_thesis_ceiling_rule
 from market.sentiment import is_extreme_greed
 from research.evaluate import EvalInput, has_min_financials, render_markdown, run_checklist
-from research.thesis import eligible, upsert
+from research.thesis import (
+    band_bounds,
+    dynamic_sizing,
+    eligible,
+    financial_drift,
+    load_by_names,
+    parse_structured,
+    price_usable,
+    upsert,
+)
 from screen.funnel import ScreenRow
 from screen.replay import apply_credibility_gate, gate_is_open
 
@@ -90,6 +101,7 @@ def book_to_dict(book: BookSnapshot) -> dict[str, object]:
                 "shares": _json_optional(row.shares),
                 "weight": _json_optional(row.weight),
                 "target": _json_optional(row.target),
+                "no_target": row.no_target,
                 "price": _json_optional(row.price),
                 "code": row.code,
             }
@@ -99,13 +111,37 @@ def book_to_dict(book: BookSnapshot) -> dict[str, object]:
         "cash": {
             "weight": _json_optional(book.cash.weight),
             "target": _json_optional(book.cash.target),
+            "no_target": book.cash.no_target,
         },
     }
 
 
 def load_book_dict(session: Session) -> dict[str, object]:
     rows, cash = load_positions(session)
-    return book_to_dict(project_book(session, rows, cash))
+    book = project_book(session, rows, cash)
+    payload = book_to_dict(book)
+    positions = payload.get("positions")
+    if isinstance(positions, list) and positions:
+        theses = load_by_names(
+            session,
+            LOCAL_USER_ID,
+            [str(item.get("name") or "") for item in positions if item.get("name")],
+        )
+        for item in positions:
+            thesis = theses.get(str(item.get("name") or ""))
+            if thesis is None:
+                continue
+            code = str(item.get("code") or "").strip()
+            fins = load_financials(session, code) if code else ()
+            usable = price_usable(item.get("price"), stale=bool(item.get("stale")))
+            item["dynamic_sizing"] = dynamic_sizing(
+                parse_structured(thesis),
+                current_price=item.get("price"),
+                price_usable=usable,
+                actual_weight=item.get("weight"),
+                financials=fins,
+            )
+    return payload
 
 
 def load_financials(session: Session, code: str) -> list[dict[str, object]]:
@@ -115,7 +151,10 @@ def load_financials(session: Session, code: str) -> list[dict[str, object]]:
             "period": row.period,
             "period_type": row.period_type,
             "roe": _json_optional(row.roe),
+            "roic": _json_optional(row.roic),
+            "revenue": _json_optional(row.revenue),
             "net_income": _json_optional(row.net_income),
+            "deducted_net_income": _json_optional(row.deducted_net_income),
             "ocf": _json_optional(row.ocf),
             "capex": _json_optional(row.capex),
             "ebit": _json_optional(row.ebit),
@@ -126,6 +165,10 @@ def load_financials(session: Session, code: str) -> list[dict[str, object]]:
             "bps": _json_optional(row.bps),
             "npl_pct": _json_optional(row.npl),
             "eps": _json_optional(row.eps),
+            "goodwill": _json_optional(row.goodwill),
+            "net_assets": _json_optional(row.net_assets),
+            "cash": _json_optional(row.cash),
+            "interest_debt": _json_optional(row.interest_debt),
         }
         for row in rows
     ]
@@ -139,13 +182,22 @@ def _has_interim(rows: list[dict[str, object]]) -> bool:
     return any(str(row.get("period_type") or "annual") != "annual" for row in rows)
 
 
+def _has_deducted(rows: list[dict[str, object]]) -> bool:
+    return any(row.get("deducted_net_income") is not None for row in rows)
+
+
 def ensure_financials(session: Session, code: str, market) -> None:
     if not code:
         return
     cached = load_financials(session, code)
     session.rollback()
-    # annual-only cache is from before interim rows; refetch so H1 lands
-    if has_min_financials(cached) and _has_bps(cached) and _has_interim(cached):
+    # annual-only or pre-deducted cache is refetched so H1 and deducted_net_income land
+    if (
+        has_min_financials(cached)
+        and _has_bps(cached)
+        and _has_interim(cached)
+        and _has_deducted(cached)
+    ):
         return
     if market is None:
         return
@@ -372,6 +424,152 @@ def _industry_of(session: Session, code: str, industry: str = "") -> str:
     return (inst.industry or "") if inst is not None else ""
 
 
+def _load_industry_precedents(
+    session: Session,
+    *,
+    user_id: int,
+    code: str,
+    industry: str,
+    limit: int = 2,
+) -> tuple[dict[str, object], ...]:
+    if not industry or not code or limit <= 0:
+        return ()
+    peer_jobs = session.scalars(
+        select(ResearchJob)
+        .join(Instrument, Instrument.code == ResearchJob.code)
+        .where(
+            ResearchJob.user_id == user_id,
+            ResearchJob.status == "done",
+            ResearchJob.code != code,
+            Instrument.industry == industry,
+        )
+        .order_by(ResearchJob.id.desc())
+        .limit(limit * 4)
+    ).all()
+    if not peer_jobs:
+        return ()
+    seen_codes: set[str] = set()
+    chosen_jobs: list[ResearchJob] = []
+    for peer in peer_jobs:
+        if peer.code in seen_codes:
+            continue
+        seen_codes.add(peer.code)
+        chosen_jobs.append(peer)
+        if len(chosen_jobs) >= limit:
+            break
+    artifacts: dict[int, ResearchArtifact] = {}
+    for art in session.scalars(
+        select(ResearchArtifact).where(
+            ResearchArtifact.research_job_id.in_([j.id for j in chosen_jobs])
+        )
+    ).all():
+        prev = artifacts.get(art.research_job_id)
+        if prev is None or art.id > prev.id:
+            artifacts[art.research_job_id] = art
+    out: list[dict[str, object]] = []
+    for peer in chosen_jobs:
+        art = artifacts.get(peer.id)
+        if art is None:
+            continue
+        try:
+            parsed = json.loads(art.structured_json)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        failed_gates = [
+            {"name": g.get("name"), "status": g.get("status"), "reason": g.get("reason")}
+            for g in (parsed.get("gates") or ())
+            if isinstance(g, dict) and g.get("status") in {"fail", "gray"}
+        ]
+        out.append(
+            {
+                "name": peer.name,
+                "code": peer.code,
+                "verdict": parsed.get("verdict"),
+                "as_of": parsed.get("as_of"),
+                "failed_gates": failed_gates,
+                "price_bands": parsed.get("price_bands"),
+            }
+        )
+    return tuple(out)
+
+
+def _load_discovery_risk_flags(
+    session: Session,
+    *,
+    code: str,
+    discovery_run_id: int | None = None,
+    discovery_track: str | None = None,
+    financials: list[dict[str, object]] | None = None,
+) -> tuple[str, ...]:
+    seen: list[str] = []
+    if code:
+        run_id = discovery_run_id
+        if run_id is None:
+            latest_run = session.scalars(
+                select(DiscoveryRun)
+                .where(DiscoveryRun.status == "completed")
+                .order_by(DiscoveryRun.id.desc())
+            ).first()
+            run_id = latest_run.id if latest_run is not None else None
+        if run_id is not None:
+            stmt = select(DiscoveryResult).where(
+                DiscoveryResult.run_id == run_id,
+                DiscoveryResult.stage == "track_gate",
+                DiscoveryResult.code == code,
+            )
+            if discovery_track:
+                stmt = stmt.where(DiscoveryResult.track == discovery_track)
+            rows = session.scalars(stmt.order_by(DiscoveryResult.id.asc())).all()
+            for row in rows:
+                try:
+                    metrics = json.loads(row.metrics_json)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(metrics, dict):
+                    continue
+                for flag in metrics.get("risk_flags") or ():
+                    text = str(flag or "").strip()
+                    if text and text not in seen:
+                        seen.append(text)
+    drift = financial_drift({"as_of": {"date": "2026-01-01"}}, financials or ())
+    if drift is not None:
+        reasons = drift.get("reasons") or ()
+        if "deducted_profit_drop" in reasons and drift.get("deducted_net_income_yoy") is not None:
+            seen.append(
+                f"{drift['period']} vs {drift['base_period']} 扣非净利润同比 {float(drift['deducted_net_income_yoy']):.2%}（主业扣非显著下滑，谨防非经常性损益粉饰归母净利）"
+            )
+        elif "profit_drop" in reasons and drift.get("net_income_yoy") is not None:
+            seen.append(
+                f"{drift['period']} vs {drift['base_period']} 归母净利润同比 {float(drift['net_income_yoy']):.2%}（同报告期同比下滑，非季节性波动）"
+            )
+        if "ocf_turned_negative" in reasons:
+            seen.append(
+                f"{drift['period']} vs {drift['base_period']} 经营活动现金流由正转负"
+            )
+        if "consecutive_decline" in reasons:
+            seen.append(
+                f"{drift['period']} 与最近年报连续两期盈利同比下滑（警惕温水煮青蛙式基本面融冰）"
+            )
+    ann_roes = [
+        (str(r.get("period")), float(r["roe"]))
+        for r in (financials or ())
+        if isinstance(r, dict)
+        and str(r.get("period_type") or "annual") == "annual"
+        and str(r.get("period") or "").isdigit()
+        and r.get("roe") is not None
+    ]
+    ann_roes.sort(key=lambda x: int(x[0]))
+    if len(ann_roes) >= 4:
+        r0, r1, r2, r3 = ann_roes[-4][1], ann_roes[-3][1], ann_roes[-2][1], ann_roes[-1][1]
+        if r0 > r1 > r2 > r3 and (r0 - r3) >= 4.0:
+            seen.append(
+                f"ROE连续3年下台阶（{ann_roes[-4][0]}年{r0:.1f}% → {ann_roes[-1][0]}年{r3:.1f}%，累计降{r0 - r3:.1f}个百分点，警惕估值陷阱）"
+            )
+    return tuple(seen)
+
+
 def _claim_research_lease(
     session: Session,
     job_id: int,
@@ -433,6 +631,19 @@ def _run_one(
         industry_name = _industry_of(
             session, job_code, industry
         )
+        precedents = _load_industry_precedents(
+            session,
+            user_id=user_id,
+            code=job_code,
+            industry=industry_name,
+        )
+        risk_flags = _load_discovery_risk_flags(
+            session,
+            code=job_code,
+            discovery_run_id=job.discovery_run_id,
+            discovery_track=job.discovery_track,
+            financials=rows,
+        )
         credibility_gate = gate_is_open(session)
         session.rollback()
         if not credibility_gate:
@@ -457,6 +668,8 @@ def _run_one(
                 valuation=fetch_valuation(market, job_code, rows),
                 industry=industry_name,
                 notices=tuple(_fetch_notices(market, job_code)),
+                precedents=precedents,
+                risk_flags=risk_flags,
             ),
         )
         if credibility_gate:
@@ -495,6 +708,22 @@ def _run_one(
                 research_job_id=job_id,
                 structured=output.structured,
             )
+            if output.structured.get("verdict") in {"pass", "gray"}:
+                as_of_obj = output.structured.get("as_of")
+                as_of_p = (
+                    _as_decimal(as_of_obj.get("price"))
+                    if isinstance(as_of_obj, dict)
+                    else None
+                )
+                _, rich = band_bounds(output.structured, ref_price=as_of_p)
+                if rich is not None and (as_of_p is None or rich >= as_of_p):
+                    sync_thesis_ceiling_rule(
+                        session,
+                        name=job_name,
+                        ceiling_price=rich,
+                        research_job_id=job_id,
+                        user_id=user_id,
+                    )
         fresh.status = "done"
         fresh.error = None
         fresh.updated_at = _now()

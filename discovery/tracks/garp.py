@@ -66,7 +66,7 @@ _DOMAINS = MappingProxyType(
         "roe": "signed",
         "interest_debt": "nonnegative",
         "goodwill": "nonnegative",
-        "acquisition_cash_paid": "nonnegative",
+        "acquisition_cash_paid": "signed",
         "gross_margin": "signed",
         "net_margin": "signed",
         "impairment_loss": "signed",
@@ -557,7 +557,7 @@ def _metric_values(
         metrics["acquisition_cash_to_revenue"] = _divide(
             _sum(
                 tuple(
-                    row.values["acquisition_cash_paid"]
+                    max(Decimal(0), row.values["acquisition_cash_paid"])
                     for row in driver_rows
                 )
             ),
@@ -912,6 +912,16 @@ def classify(company: FrozenCompanyInput, ruler: TrackRuler) -> TrackVerdict:
                 metrics,
                 (f"garp.{reason}",),
             )
+        nonfinancial = ruler.sector_branches["nonfinancial"]
+        assert isinstance(nonfinancial, Mapping)
+        if (company.industry or "").strip() in nonfinancial["excluded_industries"]:
+            return _verdict(
+                code,
+                "insufficient",
+                "industry_cyclical_unsupported",
+                metrics,
+                ("garp.industry_cyclical_unsupported",),
+            )
 
         financial_as_of = _date(company.as_of["financial"], "financial as-of")
         valuation_as_of = _date(company.as_of["valuation"], "valuation as-of")
@@ -1008,6 +1018,35 @@ def classify(company: FrozenCompanyInput, ruler: TrackRuler) -> TrackVerdict:
         value = calculated[metric]
         if value is not None and value < 0:
             risks.append(f"{metric}_deterioration")
+    latest_row = max(
+        (
+            row
+            for row in history
+            if row.values["deducted_net_income"] is not None
+            and row.values["shares"] is not None
+        ),
+        key=lambda row: row.year,
+        default=None,
+    )
+    if latest_row is not None and calculated["current_pe"] is not None:
+        deducted = latest_row.values["deducted_net_income"]
+        ttm_earnings = _divide(
+            _multiply(
+                _decimal(company.fields["price"], "current price"),
+                latest_row.values["shares"],
+            ),
+            calculated["current_pe"],
+        )
+        # ponytail: fixed 1.5x of the last annual deducted profit; ~60% real
+        # growth only reaches ~1.3x by mid-year. Move to the ruler if tuned.
+        ceiling = _multiply(deducted, Decimal("1.5"))
+        if (
+            ttm_earnings is not None
+            and ceiling is not None
+            and deducted > 0  # type: ignore[operator]
+            and ttm_earnings > ceiling
+        ):
+            risks.append("ttm_earnings_above_deducted")
     label = metrics["return_metric_label"]
     assert label is None or isinstance(label, str)
     for gate in config["gate_order"]:

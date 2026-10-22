@@ -231,6 +231,25 @@ def _ensure_discovery_indexes(engine: Engine) -> None:
                 "ON discovery_runs(user_id, week_key) WHERE current = 1"
             )
         )
+        # input_fingerprint sits after the large JSON columns, so reading
+        # a run's fingerprints without this covering index walks every
+        # overflow page (~1.6 GB for one full-market run).
+        conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS "
+                "ix_discovery_input_snapshots_run_fingerprint "
+                "ON discovery_input_snapshots(run_id, code, input_fingerprint)"
+            )
+        )
+        # Stage pages read every name of a run; one full-market row per
+        # page makes that thousands of cold page reads without this.
+        conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS "
+                "ix_discovery_input_snapshots_run_name "
+                "ON discovery_input_snapshots(run_id, code, name)"
+            )
+        )
 
 
 def _ensure_discovery_snapshot_columns(engine: Engine) -> None:

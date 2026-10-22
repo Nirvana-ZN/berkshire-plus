@@ -1,11 +1,19 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { RouterLink, useRoute } from 'vue-router'
+import { RouterLink, useRoute, useRouter } from 'vue-router'
+import { renderMarkdownHtml } from './homeViewModel'
 
 interface Gate {
   name: string
   status: string
   reason: string
+}
+
+interface HistoryItem {
+  id: number
+  date: string
+  verdict: string | null
+  is_thesis: boolean
 }
 
 const VERDICT_ZH: Record<string, string> = {
@@ -24,6 +32,13 @@ const BAND_ZH: Record<string, string> = {
   conservative: '保守',
   watch: '观望',
 }
+// Band direction is undefined in the prompt (some reports put 激进 highest), so labels stay neutral.
+const BAND_PRICE_ZH: Record<string, string> = {
+  aggressive: '激进价',
+  steady: '稳健价',
+  conservative: '保守价',
+  overvalued: '高估线',
+}
 const ROLE_ZH: Record<string, string> = {
   core: '核心',
   satellite: '卫星',
@@ -38,16 +53,26 @@ const JOB_STATUS: Record<string, string> = {
 const THESIS_ESTABLISHED = '已立为论文'
 const THESIS_UPDATED = '已更新论文'
 const VALUATION_ZH: Record<string, string> = {
-  price: '现价',
-  bps: '每股净资产',
-  pb: '市净率',
+  pe_ttm: '滚动市盈率（TTM）',
+  pe_ttm_basis: '滚动市盈率口径',
+  eps_ttm: '滚动每股收益（TTM）',
+  pe_deducted_ttm: '扣非滚动市盈率（TTM）',
+  pe_deducted_ttm_basis: '扣非滚动市盈率口径',
+  eps_deducted_ttm: '扣非滚动每股收益（TTM）',
   pe: '静态市盈率',
-  pe_basis: '市盈率口径',
+  pe_basis: '静态市盈率口径',
+  pb: '市净率',
+  pb_tangible: '扣除商誉有形市净率',
+  goodwill_pct: '商誉占净资产比（%）',
+  net_cash_yi: '账面净现金（亿元，负为净负债）',
+  bps: '每股净资产',
+  eps: '年报每股收益',
+  eps_period: '每股收益报告期',
   eps_mid: '中周期每股收益',
   pe_mid: '中周期对照市盈率',
   pe_mid_basis: '中周期市盈率口径',
   npl_pct: '不良率',
-  eps: '每股收益',
+  price: '现价',
   period: '报告期',
 }
 const TRACK_ZH: Record<string, string> = {
@@ -57,6 +82,7 @@ const TRACK_ZH: Record<string, string> = {
 }
 
 const route = useRoute()
+const router = useRouter()
 const errorText = ref('')
 const status = ref('')
 const name = ref('')
@@ -64,7 +90,9 @@ const verdict = ref('')
 const markdown = ref('')
 const gates = ref<Gate[]>([])
 const mirror = ref<string[]>([])
+const history = ref<HistoryItem[]>([])
 const bandMode = ref('')
+const bandPrices = ref<Record<string, string>>({})
 const memoRole = ref('')
 const memoEssence = ref('')
 const memoRisks = ref('')
@@ -84,6 +112,41 @@ const discoveryTrack = ref('')
 let timer: number | undefined
 
 const title = computed(() => name.value || '评估')
+const parentPath = ref<string | null>(null)
+
+function captureParent() {
+  if (parentPath.value) return
+  const back = window.history.state?.back
+  if (typeof back === 'string' && back && !back.startsWith('/research')) {
+    parentPath.value = back
+  }
+}
+
+function goBack() {
+  if (parentPath.value) {
+    void router.push(parentPath.value)
+    return
+  }
+  if (discoveryRunId.value != null) {
+    void router.push('/discover')
+    return
+  }
+  void router.push('/')
+}
+
+function fmtValue(value: string | number): string {
+  const number = typeof value === 'number' ? value : Number(value)
+  return String(value).trim() !== '' && Number.isFinite(number) && !Number.isInteger(number)
+    ? number.toFixed(2)
+    : String(value)
+}
+
+function gateBadgeClass(gateStatus: string): string {
+  if (gateStatus === 'pass') return 'badge badge-pass'
+  if (gateStatus === 'fail') return 'badge badge-fail'
+  return 'badge badge-warn'
+}
+
 const canWatch = computed(
   () =>
     !joined.value &&
@@ -114,6 +177,7 @@ function applyResearch(data: Record<string, unknown>) {
   markdown.value = typeof data.markdown === 'string' ? data.markdown : ''
   gates.value = Array.isArray(data.gates) ? (data.gates as Gate[]) : []
   mirror.value = Array.isArray(data.mirror_test) ? (data.mirror_test as string[]) : []
+  history.value = Array.isArray(data.history) ? (data.history as HistoryItem[]) : []
   discoveryRunId.value = typeof data.discovery_run_id === 'number'
     ? data.discovery_run_id
     : null
@@ -125,6 +189,13 @@ function applyResearch(data: Record<string, unknown>) {
     bands && typeof bands === 'object' && 'mode' in bands
       ? String((bands as { mode?: string }).mode || '')
       : ''
+  bandPrices.value = {}
+  if (bands && typeof bands === 'object') {
+    for (const key of Object.keys(BAND_PRICE_ZH)) {
+      const text = (bands as Record<string, unknown>)[key]
+      if (typeof text === 'string' && text.trim()) bandPrices.value[key] = text.trim()
+    }
+  }
   const memo = data.memo
   if (memo && typeof memo === 'object') {
     const row = memo as Record<string, unknown>
@@ -149,7 +220,13 @@ function applyResearch(data: Record<string, unknown>) {
   const snap = data.valuation
   valuation.value = {}
   if (snap && typeof snap === 'object') {
-    for (const [key, value] of Object.entries(snap as Record<string, unknown>)) {
+    const rawSnap = snap as Record<string, unknown>
+    const orderedKeys = [
+      ...Object.keys(VALUATION_ZH).filter((k) => k in rawSnap),
+      ...Object.keys(rawSnap).filter((k) => !(k in VALUATION_ZH)),
+    ]
+    for (const key of orderedKeys) {
+      const value = rawSnap[key]
       if (value !== null && value !== undefined && value !== '') {
         valuation.value[key] = value as string | number
       }
@@ -213,6 +290,7 @@ async function addToWatchlist() {
 }
 
 onMounted(async () => {
+  captureParent()
   await loadResearch()
   if (status.value !== 'done' && status.value !== 'failed') {
     timer = window.setInterval(() => {
@@ -238,119 +316,161 @@ onBeforeUnmount(stopPoll)
 </script>
 
 <template>
-  <section>
+  <section class="research-page">
     <div class="toolbar">
-      <h1>{{ title }}</h1>
-      <template v-if="status === 'done'">
-        <button v-if="canWatch" type="button" :disabled="watching" @click="addToWatchlist">
+      <button type="button" class="btn-link back-link" @click="goBack">← 返回</button>
+      <div class="title-group">
+        <h1>{{ title }}</h1>
+        <span
+          v-if="status"
+          class="badge"
+          :class="status === 'failed' ? 'badge-fail' : status === 'done' ? 'badge-pass' : 'badge-warn'"
+        >
+          状态：{{ JOB_STATUS[status] || status }}
+        </span>
+        <span
+          v-if="thesisMark"
+          class="badge"
+          :class="{ 'badge-pass thesis-pass': verdict === 'pass', 'badge-fail thesis-fail': verdict === 'fail', 'badge-warn': verdict === 'gray' }"
+        >
+          {{ thesisMark }}
+        </span>
+        <span v-if="discoveryRunId !== null && discoveryTrack" class="source-badge">
+          来源：每周发现 / {{ TRACK_ZH[discoveryTrack] || discoveryTrack }}
+        </span>
+      </div>
+      <div v-if="status === 'done'" class="action-group">
+        <label v-if="history.length > 1" class="history-select">
+          <span class="muted">历史评估</span>
+          <select
+            :value="Number(route.params.id)"
+            @change="router.push(`/research/${($event.target as HTMLSelectElement).value}`)"
+          >
+            <option v-for="item in history" :key="item.id" :value="item.id">
+              #{{ item.id }} · {{ item.date || '未知日期' }} · {{ (item.verdict && VERDICT_ZH[item.verdict]) || item.verdict || '—' }}{{ item.is_thesis ? '（现行论文）' : '' }}
+            </option>
+          </select>
+        </label>
+        <button v-if="canWatch" type="button" class="btn-primary" :disabled="watching" @click="addToWatchlist">
           加入观察池
         </button>
-        <RouterLink v-if="name" :to="prefillTo">预填记账</RouterLink>
-      </template>
+        <RouterLink v-if="name" class="btn-link" :to="prefillTo">预填记账</RouterLink>
+      </div>
     </div>
-    <p v-if="status">状态：{{ JOB_STATUS[status] || status }}</p>
-    <p v-if="discoveryRunId !== null && discoveryTrack" class="source-badge">
-      来源：每周发现 / {{ TRACK_ZH[discoveryTrack] || discoveryTrack }}
-    </p>
-    <p v-if="thesisMark" :class="{ 'thesis-pass': verdict === 'pass', 'thesis-fail': verdict === 'fail' }">{{ thesisMark }}</p>
-    <p v-if="errorText">{{ errorText }}</p>
-    <p v-if="watchMessage">{{ watchMessage }}</p>
+
+    <p v-if="errorText" class="alert-error">{{ errorText }}</p>
+    <p v-if="watchMessage" class="alert-ok">{{ watchMessage }}</p>
 
     <template v-if="status === 'done'">
-      <h2>结论条</h2>
-      <table>
-        <tbody>
-          <tr>
-            <th>结论</th>
-            <td :class="{ 'thesis-pass': verdict === 'pass', 'thesis-fail': verdict === 'fail' }">{{ VERDICT_ZH[verdict] || verdict }}</td>
-          </tr>
-          <tr>
-            <th>价格带</th>
-            <td>{{ BAND_ZH[bandMode] || bandMode }}</td>
-          </tr>
-          <tr>
-            <th>仓位角色</th>
-            <td>{{ ROLE_ZH[memoRole] || memoRole }}</td>
-          </tr>
-          <tr>
-            <th>信息丰富度</th>
-            <td>{{ dataGrade }}</td>
-          </tr>
-          <tr>
-            <th>研究日期</th>
-            <td>{{ asOfDate }}</td>
-          </tr>
-          <tr>
-            <th>所用股价</th>
-            <td>{{ asOfPrice == null ? '无现价' : asOfPrice }}</td>
-          </tr>
-          <tr v-for="(value, key) in valuation" :key="'v-' + key">
-            <th>{{ VALUATION_ZH[key] || key }}</th>
-            <td>{{ value }}</td>
-          </tr>
-        </tbody>
-      </table>
+      <section class="panel conclusion-panel">
+        <h2>结论条</h2>
+        <div class="stat-grid conclusion-strip">
+          <div class="stat-card">
+            <p class="stat-label">评估结论</p>
+            <p
+              class="stat-value"
+              :class="{ 'thesis-pass': verdict === 'pass', 'thesis-fail': verdict === 'fail', 'thesis-gray': verdict === 'gray' }"
+            >
+              {{ VERDICT_ZH[verdict] || verdict }}
+            </p>
+            <p class="stat-sub">仓位角色：{{ ROLE_ZH[memoRole] || memoRole || '—' }}</p>
+          </div>
+          <div class="stat-card">
+            <p class="stat-label">所用股价</p>
+            <p class="stat-value">{{ asOfPrice == null ? '无现价' : fmtValue(asOfPrice) }}</p>
+            <p class="stat-sub">研究日期：{{ asOfDate || '—' }}</p>
+          </div>
+          <div class="stat-card">
+            <p class="stat-label">价格带模式</p>
+            <p class="stat-value">{{ BAND_ZH[bandMode] || bandMode || '—' }}</p>
+            <p class="stat-sub">信息丰富度：{{ dataGrade || '—' }}</p>
+          </div>
+        </div>
 
-      <h2>对照当前仓</h2>
-      <table>
-        <tbody>
-          <tr>
-            <th>该不该进当前仓</th>
-            <td>{{ shouldEnter }}</td>
-          </tr>
-          <tr>
-            <th>用什么钱买</th>
-            <td>{{ funding }}</td>
-          </tr>
-          <tr>
-            <th>是否叠逻辑</th>
-            <td>{{ overlap }}</td>
-          </tr>
-        </tbody>
-      </table>
+        <div v-if="Object.keys(bandPrices).length" class="band-grid">
+          <div
+            v-for="(text, key) in bandPrices"
+            :key="'b-' + key"
+            class="band-item"
+            :class="key === 'overvalued' ? 'band-over' : ''"
+          >
+            <span class="band-label">{{ BAND_PRICE_ZH[key] }}</span>
+            <strong class="band-val">{{ text }}</strong>
+          </div>
+        </div>
 
-      <h2>备忘</h2>
-      <table>
-        <tbody>
-          <tr>
-            <th>生意本质</th>
-            <td>{{ memoEssence }}</td>
-          </tr>
-          <tr>
-            <th>主要风险</th>
-            <td>{{ memoRisks }}</td>
-          </tr>
-        </tbody>
-      </table>
+        <div v-if="Object.keys(valuation).length" class="val-grid">
+          <div v-for="(value, key) in valuation" :key="'v-' + key" class="val-cell">
+            <span class="val-key">{{ VALUATION_ZH[key] || key }}</span>
+            <strong class="val-num">{{ fmtValue(value) }}</strong>
+          </div>
+        </div>
+      </section>
+
+      <div class="memo-fit-grid">
+        <section class="panel">
+          <h2>备忘</h2>
+          <dl class="kv-list">
+            <div>
+              <dt>生意本质</dt>
+              <dd>{{ memoEssence || '—' }}</dd>
+            </div>
+            <div class="risk-box">
+              <dt>主要风险</dt>
+              <dd>{{ memoRisks || '—' }}</dd>
+            </div>
+          </dl>
+        </section>
+
+        <section class="panel">
+          <h2>对照当前仓</h2>
+          <dl class="kv-list">
+            <div>
+              <dt>该不该进当前仓</dt>
+              <dd>{{ shouldEnter || '—' }}</dd>
+            </div>
+            <div>
+              <dt>用什么钱买</dt>
+              <dd>{{ funding || '—' }}</dd>
+            </div>
+            <div>
+              <dt>是否叠逻辑</dt>
+              <dd>{{ overlap || '—' }}</dd>
+            </div>
+          </dl>
+        </section>
+      </div>
 
       <details class="fold" open>
         <summary>六关</summary>
-        <h2>六关</h2>
         <table>
           <thead>
             <tr>
-              <th>关</th>
-              <th>结果</th>
+              <th class="col-nowrap">关</th>
+              <th class="col-nowrap">结果</th>
               <th>理由</th>
             </tr>
           </thead>
           <tbody>
             <tr v-for="gate in gates" :key="gate.name">
-              <td>{{ gate.name }}</td>
-              <td>{{ GATE_ZH[gate.status] || gate.status }}</td>
-              <td>{{ gate.reason }}</td>
+              <td class="col-nowrap"><strong>{{ gate.name }}</strong></td>
+              <td class="col-nowrap">
+                <span :class="gateBadgeClass(gate.status)">
+                  {{ GATE_ZH[gate.status] || gate.status }}
+                </span>
+              </td>
+              <td class="gate-reason">{{ gate.reason }}</td>
             </tr>
           </tbody>
         </table>
       </details>
 
       <details class="fold">
-        <summary>镜子测试</summary>
-        <h2>镜子测试</h2>
+        <summary>镜子测试（{{ mirror.length }}）</summary>
         <table>
           <tbody>
             <tr v-for="(line, index) in mirror" :key="'m-' + index">
-              <td>{{ index + 1 }}</td>
+              <td class="col-nowrap muted">#{{ index + 1 }}</td>
               <td>{{ line }}</td>
             </tr>
           </tbody>
@@ -359,25 +479,169 @@ onBeforeUnmount(stopPoll)
 
       <details class="fold">
         <summary>决策备忘录</summary>
-        <h2>决策备忘录</h2>
-        <article class="memo">{{ markdown }}</article>
+        <article class="memo md-body" v-html="renderMarkdownHtml(markdown)"></article>
       </details>
     </template>
   </section>
 </template>
 
 <style scoped>
-.memo {
-  white-space: pre-wrap;
-  background: #fff;
-  border: 1px solid #d8d2c4;
-  padding: 1rem;
+.back-link {
+  flex: 0 0 auto;
+  padding: 0.2rem 0.15rem;
+  font-size: 0.92rem;
+}
+
+.title-group {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.55rem;
+  margin-right: auto;
+}
+
+.title-group h1 {
+  margin: 0;
+}
+
+.action-group {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.history-select {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.85rem;
 }
 
 .source-badge {
   display: inline-block;
   border: 1px solid #d8d2c4;
-  border-radius: 999px;
-  padding: 0.2rem 0.6rem;
+  background: #faf8f3;
+  border-radius: 2px;
+  padding: 0.12rem 0.5rem;
+  font-size: 0.8rem;
+  color: #464139;
+}
+
+.conclusion-strip {
+  margin-bottom: 0.75rem;
+}
+
+.band-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+  gap: 0.55rem;
+  margin-bottom: 0.75rem;
+}
+
+.band-item {
+  background: #f3efe6;
+  border: 1px solid #dfd7c7;
+  border-left: 3px solid #1b5e4a;
+  padding: 0.45rem 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.band-item.band-over {
+  border-left-color: #9f1d1d;
+  background: #fdf6f6;
+}
+
+.band-label {
+  font-size: 0.76rem;
+  color: #5c564c;
+}
+
+.band-val {
+  font-size: 0.95rem;
+  font-variant-numeric: tabular-nums;
+  color: #1a1a1a;
+}
+
+.val-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(11.5rem, 1fr));
+  gap: 0.45rem;
+  border-top: 1px dashed #e4ddd0;
+  padding-top: 0.7rem;
+}
+
+.val-cell {
+  background: #faf8f3;
+  border: 1px solid #e8e2d5;
+  padding: 0.4rem 0.65rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+}
+
+.val-key {
+  font-size: 0.76rem;
+  color: #5c564c;
+}
+
+.val-num {
+  font-size: 0.92rem;
+  font-variant-numeric: tabular-nums;
+  color: #1a1a1a;
+}
+
+.memo-fit-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.75rem;
+}
+
+.memo-fit-grid > .panel {
+  margin: 0 0 0.75rem;
+}
+
+.kv-list {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+}
+
+.kv-list > div {
+  padding: 0.55rem 0.75rem;
+  background: #faf8f3;
+  border: 1px solid #e8e2d5;
+}
+
+.kv-list > div.risk-box {
+  border-left: 3px solid #8a4b08;
+  background: #fdfaf4;
+}
+
+.kv-list dt {
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: #5c564c;
+  margin-bottom: 0.2rem;
+}
+
+.kv-list dd {
+  margin: 0;
+  line-height: 1.55;
+  font-size: 0.92rem;
+  color: #1a1a1a;
+}
+
+.gate-reason {
+  line-height: 1.55;
+}
+
+@media (max-width: 820px) {
+  .memo-fit-grid {
+    grid-template-columns: 1fr;
+  }
 }
 </style>

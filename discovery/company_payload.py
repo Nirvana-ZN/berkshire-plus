@@ -15,7 +15,7 @@ from typing import Any
 from discovery.field_dictionary import FIELD_DICTIONARY, FieldSpec
 from market.types import DiscoveryCompanyData, FinancialRow, SecurityState
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 PAYLOAD_SCHEMA_BLOCK_REASON = "payload_schema_restart_required"
 PAYLOAD_SCHEMA_RESTART_GUIDANCE = (
     f"{PAYLOAD_SCHEMA_BLOCK_REASON}: company payload schema is unavailable "

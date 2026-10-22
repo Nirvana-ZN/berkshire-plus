@@ -158,23 +158,21 @@ def test_seeded_weekly_discovery_full_flow_survives_reload(
         created = client.post("/api/discoveries", json={"sync": True})
         assert created.status_code == 200
         run_id = created.json()["id"]
-        assert created.json()["algorithm_version"] == "discovery-v2"
+        assert created.json()["algorithm_version"] == "discovery-v7"
         assert all(
             value == "ready"
             for value in created.json()["ruler_readiness"].values()
         )
-        assert client.get(
-            f"/api/discoveries/{run_id}/tracks/garp/stages/track_gate"
-        ).status_code == 404
-
         safety = client.get(
             f"/api/discoveries/{run_id}/stages/safety"
         ).json()
-        assert safety["current"]["status"] == "waiting_confirmation"
-        assert client.post(
+        assert safety["current"]["status"] == "confirmed"
+        blocked = client.post(
             f"/api/discoveries/{run_id}/stages/safety/confirm",
             json={"sync": True},
-        ).status_code == 200
+        )
+        assert blocked.status_code == 409
+        assert blocked.json()["code"] == "DISCOVERY_RULE_ONLY"
 
         frozen: dict[str, dict] = {}
         for track in TRACKS:
@@ -183,77 +181,23 @@ def test_seeded_weekly_discovery_full_flow_survives_reload(
                 "/stages/track_gate"
             )
             gate = client.get(gate_path).json()
-            assert gate["current"]["status"] == "waiting_confirmation"
+            assert gate["current"]["status"] == "confirmed"
             assert gate["current"]["ruler_version_id"] is not None
-            assert client.post(
-                f"{gate_path}/confirm", json={"sync": True}
-            ).status_code == 200
 
             competition_path = (
                 f"/api/discoveries/{run_id}/tracks/{track}"
                 "/stages/competition"
             )
             competition = client.get(competition_path).json()
-            assert competition["current"]["status"] == "waiting_confirmation"
-            excluded_code = competition["pass"][-1]["code"]
-            excluded = client.post(
-                f"/api/discoveries/{run_id}/overrides",
-                json={
-                    "track": track,
-                    "stage": "competition",
-                    "code": excluded_code,
-                    "action": "forced_drop",
-                    "reason": "seeded competition exclusion",
-                },
-            )
-            assert excluded.status_code == 200
+            assert competition["current"]["status"] == "confirmed"
             assert client.post(
                 f"{competition_path}/confirm", json={"sync": True}
-            ).status_code == 200
-            confirmed_competition = client.get(competition_path).json()
-            assert [row["code"] for row in confirmed_competition["drop"]] == [
-                excluded_code
-            ]
-
-            adjudication_path = (
+            ).json()["code"] == "DISCOVERY_RULE_ONLY"
+            assert client.get(
                 f"/api/discoveries/{run_id}/tracks/{track}"
                 "/stages/adjudication"
-            )
-            adjudication = client.get(adjudication_path).json()
-            assert adjudication["current"]["status"] == "waiting_confirmation"
-            premature = client.post(
-                f"{adjudication_path}/confirm", json={}
-            )
-            assert premature.status_code == 409
-            assert premature.json()["code"] == "DISCOVERY_DECISIONS_INCOMPLETE"
-
-            candidates = confirmed_competition["pass"]
-            assert len(candidates) == 5
-            keep_count = 4 if track == "quality_discount" else 3
-            for index, row in enumerate(candidates):
-                decision = "keep" if index < keep_count else "exclude"
-                saved = client.post(
-                    f"/api/discoveries/{run_id}/decisions",
-                    json={
-                        "track": track,
-                        "code": row["code"],
-                        "decision": decision,
-                        "reason": (
-                            "seeded adjudication exclusion"
-                            if decision == "exclude"
-                            else None
-                        ),
-                    },
-                )
-                assert saved.status_code == 200
-            assert client.post(
-                f"{adjudication_path}/confirm", json={}
-            ).status_code == 200
-            frozen[track] = client.get(adjudication_path).json()
-            assert frozen[track]["current"]["status"] == "confirmed"
-            assert len(frozen[track]["pass"]) == keep_count
-            assert len(frozen[track]["drop"]) == 5 - keep_count
-            assert len(frozen[track]["decisions"]) == 5
+            ).status_code == 404
+            frozen[track] = competition
         return run_id, frozen
 
     with TestClient(app) as client:
@@ -271,7 +215,7 @@ def test_seeded_weekly_discovery_full_flow_survives_reload(
             for change in changes.values():
                 expected = {
                     "track": track,
-                    "stage": "adjudication",
+                    "stage": "competition",
                     "previous_run_id": prior_run_id,
                     "current_run_id": run_id,
                     "previous_week_key": "2026-W38",
@@ -348,12 +292,11 @@ def test_seeded_weekly_discovery_full_flow_survives_reload(
         for track in TRACKS:
             restored = reloaded.get(
                 f"/api/discoveries/{run_id}/tracks/{track}"
-                "/stages/adjudication"
+                "/stages/competition"
             ).json()
             assert restored["current"]["status"] == "confirmed"
             assert restored["pass"] == frozen[track]["pass"]
             assert restored["drop"] == frozen[track]["drop"]
-            assert restored["decisions"] == frozen[track]["decisions"]
             assert restored["changes"] == frozen[track]["changes"]
 
     discovery_view = (

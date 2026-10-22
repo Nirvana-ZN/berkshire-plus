@@ -17,7 +17,12 @@ from app.models import (
     Setting,
 )
 from jobs.lock import JOB_TYPE_REVIEW, release
-from jobs.research import _run_one as run_research_one, load_book_dict, web_search_enabled
+from jobs.research import (
+    _run_one as run_research_one,
+    load_book_dict,
+    load_financials,
+    web_search_enabled,
+)
 from ledger.positions import LOCAL_USER_ID, load_positions
 from ledger.quotes import (
     BookSnapshot,
@@ -25,9 +30,18 @@ from ledger.quotes import (
     instrument_code_by_name,
     is_a_share_code,
     project_book,
+    quote_targets,
     rebalance_alerts,
 )
-from research.thesis import load_by_names, parse_structured, price_usable, status, utc_today
+from research.thesis import (
+    dynamic_sizing,
+    financial_drift,
+    load_by_names,
+    parse_structured,
+    price_usable,
+    status,
+    utc_today,
+)
 from review.run import ReviewInput, run_review
 
 logger = logging.getLogger(__name__)
@@ -96,6 +110,8 @@ def load_current_theses(
     for name, row in theses.items():
         structured = parse_structured(row)
         snap = by_snap.get(name, {})
+        code = str(snap.get("code") or "").strip()
+        fins = load_financials(session, code) if code else ()
         usable = price_usable(snap.get("price"), stale=bool(snap.get("stale")))
         stale = (
             status(
@@ -103,6 +119,7 @@ def load_current_theses(
                 today=utc_today(),
                 current_price=snap.get("price"),
                 price_usable=usable,
+                financials=fins,
             )
             == "stale"
         )
@@ -112,6 +129,14 @@ def load_current_theses(
             "memo": structured.get("memo"),
             "structured": structured,
             "stale": stale,
+            "financial_drift": financial_drift(structured, fins),
+            "dynamic_sizing": dynamic_sizing(
+                structured,
+                current_price=snap.get("price"),
+                price_usable=usable,
+                actual_weight=snap.get("weight"),
+                financials=fins,
+            ),
         }
     return result
 
@@ -156,8 +181,7 @@ def load_funnel_candidates(session: Session) -> list[str]:
 
 def refresh_held_quotes(session: Session, quote_client) -> None:
     rows, _cash = load_positions(session)
-    mapping = instrument_code_by_name(session)
-    targets = [(row.name, mapping.get(row.name)) for row in rows]
+    targets = quote_targets(session, [row.name for row in rows])
     codes = [
         code
         for _name, code in targets

@@ -20,7 +20,7 @@ from typing import TypeAlias
 
 from sqlalchemy import case, func, select
 from sqlalchemy import inspect as sa_inspect
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, defer
 
 from app.discovery_models import (
     DiscoveryCommonResult,
@@ -180,16 +180,20 @@ def _plain(value: object, active: set[int]) -> PlainValue:
         active.remove(identity)
 
 
-def canonical_json(value: object) -> str:
-    """Serialize supported snapshot values to deterministic UTF-8 JSON text."""
-
+def _dumps_plain(value: PlainValue) -> str:
     return json.dumps(
-        _plain(value, set()),
+        value,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
         allow_nan=False,
     )
+
+
+def canonical_json(value: object) -> str:
+    """Serialize supported snapshot values to deterministic UTF-8 JSON text."""
+
+    return _dumps_plain(_plain(value, set()))
 
 
 def _sha256(value: object) -> str:
@@ -342,6 +346,11 @@ def freeze_inputs(
 
     ruler_ids = version_values["ruler_version_ids"]
     assert isinstance(ruler_ids, dict)
+    ruler_versions_json = _dumps_plain(ruler_ids)
+    algorithm_json = _dumps_plain(version_values["algorithm_version"])
+    data_version_json = _dumps_plain(version_values["data_version"])
+    financial_version_json = _dumps_plain(version_values["financial_version"])
+    valuation_version_json = _dumps_plain(version_values["valuation_version"])
     rows: list[dict[str, object]] = []
     fingerprints: list[tuple[str, str]] = []
     for item in companies:
@@ -358,17 +367,27 @@ def freeze_inputs(
             for value in (security, fields, sources, as_of)
         ):
             raise TypeError("company payloads must be mappings")
-        semantic = {
-            "code": code,
-            "name": name,
-            "industry": item.industry,
-            "security_status": security,
-            "fields": fields,
-            "sources": sources,
-            "as_of": as_of,
-            **version_values,
-        }
-        fingerprint = _sha256(semantic)
+        security_json = _dumps_plain(security)
+        fields_json = _dumps_plain(fields)
+        sources_json = _dumps_plain(sources)
+        as_of_json = _dumps_plain(as_of)
+        semantic_json = (
+            '{"algorithm_version":' + algorithm_json
+            + ',"as_of":' + as_of_json
+            + ',"code":' + _dumps_plain(code)
+            + ',"data_version":' + data_version_json
+            + ',"fields":' + fields_json
+            + ',"financial_version":' + financial_version_json
+            + ',"industry":' + _dumps_plain(item.industry)
+            + ',"name":' + _dumps_plain(name)
+            + ',"ruler_payloads":' + run.ruler_payloads_json
+            + ',"ruler_version_ids":' + ruler_versions_json
+            + ',"security_status":' + security_json
+            + ',"sources":' + sources_json
+            + ',"valuation_version":' + valuation_version_json
+            + "}"
+        )
+        fingerprint = hashlib.sha256(semantic_json.encode("utf-8")).hexdigest()
         fingerprints.append((code, fingerprint))
         rows.append(
             {
@@ -376,14 +395,14 @@ def freeze_inputs(
                 "code": code,
                 "name": name,
                 "industry": item.industry,
-                "security_status": canonical_json(security),
-                "fields_json": canonical_json(fields),
-                "sources_json": canonical_json(sources),
-                "as_of_json": canonical_json(as_of),
+                "security_status": security_json,
+                "fields_json": fields_json,
+                "sources_json": sources_json,
+                "as_of_json": as_of_json,
                 "data_version": version_values["data_version"],
                 "financial_version": version_values["financial_version"],
                 "valuation_version": version_values["valuation_version"],
-                "ruler_versions_json": canonical_json(ruler_ids),
+                "ruler_versions_json": ruler_versions_json,
                 "algorithm_version": version_values["algorithm_version"],
                 "input_fingerprint": fingerprint,
                 "snapshot_at": captured_at,
@@ -426,6 +445,21 @@ def _object_json(text: str, label: str) -> Mapping[str, FrozenValue]:
     value = _load_json(text)
     if not isinstance(value, dict):
         raise ValueError(f"{label} must contain a JSON object")
+    frozen = _frozen(value)
+    assert isinstance(frozen, Mapping)
+    return frozen
+
+
+def _canonical_object_json(
+    text: str, field_label: str, canonical_label: str
+) -> Mapping[str, FrozenValue]:
+    value = _load_json(text)
+    if not isinstance(value, dict):
+        raise ValueError(f"{field_label} must contain a JSON object")
+    if _dumps_plain(value) != text:
+        raise ValueError(
+            f"frozen input integrity error: {canonical_label} is not canonical"
+        )
     frozen = _frozen(value)
     assert isinstance(frozen, Mapping)
     return frozen
@@ -543,8 +577,15 @@ def _require_utc(value: object, label: str) -> datetime:
     return value
 
 
-def load_frozen_inputs(session: Session, run_id: int) -> FrozenRunInputs:
-    """Load only persisted run and snapshot rows in deterministic code order."""
+def load_frozen_inputs(
+    session: Session, run_id: int, *, codes: Iterable[str] | None = None
+) -> FrozenRunInputs:
+    """Load only persisted run and snapshot rows in deterministic code order.
+
+    ``codes`` limits which companies are parsed and content-verified; the
+    run fingerprint is still checked over every stored row fingerprint.
+    Full-market rows are large, so parse only what the caller reads.
+    """
 
     run = session.get(DiscoveryRun, run_id)
     if run is None:
@@ -573,15 +614,38 @@ def load_frozen_inputs(session: Session, run_id: int) -> FrozenRunInputs:
         for exchange, values in normalized_dates.items()
     }
 
-    rows = session.scalars(
+    fingerprints = [
+        (code, fingerprint)
+        for code, fingerprint in session.execute(
+            select(
+                DiscoveryInputSnapshot.code,
+                DiscoveryInputSnapshot.input_fingerprint,
+            ).where(DiscoveryInputSnapshot.run_id == run_id)
+        )
+    ]
+    if not fingerprints:
+        raise ValueError("discovery run has no company snapshots")
+    wanted = None if codes is None else sorted(set(codes))
+    query = (
         select(DiscoveryInputSnapshot)
         .where(DiscoveryInputSnapshot.run_id == run_id)
         .order_by(DiscoveryInputSnapshot.code)
-    ).all()
-    if not rows:
-        raise ValueError("discovery run has no company snapshots")
+    )
+    if wanted is not None:
+        query = query.where(DiscoveryInputSnapshot.code.in_(wanted))
+    rows = session.scalars(query).all() if wanted != [] else []
+    expected_rulers_json = _dumps_plain(dict(run_rulers))
+    frozen_row_rulers = MappingProxyType(
+        {
+            key: int(value) if value is not None else None
+            for key, value in run_rulers.items()
+        }
+    )
+    algorithm_json = _dumps_plain(run.algorithm_version)
+    data_version_json = _dumps_plain(run.data_version)
+    financial_version_json = _dumps_plain(run.financial_version)
+    valuation_version_json = _dumps_plain(run.valuation_version)
     companies: list[FrozenCompanyInput] = []
-    fingerprints: list[tuple[str, str]] = []
     for row in rows:
         if not row.ruler_versions_json:
             raise ValueError(
@@ -592,15 +656,14 @@ def load_frozen_inputs(session: Session, run_id: int) -> FrozenRunInputs:
             raise ValueError(
                 f"frozen input integrity error: {row.code} timestamp mismatch"
             )
-        row_rulers = _object_json(row.ruler_versions_json, "ruler_versions_json")
-        if canonical_json(dict(row_rulers)) != row.ruler_versions_json:
-            raise ValueError(
-                "frozen input integrity error: row rulers are not canonical"
+        if row.ruler_versions_json != expected_rulers_json:
+            row_rulers = _canonical_object_json(
+                row.ruler_versions_json, "ruler_versions_json", "row rulers"
             )
-        if dict(row_rulers) != dict(run_rulers):
-            raise ValueError(
-                "frozen input integrity error: snapshot ruler metadata mismatch"
-            )
+            if dict(row_rulers) != dict(run_rulers):
+                raise ValueError(
+                    "frozen input integrity error: snapshot ruler metadata mismatch"
+                )
         if (
             row.data_version != run.data_version
             or row.financial_version != run.financial_version
@@ -610,41 +673,39 @@ def load_frozen_inputs(session: Session, run_id: int) -> FrozenRunInputs:
             raise ValueError(
                 "frozen input integrity error: snapshot version metadata mismatch"
             )
-        security = _object_json(row.security_status, "security_status")
-        fields = _object_json(row.fields_json, "fields_json")
-        sources = _object_json(row.sources_json, "sources_json")
-        as_of = _object_json(row.as_of_json, "as_of_json")
-        for label, value, persisted in (
-            ("security status", security, row.security_status),
-            ("fields", fields, row.fields_json),
-            ("sources", sources, row.sources_json),
-            ("as-of", as_of, row.as_of_json),
-        ):
-            if canonical_json(dict(value)) != persisted:
-                raise ValueError(
-                    f"frozen input integrity error: {label} is not canonical"
-                )
-        semantic = {
-            "code": row.code,
-            "name": row.name,
-            "industry": row.industry,
-            "security_status": dict(security),
-            "fields": dict(fields),
-            "sources": dict(sources),
-            "as_of": dict(as_of),
-            "data_version": row.data_version,
-            "financial_version": row.financial_version,
-            "valuation_version": row.valuation_version,
-            "ruler_version_ids": dict(row_rulers),
-            "ruler_payloads": plain_ruler_payloads,
-            "algorithm_version": row.algorithm_version,
-        }
-        fingerprint = _sha256(semantic)
+        security = _canonical_object_json(
+            row.security_status, "security_status", "security status"
+        )
+        fields = _canonical_object_json(
+            row.fields_json, "fields_json", "fields"
+        )
+        sources = _canonical_object_json(
+            row.sources_json, "sources_json", "sources"
+        )
+        as_of = _canonical_object_json(
+            row.as_of_json, "as_of_json", "as-of"
+        )
+        semantic_json = (
+            '{"algorithm_version":' + algorithm_json
+            + ',"as_of":' + row.as_of_json
+            + ',"code":' + _dumps_plain(row.code)
+            + ',"data_version":' + data_version_json
+            + ',"fields":' + row.fields_json
+            + ',"financial_version":' + financial_version_json
+            + ',"industry":' + _dumps_plain(row.industry)
+            + ',"name":' + _dumps_plain(row.name)
+            + ',"ruler_payloads":' + run.ruler_payloads_json
+            + ',"ruler_version_ids":' + row.ruler_versions_json
+            + ',"security_status":' + row.security_status
+            + ',"sources":' + row.sources_json
+            + ',"valuation_version":' + valuation_version_json
+            + "}"
+        )
+        fingerprint = hashlib.sha256(semantic_json.encode("utf-8")).hexdigest()
         if fingerprint != row.input_fingerprint:
             raise ValueError(
                 f"frozen input integrity error: {row.code} fingerprint mismatch"
             )
-        fingerprints.append((row.code, fingerprint))
         companies.append(
             FrozenCompanyInput(
                 code=row.code,
@@ -657,12 +718,7 @@ def load_frozen_inputs(session: Session, run_id: int) -> FrozenRunInputs:
                 data_version=row.data_version,
                 financial_version=row.financial_version,
                 valuation_version=row.valuation_version,
-                ruler_version_ids=MappingProxyType(
-                    {
-                        key: int(value) if value is not None else None
-                        for key, value in row_rulers.items()
-                    }
-                ),
+                ruler_version_ids=frozen_row_rulers,
                 algorithm_version=row.algorithm_version,
                 input_fingerprint=row.input_fingerprint,
                 snapshot_at=row_snapshot_at,
@@ -722,8 +778,20 @@ def resolve_discovery_rulers(
     return MappingProxyType(resolved)
 
 
-def _snapshot_version(prefix: str, value: object) -> str:
-    return f"{prefix}:{_sha256(value)[:20]}"
+def _feed_entry(
+    hasher: "hashlib._Hash", first: bool, key: str | None, value: object
+) -> None:
+    """Feed one canonical list item, or ``key:value`` pair, of a streamed hash.
+
+    Callers write the brackets and must feed mapping keys in sorted order.
+    """
+
+    if not first:
+        hasher.update(b",")
+    if key is not None:
+        hasher.update(json.dumps(key, ensure_ascii=False).encode("utf-8"))
+        hasher.update(b":")
+    hasher.update(canonical_json(value).encode("utf-8"))
 
 
 def build_production_snapshot(
@@ -776,11 +844,14 @@ def build_production_snapshot(
         raise ValueError("completed discovery data snapshot is empty")
     checkpoints = session.scalars(
         select(DiscoveryDataCheckpoint)
+        .options(defer(DiscoveryDataCheckpoint.payload_json))
         .where(DiscoveryDataCheckpoint.fill_id == fill.id)
         .order_by(DiscoveryDataCheckpoint.code)
     ).all()
     security_codes = {row.code for row in securities}
     checkpoint_codes = {row.code for row in checkpoints}
+    if [row.code for row in checkpoints] != sorted(checkpoint_codes):
+        raise ValueError("discovery checkpoint codes are not in canonical order")
     if security_codes != checkpoint_codes:
         raise ValueError(
             "discovery checkpoint and security snapshots do not match"
@@ -788,8 +859,7 @@ def build_production_snapshot(
     cutoff = fill.updated_at.astimezone(timezone.utc)
     cutoff_date = cutoff.astimezone(CHINA_MARKET_TIMEZONE).date()
     fill_start = fill.started_at.astimezone(timezone.utc)
-    payload_by_code: dict[str, dict[str, object]] = {}
-    payload_text_by_code: dict[str, str] = {}
+    source_as_of_by_code: dict[str, dict[str, object]] = {}
     payload_captured_at: dict[str, datetime] = {}
     restart_guidance = (
         "latest discovery fill checkpoint payload is not reproducible; "
@@ -829,6 +899,14 @@ def build_production_snapshot(
         ):
             quarter_month = int(value[5]) * 3
             return date(int(value[:4]), quarter_month, 1) <= cutoff_date
+        if (
+            len(value) == 6
+            and value[:4].isdigit()
+            and value[4] == "H"
+            and value[5] in "12"
+        ):
+            month, day = (6, 30) if value[5] == "1" else (12, 31)
+            return date(int(value[:4]), month, day) <= cutoff_date
         return False
 
     def valid_payload_date(value: object, *, nullable: bool = False) -> bool:
@@ -856,17 +934,61 @@ def build_production_snapshot(
     ):
         raise ValueError("discovery fill timestamps exceed fill cutoff")
 
-    for checkpoint in checkpoints:
-        if checkpoint.status != "done":
+    financial_by_code: dict[str, list[dict[str, object]]] = {
+        code: [] for code in security_codes
+    }
+    valuation_by_code: dict[str, list[dict[str, object]]] = {
+        code: [] for code in security_codes
+    }
+    # ~29 distinct metadata dicts repeat across ~2M annual fields.
+    shared_sources: dict[str, object] = {}
+    discovery_provenance = ["discovery"]
+    # Full-market payload text plus parsed rows peaked near 10 GB, so read,
+    # trim and hash one company at a time. Keys of the canonical mappings
+    # below are fed in sorted code order: "checkpoints" sorts first in the
+    # boundary, and checkpoints are ordered by code.
+    boundary_hasher = hashlib.sha256(b'{"checkpoints":[')
+    financial_hasher = hashlib.sha256(b"{")
+    valuation_hasher = hashlib.sha256(b"{")
+    payload_rows = iter(
+        session.execute(
+            select(
+                DiscoveryDataCheckpoint.code,
+                DiscoveryDataCheckpoint.payload_json,
+                DiscoveryDataCheckpoint.payload_digest,
+            )
+            .where(
+                DiscoveryDataCheckpoint.fill_id == fill.id,
+                DiscoveryDataCheckpoint.status == "done",
+            )
+            .order_by(DiscoveryDataCheckpoint.code)
+        ).yield_per(64)
+    )
+    first_done = True
+    for index, checkpoint in enumerate(checkpoints):
+        payload_text = None
+        if checkpoint.status == "done":
+            code, payload_text, digest = next(payload_rows, (None, None, None))
+            if code != checkpoint.code or not verify_company_payload_digest(
+                payload_text, digest
+            ):
+                raise ValueError(restart_guidance)
+        _feed_entry(
+            boundary_hasher,
+            index == 0,
+            None,
+            {
+                "code": checkpoint.code,
+                "status": checkpoint.status,
+                "valuation_points": checkpoint.valuation_points,
+                "payload_json": payload_text,
+            },
+        )
+        if payload_text is None:
             continue
-        if not verify_company_payload_digest(
-            checkpoint.payload_json,
-            checkpoint.payload_digest,
-        ):
-            raise ValueError(restart_guidance)
         try:
             payload = parse_company_payload(
-                checkpoint.payload_json,
+                payload_text,
                 expected_code=checkpoint.code,
             )
             captured_at = datetime.fromisoformat(
@@ -913,9 +1035,57 @@ def build_production_snapshot(
                 raise ValueError("payload valuation count mismatch")
         except (KeyError, TypeError, ValueError) as error:
             raise ValueError(restart_guidance) from error
-        payload_by_code[checkpoint.code] = payload
-        payload_text_by_code[checkpoint.code] = checkpoint.payload_json
-        payload_captured_at[checkpoint.code] = captured_at
+        _feed_entry(financial_hasher, first_done, code, payload["financial_rows"])
+        _feed_entry(
+            valuation_hasher, first_done, code, payload["valuation_points"]
+        )
+        first_done = False
+        source_as_of_by_code[code] = source_as_of
+        payload_captured_at[code] = captured_at
+        for row in payload["financial_rows"]:
+            # Every consumer reads annual rows only; interim and quarterly
+            # rows were 3/4 of snapshot memory. The version hash above still
+            # covers the full payload rows.
+            if row["period_type"] != "annual":
+                continue
+            field_sources = row["field_sources"]
+            trusted = {
+                field: shared_sources.setdefault(
+                    canonical_json(metadata), metadata
+                )
+                for field, metadata in field_sources.items()
+                if metadata["trusted"] is True
+            }
+            financial_by_code[code].append(
+                {
+                    "period": row["period"],
+                    "period_type": row["period_type"],
+                    "source_as_of": row["source_as_of"],
+                    "values": {
+                        field: value if field in trusted else None
+                        for field, value in row["values"].items()
+                    },
+                    "provenance": {
+                        field: discovery_provenance for field in trusted
+                    },
+                    "field_sources": trusted,
+                }
+            )
+        financial_by_code[code].sort(
+            key=lambda row: (row["period"], row["period_type"])
+        )
+        valuation_by_code[code] = sorted(
+            (
+                {
+                    **point,
+                    "fetched_at": captured_at,
+                }
+                for point in payload["valuation_points"]
+            ),
+            key=lambda row: (row["trade_date"], row["month"]),
+        )
+    if next(payload_rows, None) is not None:
+        raise ValueError(restart_guidance)
 
     dates = tuple(
         session.scalars(
@@ -939,50 +1109,6 @@ def build_production_snapshot(
     ):
         raise ValueError("discovery fill calendar exceeds fill cutoff")
 
-    financial_by_code: dict[str, list[dict[str, object]]] = {
-        code: [] for code in security_codes
-    }
-    valuation_by_code: dict[str, list[dict[str, object]]] = {
-        code: [] for code in security_codes
-    }
-    for code, payload in payload_by_code.items():
-        for row in payload["financial_rows"]:
-            field_sources = row["field_sources"]
-            trusted = {
-                field: metadata
-                for field, metadata in field_sources.items()
-                if metadata["trusted"] is True
-            }
-            financial_by_code[code].append(
-                {
-                    "period": row["period"],
-                    "period_type": row["period_type"],
-                    "source_as_of": row["source_as_of"],
-                    "values": {
-                        field: value if field in trusted else None
-                        for field, value in row["values"].items()
-                    },
-                    "provenance": {
-                        field: ["discovery"] for field in trusted
-                    },
-                    "field_sources": trusted,
-                }
-            )
-        financial_by_code[code].sort(
-            key=lambda row: (row["period"], row["period_type"])
-        )
-        captured_at = payload_captured_at[code]
-        valuation_by_code[code] = sorted(
-            (
-                {
-                    **point,
-                    "fetched_at": captured_at,
-                }
-                for point in payload["valuation_points"]
-            ),
-            key=lambda row: (row["trade_date"], row["month"]),
-        )
-
     companies: list[CompanySnapshotInput] = []
     for security in securities:
         financial_history = financial_by_code[security.code]
@@ -991,17 +1117,10 @@ def build_production_snapshot(
         price = None if latest is None else latest["price"]
         price_source = None if latest is None else latest["source"]
         price_as_of = None if latest is None else latest["trade_date"]
-        payload = payload_by_code.get(security.code)
-        source_as_of = (
-            {"financial": None, "valuation": None}
-            if payload is None
-            else payload["source_as_of"]
+        source_as_of = source_as_of_by_code.get(
+            security.code, {"financial": None, "valuation": None}
         )
-        valuation_fetched_at = (
-            None
-            if payload is None
-            else payload_captured_at[security.code]
-        )
+        valuation_fetched_at = payload_captured_at.get(security.code)
         companies.append(
             CompanySnapshotInput(
                 code=security.code,
@@ -1065,45 +1184,38 @@ def build_production_snapshot(
     rulers = resolve_discovery_rulers(
         session, algorithm_version=algorithm_version
     )
-    boundary = {
-        "fill_id": fill.id,
-        "cutoff": cutoff,
-        "checkpoints": [
-            {
-                "code": row.code,
-                "status": row.status,
-                "valuation_points": row.valuation_points,
-                "payload_json": payload_text_by_code.get(row.code),
-            }
-            for row in checkpoints
-        ],
-        "securities": [
-            {
-                column.name: getattr(row, column.name)
-                for column in DiscoveryUniverseSecurity.__table__.columns
-            }
-            for row in securities
-        ],
-        "trading_dates": dates,
-    }
+    boundary_hasher.update(b"]")
+    for key, value in (
+        ("cutoff", cutoff),
+        ("fill_id", fill.id),
+        (
+            "securities",
+            [
+                {
+                    column.name: getattr(row, column.name)
+                    for column in DiscoveryUniverseSecurity.__table__.columns
+                }
+                for row in securities
+            ],
+        ),
+        ("trading_dates", dates),
+    ):
+        _feed_entry(boundary_hasher, False, key, value)
+    boundary_hasher.update(b"}")
+    financial_hasher.update(b"}")
+    valuation_hasher.update(b"}")
     versions = SnapshotVersions(
         data_version=(
             f"discovery-fill:{fill.id}:{cutoff.isoformat()}:"
-            f"{_sha256(boundary)[:20]}"
+            f"{boundary_hasher.hexdigest()[:20]}"
         ),
-        financial_version=_snapshot_version(
-            f"financial:fill:{fill.id}:{cutoff.isoformat()}",
-            {
-                code: payload["financial_rows"]
-                for code, payload in sorted(payload_by_code.items())
-            },
+        financial_version=(
+            f"financial:fill:{fill.id}:{cutoff.isoformat()}:"
+            f"{financial_hasher.hexdigest()[:20]}"
         ),
-        valuation_version=_snapshot_version(
-            f"valuation:fill:{fill.id}:{cutoff.isoformat()}",
-            {
-                code: payload["valuation_points"]
-                for code, payload in sorted(payload_by_code.items())
-            },
+        valuation_version=(
+            f"valuation:fill:{fill.id}:{cutoff.isoformat()}:"
+            f"{valuation_hasher.hexdigest()[:20]}"
         ),
         ruler_version_ids=rulers,
         algorithm_version=algorithm_version,

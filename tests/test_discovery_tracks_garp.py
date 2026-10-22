@@ -71,7 +71,7 @@ FORMULAS = {
     ),
     "return_on_capital": "mean(primary(annual.roic,fallback=annual.roe))",
     "return_metric_label": "label(primary(annual.roic,fallback=annual.roe))",
-    "cash_conversion": "cash_conversion(annual.ocf,annual.net_income>0)",
+    "cash_conversion": "sum(annual.ocf)/sum(annual.net_income)|annual.net_income>0",
     "dilution_rate": "latest(annual.shares)/earliest(annual.shares)-1",
     "interest_debt_increase_to_revenue": (
         "max(0,latest(annual.interest_debt)-earliest(annual.interest_debt))/"
@@ -82,7 +82,7 @@ FORMULAS = {
         "latest(annual.revenue)"
     ),
     "acquisition_cash_to_revenue": (
-        "sum(annual.acquisition_cash_paid)/sum(annual.revenue)"
+        "sum(max(0,annual.acquisition_cash_paid))/sum(annual.revenue)"
     ),
     "gross_margin_change": (
         "latest(annual.gross_margin)-earliest(annual.gross_margin)"
@@ -156,7 +156,7 @@ def garp_payload(**threshold_overrides: str) -> dict[str, object]:
         "sector_branches": {
             "common": {
                 "valuation_ratio_method": "PE_TTM/PB_MRQ",
-                "field_domain_policy": "garp-domain-v1",
+                "field_domain_policy": "garp-domain-v2",
                 "annual_observations": {
                     "growth": 5,
                     "return_on_capital": 5,
@@ -205,18 +205,18 @@ def garp_payload(**threshold_overrides: str) -> dict[str, object]:
                     "return_on_capital",
                     "peg",
                 ],
+                "excluded_industries": ["贵金属"],
             },
         },
         "order": [
-            ["cash_conversion", "desc", "nulls_last"],
-            ["return_on_capital", "desc", "nulls_last"],
             [
                 "deducted_profit_consistent_growth_periods",
                 "desc",
                 "nulls_last",
             ],
             ["peg", "asc", "nulls_last"],
-            ["pe_percentile", "asc", "nulls_last"],
+            ["return_on_capital", "desc", "nulls_last"],
+            ["cash_conversion", "desc", "nulls_last"],
             ["code", "asc", "nulls_last"],
         ],
         "industry_version": "test-industry-v1",
@@ -536,6 +536,67 @@ def test_acquisition_cash_uses_multi_year_flow_intensity_not_endpoint_delta() ->
     assert Decimal("0.15") < intensity < Decimal("0.16")
 
 
+def test_cash_conversion_minimum_is_inclusive_at_base_band() -> None:
+    # net income is 20, 24, 28, 32, 36; OCF is exactly 80% of it.
+    def verdict(latest_ocf: str):
+        ocf = dict(zip(range(2021, 2025), ("16", "19.2", "22.4", "25.6")))
+        ocf[2025] = latest_ocf
+        annual = tuple(
+            _garp_annual(year, ocf=ocf[year]) for year in range(2021, 2026)
+        )
+        return _classify(
+            _company(annual=annual),
+            garp_payload(cash_conversion_min="0.8"),
+        )
+
+    assert verdict("28.8").verdict == "pass"
+    assert (verdict("28.79").verdict, verdict("28.79").primary_reason) == (
+        "drop",
+        "cash_conversion_below_min",
+    )
+
+
+def test_ttm_earnings_far_above_latest_deducted_profit_is_flagged() -> None:
+    # Market value 10 x 100 = 1000; latest deducted profit is 36.
+    def flags(latest_pe: str):
+        company = _company(valuations=_valuations(latest_pe=latest_pe))
+        return _classify(company).risk_flags
+
+    assert "ttm_earnings_above_deducted" not in flags("25")
+    assert "ttm_earnings_above_deducted" in flags("15")
+
+
+def test_net_negative_acquisition_cash_counts_as_zero_not_invalid() -> None:
+    annual = tuple(
+        _garp_annual(year, acquisition_cash_paid="-50" if year == 2023 else "0")
+        for year in range(2021, 2026)
+    )
+    verdict = _classify(_company(annual=annual))
+    assert verdict.verdict == "pass"
+    assert Decimal(str(verdict.metrics["acquisition_cash_to_revenue"])) == 0
+
+
+def test_excluded_cyclical_industry_is_unsupported_and_labels_are_strict() -> None:
+    from discovery.rulers import garp_ruler
+
+    verdict = _classify(_company(industry="贵金属"))
+    assert (verdict.verdict, verdict.primary_reason) == (
+        "insufficient",
+        "industry_cyclical_unsupported",
+    )
+    for labels in (["工业金属", "贵金属"][::-1], ["贵金属", "贵金属"], [" 贵金属"], "贵金属"):
+        payload = json.loads(json.dumps(garp_payload()))
+        payload["sector_branches"]["nonfinancial"]["excluded_industries"] = labels
+        with pytest.raises((TypeError, ValueError)):
+            garp_ruler(payload)
+    v3 = json.loads(json.dumps(garp_payload()))
+    v3["formulas"]["acquisition_cash_to_revenue"] = (
+        "sum(annual.acquisition_cash_paid)/sum(annual.revenue)"
+    )
+    with pytest.raises(ValueError):
+        garp_ruler(v3)
+
+
 @pytest.mark.parametrize(
     ("field", "reason"),
     [
@@ -791,49 +852,41 @@ def test_builtin_dispatches_garp_and_generic_evidence_in_order() -> None:
     assert all(row.rule_id.startswith("garp.") for row in ranked.evidence)
 
 
-def test_garp_competition_order_is_quality_first_before_valuation() -> None:
+def test_garp_competition_order_is_growth_consistency_then_peg() -> None:
     from discovery.competition import CompetitionCandidate, rank_competition
     from discovery.rulers import garp_ruler
+
+    def candidate(code: str, periods: str, peg: str, roc: str, cash: str):
+        return CompetitionCandidate(
+            code,
+            "制造业",
+            {
+                "deducted_profit_consistent_growth_periods": periods,
+                "peg": peg,
+                "return_on_capital": roc,
+                "cash_conversion": cash,
+            },
+        )
 
     ruler = garp_ruler(garp_payload())
     ranked = rank_competition(
         (
-            CompetitionCandidate(
-                "600001.SH",
-                "制造业",
-                {
-                    "cash_conversion": "1.5",
-                    "return_on_capital": "16",
-                    "deducted_profit_consistent_growth_periods": "4",
-                    "peg": "1.4",
-                    "pe_percentile": "60",
-                },
-            ),
-            CompetitionCandidate(
-                "600002.SH",
-                "制造业",
-                {
-                    "cash_conversion": "1",
-                    "return_on_capital": "10",
-                    "deducted_profit_consistent_growth_periods": "3",
-                    "peg": "0.5",
-                    "pe_percentile": "10",
-                },
-            ),
+            candidate("600001.SH", "3", "0.5", "30", "2"),
+            candidate("600002.SH", "4", "1.4", "10", "0.8"),
+            candidate("600003.SH", "4", "0.9", "10", "0.8"),
         ),
         ruler.order,
     )
-    assert [row.code for row in ranked] == ["600001.SH", "600002.SH"]
+    assert [row.code for row in ranked] == ["600003.SH", "600002.SH", "600001.SH"]
     assert ruler.order == (
-        ("cash_conversion", "desc", "nulls_last"),
-        ("return_on_capital", "desc", "nulls_last"),
         (
             "deducted_profit_consistent_growth_periods",
             "desc",
             "nulls_last",
         ),
         ("peg", "asc", "nulls_last"),
-        ("pe_percentile", "asc", "nulls_last"),
+        ("return_on_capital", "desc", "nulls_last"),
+        ("cash_conversion", "desc", "nulls_last"),
         ("code", "asc", "nulls_last"),
     )
 

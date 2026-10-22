@@ -28,20 +28,20 @@ def ruler_payload() -> dict[str, object]:
         "track": "quality_discount",
         "fields": [
             "pe_percentile",
-            "roe_cv",
+            "roe_downside_volatility",
             "cash_conversion",
             "margin_change",
             "code",
         ],
         "formulas": {
             "pe_percentile": "percentile_rank(current.pe,monthly.pe)",
-            "roe_cv": "coefficient_of_variation(annual.roe)",
+            "roe_downside_volatility": "downside_volatility(annual.roe)",
             "cash_conversion": "mean(annual.ocf/annual.net_income)",
             "margin_change": "latest(gross_margin)-earliest(gross_margin)",
         },
         "thresholds": {
             "pe_percentile_max": "30",
-            "roe_cv_max": "0.25",
+            "roe_downside_volatility_max": "0.25",
             "cash_conversion_min": "1",
         },
         "min_observations": {
@@ -51,14 +51,14 @@ def ruler_payload() -> dict[str, object]:
         },
         "missing_policy": {
             "pe_percentile": "insufficient",
-            "roe_cv": "insufficient",
+            "roe_downside_volatility": "insufficient",
             "cash_conversion": "insufficient",
             "margin_change": "skip",
             "code": "insufficient",
         },
         "order": [
             ["pe_percentile", "asc", "nulls_last"],
-            ["roe_cv", "asc", "nulls_last"],
+            ["roe_downside_volatility", "asc", "nulls_last"],
             ["cash_conversion", "desc", "nulls_last"],
             ["code", "asc", "nulls_last"],
         ],
@@ -69,7 +69,7 @@ def ruler_payload() -> dict[str, object]:
 def metrics(**changes: object) -> dict[str, object]:
     values = {
         "pe_percentile": "20",
-        "roe_cv": "0.1",
+        "roe_downside_volatility": "0.1",
         "cash_conversion": "1.2",
         "margin_change": "1",
         "valuation_pe_observations": "60",
@@ -104,7 +104,7 @@ def test_evidence_is_deterministic_and_carries_rule_inputs() -> None:
     }
     facts = {item.rule_id: item for item in first.items if item.kind == "fact"}
     assert facts["quality_discount.fact.pe_percentile"].as_of == "2026-08-31"
-    assert facts["quality_discount.fact.roe_cv"].as_of == "2026-04-01"
+    assert facts["quality_discount.fact.roe_downside_volatility"].as_of == "2026-04-01"
     assert facts["quality_discount.fact.cash_conversion"].as_of == "2026-04-01"
     assert first.items[-1].display_text == FALLBACK_RISK_TEXT
     assert first.items[-1].kind == "risk"
@@ -217,6 +217,18 @@ def test_risks_use_only_allowed_categories() -> None:
     assert categories <= ALLOWED_RISK_CATEGORIES
 
 
+def test_cash_debt_double_high_is_a_balance_sheet_risk() -> None:
+    card = build_evidence_card(
+        "600000.SH",
+        metrics(risk_flags=["cash_debt_double_high"]),
+        ruler_payload(),
+        source_as_of=SOURCE_AS_OF,
+    )
+    assert "balance_sheet_risk" in {
+        item.category for item in card.items if item.kind == "risk"
+    }
+
+
 def test_fewer_than_three_reliable_facts_is_insufficient_not_padded() -> None:
     card = build_evidence_card(
         "600000.SH",
@@ -327,7 +339,7 @@ def test_builtin_competition_emits_evidence_for_every_entrant() -> None:
                 {
                         "code": code,
                     "pe_percentile": "20",
-                    "roe_cv": "0.1",
+                    "roe_downside_volatility": "0.1",
                     "cash_conversion": "1.2",
                     "roe_mean": "15",
                     "branch": "nonfinancial",

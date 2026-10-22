@@ -197,6 +197,7 @@ const RISK_CATEGORIES = new Set([
   'metric_near_threshold',
   'worsening_trend',
   'sector_specific_risk',
+  'balance_sheet_risk',
   'missing_non_gating_evidence',
 ])
 // Mirrors SUMMARY_* limits in discovery/summaries.py; 128 is the ruler's
@@ -268,8 +269,148 @@ export function candidateSurfacedReason(
     .join('；')
 }
 
+// Evidence text is frozen backend output ("field=value", "x接近阈值",
+// "metric_worsening"); only its display is translated here.
+type EvidenceUnit = 'ratio' | 'percent' | 'times' | 'yuan' | 'plain'
+
+const EVIDENCE_FIELDS: Record<string, [string, EvidenceUnit]> = {
+  cumulative_fcf: ['累计自由现金流', 'yuan'],
+  interest_coverage: ['利息保障倍数', 'times'],
+  net_debt_to_normalized_fcf: ['净负债/常态自由现金流', 'times'],
+  normalized_pe: ['常态市盈率', 'times'],
+  deducted_profit_cagr: ['扣非利润复合增速', 'ratio'],
+  revenue_cagr: ['营收复合增速', 'ratio'],
+  peg: ['PEG', 'plain'],
+  return_on_capital: ['资本回报率', 'percent'],
+  cash_conversion: ['现金转化率', 'times'],
+  pe_percentile: ['市盈率历史分位', 'percent'],
+  pb_percentile: ['市净率历史分位', 'percent'],
+  roe_cv: ['ROE 波动系数', 'plain'],
+  roe_downside_volatility: ['ROE 下行波动', 'plain'],
+  roe_mean: ['平均 ROE', 'percent'],
+  bank_capital_adequacy: ['资本充足率', 'percent'],
+  bank_core_tier1_capital_adequacy: ['核心一级资本充足率', 'percent'],
+  bank_npl: ['不良贷款率', 'percent'],
+}
+
+const EVIDENCE_TERMS: Record<string, string> = {
+  revenue_growth_slowdown: '营收增速放缓',
+  deducted_profit_growth_slowdown: '扣非利润增速放缓',
+  interest_debt_increase_to_revenue: '有息负债增幅高于营收',
+  goodwill_increase_to_revenue: '商誉增幅高于营收',
+  acquisition_cash_to_revenue: '收购支出占营收',
+  dilution_rate: '股本稀释',
+  revenue_decline: '营收下滑',
+  earnings_decline: '盈利较常态下滑',
+  npl_change: '不良率',
+  gross_margin_change: '毛利率',
+  net_margin_change: '净利率',
+  margin: '利润率',
+  impairment_share: '减值占比',
+  cash_debt_double_high: '存贷双高',
+  ttm_earnings_above_deducted: '近四季利润明显高于扣非利润',
+  total_cap_exceeded: '名额上限挤出',
+  industry_cap_exceeded: '行业上限挤出',
+  industry_unknown: '行业未知',
+  roe_mean_below_min: '平均 ROE 未达标',
+  roe_stability_above_max: 'ROE 波动超上限',
+  roe_recent_ratio_below_min: '近期 ROE 趋势回落',
+  positive_net_income_observations_below_min: '正净利润年数不足',
+  latest_net_income_not_positive: '最近年度净利润非正',
+  latest_net_assets_not_positive: '最近年度净资产非正',
+  cash_conversion_below_min: '现金转化率未达标',
+  dilution_rate_above_max: '股本稀释率超上限',
+  debt_to_equity_above_max: '有息负债/净资产超上限',
+  interest_coverage_below_min: '利息保障倍数未达标',
+  pe_percentile_above_max: '市盈率分位超上限',
+  pe_median_ratio_above_max: '市盈率高于历史中位上限',
+  pb_percentile_above_max: '市净率分位超上限',
+  pb_median_ratio_above_max: '市净率高于历史中位上限',
+  earnings_yield_below_min: '盈利收益率未达国债利差',
+  normalized_pe_above_max: '常态市盈率超上限',
+  normalized_earnings_not_positive: '常态扣非利润非正',
+  cumulative_fcf_not_positive: '累计自由现金流非正',
+  normalized_fcf_not_positive: '常态自由现金流非正',
+  net_debt_to_normalized_fcf_above_max: '净负债/常态自由现金流超上限',
+  revenue_decline_above_max: '营收下滑超上限',
+  one_time_profit_share_above_max: '非经常性损益占比超上限',
+  impairment_share_above_max: '资产减值占比超上限',
+  non_core_income_proxy_share_above_max: '非主营收益占比超上限',
+  peg_above_max: 'PEG 超上限',
+  revenue_cagr_below_min: '营收复合增速未达标',
+  deducted_profit_cagr_below_min: '扣非利润复合增速未达标',
+  return_on_capital_below_min: '资本回报率未达标',
+  st_security: 'ST 股票',
+  delisting_security: '退市整理期',
+  listing_history_insufficient: '上市年限不足',
+  price_date_mismatch: '价格日期不匹配',
+  price_missing: '缺少现价',
+  suspension_too_old: '长期停牌',
+}
+
+function evidenceLabel(field: string): string {
+  return EVIDENCE_FIELDS[field]?.[0] ?? EVIDENCE_TERMS[field] ?? field
+}
+
+function formatEvidenceValue(value: number, unit: EvidenceUnit): string {
+  if (unit === 'ratio') return `${(value * 100).toFixed(2)}%`
+  if (unit === 'percent') return `${value.toFixed(2)}%`
+  if (unit === 'times') return `${value.toFixed(2)} 倍`
+  if (unit === 'yuan') return `${(value / 1e8).toFixed(2)} 亿元`
+  return value.toFixed(2)
+}
+
+function formatEvidenceFact(fact: string): string {
+  const match = /^(\w+)=(\S+)( \(ROE fallback\))?$/.exec(fact.trim())
+  if (!match) return fact
+  const [, field, raw, fallback] = match as unknown as [string, string, string, string?]
+  const [label, unit] = EVIDENCE_FIELDS[field] ?? [field, 'plain']
+  const value = Number(raw)
+  if (!Number.isFinite(value)) return `${label} ${raw}`
+  const netCash = field === 'net_debt_to_normalized_fcf' && value < 0 ? '（净现金）' : ''
+  return `${label} ${formatEvidenceValue(value, unit)}${netCash}${fallback ? '（以 ROE 代替）' : ''}`
+}
+
+function formatEvidencePart(part: string): string {
+  const near = /^(\w+)接近阈值$/.exec(part)
+  if (near) return `${evidenceLabel(near[1]!)}接近阈值`
+  const trend = /^(\w+?)_(worsening|deterioration)$/.exec(part)
+  if (trend) return `${evidenceLabel(trend[1]!)}${trend[2] === 'worsening' ? '持续恶化' : '恶化'}`
+  if (EVIDENCE_TERMS[part]) return EVIDENCE_TERMS[part]
+  return part.includes('=') ? part.split(',').map(formatEvidenceFact).join('，') : part
+}
+
+export function formatEvidenceText(text: string): string {
+  return text.split('；').map(formatEvidencePart).join('；')
+}
+
 export function shouldPollStage(created: boolean, status: DiscoveryStageStatus): boolean {
   return created && (status === 'queued' || status === 'running')
+}
+
+export function preferredViewStage(
+  latestStage: DiscoveryTrackStage | null | undefined,
+  _latestStatus: DiscoveryStageStatus | null | undefined,
+): DiscoveryTrackStage {
+  if (!latestStage || !TRACK_STAGES.includes(latestStage)) {
+    return 'track_gate'
+  }
+  if (latestStage === 'adjudication') {
+    return 'competition'
+  }
+  return latestStage
+}
+
+export function stageIsReachable(
+  stage: DiscoveryTrackStage,
+  pointer: { created: boolean; stage: string | null } | null | undefined,
+): boolean {
+  if (!pointer?.created || pointer.stage == null) return false
+  if (!TRACK_STAGES.includes(pointer.stage as DiscoveryTrackStage)) return false
+  return (
+    TRACK_STAGES.indexOf(stage)
+    <= TRACK_STAGES.indexOf(pointer.stage as DiscoveryTrackStage)
+  )
 }
 
 export function latestStagesNeedPolling(
@@ -372,10 +513,9 @@ export function stageActions(
   status: DiscoveryStageStatus,
   failureKind: DiscoveryFailureKind,
 ): { confirm: boolean; override: boolean; retry: boolean } {
-  const waiting = status === 'waiting_confirmation' && stage !== 'adjudication'
   return {
-    confirm: waiting,
-    override: waiting && stage !== 'safety',
+    confirm: false,
+    override: false,
     retry: stage !== 'adjudication' && status === 'failed' && failureKind === 'transient',
   }
 }

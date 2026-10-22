@@ -687,3 +687,46 @@ def test_screen_view_has_three_chinese_tables_not_json() -> None:
     assert "收益排行" not in source
     assert "<pre" not in source.lower()
     assert "snapshot_json" not in source
+
+
+def test_funnel_interim_deterioration_and_quality_value_order() -> None:
+    snaps = [
+        Constituent("600001.SH", "大盘高估", Decimal("500"), Decimal("25"), "制造业"),
+        Constituent("600002.SH", "中盘高质低估", Decimal("120"), Decimal("10"), "制造业"),
+        Constituent("600003.SH", "中报变脸", Decimal("300"), Decimal("12"), "制造业"),
+    ]
+    rows = (
+        _annual("600001.SH", roe="15")
+        + _annual("600002.SH", roe="20")
+        + _annual("600003.SH", roe="18")
+        + [
+            FinancialRow(code="600003.SH", period="2025H1", period_type="interim", net_income=Decimal("100"), ocf=Decimal("90")),
+            FinancialRow(code="600003.SH", period="2026H1", period_type="interim", net_income=Decimal("70"), ocf=Decimal("80")),
+        ]
+    )
+    result = run_funnel(snaps, rows, as_of_year=2026)
+    assert [row.name for row in result.keep] == ["中盘高质低估", "大盘高估"]
+    assert any(row.name == "中报变脸" and "2026H1" in (row.reason or "") for row in result.drop)
+
+    # Recent OCF/NI collapse (e.g. 大族数控 2025 OCF/NI=0.22 despite 5y mean > 0.7) is dropped
+    collapse_rows = _annual("600004.SH", roe="18", ni="100", ocf="120", start=2016, years=9) + [
+        FinancialRow(
+            code="600004.SH",
+            period="2025",
+            period_type="annual",
+            roe=Decimal("15"),
+            net_income=Decimal("824"),
+            ocf=Decimal("181"),
+            capex=Decimal("157"),
+            ebit=Decimal("40"),
+            interest=Decimal("5"),
+            gross_margin=Decimal("35"),
+            net_margin=Decimal("12"),
+            shares=Decimal("100"),
+        )
+    ]
+    res2 = run_funnel([Constituent("600004.SH", "纸面富贵", Decimal("200"), Decimal("15"), "专用设备")], collapse_rows, as_of_year=2026)
+    assert res2.keep == []
+    assert any("近期现金流骤降" in (r.reason or "") for r in res2.drop)
+
+

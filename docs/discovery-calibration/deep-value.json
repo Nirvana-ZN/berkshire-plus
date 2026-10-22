@@ -1,0 +1,2208 @@
+{
+  "algorithm_build": "discovery-v7",
+  "approval_ready": true,
+  "blocked_reasons": [],
+  "branch_coverage": {
+    "financial": {
+      "capital_adequacy": {
+        "present": 32,
+        "ratio": "1",
+        "total": 32,
+        "trusted": 32
+      },
+      "core_tier1_capital_adequacy": {
+        "present": 32,
+        "ratio": "1",
+        "total": 32,
+        "trusted": 32
+      },
+      "npl": {
+        "present": 32,
+        "ratio": "1",
+        "total": 32,
+        "trusted": 32
+      },
+      "roe": {
+        "present": 32,
+        "ratio": "1",
+        "total": 32,
+        "trusted": 32
+      },
+      "valuation_pb": {
+        "present": 32,
+        "ratio": "1",
+        "total": 32,
+        "trusted": 32
+      }
+    },
+    "nonfinancial": {
+      "asset_disposal_gain": {
+        "present": 5017,
+        "ratio": "0.845158761270090160721285770286162289298314386515092120736965895727165817",
+        "total": 5102,
+        "trusted": 4312
+      },
+      "capex": {
+        "present": 5102,
+        "ratio": "0.98745589964719717757742061936495491963935711485691885535084280674245394",
+        "total": 5102,
+        "trusted": 5038
+      },
+      "cash": {
+        "present": 5102,
+        "ratio": "1",
+        "total": 5102,
+        "trusted": 5102
+      },
+      "deducted_net_income": {
+        "present": 5102,
+        "ratio": "0.989219913759310074480595844766758134065072520580164641317130537044296354",
+        "total": 5102,
+        "trusted": 5047
+      },
+      "impairment_loss": {
+        "present": 5101,
+        "ratio": "0.999607996863974911799294394355154841238729909839278714229713837710701686",
+        "total": 5102,
+        "trusted": 5100
+      },
+      "interest_coverage": {
+        "present": 4991,
+        "ratio": "0.978243825950607604860838886711093688749509996079968639749117992943943552",
+        "total": 5102,
+        "trusted": 4991
+      },
+      "interest_debt": {
+        "present": 5102,
+        "ratio": "1",
+        "total": 5102,
+        "trusted": 5102
+      },
+      "net_income": {
+        "present": 5102,
+        "ratio": "1",
+        "total": 5102,
+        "trusted": 5102
+      },
+      "ocf": {
+        "present": 5102,
+        "ratio": "0.989415915327322618580948647589180713445707565660525284202273618188945512",
+        "total": 5102,
+        "trusted": 5048
+      },
+      "other_income": {
+        "present": 5099,
+        "ratio": "0.998823990591924735397883183065464523716189729517836142689141513132105057",
+        "total": 5102,
+        "trusted": 5096
+      },
+      "revenue": {
+        "present": 5102,
+        "ratio": "0.988631909055272442179537436299490395923167385339082712661701293610348883",
+        "total": 5102,
+        "trusted": 5044
+      },
+      "shares": {
+        "present": 5102,
+        "ratio": "0.989415915327322618580948647589180713445707565660525284202273618188945512",
+        "total": 5102,
+        "trusted": 5048
+      },
+      "valuation_price": {
+        "present": 5102,
+        "ratio": "1",
+        "total": 5102,
+        "trusted": 5102
+      }
+    }
+  },
+  "candidate_counts": {
+    "base": {
+      "branches": {
+        "financial": {
+          "drop": 32,
+          "insufficient": 0,
+          "pass": 0
+        },
+        "nonfinancial": {
+          "drop": 4146,
+          "insufficient": 922,
+          "pass": 34
+        },
+        "unsupported_insurance": {
+          "drop": 0,
+          "insufficient": 5,
+          "pass": 0
+        },
+        "unsupported_other_financial": {
+          "drop": 0,
+          "insufficient": 26,
+          "pass": 0
+        }
+      },
+      "drop": 4178,
+      "insufficient": 953,
+      "pass": 34
+    },
+    "conservative": {
+      "branches": {
+        "financial": {
+          "drop": 32,
+          "insufficient": 0,
+          "pass": 0
+        },
+        "nonfinancial": {
+          "drop": 4180,
+          "insufficient": 918,
+          "pass": 4
+        },
+        "unsupported_insurance": {
+          "drop": 0,
+          "insufficient": 5,
+          "pass": 0
+        },
+        "unsupported_other_financial": {
+          "drop": 0,
+          "insufficient": 26,
+          "pass": 0
+        }
+      },
+      "drop": 4212,
+      "insufficient": 949,
+      "pass": 4
+    },
+    "relaxed": {
+      "branches": {
+        "financial": {
+          "drop": 26,
+          "insufficient": 0,
+          "pass": 6
+        },
+        "nonfinancial": {
+          "drop": 4064,
+          "insufficient": 930,
+          "pass": 108
+        },
+        "unsupported_insurance": {
+          "drop": 0,
+          "insufficient": 5,
+          "pass": 0
+        },
+        "unsupported_other_financial": {
+          "drop": 0,
+          "insufficient": 26,
+          "pass": 0
+        }
+      },
+      "drop": 4090,
+      "insufficient": 961,
+      "pass": 114
+    }
+  },
+  "distributions": {
+    "metrics": {
+      "allowed_latest_annual_staleness_years": {
+        "max": "1",
+        "min": "1",
+        "p25": "1",
+        "p50": "1",
+        "p75": "1"
+      },
+      "bank_capital_adequacy": {
+        "max": "19.69",
+        "min": "12.12",
+        "p25": "13.1575",
+        "p50": "13.9",
+        "p75": "14.5825"
+      },
+      "bank_capital_available_count": {
+        "max": "5",
+        "min": "0",
+        "p25": "0",
+        "p50": "0",
+        "p75": "0"
+      },
+      "bank_capital_observations": {
+        "max": "5",
+        "min": "5",
+        "p25": "5",
+        "p50": "5",
+        "p75": "5"
+      },
+      "bank_capital_window_end_year": {
+        "max": "2025",
+        "min": "2024",
+        "p25": "2025",
+        "p50": "2025",
+        "p75": "2025"
+      },
+      "bank_capital_window_start_year": {
+        "max": "2021",
+        "min": "2020",
+        "p25": "2021",
+        "p50": "2021",
+        "p75": "2021"
+      },
+      "bank_core_tier1_capital_adequacy": {
+        "max": "14.63",
+        "min": "8.37",
+        "p25": "9.375",
+        "p50": "10.06",
+        "p75": "11.6675"
+      },
+      "bank_npl_available_count": {
+        "max": "5",
+        "min": "0",
+        "p25": "0",
+        "p50": "0",
+        "p75": "0"
+      },
+      "bank_npl_observations": {
+        "max": "5",
+        "min": "5",
+        "p25": "5",
+        "p50": "5",
+        "p75": "5"
+      },
+      "bank_npl_window_end_year": {
+        "max": "2025",
+        "min": "2024",
+        "p25": "2025",
+        "p50": "2025",
+        "p75": "2025"
+      },
+      "bank_npl_window_start_year": {
+        "max": "2021",
+        "min": "2020",
+        "p25": "2021",
+        "p50": "2021",
+        "p75": "2021"
+      },
+      "bank_roe_available_count": {
+        "max": "5",
+        "min": "0",
+        "p25": "0",
+        "p50": "0",
+        "p75": "0"
+      },
+      "bank_roe_observations": {
+        "max": "5",
+        "min": "5",
+        "p25": "5",
+        "p50": "5",
+        "p75": "5"
+      },
+      "bank_roe_window_end_year": {
+        "max": "2025",
+        "min": "2024",
+        "p25": "2025",
+        "p50": "2025",
+        "p75": "2025"
+      },
+      "bank_roe_window_start_year": {
+        "max": "2021",
+        "min": "2020",
+        "p25": "2021",
+        "p50": "2021",
+        "p75": "2021"
+      },
+      "cash_to_assets": {
+        "max": "0.886524272121648297345900583881686386275391530460468611358313452261479881932073603894172614",
+        "min": "0.002969818577552720549673031450505486905394226657220929196069535238072026694130788183867076",
+        "p25": "0.08355081523463476847191977454567081409167026711055116140492736430836459624851532135670205",
+        "p50": "0.14053797998068907446925771908029098728383650827143247430279720322410808662840446748713935",
+        "p75": "0.2264085240813240198947866538073005914897247059056015278272346572918722510717295816575527"
+      },
+      "cumulative_fcf": {
+        "max": "623863000000",
+        "min": "-179788995708",
+        "p25": "-492564344.545",
+        "p50": "31503124.84",
+        "p75": "723285938.77"
+      },
+      "dilution_available_count": {
+        "max": "5",
+        "min": "0",
+        "p25": "5",
+        "p50": "5",
+        "p75": "5"
+      },
+      "dilution_observations": {
+        "max": "5",
+        "min": "4",
+        "p25": "5",
+        "p50": "5",
+        "p75": "5"
+      },
+      "dilution_rate": {
+        "max": "0.489945989050226136634134729826231849559628659842894548916924541775767674363246846",
+        "min": "-0.04574246834245165494241957910267239171424172960798669489626467827573252079584661",
+        "p25": "0",
+        "p50": "0",
+        "p75": "0"
+      },
+      "dilution_window_end_year": {
+        "max": "2025",
+        "min": "2024",
+        "p25": "2025",
+        "p50": "2025",
+        "p75": "2025"
+      },
+      "dilution_window_start_year": {
+        "max": "2021",
+        "min": "2020",
+        "p25": "2021",
+        "p50": "2021",
+        "p75": "2021"
+      },
+      "earnings_decline": {
+        "max": "407.52879916550070727493289045035168794612165012629899139488702122969524464925674319759",
+        "min": "0",
+        "p25": "0",
+        "p50": "0",
+        "p75": "0.5564687167803724636621522652282743599410983770868396918372488756071368743979057482699425"
+      },
+      "fcf_available_count": {
+        "max": "5",
+        "min": "0",
+        "p25": "5",
+        "p50": "5",
+        "p75": "5"
+      },
+      "fcf_observations": {
+        "max": "5",
+        "min": "3",
+        "p25": "5",
+        "p50": "5",
+        "p75": "5"
+      },
+      "fcf_window_end_year": {
+        "max": "2025",
+        "min": "2024",
+        "p25": "2025",
+        "p50": "2025",
+        "p75": "2025"
+      },
+      "fcf_window_start_year": {
+        "max": "2021",
+        "min": "2020",
+        "p25": "2021",
+        "p50": "2021",
+        "p75": "2021"
+      },
+      "impairment_available_count": {
+        "max": "3",
+        "min": "0",
+        "p25": "3",
+        "p50": "3",
+        "p75": "3"
+      },
+      "impairment_observations": {
+        "max": "3",
+        "min": "0",
+        "p25": "3",
+        "p50": "3",
+        "p75": "3"
+      },
+      "impairment_share": {
+        "max": "515.90523216482862889495262266575256636685992926316554144551947079040921122527275451",
+        "min": "0.0001674090228778150696689212189950649643043211969007173383899993231416949712218937145600827",
+        "p25": "0.10147098660941782157064430527764323604055622893962710366411812037687306776790461596892",
+        "p50": "0.2967440252786833484917339733187837622495574586659494348932275432125939484742865130817655",
+        "p75": "0.78776309153925863612377606627835008961177119928902903632601980915258807621987926444164"
+      },
+      "impairment_window_end_year": {
+        "max": "2025",
+        "min": "2024",
+        "p25": "2025",
+        "p50": "2025",
+        "p75": "2025"
+      },
+      "impairment_window_start_year": {
+        "max": "2023",
+        "min": "2022",
+        "p25": "2023",
+        "p50": "2023",
+        "p75": "2023"
+      },
+      "interest_coverage": {
+        "max": "2069660.32387857",
+        "min": "-9914.01880364722",
+        "p25": "-0.0306398978485",
+        "p50": "6.627258521187",
+        "p75": "37.0970670393735"
+      },
+      "interest_coverage_available_count": {
+        "max": "1",
+        "min": "0",
+        "p25": "1",
+        "p50": "1",
+        "p75": "1"
+      },
+      "interest_coverage_observations": {
+        "max": "1",
+        "min": "0",
+        "p25": "1",
+        "p50": "1",
+        "p75": "1"
+      },
+      "interest_coverage_window_end_year": {
+        "max": "2025",
+        "min": "2024",
+        "p25": "2025",
+        "p50": "2025",
+        "p75": "2025"
+      },
+      "interest_coverage_window_start_year": {
+        "max": "2025",
+        "min": "2024",
+        "p25": "2025",
+        "p50": "2025",
+        "p75": "2025"
+      },
+      "interest_debt_to_assets": {
+        "max": "0.8618634142748906108061669872393335547873274623810480983302636520288700575006354159673493",
+        "min": "0",
+        "p25": "0.0235251452517264870321165420804362766060765221793543177660815560087852367920661998432171",
+        "p50": "0.1146626305729513721039221188754323355855872678547116689377564696574755156808765306476124",
+        "p75": "0.2535328231034894897402749460455885737516884308494843860666826178920356508577653707019805"
+      },
+      "latest_fiscal_year": {
+        "max": "2025",
+        "min": "2024",
+        "p25": "2025",
+        "p50": "2025",
+        "p75": "2025"
+      },
+      "latest_fiscal_year_staleness": {
+        "max": "1",
+        "min": "0",
+        "p25": "0",
+        "p50": "0",
+        "p75": "0"
+      },
+      "listing_years": {
+        "max": "35",
+        "min": "0",
+        "p25": "5",
+        "p50": "10",
+        "p75": "19"
+      },
+      "net_debt_available_count": {
+        "max": "1",
+        "min": "0",
+        "p25": "1",
+        "p50": "1",
+        "p75": "1"
+      },
+      "net_debt_observations": {
+        "max": "1",
+        "min": "1",
+        "p25": "1",
+        "p50": "1",
+        "p75": "1"
+      },
+      "net_debt_to_normalized_fcf": {
+        "max": "7436.8838172130567000240447403596605947306380066594457258782307582303612440288518839483",
+        "min": "-4408.2089536041533986971340321094590732590802632711041242145686304774826073403055297222",
+        "p25": "-7.279218061687316718597891830091888470394978504292041657511796882136011769074040862849375",
+        "p50": "-2.3284240514182042693693069061728629349899250222643958872527547371090451821567860083263",
+        "p75": "1.655677446733881444721754644278168616571905410892009548286473278612780606084231337906575"
+      },
+      "net_debt_window_end_year": {
+        "max": "2025",
+        "min": "2024",
+        "p25": "2025",
+        "p50": "2025",
+        "p75": "2025"
+      },
+      "net_debt_window_start_year": {
+        "max": "2025",
+        "min": "2024",
+        "p25": "2025",
+        "p50": "2025",
+        "p75": "2025"
+      },
+      "non_core_income_proxy_available_count": {
+        "max": "3",
+        "min": "0",
+        "p25": "3",
+        "p50": "3",
+        "p75": "3"
+      },
+      "non_core_income_proxy_observations": {
+        "max": "3",
+        "min": "0",
+        "p25": "3",
+        "p50": "3",
+        "p75": "3"
+      },
+      "non_core_income_proxy_share": {
+        "max": "792.5200448272365567476190259988891562581818787182618776286058911040182577914186564239",
+        "min": "0.000057875079064643123908279270461086486336317027752128242845323924147236697560796188150415016",
+        "p25": "0.075156306678961954296492841901078073749772185302811872867351718658305745987093549870464",
+        "p50": "0.1660286132826047850520525736682178067763015338525835800612569625145213425845749220674229",
+        "p75": "0.38721752553752612350902520052734840098558609980781850128938336884687773622446018804515905"
+      },
+      "non_core_income_proxy_window_end_year": {
+        "max": "2025",
+        "min": "2024",
+        "p25": "2025",
+        "p50": "2025",
+        "p75": "2025"
+      },
+      "non_core_income_proxy_window_start_year": {
+        "max": "2023",
+        "min": "2022",
+        "p25": "2023",
+        "p50": "2023",
+        "p75": "2023"
+      },
+      "normalized_earnings": {
+        "max": "170460000000",
+        "min": "-20519842580.7",
+        "p25": "5443860.85",
+        "p50": "80744400.09",
+        "p75": "257825218.215"
+      },
+      "normalized_earnings_available_count": {
+        "max": "5",
+        "min": "0",
+        "p25": "5",
+        "p50": "5",
+        "p75": "5"
+      },
+      "normalized_earnings_observations": {
+        "max": "5",
+        "min": "4",
+        "p25": "5",
+        "p50": "5",
+        "p75": "5"
+      },
+      "normalized_earnings_window_end_year": {
+        "max": "2025",
+        "min": "2024",
+        "p25": "2025",
+        "p50": "2025",
+        "p75": "2025"
+      },
+      "normalized_earnings_window_start_year": {
+        "max": "2021",
+        "min": "2020",
+        "p25": "2021",
+        "p50": "2021",
+        "p75": "2021"
+      },
+      "normalized_fcf": {
+        "max": "119721000000",
+        "min": "-41796394386",
+        "p25": "-90232235.16",
+        "p50": "10978358.43",
+        "p75": "155571308.775"
+      },
+      "normalized_pe": {
+        "max": "150275.282619532991605108670483489441687513904464411381456779249317829950102836283728258",
+        "min": "1.563487194245189656807773759309178461730591662932659704020410119697553570024411586536",
+        "p25": "26.17154879444445070331736881278983875753245255765683139236181874305104993593064435867823615",
+        "p50": "49.040049083974004767661364573794571223679729336187967684818571029099026156452706660917075",
+        "p75": "113.651671439951070001588346290830031180227962010905231606794373288193600429602270183420643"
+      },
+      "normalized_pe_bucket": {
+        "max": "3",
+        "min": "0",
+        "p25": "3",
+        "p50": "3",
+        "p75": "3"
+      },
+      "npl_change": {
+        "max": "0.33",
+        "min": "-0.5",
+        "p25": "-0.225",
+        "p50": "-0.11",
+        "p75": "-0.0175"
+      },
+      "one_time_profit_available_count": {
+        "max": "3",
+        "min": "0",
+        "p25": "3",
+        "p50": "3",
+        "p75": "3"
+      },
+      "one_time_profit_observations": {
+        "max": "3",
+        "min": "3",
+        "p25": "3",
+        "p50": "3",
+        "p75": "3"
+      },
+      "one_time_profit_share": {
+        "max": "775.3286096746317492459429232140614051416628453036583686336470634527868708560912526352",
+        "min": "0",
+        "p25": "0.064638520663695155451145658750147414983374966187456941788315543729336501518111991811111215",
+        "p50": "0.1539109273034070412307520633064527094433779501674654996454594460443293775620387804793125",
+        "p75": "0.389791509071658310436016199091683230582292010079551740069676136770042585412120298383631525"
+      },
+      "one_time_profit_window_end_year": {
+        "max": "2025",
+        "min": "2024",
+        "p25": "2025",
+        "p50": "2025",
+        "p75": "2025"
+      },
+      "one_time_profit_window_start_year": {
+        "max": "2023",
+        "min": "2022",
+        "p25": "2023",
+        "p50": "2023",
+        "p75": "2023"
+      },
+      "pb_median_ratio": {
+        "max": "1.392565928199298454056283076522730132638500375888352929939879894567237231621483",
+        "min": "0.82969664222287301146647803419629651039701146024671694591482965228596459610100784",
+        "p25": "0.899739986260084942071448851595979359392193622705573156159502844819957162848163145",
+        "p50": "0.99691974764700742223178983592244844609650712418294618944097665796608836502494891",
+        "p75": "1.177254592740456286931744430278095302025185334974616429543304636224026574671256425"
+      },
+      "pb_percentile": {
+        "max": "100",
+        "min": "5",
+        "p25": "10",
+        "p50": "48.333333333333333333333333333333335",
+        "p75": "89.58333333333333333333333333333333"
+      },
+      "revenue_available_count": {
+        "max": "5",
+        "min": "0",
+        "p25": "5",
+        "p50": "5",
+        "p75": "5"
+      },
+      "revenue_decline": {
+        "max": "0.991022343542431516385033499431713714993811258489210739461433095991734161719155111799591799",
+        "min": "0",
+        "p25": "0",
+        "p50": "0",
+        "p75": "0.171130699237044819918914496846162564058609855232505315295862654009425306588606877725692975"
+      },
+      "revenue_observations": {
+        "max": "5",
+        "min": "1",
+        "p25": "5",
+        "p50": "5",
+        "p75": "5"
+      },
+      "revenue_window_end_year": {
+        "max": "2025",
+        "min": "2024",
+        "p25": "2025",
+        "p50": "2025",
+        "p75": "2025"
+      },
+      "revenue_window_start_year": {
+        "max": "2021",
+        "min": "2020",
+        "p25": "2021",
+        "p50": "2021",
+        "p75": "2021"
+      },
+      "roe_mean": {
+        "max": "15.634",
+        "min": "5.822",
+        "p25": "8.8315",
+        "p50": "10.672",
+        "p75": "11.4445"
+      },
+      "valuation_pb_observations": {
+        "max": "61",
+        "min": "61",
+        "p25": "61",
+        "p50": "61",
+        "p75": "61"
+      }
+    },
+    "missing_reasons": {
+      "capex_negative": 2,
+      "field_domain_invalid": 5,
+      "industry_branch_insurance_unsupported": 5,
+      "industry_branch_other_financial_unsupported": 26,
+      "listing_history_insufficient": 913,
+      "missing_trusted_asset_disposal_gain": 790,
+      "missing_trusted_capex": 64,
+      "missing_trusted_deducted_net_income": 55,
+      "missing_trusted_impairment_loss": 2,
+      "missing_trusted_interest_coverage": 111,
+      "missing_trusted_ocf": 54,
+      "missing_trusted_other_income": 6,
+      "missing_trusted_revenue": 58,
+      "missing_trusted_shares": 54,
+      "non_core_income_proxy_insufficient": 4,
+      "revenue_negative": 3
+    },
+    "valid_valuation_months": {
+      "pb": {
+        "max": "61",
+        "min": "61",
+        "p25": "61",
+        "p50": "61",
+        "p75": "61"
+      },
+      "pe": null
+    },
+    "valuation_ratio_methods": {
+      "PE_TTM/PB_MRQ": {
+        "companies": 5175,
+        "points": 297889
+      }
+    }
+  },
+  "field_coverage": {
+    "allowed_latest_annual_staleness_years": {
+      "present": 5129,
+      "ratio": "0.993030009680542110358180058083252662149080348499515972894482090997095837",
+      "total": 5165
+    },
+    "bank_capital_adequacy": {
+      "present": 32,
+      "ratio": "0.00619554695062923523717328170377541142303969022265246853823814133591481123",
+      "total": 5165
+    },
+    "bank_capital_available_count": {
+      "present": 5129,
+      "ratio": "0.993030009680542110358180058083252662149080348499515972894482090997095837",
+      "total": 5165
+    },
+    "bank_capital_observations": {
+      "present": 32,
+      "ratio": "0.00619554695062923523717328170377541142303969022265246853823814133591481123",
+      "total": 5165
+    },
+    "bank_capital_window_end_year": {
+      "present": 5129,
+      "ratio": "0.993030009680542110358180058083252662149080348499515972894482090997095837",
+      "total": 5165
+    },
+    "bank_capital_window_start_year": {
+      "present": 5129,
+      "ratio": "0.993030009680542110358180058083252662149080348499515972894482090997095837",
+      "total": 5165
+    },
+    "bank_core_tier1_capital_adequacy": {
+      "present": 32,
+      "ratio": "0.00619554695062923523717328170377541142303969022265246853823814133591481123",
+      "total": 5165
+    },
+    "bank_npl_available_count": {
+      "present": 5129,
+      "ratio": "0.993030009680542110358180058083252662149080348499515972894482090997095837",
+      "total": 5165
+    },
+    "bank_npl_observations": {
+      "present": 32,
+      "ratio": "0.00619554695062923523717328170377541142303969022265246853823814133591481123",
+      "total": 5165
+    },
+    "bank_npl_window_end_year": {
+      "present": 5129,
+      "ratio": "0.993030009680542110358180058083252662149080348499515972894482090997095837",
+      "total": 5165
+    },
+    "bank_npl_window_start_year": {
+      "present": 5129,
+      "ratio": "0.993030009680542110358180058083252662149080348499515972894482090997095837",
+      "total": 5165
+    },
+    "bank_roe_available_count": {
+      "present": 5129,
+      "ratio": "0.993030009680542110358180058083252662149080348499515972894482090997095837",
+      "total": 5165
+    },
+    "bank_roe_observations": {
+      "present": 32,
+      "ratio": "0.00619554695062923523717328170377541142303969022265246853823814133591481123",
+      "total": 5165
+    },
+    "bank_roe_window_end_year": {
+      "present": 5129,
+      "ratio": "0.993030009680542110358180058083252662149080348499515972894482090997095837",
+      "total": 5165
+    },
+    "bank_roe_window_start_year": {
+      "present": 5129,
+      "ratio": "0.993030009680542110358180058083252662149080348499515972894482090997095837",
+      "total": 5165
+    },
+    "cash_to_assets": {
+      "present": 5097,
+      "ratio": "0.986834462729912875121006776379477250726040658276863504356243949661181026",
+      "total": 5165
+    },
+    "cumulative_fcf": {
+      "present": 5035,
+      "ratio": "0.974830590513068731848983543078412391093901258470474346563407550822846079",
+      "total": 5165
+    },
+    "dilution_available_count": {
+      "present": 5129,
+      "ratio": "0.993030009680542110358180058083252662149080348499515972894482090997095837",
+      "total": 5165
+    },
+    "dilution_observations": {
+      "present": 5097,
+      "ratio": "0.986834462729912875121006776379477250726040658276863504356243949661181026",
+      "total": 5165
+    },
+    "dilution_rate": {
+      "present": 5097,
+      "ratio": "0.986834462729912875121006776379477250726040658276863504356243949661181026",
+      "total": 5165
+    },
+    "dilution_window_end_year": {
+      "present": 5129,
+      "ratio": "0.993030009680542110358180058083252662149080348499515972894482090997095837",
+      "total": 5165
+    },
+    "dilution_window_start_year": {
+      "present": 5129,
+      "ratio": "0.993030009680542110358180058083252662149080348499515972894482090997095837",
+      "total": 5165
+    },
+    "earnings_decline": {
+      "present": 3870,
+      "ratio": "0.749273959341723136495643756050338818973862536302032913843175217812197483",
+      "total": 5165
+    },
+    "fcf_available_count": {
+      "present": 5129,
+      "ratio": "0.993030009680542110358180058083252662149080348499515972894482090997095837",
+      "total": 5165
+    },
+    "fcf_observations": {
+      "present": 5097,
+      "ratio": "0.986834462729912875121006776379477250726040658276863504356243949661181026",
+      "total": 5165
+    },
+    "fcf_window_end_year": {
+      "present": 5129,
+      "ratio": "0.993030009680542110358180058083252662149080348499515972894482090997095837",
+      "total": 5165
+    },
+    "fcf_window_start_year": {
+      "present": 5129,
+      "ratio": "0.993030009680542110358180058083252662149080348499515972894482090997095837",
+      "total": 5165
+    },
+    "field_domain_valid": {
+      "present": 5160,
+      "ratio": "0.999031945788964181994191674733785091965150048402710551790900290416263311",
+      "total": 5165
+    },
+    "impairment_available_count": {
+      "present": 5129,
+      "ratio": "0.993030009680542110358180058083252662149080348499515972894482090997095837",
+      "total": 5165
+    },
+    "impairment_observations": {
+      "present": 5097,
+      "ratio": "0.986834462729912875121006776379477250726040658276863504356243949661181026",
+      "total": 5165
+    },
+    "impairment_share": {
+      "present": 5041,
+      "ratio": "0.975992255566311713455953533397870280735721200387221684414327202323330106",
+      "total": 5165
+    },
+    "impairment_window_end_year": {
+      "present": 5129,
+      "ratio": "0.993030009680542110358180058083252662149080348499515972894482090997095837",
+      "total": 5165
+    },
+    "impairment_window_start_year": {
+      "present": 5129,
+      "ratio": "0.993030009680542110358180058083252662149080348499515972894482090997095837",
+      "total": 5165
+    },
+    "interest_coverage": {
+      "present": 4987,
+      "ratio": "0.965537270087124878993223620522749273959341723136495643756050338818973863",
+      "total": 5165
+    },
+    "interest_coverage_available_count": {
+      "present": 5129,
+      "ratio": "0.993030009680542110358180058083252662149080348499515972894482090997095837",
+      "total": 5165
+    },
+    "interest_coverage_observations": {
+      "present": 5097,
+      "ratio": "0.986834462729912875121006776379477250726040658276863504356243949661181026",
+      "total": 5165
+    },
+    "interest_coverage_window_end_year": {
+      "present": 5129,
+      "ratio": "0.993030009680542110358180058083252662149080348499515972894482090997095837",
+      "total": 5165
+    },
+    "interest_coverage_window_start_year": {
+      "present": 5129,
+      "ratio": "0.993030009680542110358180058083252662149080348499515972894482090997095837",
+      "total": 5165
+    },
+    "interest_debt_to_assets": {
+      "present": 5097,
+      "ratio": "0.986834462729912875121006776379477250726040658276863504356243949661181026",
+      "total": 5165
+    },
+    "latest_fiscal_year": {
+      "present": 5129,
+      "ratio": "0.993030009680542110358180058083252662149080348499515972894482090997095837",
+      "total": 5165
+    },
+    "latest_fiscal_year_staleness": {
+      "present": 5129,
+      "ratio": "0.993030009680542110358180058083252662149080348499515972894482090997095837",
+      "total": 5165
+    },
+    "listing_years": {
+      "present": 5129,
+      "ratio": "0.993030009680542110358180058083252662149080348499515972894482090997095837",
+      "total": 5165
+    },
+    "net_debt_available_count": {
+      "present": 5129,
+      "ratio": "0.993030009680542110358180058083252662149080348499515972894482090997095837",
+      "total": 5165
+    },
+    "net_debt_observations": {
+      "present": 5097,
+      "ratio": "0.986834462729912875121006776379477250726040658276863504356243949661181026",
+      "total": 5165
+    },
+    "net_debt_to_normalized_fcf": {
+      "present": 2692,
+      "ratio": "0.521200387221684414327202323330106485963213939980638915779283639883833495",
+      "total": 5165
+    },
+    "net_debt_window_end_year": {
+      "present": 5129,
+      "ratio": "0.993030009680542110358180058083252662149080348499515972894482090997095837",
+      "total": 5165
+    },
+    "net_debt_window_start_year": {
+      "present": 5129,
+      "ratio": "0.993030009680542110358180058083252662149080348499515972894482090997095837",
+      "total": 5165
+    },
+    "non_core_income_proxy_available_count": {
+      "present": 5129,
+      "ratio": "0.993030009680542110358180058083252662149080348499515972894482090997095837",
+      "total": 5165
+    },
+    "non_core_income_proxy_observations": {
+      "present": 5097,
+      "ratio": "0.986834462729912875121006776379477250726040658276863504356243949661181026",
+      "total": 5165
+    },
+    "non_core_income_proxy_share": {
+      "present": 4707,
+      "ratio": "0.911326234269119070667957405614714424007744433688286544046466602129719264",
+      "total": 5165
+    },
+    "non_core_income_proxy_window_end_year": {
+      "present": 5129,
+      "ratio": "0.993030009680542110358180058083252662149080348499515972894482090997095837",
+      "total": 5165
+    },
+    "non_core_income_proxy_window_start_year": {
+      "present": 5129,
+      "ratio": "0.993030009680542110358180058083252662149080348499515972894482090997095837",
+      "total": 5165
+    },
+    "normalized_earnings": {
+      "present": 5042,
+      "ratio": "0.976185866408518877057115198451113262342691190706679574056147144240077444",
+      "total": 5165
+    },
+    "normalized_earnings_available_count": {
+      "present": 5129,
+      "ratio": "0.993030009680542110358180058083252662149080348499515972894482090997095837",
+      "total": 5165
+    },
+    "normalized_earnings_observations": {
+      "present": 5097,
+      "ratio": "0.986834462729912875121006776379477250726040658276863504356243949661181026",
+      "total": 5165
+    },
+    "normalized_earnings_window_end_year": {
+      "present": 5129,
+      "ratio": "0.993030009680542110358180058083252662149080348499515972894482090997095837",
+      "total": 5165
+    },
+    "normalized_earnings_window_start_year": {
+      "present": 5129,
+      "ratio": "0.993030009680542110358180058083252662149080348499515972894482090997095837",
+      "total": 5165
+    },
+    "normalized_fcf": {
+      "present": 5035,
+      "ratio": "0.974830590513068731848983543078412391093901258470474346563407550822846079",
+      "total": 5165
+    },
+    "normalized_pe": {
+      "present": 3870,
+      "ratio": "0.749273959341723136495643756050338818973862536302032913843175217812197483",
+      "total": 5165
+    },
+    "normalized_pe_bucket": {
+      "present": 3870,
+      "ratio": "0.749273959341723136495643756050338818973862536302032913843175217812197483",
+      "total": 5165
+    },
+    "npl_change": {
+      "present": 32,
+      "ratio": "0.00619554695062923523717328170377541142303969022265246853823814133591481123",
+      "total": 5165
+    },
+    "one_time_profit_available_count": {
+      "present": 5129,
+      "ratio": "0.993030009680542110358180058083252662149080348499515972894482090997095837",
+      "total": 5165
+    },
+    "one_time_profit_observations": {
+      "present": 5097,
+      "ratio": "0.986834462729912875121006776379477250726040658276863504356243949661181026",
+      "total": 5165
+    },
+    "one_time_profit_share": {
+      "present": 5042,
+      "ratio": "0.976185866408518877057115198451113262342691190706679574056147144240077444",
+      "total": 5165
+    },
+    "one_time_profit_window_end_year": {
+      "present": 5129,
+      "ratio": "0.993030009680542110358180058083252662149080348499515972894482090997095837",
+      "total": 5165
+    },
+    "one_time_profit_window_start_year": {
+      "present": 5129,
+      "ratio": "0.993030009680542110358180058083252662149080348499515972894482090997095837",
+      "total": 5165
+    },
+    "pb_median_ratio": {
+      "present": 32,
+      "ratio": "0.00619554695062923523717328170377541142303969022265246853823814133591481123",
+      "total": 5165
+    },
+    "pb_percentile": {
+      "present": 32,
+      "ratio": "0.00619554695062923523717328170377541142303969022265246853823814133591481123",
+      "total": 5165
+    },
+    "revenue_available_count": {
+      "present": 5129,
+      "ratio": "0.993030009680542110358180058083252662149080348499515972894482090997095837",
+      "total": 5165
+    },
+    "revenue_decline": {
+      "present": 5096,
+      "ratio": "0.986640851887705711519845111326234269119070667957405614714424007744433688",
+      "total": 5165
+    },
+    "revenue_observations": {
+      "present": 5097,
+      "ratio": "0.986834462729912875121006776379477250726040658276863504356243949661181026",
+      "total": 5165
+    },
+    "revenue_window_end_year": {
+      "present": 5129,
+      "ratio": "0.993030009680542110358180058083252662149080348499515972894482090997095837",
+      "total": 5165
+    },
+    "revenue_window_start_year": {
+      "present": 5129,
+      "ratio": "0.993030009680542110358180058083252662149080348499515972894482090997095837",
+      "total": 5165
+    },
+    "roe_mean": {
+      "present": 32,
+      "ratio": "0.00619554695062923523717328170377541142303969022265246853823814133591481123",
+      "total": 5165
+    },
+    "valuation_pb_observations": {
+      "present": 32,
+      "ratio": "0.00619554695062923523717328170377541142303969022265246853823814133591481123",
+      "total": 5165
+    }
+  },
+  "field_domain_policy": "deep-value-domain-v1",
+  "hypotheses": {
+    "base": {
+      "algorithm_version": "discovery-v7",
+      "fields": [
+        "listing_years",
+        "normalized_earnings",
+        "normalized_pe",
+        "normalized_pe_bucket",
+        "cumulative_fcf",
+        "normalized_fcf",
+        "net_debt_to_normalized_fcf",
+        "cash_to_assets",
+        "interest_debt_to_assets",
+        "interest_coverage",
+        "dilution_rate",
+        "revenue_decline",
+        "earnings_decline",
+        "one_time_profit_share",
+        "impairment_share",
+        "non_core_income_proxy_share",
+        "pb_percentile",
+        "pb_median_ratio",
+        "roe_mean",
+        "npl_change",
+        "bank_capital_adequacy",
+        "bank_core_tier1_capital_adequacy",
+        "code"
+      ],
+      "formulas": {
+        "bank_capital_adequacy": "latest(annual.capital_adequacy)",
+        "bank_core_tier1_capital_adequacy": "latest(annual.core_tier1_capital_adequacy)",
+        "cash_to_assets": "latest(annual.cash)/latest(annual.total_assets)",
+        "cumulative_fcf": "sum(annual.ocf-annual.capex)",
+        "dilution_rate": "latest(annual.shares)/earliest(annual.shares)-1",
+        "earnings_decline": "max(0,(normalized_earnings-latest(annual.deducted_net_income))/normalized_earnings)",
+        "impairment_share": "sum(copy_abs(annual.impairment_loss))/(copy_abs(normalized_earnings)*count(annual))",
+        "interest_coverage": "latest(annual.interest_coverage)",
+        "interest_debt_to_assets": "latest(annual.interest_debt)/latest(annual.total_assets)",
+        "net_debt_to_normalized_fcf": "(latest(annual.interest_debt)-latest(annual.cash))/normalized_fcf",
+        "non_core_income_proxy_share": "sum(copy_abs(annual.other_income)+copy_abs(annual.asset_disposal_gain))/(copy_abs(normalized_earnings)*count(annual))",
+        "normalized_earnings": "median(annual.deducted_net_income)",
+        "normalized_fcf": "median(annual.ocf-annual.capex)",
+        "normalized_pe": "current.price*latest(annual.shares)/normalized_earnings",
+        "normalized_pe_bucket": "min(floor(normalized_pe*4/normalized_pe_max),3)",
+        "npl_change": "latest(annual.npl)-earliest(annual.npl)",
+        "one_time_profit_share": "sum(max(0,annual.net_income-annual.deducted_net_income))/(copy_abs(normalized_earnings)*count(annual))",
+        "pb_median_ratio": "current.pb/median(monthly.pb)",
+        "pb_percentile": "percentile_rank(current.pb,monthly.pb)",
+        "revenue_decline": "max(0,(earliest(annual.revenue)-latest(annual.revenue))/earliest(annual.revenue))",
+        "roe_mean": "mean(annual.roe)"
+      },
+      "industry_version": "eastmoney:push2delay:clist:f100:v1",
+      "min_observations": {
+        "bank_capital": 1,
+        "bank_npl": 2,
+        "bank_roe": 5,
+        "dilution": 2,
+        "fcf": 5,
+        "impairment": 3,
+        "interest_coverage": 1,
+        "net_debt": 1,
+        "non_core_income_proxy": 3,
+        "normalized_earnings": 5,
+        "one_time_profit": 3,
+        "revenue": 2,
+        "valuation_pb": 60
+      },
+      "missing_policy": {
+        "bank_capital_adequacy": "insufficient",
+        "bank_core_tier1_capital_adequacy": "insufficient",
+        "cash_to_assets": "insufficient",
+        "code": "insufficient",
+        "cumulative_fcf": "insufficient",
+        "dilution_rate": "insufficient",
+        "earnings_decline": "insufficient",
+        "impairment_share": "insufficient",
+        "interest_coverage": "insufficient",
+        "interest_debt_to_assets": "insufficient",
+        "listing_years": "insufficient",
+        "net_debt_to_normalized_fcf": "insufficient",
+        "non_core_income_proxy_share": "insufficient",
+        "normalized_earnings": "insufficient",
+        "normalized_fcf": "insufficient",
+        "normalized_pe": "insufficient",
+        "normalized_pe_bucket": "insufficient",
+        "npl_change": "insufficient",
+        "one_time_profit_share": "insufficient",
+        "pb_median_ratio": "insufficient",
+        "pb_percentile": "insufficient",
+        "revenue_decline": "insufficient",
+        "roe_mean": "insufficient"
+      },
+      "order": [
+        [
+          "normalized_pe_bucket",
+          "asc",
+          "nulls_last"
+        ],
+        [
+          "pb_percentile",
+          "asc",
+          "nulls_last"
+        ],
+        [
+          "net_debt_to_normalized_fcf",
+          "asc",
+          "nulls_last"
+        ],
+        [
+          "normalized_pe",
+          "asc",
+          "nulls_last"
+        ],
+        [
+          "code",
+          "asc",
+          "nulls_last"
+        ]
+      ],
+      "scope": "weekly-discovery",
+      "sector_branches": {
+        "branch_policies": {
+          "bank": "financial",
+          "insurance": "unsupported",
+          "nonfinancial": "nonfinancial",
+          "other_financial": "unsupported",
+          "unknown": "insufficient"
+        },
+        "common": {
+          "field_domain_policy": "deep-value-domain-v1",
+          "latest_annual_staleness_years": 1,
+          "lookback_windows": {
+            "bank_capital": 5,
+            "bank_npl": 5,
+            "bank_roe": 5,
+            "dilution": 5,
+            "fcf": 5,
+            "impairment": 3,
+            "interest_coverage": 1,
+            "net_debt": 1,
+            "non_core_income_proxy": 3,
+            "normalized_earnings": 5,
+            "one_time_profit": 3,
+            "revenue": 5
+          },
+          "valuation_ratio_method": "PE_TTM/PB_MRQ"
+        },
+        "financial": {
+          "evidence_fields": [
+            "pb_percentile",
+            "roe_mean",
+            "npl_change",
+            "bank_capital_adequacy"
+          ],
+          "gate_order": [
+            "listing_age",
+            "bank_valuation",
+            "bank_roe",
+            "bank_npl_trend",
+            "bank_capital"
+          ]
+        },
+        "nonfinancial": {
+          "evidence_fields": [
+            "normalized_pe",
+            "cumulative_fcf",
+            "net_debt_to_normalized_fcf",
+            "interest_coverage"
+          ],
+          "gate_order": [
+            "listing_age",
+            "normalized_earnings",
+            "normalized_valuation",
+            "positive_cumulative_fcf",
+            "net_debt",
+            "interest_coverage",
+            "cash_debt",
+            "dilution",
+            "revenue_decline",
+            "earnings_decline",
+            "one_time_profit",
+            "impairment",
+            "non_core_income_proxy"
+          ]
+        }
+      },
+      "thresholds": {
+        "bank_capital_adequacy_min": "12",
+        "bank_core_tier1_min": "9",
+        "bank_npl_increase_max": "0.2",
+        "bank_roe_min": "8",
+        "cash_to_assets_min": "0.2",
+        "cumulative_fcf_min": "0",
+        "dilution_rate_max": "0.1",
+        "earnings_decline_max": "0.3",
+        "impairment_share_max": "0.3",
+        "interest_coverage_min": "2",
+        "interest_debt_to_assets_min": "0.2",
+        "listing_years_min": "5",
+        "net_debt_to_normalized_fcf_max": "3",
+        "non_core_income_proxy_share_max": "0.2",
+        "normalized_earnings_min": "0",
+        "normalized_fcf_min": "0",
+        "normalized_pe_max": "12",
+        "one_time_profit_share_max": "0.3",
+        "pb_median_ratio_max": "0.8",
+        "pb_percentile_max": "30",
+        "readiness_min": "0.8",
+        "revenue_decline_max": "0.2"
+      },
+      "track": "deep_value"
+    },
+    "conservative": {
+      "algorithm_version": "discovery-v7",
+      "fields": [
+        "listing_years",
+        "normalized_earnings",
+        "normalized_pe",
+        "normalized_pe_bucket",
+        "cumulative_fcf",
+        "normalized_fcf",
+        "net_debt_to_normalized_fcf",
+        "cash_to_assets",
+        "interest_debt_to_assets",
+        "interest_coverage",
+        "dilution_rate",
+        "revenue_decline",
+        "earnings_decline",
+        "one_time_profit_share",
+        "impairment_share",
+        "non_core_income_proxy_share",
+        "pb_percentile",
+        "pb_median_ratio",
+        "roe_mean",
+        "npl_change",
+        "bank_capital_adequacy",
+        "bank_core_tier1_capital_adequacy",
+        "code"
+      ],
+      "formulas": {
+        "bank_capital_adequacy": "latest(annual.capital_adequacy)",
+        "bank_core_tier1_capital_adequacy": "latest(annual.core_tier1_capital_adequacy)",
+        "cash_to_assets": "latest(annual.cash)/latest(annual.total_assets)",
+        "cumulative_fcf": "sum(annual.ocf-annual.capex)",
+        "dilution_rate": "latest(annual.shares)/earliest(annual.shares)-1",
+        "earnings_decline": "max(0,(normalized_earnings-latest(annual.deducted_net_income))/normalized_earnings)",
+        "impairment_share": "sum(copy_abs(annual.impairment_loss))/(copy_abs(normalized_earnings)*count(annual))",
+        "interest_coverage": "latest(annual.interest_coverage)",
+        "interest_debt_to_assets": "latest(annual.interest_debt)/latest(annual.total_assets)",
+        "net_debt_to_normalized_fcf": "(latest(annual.interest_debt)-latest(annual.cash))/normalized_fcf",
+        "non_core_income_proxy_share": "sum(copy_abs(annual.other_income)+copy_abs(annual.asset_disposal_gain))/(copy_abs(normalized_earnings)*count(annual))",
+        "normalized_earnings": "median(annual.deducted_net_income)",
+        "normalized_fcf": "median(annual.ocf-annual.capex)",
+        "normalized_pe": "current.price*latest(annual.shares)/normalized_earnings",
+        "normalized_pe_bucket": "min(floor(normalized_pe*4/normalized_pe_max),3)",
+        "npl_change": "latest(annual.npl)-earliest(annual.npl)",
+        "one_time_profit_share": "sum(max(0,annual.net_income-annual.deducted_net_income))/(copy_abs(normalized_earnings)*count(annual))",
+        "pb_median_ratio": "current.pb/median(monthly.pb)",
+        "pb_percentile": "percentile_rank(current.pb,monthly.pb)",
+        "revenue_decline": "max(0,(earliest(annual.revenue)-latest(annual.revenue))/earliest(annual.revenue))",
+        "roe_mean": "mean(annual.roe)"
+      },
+      "industry_version": "eastmoney:push2delay:clist:f100:v1",
+      "min_observations": {
+        "bank_capital": 1,
+        "bank_npl": 2,
+        "bank_roe": 5,
+        "dilution": 2,
+        "fcf": 5,
+        "impairment": 3,
+        "interest_coverage": 1,
+        "net_debt": 1,
+        "non_core_income_proxy": 3,
+        "normalized_earnings": 5,
+        "one_time_profit": 3,
+        "revenue": 2,
+        "valuation_pb": 60
+      },
+      "missing_policy": {
+        "bank_capital_adequacy": "insufficient",
+        "bank_core_tier1_capital_adequacy": "insufficient",
+        "cash_to_assets": "insufficient",
+        "code": "insufficient",
+        "cumulative_fcf": "insufficient",
+        "dilution_rate": "insufficient",
+        "earnings_decline": "insufficient",
+        "impairment_share": "insufficient",
+        "interest_coverage": "insufficient",
+        "interest_debt_to_assets": "insufficient",
+        "listing_years": "insufficient",
+        "net_debt_to_normalized_fcf": "insufficient",
+        "non_core_income_proxy_share": "insufficient",
+        "normalized_earnings": "insufficient",
+        "normalized_fcf": "insufficient",
+        "normalized_pe": "insufficient",
+        "normalized_pe_bucket": "insufficient",
+        "npl_change": "insufficient",
+        "one_time_profit_share": "insufficient",
+        "pb_median_ratio": "insufficient",
+        "pb_percentile": "insufficient",
+        "revenue_decline": "insufficient",
+        "roe_mean": "insufficient"
+      },
+      "order": [
+        [
+          "normalized_pe_bucket",
+          "asc",
+          "nulls_last"
+        ],
+        [
+          "pb_percentile",
+          "asc",
+          "nulls_last"
+        ],
+        [
+          "net_debt_to_normalized_fcf",
+          "asc",
+          "nulls_last"
+        ],
+        [
+          "normalized_pe",
+          "asc",
+          "nulls_last"
+        ],
+        [
+          "code",
+          "asc",
+          "nulls_last"
+        ]
+      ],
+      "scope": "weekly-discovery",
+      "sector_branches": {
+        "branch_policies": {
+          "bank": "financial",
+          "insurance": "unsupported",
+          "nonfinancial": "nonfinancial",
+          "other_financial": "unsupported",
+          "unknown": "insufficient"
+        },
+        "common": {
+          "field_domain_policy": "deep-value-domain-v1",
+          "latest_annual_staleness_years": 1,
+          "lookback_windows": {
+            "bank_capital": 5,
+            "bank_npl": 5,
+            "bank_roe": 5,
+            "dilution": 5,
+            "fcf": 5,
+            "impairment": 3,
+            "interest_coverage": 1,
+            "net_debt": 1,
+            "non_core_income_proxy": 3,
+            "normalized_earnings": 5,
+            "one_time_profit": 3,
+            "revenue": 5
+          },
+          "valuation_ratio_method": "PE_TTM/PB_MRQ"
+        },
+        "financial": {
+          "evidence_fields": [
+            "pb_percentile",
+            "roe_mean",
+            "npl_change",
+            "bank_capital_adequacy"
+          ],
+          "gate_order": [
+            "listing_age",
+            "bank_valuation",
+            "bank_roe",
+            "bank_npl_trend",
+            "bank_capital"
+          ]
+        },
+        "nonfinancial": {
+          "evidence_fields": [
+            "normalized_pe",
+            "cumulative_fcf",
+            "net_debt_to_normalized_fcf",
+            "interest_coverage"
+          ],
+          "gate_order": [
+            "listing_age",
+            "normalized_earnings",
+            "normalized_valuation",
+            "positive_cumulative_fcf",
+            "net_debt",
+            "interest_coverage",
+            "cash_debt",
+            "dilution",
+            "revenue_decline",
+            "earnings_decline",
+            "one_time_profit",
+            "impairment",
+            "non_core_income_proxy"
+          ]
+        }
+      },
+      "thresholds": {
+        "bank_capital_adequacy_min": "14",
+        "bank_core_tier1_min": "10",
+        "bank_npl_increase_max": "0.1",
+        "bank_roe_min": "10",
+        "cash_to_assets_min": "0.15",
+        "cumulative_fcf_min": "0",
+        "dilution_rate_max": "0.05",
+        "earnings_decline_max": "0.2",
+        "impairment_share_max": "0.2",
+        "interest_coverage_min": "3",
+        "interest_debt_to_assets_min": "0.15",
+        "listing_years_min": "5",
+        "net_debt_to_normalized_fcf_max": "2",
+        "non_core_income_proxy_share_max": "0.1",
+        "normalized_earnings_min": "0",
+        "normalized_fcf_min": "0",
+        "normalized_pe_max": "10",
+        "one_time_profit_share_max": "0.2",
+        "pb_median_ratio_max": "0.7",
+        "pb_percentile_max": "20",
+        "readiness_min": "0.9",
+        "revenue_decline_max": "0.1"
+      },
+      "track": "deep_value"
+    },
+    "relaxed": {
+      "algorithm_version": "discovery-v7",
+      "fields": [
+        "listing_years",
+        "normalized_earnings",
+        "normalized_pe",
+        "normalized_pe_bucket",
+        "cumulative_fcf",
+        "normalized_fcf",
+        "net_debt_to_normalized_fcf",
+        "cash_to_assets",
+        "interest_debt_to_assets",
+        "interest_coverage",
+        "dilution_rate",
+        "revenue_decline",
+        "earnings_decline",
+        "one_time_profit_share",
+        "impairment_share",
+        "non_core_income_proxy_share",
+        "pb_percentile",
+        "pb_median_ratio",
+        "roe_mean",
+        "npl_change",
+        "bank_capital_adequacy",
+        "bank_core_tier1_capital_adequacy",
+        "code"
+      ],
+      "formulas": {
+        "bank_capital_adequacy": "latest(annual.capital_adequacy)",
+        "bank_core_tier1_capital_adequacy": "latest(annual.core_tier1_capital_adequacy)",
+        "cash_to_assets": "latest(annual.cash)/latest(annual.total_assets)",
+        "cumulative_fcf": "sum(annual.ocf-annual.capex)",
+        "dilution_rate": "latest(annual.shares)/earliest(annual.shares)-1",
+        "earnings_decline": "max(0,(normalized_earnings-latest(annual.deducted_net_income))/normalized_earnings)",
+        "impairment_share": "sum(copy_abs(annual.impairment_loss))/(copy_abs(normalized_earnings)*count(annual))",
+        "interest_coverage": "latest(annual.interest_coverage)",
+        "interest_debt_to_assets": "latest(annual.interest_debt)/latest(annual.total_assets)",
+        "net_debt_to_normalized_fcf": "(latest(annual.interest_debt)-latest(annual.cash))/normalized_fcf",
+        "non_core_income_proxy_share": "sum(copy_abs(annual.other_income)+copy_abs(annual.asset_disposal_gain))/(copy_abs(normalized_earnings)*count(annual))",
+        "normalized_earnings": "median(annual.deducted_net_income)",
+        "normalized_fcf": "median(annual.ocf-annual.capex)",
+        "normalized_pe": "current.price*latest(annual.shares)/normalized_earnings",
+        "normalized_pe_bucket": "min(floor(normalized_pe*4/normalized_pe_max),3)",
+        "npl_change": "latest(annual.npl)-earliest(annual.npl)",
+        "one_time_profit_share": "sum(max(0,annual.net_income-annual.deducted_net_income))/(copy_abs(normalized_earnings)*count(annual))",
+        "pb_median_ratio": "current.pb/median(monthly.pb)",
+        "pb_percentile": "percentile_rank(current.pb,monthly.pb)",
+        "revenue_decline": "max(0,(earliest(annual.revenue)-latest(annual.revenue))/earliest(annual.revenue))",
+        "roe_mean": "mean(annual.roe)"
+      },
+      "industry_version": "eastmoney:push2delay:clist:f100:v1",
+      "min_observations": {
+        "bank_capital": 1,
+        "bank_npl": 2,
+        "bank_roe": 5,
+        "dilution": 2,
+        "fcf": 5,
+        "impairment": 3,
+        "interest_coverage": 1,
+        "net_debt": 1,
+        "non_core_income_proxy": 3,
+        "normalized_earnings": 5,
+        "one_time_profit": 3,
+        "revenue": 2,
+        "valuation_pb": 60
+      },
+      "missing_policy": {
+        "bank_capital_adequacy": "insufficient",
+        "bank_core_tier1_capital_adequacy": "insufficient",
+        "cash_to_assets": "insufficient",
+        "code": "insufficient",
+        "cumulative_fcf": "insufficient",
+        "dilution_rate": "insufficient",
+        "earnings_decline": "insufficient",
+        "impairment_share": "insufficient",
+        "interest_coverage": "insufficient",
+        "interest_debt_to_assets": "insufficient",
+        "listing_years": "insufficient",
+        "net_debt_to_normalized_fcf": "insufficient",
+        "non_core_income_proxy_share": "insufficient",
+        "normalized_earnings": "insufficient",
+        "normalized_fcf": "insufficient",
+        "normalized_pe": "insufficient",
+        "normalized_pe_bucket": "insufficient",
+        "npl_change": "insufficient",
+        "one_time_profit_share": "insufficient",
+        "pb_median_ratio": "insufficient",
+        "pb_percentile": "insufficient",
+        "revenue_decline": "insufficient",
+        "roe_mean": "insufficient"
+      },
+      "order": [
+        [
+          "normalized_pe_bucket",
+          "asc",
+          "nulls_last"
+        ],
+        [
+          "pb_percentile",
+          "asc",
+          "nulls_last"
+        ],
+        [
+          "net_debt_to_normalized_fcf",
+          "asc",
+          "nulls_last"
+        ],
+        [
+          "normalized_pe",
+          "asc",
+          "nulls_last"
+        ],
+        [
+          "code",
+          "asc",
+          "nulls_last"
+        ]
+      ],
+      "scope": "weekly-discovery",
+      "sector_branches": {
+        "branch_policies": {
+          "bank": "financial",
+          "insurance": "unsupported",
+          "nonfinancial": "nonfinancial",
+          "other_financial": "unsupported",
+          "unknown": "insufficient"
+        },
+        "common": {
+          "field_domain_policy": "deep-value-domain-v1",
+          "latest_annual_staleness_years": 1,
+          "lookback_windows": {
+            "bank_capital": 5,
+            "bank_npl": 5,
+            "bank_roe": 5,
+            "dilution": 5,
+            "fcf": 5,
+            "impairment": 3,
+            "interest_coverage": 1,
+            "net_debt": 1,
+            "non_core_income_proxy": 3,
+            "normalized_earnings": 5,
+            "one_time_profit": 3,
+            "revenue": 5
+          },
+          "valuation_ratio_method": "PE_TTM/PB_MRQ"
+        },
+        "financial": {
+          "evidence_fields": [
+            "pb_percentile",
+            "roe_mean",
+            "npl_change",
+            "bank_capital_adequacy"
+          ],
+          "gate_order": [
+            "listing_age",
+            "bank_valuation",
+            "bank_roe",
+            "bank_npl_trend",
+            "bank_capital"
+          ]
+        },
+        "nonfinancial": {
+          "evidence_fields": [
+            "normalized_pe",
+            "cumulative_fcf",
+            "net_debt_to_normalized_fcf",
+            "interest_coverage"
+          ],
+          "gate_order": [
+            "listing_age",
+            "normalized_earnings",
+            "normalized_valuation",
+            "positive_cumulative_fcf",
+            "net_debt",
+            "interest_coverage",
+            "cash_debt",
+            "dilution",
+            "revenue_decline",
+            "earnings_decline",
+            "one_time_profit",
+            "impairment",
+            "non_core_income_proxy"
+          ]
+        }
+      },
+      "thresholds": {
+        "bank_capital_adequacy_min": "11",
+        "bank_core_tier1_min": "8",
+        "bank_npl_increase_max": "0.3",
+        "bank_roe_min": "6",
+        "cash_to_assets_min": "0.25",
+        "cumulative_fcf_min": "0",
+        "dilution_rate_max": "0.15",
+        "earnings_decline_max": "0.4",
+        "impairment_share_max": "0.4",
+        "interest_coverage_min": "1.5",
+        "interest_debt_to_assets_min": "0.25",
+        "listing_years_min": "5",
+        "net_debt_to_normalized_fcf_max": "4",
+        "non_core_income_proxy_share_max": "0.3",
+        "normalized_earnings_min": "0",
+        "normalized_fcf_min": "0",
+        "normalized_pe_max": "15",
+        "one_time_profit_share_max": "0.4",
+        "pb_median_ratio_max": "0.9",
+        "pb_percentile_max": "40",
+        "readiness_min": "0.7",
+        "revenue_decline_max": "0.3"
+      },
+      "track": "deep_value"
+    }
+  },
+  "hypothesis_labels": {
+    "base": "calibration hypothesis; never a runtime fallback",
+    "conservative": "calibration hypothesis; never a runtime fallback",
+    "relaxed": "calibration hypothesis; never a runtime fallback"
+  },
+  "industry_versions": [
+    "eastmoney:push2delay:clist:f100:v1"
+  ],
+  "note": "Evidence-only proposal. other_income is used only as a trusted conservative non-core-income proxy; it is not a government-grant claim. No ruler was activated; activation requires explicit approval and a nonblank reason.",
+  "proposal": {
+    "algorithm_version": "discovery-v7",
+    "fields": [
+      "listing_years",
+      "normalized_earnings",
+      "normalized_pe",
+      "normalized_pe_bucket",
+      "cumulative_fcf",
+      "normalized_fcf",
+      "net_debt_to_normalized_fcf",
+      "cash_to_assets",
+      "interest_debt_to_assets",
+      "interest_coverage",
+      "dilution_rate",
+      "revenue_decline",
+      "earnings_decline",
+      "one_time_profit_share",
+      "impairment_share",
+      "non_core_income_proxy_share",
+      "pb_percentile",
+      "pb_median_ratio",
+      "roe_mean",
+      "npl_change",
+      "bank_capital_adequacy",
+      "bank_core_tier1_capital_adequacy",
+      "code"
+    ],
+    "formulas": {
+      "bank_capital_adequacy": "latest(annual.capital_adequacy)",
+      "bank_core_tier1_capital_adequacy": "latest(annual.core_tier1_capital_adequacy)",
+      "cash_to_assets": "latest(annual.cash)/latest(annual.total_assets)",
+      "cumulative_fcf": "sum(annual.ocf-annual.capex)",
+      "dilution_rate": "latest(annual.shares)/earliest(annual.shares)-1",
+      "earnings_decline": "max(0,(normalized_earnings-latest(annual.deducted_net_income))/normalized_earnings)",
+      "impairment_share": "sum(copy_abs(annual.impairment_loss))/(copy_abs(normalized_earnings)*count(annual))",
+      "interest_coverage": "latest(annual.interest_coverage)",
+      "interest_debt_to_assets": "latest(annual.interest_debt)/latest(annual.total_assets)",
+      "net_debt_to_normalized_fcf": "(latest(annual.interest_debt)-latest(annual.cash))/normalized_fcf",
+      "non_core_income_proxy_share": "sum(copy_abs(annual.other_income)+copy_abs(annual.asset_disposal_gain))/(copy_abs(normalized_earnings)*count(annual))",
+      "normalized_earnings": "median(annual.deducted_net_income)",
+      "normalized_fcf": "median(annual.ocf-annual.capex)",
+      "normalized_pe": "current.price*latest(annual.shares)/normalized_earnings",
+      "normalized_pe_bucket": "min(floor(normalized_pe*4/normalized_pe_max),3)",
+      "npl_change": "latest(annual.npl)-earliest(annual.npl)",
+      "one_time_profit_share": "sum(max(0,annual.net_income-annual.deducted_net_income))/(copy_abs(normalized_earnings)*count(annual))",
+      "pb_median_ratio": "current.pb/median(monthly.pb)",
+      "pb_percentile": "percentile_rank(current.pb,monthly.pb)",
+      "revenue_decline": "max(0,(earliest(annual.revenue)-latest(annual.revenue))/earliest(annual.revenue))",
+      "roe_mean": "mean(annual.roe)"
+    },
+    "industry_version": "eastmoney:push2delay:clist:f100:v1",
+    "min_observations": {
+      "bank_capital": 1,
+      "bank_npl": 2,
+      "bank_roe": 5,
+      "dilution": 2,
+      "fcf": 5,
+      "impairment": 3,
+      "interest_coverage": 1,
+      "net_debt": 1,
+      "non_core_income_proxy": 3,
+      "normalized_earnings": 5,
+      "one_time_profit": 3,
+      "revenue": 2,
+      "valuation_pb": 60
+    },
+    "missing_policy": {
+      "bank_capital_adequacy": "insufficient",
+      "bank_core_tier1_capital_adequacy": "insufficient",
+      "cash_to_assets": "insufficient",
+      "code": "insufficient",
+      "cumulative_fcf": "insufficient",
+      "dilution_rate": "insufficient",
+      "earnings_decline": "insufficient",
+      "impairment_share": "insufficient",
+      "interest_coverage": "insufficient",
+      "interest_debt_to_assets": "insufficient",
+      "listing_years": "insufficient",
+      "net_debt_to_normalized_fcf": "insufficient",
+      "non_core_income_proxy_share": "insufficient",
+      "normalized_earnings": "insufficient",
+      "normalized_fcf": "insufficient",
+      "normalized_pe": "insufficient",
+      "normalized_pe_bucket": "insufficient",
+      "npl_change": "insufficient",
+      "one_time_profit_share": "insufficient",
+      "pb_median_ratio": "insufficient",
+      "pb_percentile": "insufficient",
+      "revenue_decline": "insufficient",
+      "roe_mean": "insufficient"
+    },
+    "order": [
+      [
+        "normalized_pe_bucket",
+        "asc",
+        "nulls_last"
+      ],
+      [
+        "pb_percentile",
+        "asc",
+        "nulls_last"
+      ],
+      [
+        "net_debt_to_normalized_fcf",
+        "asc",
+        "nulls_last"
+      ],
+      [
+        "normalized_pe",
+        "asc",
+        "nulls_last"
+      ],
+      [
+        "code",
+        "asc",
+        "nulls_last"
+      ]
+    ],
+    "scope": "weekly-discovery",
+    "sector_branches": {
+      "branch_policies": {
+        "bank": "financial",
+        "insurance": "unsupported",
+        "nonfinancial": "nonfinancial",
+        "other_financial": "unsupported",
+        "unknown": "insufficient"
+      },
+      "common": {
+        "field_domain_policy": "deep-value-domain-v1",
+        "latest_annual_staleness_years": 1,
+        "lookback_windows": {
+          "bank_capital": 5,
+          "bank_npl": 5,
+          "bank_roe": 5,
+          "dilution": 5,
+          "fcf": 5,
+          "impairment": 3,
+          "interest_coverage": 1,
+          "net_debt": 1,
+          "non_core_income_proxy": 3,
+          "normalized_earnings": 5,
+          "one_time_profit": 3,
+          "revenue": 5
+        },
+        "valuation_ratio_method": "PE_TTM/PB_MRQ"
+      },
+      "financial": {
+        "evidence_fields": [
+          "pb_percentile",
+          "roe_mean",
+          "npl_change",
+          "bank_capital_adequacy"
+        ],
+        "gate_order": [
+          "listing_age",
+          "bank_valuation",
+          "bank_roe",
+          "bank_npl_trend",
+          "bank_capital"
+        ]
+      },
+      "nonfinancial": {
+        "evidence_fields": [
+          "normalized_pe",
+          "cumulative_fcf",
+          "net_debt_to_normalized_fcf",
+          "interest_coverage"
+        ],
+        "gate_order": [
+          "listing_age",
+          "normalized_earnings",
+          "normalized_valuation",
+          "positive_cumulative_fcf",
+          "net_debt",
+          "interest_coverage",
+          "cash_debt",
+          "dilution",
+          "revenue_decline",
+          "earnings_decline",
+          "one_time_profit",
+          "impairment",
+          "non_core_income_proxy"
+        ]
+      }
+    },
+    "thresholds": {
+      "bank_capital_adequacy_min": "12",
+      "bank_core_tier1_min": "9",
+      "bank_npl_increase_max": "0.2",
+      "bank_roe_min": "8",
+      "cash_to_assets_min": "0.2",
+      "cumulative_fcf_min": "0",
+      "dilution_rate_max": "0.1",
+      "earnings_decline_max": "0.3",
+      "impairment_share_max": "0.3",
+      "interest_coverage_min": "2",
+      "interest_debt_to_assets_min": "0.2",
+      "listing_years_min": "5",
+      "net_debt_to_normalized_fcf_max": "3",
+      "non_core_income_proxy_share_max": "0.2",
+      "normalized_earnings_min": "0",
+      "normalized_fcf_min": "0",
+      "normalized_pe_max": "12",
+      "one_time_profit_share_max": "0.3",
+      "pb_median_ratio_max": "0.8",
+      "pb_percentile_max": "30",
+      "readiness_min": "0.8",
+      "revenue_decline_max": "0.2"
+    },
+    "track": "deep_value"
+  },
+  "proposed_readiness_threshold": "0.8",
+  "provenance_coverage": {
+    "asset_disposal_gain": {
+      "present": 5017,
+      "ratio": "0.845158761270090160721285770286162289298314386515092120736965895727165817",
+      "sources": [
+        "discovery"
+      ],
+      "total": 5102,
+      "trusted": 4312
+    },
+    "capex": {
+      "present": 5102,
+      "ratio": "0.98745589964719717757742061936495491963935711485691885535084280674245394",
+      "sources": [
+        "discovery"
+      ],
+      "total": 5102,
+      "trusted": 5038
+    },
+    "capital_adequacy": {
+      "present": 32,
+      "ratio": "1",
+      "sources": [
+        "discovery"
+      ],
+      "total": 32,
+      "trusted": 32
+    },
+    "cash": {
+      "present": 5102,
+      "ratio": "1",
+      "sources": [
+        "discovery"
+      ],
+      "total": 5102,
+      "trusted": 5102
+    },
+    "core_tier1_capital_adequacy": {
+      "present": 32,
+      "ratio": "1",
+      "sources": [
+        "discovery"
+      ],
+      "total": 32,
+      "trusted": 32
+    },
+    "deducted_net_income": {
+      "present": 5102,
+      "ratio": "0.989219913759310074480595844766758134065072520580164641317130537044296354",
+      "sources": [
+        "discovery"
+      ],
+      "total": 5102,
+      "trusted": 5047
+    },
+    "impairment_loss": {
+      "present": 5101,
+      "ratio": "0.999607996863974911799294394355154841238729909839278714229713837710701686",
+      "sources": [
+        "discovery"
+      ],
+      "total": 5102,
+      "trusted": 5100
+    },
+    "interest_coverage": {
+      "present": 4991,
+      "ratio": "0.978243825950607604860838886711093688749509996079968639749117992943943552",
+      "sources": [
+        "discovery"
+      ],
+      "total": 5102,
+      "trusted": 4991
+    },
+    "interest_debt": {
+      "present": 5102,
+      "ratio": "1",
+      "sources": [
+        "discovery"
+      ],
+      "total": 5102,
+      "trusted": 5102
+    },
+    "net_income": {
+      "present": 5102,
+      "ratio": "1",
+      "sources": [
+        "discovery"
+      ],
+      "total": 5102,
+      "trusted": 5102
+    },
+    "npl": {
+      "present": 32,
+      "ratio": "1",
+      "sources": [
+        "discovery"
+      ],
+      "total": 32,
+      "trusted": 32
+    },
+    "ocf": {
+      "present": 5102,
+      "ratio": "0.989415915327322618580948647589180713445707565660525284202273618188945512",
+      "sources": [
+        "discovery"
+      ],
+      "total": 5102,
+      "trusted": 5048
+    },
+    "other_income": {
+      "present": 5099,
+      "ratio": "0.998823990591924735397883183065464523716189729517836142689141513132105057",
+      "sources": [
+        "discovery"
+      ],
+      "total": 5102,
+      "trusted": 5096
+    },
+    "revenue": {
+      "present": 5102,
+      "ratio": "0.988631909055272442179537436299490395923167385339082712661701293610348883",
+      "sources": [
+        "discovery"
+      ],
+      "total": 5102,
+      "trusted": 5044
+    },
+    "roe": {
+      "present": 32,
+      "ratio": "1",
+      "sources": [
+        "discovery"
+      ],
+      "total": 32,
+      "trusted": 32
+    },
+    "shares": {
+      "present": 5102,
+      "ratio": "0.989415915327322618580948647589180713445707565660525284202273618188945512",
+      "sources": [
+        "discovery"
+      ],
+      "total": 5102,
+      "trusted": 5048
+    },
+    "valuation_pb": {
+      "present": 32,
+      "ratio": "1",
+      "sources": [
+        "valuation"
+      ],
+      "total": 32,
+      "trusted": 32
+    },
+    "valuation_price": {
+      "present": 5102,
+      "ratio": "1",
+      "sources": [
+        "valuation"
+      ],
+      "total": 5102,
+      "trusted": 5102
+    }
+  },
+  "return_metric_coverage": null,
+  "schema_version": 1,
+  "source_as_of": {
+    "fill": "2026-10-09 02:01:23.528839+00:00",
+    "financial": "2026-09-30",
+    "request_snapshot_at": "2026-10-09T02:01:23.528839+00:00",
+    "security": "2026-10-08",
+    "valuation": "2026-10-08",
+    "valuation_fetched_at": "2026-10-09 02:01:23.235922+00:00"
+  },
+  "source_coverage": {
+    "fill": {
+      "present": 5165,
+      "ratio": "1",
+      "total": 5165
+    },
+    "financial": {
+      "present": 5165,
+      "ratio": "1",
+      "total": 5165
+    },
+    "price": {
+      "present": 5165,
+      "ratio": "1",
+      "total": 5165
+    },
+    "security": {
+      "present": 5165,
+      "ratio": "1",
+      "total": 5165
+    },
+    "valuation": {
+      "present": 5165,
+      "ratio": "1",
+      "total": 5165
+    }
+  },
+  "status": "ready",
+  "track": "deep_value",
+  "universe": {
+    "branches": {
+      "financial": 32,
+      "nonfinancial": 5102,
+      "unsupported_insurance": 5,
+      "unsupported_other_financial": 26
+    },
+    "eligible": 4252,
+    "fill_id": 9,
+    "scope": "latest_completed_full_market_fill",
+    "snapshot_bytes": 579449967,
+    "total": 5165
+  }
+}

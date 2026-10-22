@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from app.models import (
     DiscoveryDataCheckpoint,
     DiscoveryDataFill,
+    IndexFundRun,
     JobLock,
     PortfolioReview,
     ResearchJob,
@@ -23,6 +24,7 @@ JOB_TYPE_DISCOVERY_DATA = "discovery_data"
 JOB_TYPE_DISCOVERY = "discovery"
 LOCK_ROW_ID = 1
 ACTIVE_STATUSES = ("queued", "running")
+FILL_RESTART_PAUSE = "进程重启，任务已暂停"
 
 
 def ensure_lock_row(session: Session) -> JobLock:
@@ -68,6 +70,14 @@ def clear_stale_lock(
         review.status = "failed"
         review.error = "进程重启，任务中断"
         review.updated_at = datetime.now(timezone.utc)
+    leftover_index_funds = session.scalars(
+        select(IndexFundRun).where(IndexFundRun.status.in_(ACTIVE_STATUSES))
+    ).all()
+    for run in leftover_index_funds:
+        run.status = "failed"
+        run.progress = None
+        run.error = "进程重启，任务中断"
+        run.updated_at = datetime.now(timezone.utc)
     leftover_discovery = session.scalars(
         select(DiscoveryDataFill).where(
             DiscoveryDataFill.status.in_(ACTIVE_STATUSES)
@@ -76,7 +86,7 @@ def clear_stale_lock(
     interrupted_at = datetime.now(timezone.utc)
     for fill in leftover_discovery:
         fill.status = "paused"
-        fill.last_error = "进程重启，任务已暂停"
+        fill.last_error = FILL_RESTART_PAUSE
         fill.updated_at = interrupted_at
     interrupted_checkpoints = session.scalars(
         select(DiscoveryDataCheckpoint).where(
@@ -91,7 +101,7 @@ def clear_stale_lock(
             fill.status = "paused"
             fill.updated_at = interrupted_at
             if fill.last_error is None:
-                fill.last_error = "进程重启，任务已暂停"
+                fill.last_error = FILL_RESTART_PAUSE
     discovery_interrupted_at = aware_utc_now(now_provider)
     current_discovery_week = china_week_key(discovery_interrupted_at)
     interrupted_stages = [

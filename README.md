@@ -1,12 +1,25 @@
 # Berkshire Plus
 
-本机 A 股看仓与选股工作台。浏览器打开即可，无登录、不绑定公网。
+[English](README.en.md)
 
-## 运行
+本机 A 股看仓与选股工作台。浏览器打开即可，无登录，只监听本机，不构成投资建议。
 
-需要 Python 3.12–3.14，以及一次前端构建（已构建过可跳过 `npm run build`）。
+克隆下来的是空账本：没有持仓、没有密钥、没有已构建的页面。按下面的顺序做完，就能在浏览器里使用。
+
+## 准备
+
+安装这两样：
+
+- [uv](https://docs.astral.sh/uv/getting-started/installation/)。它会按项目要求准备 Python 3.12–3.14，不用单独装 Python。
+- Node.js **22.18 及以上的 22.x**，或 **24.12 及以上**。Node 20 和 23 不符合前端要求。
+
+命令在 PowerShell 和 Git Bash 里相同。下面都在仓库根目录执行。
+
+## 安装并启动
 
 ```powershell
+git clone https://github.com/Nirvana-ZN/berkshire-plus.git
+cd berkshire-plus
 cd web
 npm install
 npm run build
@@ -14,36 +27,91 @@ cd ..
 uv run berkshire-plus
 ```
 
-浏览器打开 http://127.0.0.1:8765
+浏览器打开 http://127.0.0.1:8765 。这个地址只在运行命令的那台电脑上能打开。
+
+结束时在该终端按 Ctrl+C。
+
+页面若显示「前端尚未构建」，说明跳过了 `npm run build`。回到 `web` 目录建好再启动。`web/dist` 不进版本库，每台机器都要构建一次。
+
+同一时间只能跑一个后台任务。页眉会显示正在运行的是选股漏斗、个股评估、组合审视、每周发现还是全市场抓取。
+
+## 第一次使用
+
+空库可以直接用，不必准备 YAML。
+
+1. **看仓** http://127.0.0.1:8765/positions  
+   打开「记账（买 / 卖）」，填写日期、方向、名称、股数和价格，点「记账」。名称可检索，也可直接填写。已有持仓时，名称旁的「记买入」「记卖出」会把表单预填好。
+
+2. **设置** http://127.0.0.1:8765/settings  
+   漏斗筛名单不需要密钥。评估、一键审视需要 OpenAI 兼容密钥，见下一节。
+
+3. **选股** http://127.0.0.1:8765/screen  
+   选择行业、指数或主题，点「开始筛选」。勾选「评估终选」，或使用「个股直接评估」，才会调用模型。
+
+4. **每周发现** http://127.0.0.1:8765/discover  
+   先点「更新全市场数据」。抓取完成前，「开始本周发现」是不可用的。抓取要从东方财富拉全市场快照，耗时很长，期间不要关掉运行工作台的终端。
+
+5. **指数基金** http://127.0.0.1:8765/index-funds  
+   点「刷新数据」。每个指数给出一只代表基金的低估值筛选结果。
+
+行情在使用时拉取，不随仓库提供。
+
+## 模型密钥
+
+工作台启动后打开 http://127.0.0.1:8765/settings ，在「大模型接口配置」里填写后点「保存设置」：
+
+- **API 密钥**：评估和审视必填。写入 `.env` 的 `OPENAI_API_KEY`。
+- **接口地址**：兼容接口的根地址，末尾不要带 `/chat/completions`。留空则使用 `https://api.openai.com/v1`。智谱 Coding Plan 用 `https://open.bigmodel.cn/api/coding/paas/v4`，按量计费用 `https://open.bigmodel.cn/api/paas/v4`。
+- **模型**：可选。留空则使用 `gpt-4o-mini`。
+
+保存后密钥和接口地址立即生效，不用重启。页面只显示「已保存」，输入框留空再保存不会清掉已有密钥。
+
+网页搜索是可选项。要在评估前检索中报、分红和股权结构，在同一页填写 Tavily 密钥并勾选「网页搜索」。没有这把密钥时，勾选也不会发起搜索。财务数字仍以已抓取的年报为准。
+
+密钥写在项目根目录 `.env`，不进数据库、不进 git。也可以手工创建这个文件，改完后需要重新启动工作台：
+
+```
+OPENAI_API_KEY=sk-...
+OPENAI_BASE_URL=https://api.openai.com/v1
+TAVILY_API_KEY=tvly-...
+```
 
 ## 迁入已有 YAML 账本（可选）
 
-首次启动且库中还没有成交时，会读取环境变量 `PORTFOLIO_YAML_DIR` 下的四个文件：`trades.yaml`、`cash.yaml`、`rules.yaml`、`symbols.yaml`。迁入只发生一次。
+只有在第一次启动、库里还没有任何成交时才会迁入。四个文件必须放在同一目录：`trades.yaml`、`cash.yaml`、`rules.yaml`、`symbols.yaml`。
+
+PowerShell：
 
 ```powershell
 $env:PORTFOLIO_YAML_DIR = "D:\path\to\your-yaml"
 uv run berkshire-plus
 ```
 
-没有 YAML 也可以先打开工作台，在看仓页手记买卖。
+Git Bash：
 
-## 模型密钥
+```bash
+export PORTFOLIO_YAML_DIR="/d/path/to/your-yaml"
+uv run berkshire-plus
+```
 
-漏斗可以只筛名单。评估与一键审视需要 OpenAI 兼容密钥，在设置页填写（写入项目根目录 `.env`，不进数据库、不进 git）。
+迁入只发生一次。改了 YAML 想重新迁入，先停掉工作台，删除 `data/app.db`，再带同一个环境变量启动。删除数据库会同时清掉已经记在里面的成交、发现结果和设置里的模型名称。
+
+没有这四个文件就跳过本节，在看仓页记账。
 
 ## 数据文件
 
 | 路径 | 用途 |
 |------|------|
-| `data/app.db` | SQLite 账本与产物 |
-| `.env` | 模型密钥 |
+| `data/app.db` | SQLite 账本与产物。首次启动自动创建 |
+| `.env` | 模型密钥与接口地址 |
 | `reports/` | 评估与审视 Markdown |
+| `web/dist` | 前端构建结果 |
 
-三者均不进版本库。改 YAML 后若要重新迁入，需先停进程并删除 `data/app.db`。
+这些都不进版本库。换一台电脑要重新构建前端，并重新记账或迁入 YAML。不要把另一台机器上数 GB 的数据库备份拷进仓库。
 
-## 发现数据快照升级
+## 已有库升级
 
-本版本会原样封存所有已经标记为 `ready` 的全市场证券快照；迁移不会补字段、修值或追认旧数据正确。升级前已经初始化的发现数据填充不得继续复用，需停掉工作进程，将旧填充标记为 `snapshot_unavailable` 后重新发起填充：
+新克隆不需要做这一节。它只针对升级前已经标记为 `ready` 的全市场快照：旧快照原样保留，不会补字段或改值。升级后不要继续复用那次填充。停掉工作台，把旧填充标成不可用，再在「每周发现」页重新点「更新全市场数据」：
 
 ```sql
 UPDATE discovery_data_fills
@@ -53,4 +121,4 @@ SET snapshot_status = 'unavailable',
 WHERE id = <旧填充 ID> AND snapshot_status = 'ready';
 ```
 
-随后调用 `POST /api/discovery-data/fill` 创建新填充。旧快照继续保持只读，不能逐行删除或修改。
+旧快照保持只读，不能逐行删除或修改。

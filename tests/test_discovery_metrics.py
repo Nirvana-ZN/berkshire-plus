@@ -20,7 +20,7 @@ from discovery.metrics import (
     FINANCIAL_PRECISION_CEILING,
     cagr,
     cash_conversion,
-    coefficient_of_variation,
+    downside_volatility,
     empirical_percentile_rank,
     finite_values,
     mean,
@@ -104,19 +104,22 @@ def test_cagr_still_validates_interior_types() -> None:
         cagr([D("100"), "missing", D("121")], 2)  # type: ignore[list-item]
 
 
-def test_coefficient_of_variation_is_population_based() -> None:
-    assert coefficient_of_variation([D("1"), D("3")]) == D("0.5")
-    assert coefficient_of_variation([D("7"), D("7"), D("7")]) == D("0")
-    assert coefficient_of_variation([D("-1"), D("1")]) is None
-    assert coefficient_of_variation([D("7")]) is None
-    assert coefficient_of_variation([None, D("NaN")]) is None
+def test_downside_volatility_counts_only_declines() -> None:
+    assert downside_volatility([D("3"), D("1")]) == D("1")
+    assert downside_volatility([D("5"), D("10"), D("15"), D("20")]) == D("0")
+    assert downside_volatility([D("7"), D("7"), D("7")]) == D("0")
+    # Declines of 2 then 5 over 2 steps: sqrt((4 + 25) / 2) / mean 5.
+    assert abs(downside_volatility([D("8"), D("6"), D("1")]) - D("0.761577311")) < D("1e-9")
+    assert downside_volatility([D("-1"), D("1")]) is None
+    assert downside_volatility([D("7")]) is None
+    assert downside_volatility([None, D("NaN")]) is None
 
 
-def test_cash_conversion_averages_only_valid_aligned_ratios() -> None:
+def test_cash_conversion_sums_only_valid_aligned_pairs() -> None:
     ocf = [D("10"), None, D("9"), D("Infinity"), D("4")]
     net_income = [D("5"), D("2"), D("-3"), D("1"), D("0")]
 
-    assert cash_conversion(ocf, net_income, 2) == D("-0.5")
+    assert cash_conversion(ocf, net_income, 2) == D("9.5")
     assert cash_conversion(ocf, net_income, 3) is None
     assert ocf == [D("10"), None, D("9"), D("Infinity"), D("4")]
     assert net_income == [D("5"), D("2"), D("-3"), D("1"), D("0")]
@@ -127,9 +130,17 @@ def test_cash_conversion_accepts_generators_but_requires_equal_lengths() -> None
         (value for value in [D("4"), D("9")]),
         (value for value in [D("2"), D("3")]),
         2,
-    ) == D("2.5")
+    ) == D("2.6")
     with pytest.raises(ValueError):
         cash_conversion([D("1")], [D("1"), D("2")], 1)
+
+
+def test_cash_conversion_thin_profit_year_does_not_inflate_ratio() -> None:
+    income = [D("1"), D("1"), D("1"), D("1"), D("0.1")]
+    ratio = cash_conversion([D("1")] * 5, income, 5)
+
+    # 5 / 4.1; averaging the yearly ratios would have given 2.8.
+    assert D("1.2195") < ratio < D("1.2196")
 
 
 @pytest.mark.parametrize("minimum", [0, -1])
@@ -223,7 +234,7 @@ def test_metrics_leave_global_decimal_context_unchanged_and_return_finite_values
         mean([D("1"), D("2")]),
         median([D("1"), D("2")]),
         cagr([D("100"), D("121")], 2),
-        coefficient_of_variation([D("1"), D("3")]),
+        downside_volatility([D("3"), D("1")]),
         cash_conversion([D("1")], [D("3")], 1),
         normalized_earnings([D("1"), D("2")], 2),
         percentile_rank(D("2"), [D("1"), D("3")]),
@@ -266,7 +277,7 @@ def _metric_probe() -> tuple[Decimal | None, ...]:
         mean(decimal_series("1", "3", "sNaN")),
         median(decimal_series("1", "3", "sNaN")),
         cagr(decimal_series("100", "sNaN", "121"), 2),
-        coefficient_of_variation(decimal_series("1", "3", "sNaN")),
+        downside_volatility(decimal_series("3", "1", "sNaN")),
         cash_conversion(decimal_series("4", "9"), decimal_series("2", "3"), 2),
         normalized_earnings(decimal_series("1", "2", "3"), 3),
         percentile_rank(D("2"), decimal_series("1", "sNaN", "3")),
@@ -274,7 +285,7 @@ def _metric_probe() -> tuple[Decimal | None, ...]:
 
 
 def test_results_ignore_hostile_current_context_and_preserve_every_field() -> None:
-    expected = (D("2"), D("2"), D("0.1"), D("0.5"), D("2.5"), D("2"), D("50"))
+    expected = (D("2"), D("2"), D("0.1"), D("1"), D("2.6"), D("2"), D("50"))
     with localcontext() as hostile:
         hostile.prec = 1
         hostile.rounding = ROUND_DOWN
@@ -311,8 +322,8 @@ def test_results_ignore_hostile_default_context_without_mutating_it() -> None:
             D("2"),
             D("2"),
             D("0.1"),
-            D("0.5"),
-            D("2.5"),
+            D("1"),
+            D("2.6"),
             D("2"),
             D("50"),
         )
@@ -343,7 +354,7 @@ def test_scale_stable_mean_median_and_cv_at_decimal_limits(
 ) -> None:
     assert mean([first, third]) == expected
     assert median([first, third]) == expected
-    assert coefficient_of_variation([first, third]) == D("0.5")
+    assert downside_volatility([third, first]) == D("1")
 
 
 @pytest.mark.parametrize(
@@ -370,7 +381,7 @@ def test_precision_ceiling_returns_none_instead_of_allocating_unbounded_work() -
     distant = D(f"1E+{FINANCIAL_PRECISION_CEILING + 10}")
     assert mean([D("1"), distant]) is None
     assert median([D("1"), distant]) is None
-    assert coefficient_of_variation([D("1"), distant]) is None
+    assert downside_volatility([D("1"), distant]) is None
     assert cash_conversion([distant, D("1")], [D("1"), D("1")], 2) is None
     assert cagr(
         [D("1"), D("1" + "0" * (FINANCIAL_PRECISION_CEILING + 1))],

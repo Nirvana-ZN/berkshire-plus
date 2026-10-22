@@ -10,9 +10,9 @@ from urllib.parse import quote
 
 from discovery.constants import china_market_date
 from discovery.field_dictionary import FIELD_DICTIONARY
-from market.cheap import (
+from market.universe import (
     INDUSTRY_MAPPING_VERSION,
-    CheapRow,
+    UniverseRow,
     delisting_name_state,
     is_st_name,
 )
@@ -110,6 +110,89 @@ _BOARD_CODES = {
     "工程机械": "BK0739",
 }
 _SUFFIXES = ("Ⅱ", "II", "2")
+_DATACENTER_INDEX_TYPES = {
+    "沪深300": "1",
+    "上证50": "2",
+    "中证500": "3",
+    "科创50": "4",
+    "中证A50": "5",
+    "中证A500": "6",
+    "中证1000": "7",
+    "深证50": "8",
+    "中小100": "9",
+    "北证50": "10",
+    "上证180": "11",
+    "中证A100": "12",
+    "中证2000": "13",
+}
+_DATACENTER_INDEX_BOARDS = {
+    "创业板指": "创业成份",
+    "创业板综": "创业板综",
+    "深证100": "深证100R",
+    "深证100R": "深证100R",
+    "深证成指": "深成500",
+    "深成500": "深成500",
+    "沪深300": "HS300_",
+    "上证50": "上证50_",
+    "中证500": "中证500",
+    "上证180": "上证180_",
+}
+_INDEX_ALIASES = {
+    "创业板指数": "创业板指",
+    "创业板": "创业板指",
+    "创业成份": "创业板指",
+    "创业板综指": "创业板综",
+    "沪深300指数": "沪深300",
+    "上证50指数": "上证50",
+    "中证500指数": "中证500",
+    "科创50指数": "科创50",
+    "中证1000指数": "中证1000",
+    "中证2000指数": "中证2000",
+    "中证A50指数": "中证A50",
+    "中证A500指数": "中证A500",
+    "中证A100指数": "中证A100",
+    "上证180指数": "上证180",
+    "深证50指数": "深证50",
+    "深证100指数": "深证100",
+    "深证成份指数": "深证成指",
+    "中小100指数": "中小100",
+    "中小板指": "中小100",
+    "中小板指数": "中小100",
+    "北证50指数": "北证50",
+}
+_BUILTIN_INDEX_ROWS = (
+    {"name": "创业板指", "code": "0.399006"},
+    {"name": "创业板指数", "code": "0.399006"},
+    {"name": "创业板综", "code": "0.399102"},
+    {"name": "深证成指", "code": "0.399001"},
+    {"name": "深证100", "code": "0.399330"},
+    {"name": "深证50", "code": "0.399850"},
+    {"name": "中小100", "code": "0.399005"},
+    {"name": "沪深300", "code": "1.000300"},
+    {"name": "上证50", "code": "1.000016"},
+    {"name": "上证180", "code": "1.000010"},
+    {"name": "中证500", "code": "1.000905"},
+    {"name": "中证1000", "code": "1.000852"},
+    {"name": "中证2000", "code": "2.932000"},
+    {"name": "科创50", "code": "1.000688"},
+    {"name": "中证A50", "code": "2.930050"},
+    {"name": "中证A100", "code": "1.000903"},
+    {"name": "中证A500", "code": "1.000510"},
+    {"name": "北证50", "code": "0.899050"},
+)
+
+
+def _normalize_index_name(name: str) -> str:
+    text = (name or "").strip()
+    if text in _INDEX_ALIASES:
+        return _INDEX_ALIASES[text]
+    if text.endswith("指数"):
+        stem = text[:-2].strip()
+        if stem in _DATACENTER_INDEX_TYPES or stem in _DATACENTER_INDEX_BOARDS:
+            return stem
+        if f"{stem}指" in _DATACENTER_INDEX_BOARDS:
+            return f"{stem}指"
+    return text
 
 
 class MarketClient(Protocol):
@@ -135,15 +218,17 @@ class MarketClient(Protocol):
     def list_boards(self, scope_type: str, query: str = "") -> list[dict[str, str]]:
         """Return board or index names for the screen picker."""
 
-    def fetch_cheap_universe(
+    def fetch_universe(
         self,
         *,
         before_request: DiscoveryPreRequest | None = None,
         as_of: date | None = None,
-    ) -> list[CheapRow]:
+    ) -> list[UniverseRow]:
         """沪深 A 股截面：现价 / PE / PB / 市值 / 行业。"""
 
-    def fetch_valuation_history(self, code: str) -> list[ValuationPoint]:
+    def fetch_valuation_history(
+        self, code: str, *, through: str | None = None
+    ) -> list[ValuationPoint]:
         """Return one source-reported PE/PB point per month for five years."""
 
     def fetch_trading_dates(self, end: str, limit: int = 6) -> list[str]:
@@ -173,8 +258,8 @@ class FakeMarketClient:
         gate: Event | None = None,
         boards: Sequence[Mapping[str, str]] | None = None,
         breadth: Mapping[str, object] | None = None,
-        cheap_universe: Sequence[CheapRow] | None = None,
-        cheap_error: str | None = None,
+        universe: Sequence[UniverseRow] | None = None,
+        universe_error: str | None = None,
         valuation_history: Sequence[ValuationPoint] | None = None,
         trading_dates: Sequence[str] | None = None,
         discovery_data: Mapping[str, DiscoveryCompanyData] | None = None,
@@ -205,8 +290,8 @@ class FakeMarketClient:
             "zt": 40,
             "dt": 40,
         }
-        self.cheap_universe = list(cheap_universe or [])
-        self.cheap_error = cheap_error
+        self.universe = list(universe or [])
+        self.universe_error = universe_error
         self.valuation_history = list(valuation_history or [])
         self.trading_dates = list(trading_dates or [])
         self.discovery_data = dict(discovery_data or {})
@@ -214,7 +299,7 @@ class FakeMarketClient:
         self.discovery_request_counts = dict(discovery_request_counts or {})
         self.discovery_gate = discovery_gate
         self.discovery_security_states: list[SecurityState | None] = []
-        self.cheap_as_of: list[date] = []
+        self.universe_as_of: list[date] = []
         self._request_count = 0
 
     @property
@@ -252,30 +337,36 @@ class FakeMarketClient:
         self.calls.append(("breadth",))
         return dict(self.breadth)
 
-    def fetch_cheap_universe(
+    def fetch_universe(
         self,
         *,
         before_request: DiscoveryPreRequest | None = None,
         as_of: date | None = None,
-    ) -> list[CheapRow]:
+    ) -> list[UniverseRow]:
         snapshot_date = as_of or china_market_date()
-        self.cheap_as_of.append(snapshot_date)
+        self.universe_as_of.append(snapshot_date)
         if before_request is not None:
             before_request()
         self._request_count += 1
-        self.calls.append(("cheap",))
-        if self.cheap_error is not None:
-            raise MarketError(self.cheap_error)
-        self._last_cheap_trading_dates = tuple(
+        self.calls.append(("universe",))
+        if self.universe_error is not None:
+            raise MarketError(self.universe_error)
+        self._last_universe_trading_dates = tuple(
             day
             for day in self.trading_dates
             if day <= snapshot_date.isoformat()
         )[-6:]
-        return list(self.cheap_universe)
+        return list(self.universe)
 
-    def fetch_valuation_history(self, code: str) -> list[ValuationPoint]:
+    def fetch_valuation_history(
+        self, code: str, *, through: str | None = None
+    ) -> list[ValuationPoint]:
         self.calls.append(("valuation_history", code))
-        return [row for row in self.valuation_history if row.code == code]
+        return [
+            row
+            for row in self.valuation_history
+            if row.code == code and (through is None or row.trade_date <= through)
+        ]
 
     def fetch_trading_dates(self, end: str, limit: int = 6) -> list[str]:
         self.calls.append(("trading_dates", end, str(limit)))
@@ -450,6 +541,23 @@ def _dictionary_decimal(
         if spec.trusted and isinstance(spec.field, str)
         else None
     )
+
+
+def _detail_decimal(
+    metric: str, item: Mapping[str, object]
+) -> Decimal | None:
+    # Detailed statements list every line and leave unused ones null, so a
+    # null line inside a present period row is a zero balance, not a gap.
+    spec = FIELD_DICTIONARY[metric]
+    if (
+        item
+        and spec.trusted
+        and isinstance(spec.field, str)
+        and spec.field in item
+        and item[spec.field] is None
+    ):
+        return Decimal(0)
+    return _dictionary_decimal(metric, item)
 
 
 def _dictionary_financial_decimal(
@@ -820,14 +928,28 @@ class EastMoneyClient:
         rows: list[FinancialRow] = []
         last_error: MarketError | None = None
         any_ok = False
-        for code in codes:
-            try:
-                rows.extend(self._financials_for(code))
-                any_ok = True
-            except MarketError as exc:
-                last_error = exc
-            except Exception as exc:
-                last_error = MarketError(str(exc))
+        if type(self) is EastMoneyClient and len(codes) > 3:
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                futures = [pool.submit(self._financials_for, code) for code in codes]
+                for fut in futures:
+                    try:
+                        rows.extend(fut.result())
+                        any_ok = True
+                    except MarketError as exc:
+                        last_error = exc
+                    except Exception as exc:
+                        last_error = MarketError(str(exc))
+        else:
+            for code in codes:
+                try:
+                    rows.extend(self._financials_for(code))
+                    any_ok = True
+                except MarketError as exc:
+                    last_error = exc
+                except Exception as exc:
+                    last_error = MarketError(str(exc))
         if not any_ok:
             raise last_error or MarketError("财务接口整体不可用")
         return rows
@@ -928,12 +1050,18 @@ class EastMoneyClient:
                 str(exc),
                 request_count=request_count(),
             ) from exc
+        # A fill fetches companies for hours; pin every price to the security
+        # snapshot's trading day so fetches after a close don't run a day ahead.
         try:
             valuations = (
-                self.fetch_valuation_history(normalized)
+                self.fetch_valuation_history(
+                    normalized, through=security.last_trade_date
+                )
                 if request_gate is None
                 else self.fetch_valuation_history(
-                    normalized, before_request=request_gate
+                    normalized,
+                    before_request=request_gate,
+                    through=security.last_trade_date,
                 )
             )
         except DiscoveryRequestStopped:
@@ -972,6 +1100,25 @@ class EastMoneyClient:
 
     def fetch_listed_years(self, codes: Sequence[str]) -> dict[str, int]:
         years: dict[str, int] = {}
+        if type(self) is EastMoneyClient and len(codes) > 3:
+            try:
+                clean = [c.strip().upper() for c in codes if c and c.strip()]
+                for i in range(0, len(clean), 50):
+                    chunk = clean[i : i + 50]
+                    in_clause = ",".join(f'"{c}"' for c in chunk)
+                    for row in self._datacenter_rows(
+                        "RPT_F10_BASIC_ORGINFO",
+                        "SECUCODE,LISTING_DATE",
+                        f"(SECUCODE in ({in_clause}))",
+                        allow_empty=True,
+                    ):
+                        secu = str(row.get("SECUCODE") or "").strip().upper()
+                        raw = str(row.get("LISTING_DATE") or "")[:4]
+                        if secu and raw.isdigit():
+                            years[secu] = int(raw)
+                return years
+            except Exception:
+                pass
         for code in codes:
             try:
                 year = self._listed_year_for(code)
@@ -986,6 +1133,7 @@ class EastMoneyClient:
         code: str,
         *,
         before_request: DiscoveryPreRequest | None = None,
+        through: str | None = None,
     ) -> list[ValuationPoint]:
         normalized = code.strip().upper()
         try:
@@ -1084,7 +1232,7 @@ class EastMoneyClient:
                 parsed_date = date.fromisoformat(trade_date)
             except ValueError:
                 continue
-            if parsed_date < start:
+            if parsed_date < start or (through is not None and trade_date > through):
                 continue
             month = trade_date[:7]
             previous = monthly.get(month)
@@ -1284,12 +1432,12 @@ class EastMoneyClient:
         out["zt"], out["dt"] = self._limit_counts()
         return out
 
-    def fetch_cheap_universe(
+    def fetch_universe(
         self,
         *,
         before_request: DiscoveryPreRequest | None = None,
         as_of: date | None = None,
-    ) -> list[CheapRow]:
+    ) -> list[UniverseRow]:
         # ponytail: 东财截面约 50–80 页；历史分位另存每日快照
         snapshot_date = (as_of or china_market_date()).isoformat()
         try:
@@ -1309,8 +1457,13 @@ class EastMoneyClient:
                     before_request=before_request,
                 )
             )
-        except MarketError:
-            raise
+        except MarketError as exc:
+            # push2 blocks clist per IP for hours while datacenter stays up.
+            if not isinstance(exc.__cause__, TransientMarketError):
+                raise
+            return self._datacenter_universe(
+                snapshot_date, before_request=before_request
+            )
         except Exception as exc:
             raise MarketError(str(exc)) from exc
         exchange_dates: list[str] = []
@@ -1336,8 +1489,8 @@ class EastMoneyClient:
                 )
             )
         latest_exchange_date = exchange_dates[-1] if exchange_dates else None
-        self._last_cheap_trading_dates = tuple(exchange_dates)
-        rows: list[CheapRow] = []
+        self._last_universe_trading_dates = tuple(exchange_dates)
+        rows: list[UniverseRow] = []
         for item in diff:
             if not isinstance(item, dict):
                 continue
@@ -1390,7 +1543,7 @@ class EastMoneyClient:
                 trading_status = None
                 last_trade_date = None
             rows.append(
-                CheapRow(
+                UniverseRow(
                     code=code,
                     name=name,
                     price=price,
@@ -1413,7 +1566,150 @@ class EastMoneyClient:
                 )
             )
         if not rows:
-            raise MarketError("低估值榜解析不到沪深A股名单")
+            raise MarketError("全市场名单解析不到沪深A股")
+        return rows
+
+    def _datacenter_universe(
+        self,
+        snapshot_date: str,
+        *,
+        before_request: DiscoveryPreRequest | None = None,
+    ) -> list[UniverseRow]:
+        calendar = self.fetch_trading_dates(
+            snapshot_date,
+            limit=VALUATION_CALENDAR_LIMIT,
+            before_request=before_request,
+            retry_transient=True,
+        )
+        if not calendar:
+            raise MarketError("交易日接口没有返回日期")
+        exchange_dates = calendar[-6:]
+        latest = exchange_dates[-1]
+        # Intervals cover whole-day suspensions; intraday halts still trade.
+        suspended_since = {
+            str(row.get("SECUCODE") or "").upper(): str(row["SUSPEND_START_DATE"])[:10]
+            for row in self._datacenter_rows(
+                "RPT_CUSTOM_SUSPEND_DATA_INTERFACE",
+                "SECUCODE,SUSPEND_START_DATE,SUSPEND_END_TIME,SUSPEND_EXPIRE",
+                f"(MARKET=\"全部\")(DATETIME='{latest}')",
+                before_request=before_request,
+                allow_empty=True,
+            )
+            if row.get("SUSPEND_EXPIRE") != "盘中停牌"
+            and str(row.get("SUSPEND_START_DATE") or "")[:10] <= latest
+            and (
+                row.get("SUSPEND_END_TIME") is None
+                or str(row["SUSPEND_END_TIME"])[:10] >= latest
+            )
+        }
+        valuations = self._datacenter_rows(
+            "RPT_VALUEANALYSIS_DET",
+            "SECUCODE,SECURITY_NAME_ABBR,BOARD_NAME,CLOSE_PRICE,"
+            "PE_TTM,PB_MRQ,TOTAL_MARKET_CAP",
+            f"(TRADE_DATE='{latest}')",
+            before_request=before_request,
+        )
+        listings = {
+            str(row.get("SECUCODE") or "").upper(): str(row.get("LISTING_DATE") or "")
+            for row in self._datacenter_rows(
+                "RPT_F10_BASIC_ORGINFO",
+                "SECUCODE,LISTING_DATE",
+                before_request=before_request,
+            )
+        }
+        self._last_universe_trading_dates = tuple(exchange_dates)
+        rows: list[UniverseRow] = []
+        for item in valuations:
+            code = str(item.get("SECUCODE") or "").strip().upper()
+            name = str(item.get("SECURITY_NAME_ABBR") or "").strip()
+            if not name or not _is_hs_code(code):
+                continue
+            # Suspended stocks keep a valuation row, so only the suspension
+            # interval can tell them apart.
+            start = suspended_since.get(code)
+            if start is None:
+                trading_status: str | None = "trading"
+                last_trade_date: str | None = latest
+            else:
+                before = [day for day in calendar if day < start]
+                trading_status = "suspended" if before else None
+                last_trade_date = before[-1] if before else None
+            rows.append(
+                UniverseRow(
+                    code=code,
+                    name=name,
+                    price=_as_decimal(item.get("CLOSE_PRICE")),
+                    pe=_as_decimal(item.get("PE_TTM")),
+                    pb=_as_decimal(item.get("PB_MRQ")),
+                    mcap=_as_decimal(item.get("TOTAL_MARKET_CAP")),
+                    industry=str(item.get("BOARD_NAME") or "").strip(),
+                    exchange=code.rsplit(".", 1)[1],
+                    listing_date=_compact_date(
+                        listings.get(code, "")[:10].replace("-", "")
+                    ),
+                    is_st=is_st_name(name),
+                    is_delisting=delisting_name_state(code, name),
+                    trading_status=trading_status,
+                    last_trade_date=last_trade_date,
+                    # Same East Money level-2 labels as clist f100 (2 of 5,222
+                    # differed on the 2026-09-22 cross-check).
+                    industry_version=INDUSTRY_MAPPING_VERSION,
+                    industry_as_of=snapshot_date,
+                    security_source="eastmoney:datacenter",
+                    market_status_code=None,
+                )
+            )
+        if not rows:
+            raise MarketError("数据中心解析不到沪深A股名单")
+        return rows
+
+    def _datacenter_rows(
+        self,
+        report: str,
+        columns: str,
+        filt: str | None = None,
+        *,
+        before_request: DiscoveryPreRequest | None = None,
+        allow_empty: bool = False,
+    ) -> list[dict]:
+        rows: list[dict] = []
+        pages = count = None
+        page = 1
+        while pages is None or page <= pages:
+            url = (
+                f"{FINANCIALS_URL}?reportName={report}&columns={columns}"
+                f"&pageSize=500&pageNumber={page}&sortColumns=SECUCODE&sortTypes=1"
+                + (f"&filter={quote(filt)}" if filt else "")
+            )
+            for attempt in range(1, CLIST_PAGE_RETRY_ROUNDS + 1):
+                try:
+                    payload = (
+                        self._get_json(url)
+                        if before_request is None
+                        else self._get_json(url, before_request=before_request)
+                    )
+                    break
+                except TransientMarketError:
+                    if attempt == CLIST_PAGE_RETRY_ROUNDS:
+                        raise
+            result = payload.get("result")
+            data = result.get("data") if isinstance(result, dict) else None
+            # datacenter answers an empty result set with code 9201.
+            if allow_empty and page == 1 and payload.get("code") == 9201:
+                return []
+            if payload.get("success") is not True or not isinstance(data, list) or not data:
+                raise MarketError(f"{report} page {page} 返回格式错误")
+            if pages is None:
+                pages, count = result.get("pages"), result.get("count")
+                if type(pages) is not int or type(count) is not int or pages < 1:
+                    raise MarketError(f"{report} 分页信息无效")
+            elif result.get("pages") != pages or result.get("count") != count:
+                raise MarketError(f"{report} 分页信息前后不一致")
+            rows.extend(row for row in data if isinstance(row, dict))
+            page += 1
+        codes = [row.get("SECUCODE") for row in rows]
+        if len(rows) != count or len(set(codes)) != len(codes):
+            raise MarketError(f"{report} 行数或代码与总数不一致")
         return rows
 
     def _security_state_for(
@@ -1826,12 +2122,19 @@ class EastMoneyClient:
         cached = self._board_lists.get(board_type)
         if cached is not None:
             return cached
-        diff = self._clist_diff(
-            fs=f"m:90+t:{board_type}+f:!50",
-            fields="f12,f14",
-            fid="f3",
-        )
-        rows: list[dict[str, str]] = []
+        try:
+            diff = self._clist_diff(
+                fs=f"m:90+t:{board_type}+f:!50",
+                fields="f12,f14",
+                fid="f3",
+            )
+        except MarketError as exc:
+            if not isinstance(exc.__cause__, TransientMarketError):
+                raise
+            rows = self._datacenter_board_catalog(board_type)
+            self._board_lists[board_type] = rows
+            return rows
+        rows = []
         for item in diff:
             name = str(item.get("f14") or "").strip()
             code = str(item.get("f12") or "").strip()
@@ -1845,11 +2148,16 @@ class EastMoneyClient:
         cached = self._board_lists.get(-1)
         if cached is not None:
             return cached
-        diff = self._clist_diff(
-            fs="m:1+s:3,m:0+s:3",
-            fields="f12,f13,f14",
-            fid="f3",
-        )
+        try:
+            diff = self._clist_diff(
+                fs="m:1+s:3,m:0+s:3",
+                fields="f12,f13,f14",
+                fid="f3",
+            )
+        except MarketError as exc:
+            if not isinstance(exc.__cause__, TransientMarketError):
+                raise
+            diff = []
         rows: list[dict[str, str]] = []
         seen: set[str] = set()
         for item in diff:
@@ -1859,6 +2167,10 @@ class EastMoneyClient:
                 continue
             seen.add(name)
             rows.append({"name": name, "code": secid})
+        for builtin in _BUILTIN_INDEX_ROWS:
+            if builtin["name"] not in seen:
+                seen.add(builtin["name"])
+                rows.append(dict(builtin))
         rows.sort(key=lambda row: row["name"])
         self._board_lists[-1] = rows
         return rows
@@ -1867,25 +2179,49 @@ class EastMoneyClient:
         mapped = board_code(name)
         if mapped:
             label = _BOARD_ALIASES.get(name, name)
-            return self._clist_constituents(f"b:{mapped}+f:!50", industry=label)
-        diff = self._clist_diff(
-            fs=f"m:90+t:{board_type}+f:!50",
-            fields="f12,f14",
-            fid="f3",
-        )
-        if not diff:
-            raise MarketError(f"解析不到明确列表: {name}")
-        chosen = pick_board(name, diff)
-        board = str(chosen.get("f12") or "").strip()
-        if not board:
-            raise MarketError(f"解析不到明确列表: {name}")
-        label = str(chosen.get("f14") or "").strip() or name
-        return self._clist_constituents(f"b:{board}+f:!50", industry=label)
+            try:
+                return self._clist_constituents(f"b:{mapped}+f:!50", industry=label)
+            except MarketError as exc:
+                if not isinstance(exc.__cause__, TransientMarketError):
+                    raise
+                return self._datacenter_board_constituents(
+                    name, board_code_override=mapped, industry_label=label
+                )
+        try:
+            diff = self._clist_diff(
+                fs=f"m:90+t:{board_type}+f:!50",
+                fields="f12,f14",
+                fid="f3",
+            )
+            if not diff:
+                raise MarketError(f"解析不到明确列表: {name}")
+            chosen = pick_board(name, diff)
+            board = str(chosen.get("f12") or "").strip()
+            if not board:
+                raise MarketError(f"解析不到明确列表: {name}")
+            label = str(chosen.get("f14") or "").strip() or name
+            return self._clist_constituents(f"b:{board}+f:!50", industry=label)
+        except MarketError as exc:
+            if not isinstance(exc.__cause__, TransientMarketError):
+                raise
+            return self._datacenter_board_constituents(name, industry_label=name)
 
     def _constituents_from_index(self, name: str) -> list[Constituent]:
-        for row in self._list_index_catalog():
-            if row["name"] == name and row["code"]:
-                return self._clist_constituents(f"b:{row['code']}", industry=name)
+        canonical = _normalize_index_name(name)
+        if type(self) is EastMoneyClient and (
+            canonical in _DATACENTER_INDEX_BOARDS
+            or canonical in _DATACENTER_INDEX_TYPES
+        ):
+            return self._datacenter_index_constituents(canonical, display_name=name)
+        try:
+            for row in self._list_index_catalog():
+                if row["name"] in {name, canonical} and row["code"]:
+                    return self._clist_constituents(f"b:{row['code']}", industry=name)
+        except MarketError as exc:
+            if not isinstance(exc.__cause__, TransientMarketError) and canonical not in _DATACENTER_INDEX_BOARDS and canonical not in _DATACENTER_INDEX_TYPES:
+                pass
+        if canonical in _DATACENTER_INDEX_BOARDS or canonical in _DATACENTER_INDEX_TYPES:
+            return self._datacenter_index_constituents(canonical, display_name=name)
         url = f"{SUGGEST_URL}?input={quote(name)}&type=14"
         payload = self._get_json(url)
         quotes = payload.get("QuotationCodeTable") or payload.get("data") or {}
@@ -1896,16 +2232,210 @@ class EastMoneyClient:
             item
             for item in items
             if isinstance(item, dict)
-            and str(item.get("Name") or item.get("name") or "").strip() == name
+            and (
+                str(item.get("Name") or item.get("name") or "").strip() in {name, canonical}
+                or _normalize_index_name(str(item.get("Name") or item.get("name") or "").strip()) == canonical
+            )
         ]
         if len(exact) != 1:
-            raise MarketError(f"解析不到明确列表: {name}")
+            return self._datacenter_board_constituents(canonical, industry_label=name)
         code = str(exact[0].get("Code") or exact[0].get("code") or "").strip()
+        matched_name = str(exact[0].get("Name") or exact[0].get("name") or "").strip()
+        norm_matched = _normalize_index_name(matched_name)
+        if norm_matched in _DATACENTER_INDEX_BOARDS or norm_matched in _DATACENTER_INDEX_TYPES:
+            return self._datacenter_index_constituents(norm_matched, display_name=name)
         quote_id = str(exact[0].get("QuoteID") or exact[0].get("quoteID") or "").strip()
         secid = quote_id if "." in quote_id else (f"1.{code}" if code else "")
         if not secid:
             raise MarketError(f"解析不到明确列表: {name}")
-        return self._clist_constituents(f"b:{secid}", industry=name)
+        try:
+            return self._clist_constituents(f"b:{secid}", industry=name)
+        except MarketError:
+            return self._datacenter_index_constituents(
+                norm_matched or canonical, display_name=name, index_code=code
+            )
+
+    def _datacenter_board_catalog(self, board_type: int) -> list[dict[str, str]]:
+        latest = self._valuation_trade_dates(
+            "600519.SH", china_market_date().isoformat(), limit=1, retry_transient=True
+        )[0]
+        if board_type == 2:
+            val_rows = self._datacenter_rows(
+                "RPT_VALUEANALYSIS_DET",
+                "SECUCODE,BOARD_NAME,BOARD_CODE",
+                f"(TRADE_DATE='{latest}')",
+            )
+            seen: set[str] = set()
+            rows: list[dict[str, str]] = []
+            for item in val_rows:
+                bname = str(item.get("BOARD_NAME") or "").strip()
+                bcode = str(item.get("BOARD_CODE") or "").strip()
+                if bname and bname not in seen:
+                    seen.add(bname)
+                    rows.append({"name": bname, "code": bcode or bname})
+            return _alias_rows(rows)
+        return _alias_rows(
+            [{"name": k, "code": v} for k, v in _BOARD_CODES.items()]
+        )
+
+    def _datacenter_constituents_for_codes(
+        self, codes: Sequence[str], *, default_industry: str
+    ) -> list[Constituent]:
+        clean = [c.strip().upper() for c in codes if c and _is_a_share_code(c.strip().upper()) and not c.strip().upper().endswith(".BJ")]
+        if not clean:
+            raise MarketError(f"解析不到明确列表: {default_industry}")
+        latest = self._valuation_trade_dates(
+            "600519.SH", china_market_date().isoformat(), limit=1, retry_transient=True
+        )[0]
+        val_rows: list[dict] = []
+        for i in range(0, len(clean), 50):
+            chunk = clean[i : i + 50]
+            in_clause = ",".join(f'"{c}"' for c in chunk)
+            val_rows.extend(
+                self._datacenter_rows(
+                    "RPT_VALUEANALYSIS_DET",
+                    "SECUCODE,SECURITY_NAME_ABBR,BOARD_NAME,TOTAL_MARKET_CAP,PE_TTM,PEG_CAR",
+                    f"(TRADE_DATE='{latest}')(SECUCODE in ({in_clause}))",
+                    allow_empty=True,
+                )
+            )
+        result: list[Constituent] = []
+        seen: set[str] = set()
+        for item in val_rows:
+            code = str(item.get("SECUCODE") or "").strip().upper()
+            name = str(item.get("SECURITY_NAME_ABBR") or "").strip()
+            if not code or not name or code in seen:
+                continue
+            seen.add(code)
+            industry_name = str(item.get("BOARD_NAME") or "").strip() or default_industry
+            result.append(
+                Constituent(
+                    code=code,
+                    name=name,
+                    mcap=_as_decimal(item.get("TOTAL_MARKET_CAP")),
+                    pe=_as_decimal(item.get("PE_TTM")),
+                    industry=industry_name,
+                    peg=_as_decimal(item.get("PEG_CAR")),
+                )
+            )
+        if not result:
+            raise MarketError(f"解析不到明确列表: {default_industry}")
+        return result
+
+    def _datacenter_index_constituents(
+        self, canonical: str, *, display_name: str, index_code: str = ""
+    ) -> list[Constituent]:
+        if canonical in _DATACENTER_INDEX_BOARDS:
+            board_name = _DATACENTER_INDEX_BOARDS[canonical]
+            rows = self._datacenter_rows(
+                "RPT_F10_CORETHEME_BOARDTYPE",
+                "SECUCODE,SECURITY_NAME_ABBR",
+                f'(BOARD_NAME="{board_name}")',
+                allow_empty=True,
+            )
+            if rows:
+                return self._datacenter_constituents_for_codes(
+                    [str(r.get("SECUCODE") or "") for r in rows],
+                    default_industry=display_name,
+                )
+        if canonical in _DATACENTER_INDEX_TYPES:
+            type_id = _DATACENTER_INDEX_TYPES[canonical]
+            rows = self._datacenter_rows(
+                "RPT_INDEX_TS_COMPONENT",
+                "SECUCODE,SECURITY_NAME_ABBR",
+                f'(TYPE="{type_id}")',
+                allow_empty=True,
+            )
+            if rows:
+                return self._datacenter_constituents_for_codes(
+                    [str(r.get("SECUCODE") or "") for r in rows],
+                    default_industry=display_name,
+                )
+        if index_code and len(index_code) == 6 and index_code.startswith("399"):
+            import httpx2
+
+            try:
+                with httpx2.Client(timeout=self.timeout, headers=_HTTP_HEADERS) as client:
+                    res = client.get(
+                        f"https://www.cnindex.com.cn/sample-detail/detail?indexcode={index_code}&pageNum=1&rows=500"
+                    )
+                    res.raise_for_status()
+                    cn_rows = ((res.json().get("data") or {}).get("rows")) or []
+                codes = [
+                    _code_with_suffix(str(r.get("seccode") or ""))
+                    for r in cn_rows
+                    if isinstance(r, dict) and r.get("seccode")
+                ]
+                if codes:
+                    return self._datacenter_constituents_for_codes(
+                        codes, default_industry=display_name
+                    )
+            except Exception:
+                pass
+        return self._datacenter_board_constituents(canonical, industry_label=display_name)
+
+    def _datacenter_board_constituents(
+        self,
+        name: str,
+        *,
+        board_code_override: str | None = None,
+        industry_label: str | None = None,
+    ) -> list[Constituent]:
+        label = industry_label or name
+        target = _BOARD_ALIASES.get(name, name)
+        bk = board_code_override or board_code(name)
+        if bk:
+            rows = self._datacenter_rows(
+                "RPT_F10_CORETHEME_BOARDTYPE",
+                "SECUCODE,SECURITY_NAME_ABBR",
+                f'(NEW_BOARD_CODE="{bk}")',
+                allow_empty=True,
+            )
+            if rows:
+                return self._datacenter_constituents_for_codes(
+                    [str(r.get("SECUCODE") or "") for r in rows],
+                    default_industry=label,
+                )
+        for candidate in dict.fromkeys((name, target, _fold_board(target), f"{_fold_board(target)}Ⅱ")):
+            if not candidate:
+                continue
+            rows = self._datacenter_rows(
+                "RPT_F10_CORETHEME_BOARDTYPE",
+                "SECUCODE,SECURITY_NAME_ABBR",
+                f'(BOARD_NAME="{candidate}")',
+                allow_empty=True,
+            )
+            if rows:
+                return self._datacenter_constituents_for_codes(
+                    [str(r.get("SECUCODE") or "") for r in rows],
+                    default_industry=label,
+                )
+        latest = self._valuation_trade_dates(
+            "600519.SH", china_market_date().isoformat(), limit=1, retry_transient=True
+        )[0]
+        for candidate in dict.fromkeys((name, target, _fold_board(target), f"{_fold_board(target)}Ⅱ")):
+            if not candidate:
+                continue
+            val_rows = self._datacenter_rows(
+                "RPT_VALUEANALYSIS_DET",
+                "SECUCODE,SECURITY_NAME_ABBR,BOARD_NAME,TOTAL_MARKET_CAP,PE_TTM,PEG_CAR",
+                f"(TRADE_DATE='{latest}')(BOARD_NAME=\"{candidate}\")",
+                allow_empty=True,
+            )
+            if val_rows:
+                return [
+                    Constituent(
+                        code=str(item.get("SECUCODE") or "").strip().upper(),
+                        name=str(item.get("SECURITY_NAME_ABBR") or "").strip(),
+                        mcap=_as_decimal(item.get("TOTAL_MARKET_CAP")),
+                        pe=_as_decimal(item.get("PE_TTM")),
+                        industry=str(item.get("BOARD_NAME") or "").strip() or label,
+                        peg=_as_decimal(item.get("PEG_CAR")),
+                    )
+                    for item in val_rows
+                    if item.get("SECUCODE") and item.get("SECURITY_NAME_ABBR")
+                ]
+        raise MarketError(f"解析不到明确列表: {name}")
 
     def _clist_constituents(self, fs: str, *, industry: str) -> list[Constituent]:
         diff = self._clist_diff(
@@ -2097,10 +2627,20 @@ class EastMoneyClient:
                     "CONSTRUCTCASHPAY",
                     "CAPEX",
                 )
-            short_loan = metric("short_loan", balance_detail)
-            long_loan = metric("long_loan", balance_detail)
-            bond_payable = metric("bond_payable", balance_detail)
-            noncurrent_liab_1year = metric(
+            revenue = metric("revenue", income)
+            if not strict and revenue is None:
+                revenue = _first_decimal(
+                    main, "TOTALOPERATEREVE", "OPERATEREVE"
+                )
+            deducted_net_income = metric("deducted_net_income", income)
+            if not strict and deducted_net_income is None:
+                deducted_net_income = _first_decimal(
+                    main, "KCFJCXSYJLR", "DEDUCT_PARENT_NETPROFIT"
+                )
+            short_loan = _detail_decimal("short_loan", balance_detail)
+            long_loan = _detail_decimal("long_loan", balance_detail)
+            bond_payable = _detail_decimal("bond_payable", balance_detail)
+            noncurrent_liab_1year = _detail_decimal(
                 "noncurrent_liab_1year", balance_detail
             )
             # NONCURRENT_LIAB_1YEAR can include non-interest-bearing items and
@@ -2166,10 +2706,8 @@ class EastMoneyClient:
                         if not strict
                         else None
                     ),
-                    revenue=metric("revenue", income),
-                    deducted_net_income=metric(
-                        "deducted_net_income", income
-                    ),
+                    revenue=revenue,
+                    deducted_net_income=deducted_net_income,
                     total_assets=metric("total_assets", balance),
                     net_assets=metric("net_assets", balance),
                     cash=metric("cash", balance),
@@ -2203,8 +2741,8 @@ class EastMoneyClient:
                     asset_disposal_gain=metric(
                         "asset_disposal_gain", income_detail
                     ),
-                    goodwill=metric("goodwill", balance_detail),
-                    acquisition_cash_paid=metric(
+                    goodwill=_detail_decimal("goodwill", balance_detail),
+                    acquisition_cash_paid=_detail_decimal(
                         "acquisition_cash_paid", cashflow_detail
                     ),
                     source_as_of=_source_as_of(

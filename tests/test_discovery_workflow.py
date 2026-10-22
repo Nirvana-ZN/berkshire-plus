@@ -4,7 +4,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
-from sqlalchemy import inspect, text
+from sqlalchemy import inspect, select, text
 from sqlalchemy.exc import IntegrityError
 
 from app.db import create_session_factory, init_db
@@ -597,6 +597,35 @@ def test_shutdown_revokes_hung_discovery_worker_without_waiting(
             "transient",
         )
     engine.dispose()
+
+
+def test_snapshot_build_runs_off_the_event_loop(tmp_path: Path) -> None:
+    import asyncio
+
+    from fastapi.testclient import TestClient
+
+    from app.main import create_app
+    from market.quotes import FakeQuoteClient
+
+    on_loop: list[bool] = []
+
+    def snapshot(session, **kwargs):
+        try:
+            asyncio.get_running_loop()
+            on_loop.append(True)
+        except RuntimeError:
+            on_loop.append(False)
+        raise ValueError("snapshot abandoned by test")
+
+    app = create_app(
+        db_path=tmp_path / "snapshot-thread.db",
+        quote_client=FakeQuoteClient(),
+        env_path=tmp_path / ".env",
+        discovery_snapshot_provider=snapshot,
+    )
+    with TestClient(app) as client:
+        client.post("/api/discoveries", json={})
+    assert on_loop == [False]
 
 
 def test_shutdown_does_not_revoke_newer_discovery_lease(
@@ -2377,7 +2406,7 @@ def test_recomputation_requires_complete_available_saved_build() -> None:
         validate_recomputation,
     )
 
-    assert BUILD_VERSION == "discovery-v2"
+    assert BUILD_VERSION == "discovery-v7"
     assert AVAILABLE_BUILDS == frozenset({BUILD_VERSION})
     validate_recomputation(
         BUILD_VERSION,
@@ -2391,6 +2420,42 @@ def test_recomputation_requires_complete_available_saved_build() -> None:
     for values in (
         {
             "algorithm_version": "discovery-v1",
+            "snapshot_complete": True,
+            "ruler_payload_complete": True,
+            "persisted_input_fingerprint": "input-1",
+            "requested_input_fingerprint": "input-1",
+            "persisted_ruler_version_id": 7,
+            "requested_ruler_version_id": 7,
+        },
+        {
+            "algorithm_version": "discovery-v2",
+            "snapshot_complete": True,
+            "ruler_payload_complete": True,
+            "persisted_input_fingerprint": "input-1",
+            "requested_input_fingerprint": "input-1",
+            "persisted_ruler_version_id": 7,
+            "requested_ruler_version_id": 7,
+        },
+        {
+            "algorithm_version": "discovery-v3",
+            "snapshot_complete": True,
+            "ruler_payload_complete": True,
+            "persisted_input_fingerprint": "input-1",
+            "requested_input_fingerprint": "input-1",
+            "persisted_ruler_version_id": 7,
+            "requested_ruler_version_id": 7,
+        },
+        {
+            "algorithm_version": "discovery-v4",
+            "snapshot_complete": True,
+            "ruler_payload_complete": True,
+            "persisted_input_fingerprint": "input-1",
+            "requested_input_fingerprint": "input-1",
+            "persisted_ruler_version_id": 7,
+            "requested_ruler_version_id": 7,
+        },
+        {
+            "algorithm_version": "discovery-v5",
             "snapshot_complete": True,
             "ruler_payload_complete": True,
             "persisted_input_fingerprint": "input-1",
@@ -2570,6 +2635,13 @@ def test_snapshot_canonical_json_supports_financial_primitives() -> None:
         '{"amount":"10.25","as_of":"2025-12-31","missing":null,'
         '"snapshot":"2026-09-17T03:00:00.123000Z","中文":"值"}'
     )
+    from discovery.snapshot import _sha256
+    import hashlib
+
+    nested = {"b": [value, True, 1.5], "a": False}
+    assert _sha256(nested) == hashlib.sha256(
+        canonical_json(nested).encode("utf-8")
+    ).hexdigest()
 
 
 @pytest.mark.parametrize(
@@ -3898,7 +3970,7 @@ def _add_second_api_fill(
     return started, completed
 
 
-def test_discovery_api_create_read_confirm_and_missing_rulers(tmp_path: Path) -> None:
+def test_discovery_api_create_read_and_missing_rulers(tmp_path: Path) -> None:
     from fastapi.testclient import TestClient
 
     from app.main import create_app
@@ -3917,7 +3989,7 @@ def test_discovery_api_create_read_confirm_and_missing_rulers(tmp_path: Path) ->
         created = client.post("/api/discoveries", json={"sync": True})
         assert created.status_code == 200
         run = created.json()
-        assert run["status"] == "waiting_confirmation"
+        assert run["status"] == "failed"
         assert run["ruler_version_ids"] == {
             "quality_discount": None,
             "deep_value": None,
@@ -3928,18 +4000,9 @@ def test_discovery_api_create_read_confirm_and_missing_rulers(tmp_path: Path) ->
         safety = client.get(
             f"/api/discoveries/{run['id']}/stages/safety"
         ).json()
-        assert safety["current"]["status"] == "waiting_confirmation"
+        assert safety["current"]["status"] == "confirmed"
         assert [row["code"] for row in safety["pass"]] == ["600000.SH"]
 
-        confirmed = client.post(
-            f"/api/discoveries/{run['id']}/stages/safety/confirm",
-            json={"sync": True},
-        )
-        assert confirmed.status_code == 200
-        assert client.post(
-            f"/api/discoveries/{run['id']}/stages/safety/confirm",
-            json={},
-        ).status_code == 200
         for track in ("quality_discount", "deep_value", "garp"):
             stage = client.get(
                 f"/api/discoveries/{run['id']}/tracks/{track}"
@@ -4004,13 +4067,11 @@ def test_discovery_api_rejects_bad_body_and_supports_abandon(tmp_path: Path) -> 
         assert abandoned.status_code == 200
         body = abandoned.json()
         assert body["status"] == "abandoned"
-        assert body["tracks"] == {
-            track: {
-                "track": track,
-                "stage": None,
-                "status": None,
-                "created": False,
-            }
+        assert {
+            track: (row["stage"], row["status"], row["created"])
+            for track, row in body["tracks"].items()
+        } == {
+            track: ("track_gate", "ruler_not_ready", True)
             for track in ("quality_discount", "deep_value", "garp")
         }
         assert client.get("/api/discoveries/current").status_code == 404
@@ -4182,51 +4243,36 @@ def test_three_tracks_advance_independently_with_injected_executor(
             "/api/discoveries", json={"sync": True}
         ).json()
         run_id = run["id"]
-        client.post(
-            f"/api/discoveries/{run_id}/stages/safety/confirm",
-            json={"sync": True},
-        )
-        assert executed == [
+        assert run["status"] == "completed"
+        assert executed[:3] == [
             ("quality_discount", "track_gate"),
             ("deep_value", "track_gate"),
             ("garp", "track_gate"),
         ]
+        assert sorted(executed[3:]) == sorted(
+            (track, "competition")
+            for track in ("quality_discount", "deep_value", "garp")
+        )
         for track in ("quality_discount", "deep_value", "garp"):
             gate = client.get(
                 f"/api/discoveries/{run_id}/tracks/{track}"
                 "/stages/track_gate"
             ).json()
-            assert gate["current"]["status"] == "waiting_confirmation"
+            assert gate["current"]["status"] == "confirmed"
             assert gate["pass"][0]["metrics"]["code"] == "600000.SH"
-            client.post(
-                f"/api/discoveries/{run_id}/tracks/{track}"
-                "/stages/track_gate/confirm",
-                json={"sync": True},
-            )
             competition_body = client.get(
                 f"/api/discoveries/{run_id}/tracks/{track}"
                 "/stages/competition"
             ).json()
             assert (
-                competition_body["current"]["status"]
-                == "waiting_confirmation"
+                competition_body["current"]["status"] == "confirmed"
             ), competition_body["current"]["error"]
-            client.post(
-                f"/api/discoveries/{run_id}/tracks/{track}"
-                "/stages/competition/confirm",
-                json={"sync": True},
-            )
-            assert client.get(
-                f"/api/discoveries/{run_id}/tracks/{track}"
-                "/stages/adjudication"
-            ).json()["current"]["status"] == "waiting_confirmation"
-        assert len(executed) == 6
 
     with SessionLocal() as session:
         stages = session.scalars(
             select(DiscoveryStage).order_by(DiscoveryStage.id)
         ).all()
-        assert len(stages) == 9
+        assert len(stages) == 6
         assert all(stage.attempt == 1 for stage in stages)
 
 
@@ -4236,14 +4282,9 @@ def test_startup_resumes_confirmed_upstream_queued_stage_once(
     from fastapi.testclient import TestClient
     from sqlalchemy import select
 
-    from app.discovery_models import (
-        DiscoveryCommonStage,
-        DiscoveryRun,
-        DiscoveryStage,
-    )
+    from app.discovery_models import DiscoveryRun, DiscoveryStage
     from app.main import create_app
     from app.models import RulerVersion
-    from discovery.snapshot import canonical_json
     from market.quotes import FakeQuoteClient
 
     db_path = tmp_path / "discovery-resume.db"
@@ -4272,49 +4313,36 @@ def test_startup_resumes_confirmed_upstream_queued_stage_once(
         allow_sync=True,
         discovery_clock=lambda: SNAPSHOT_AT,
     )
-    with TestClient(create_app(**base)) as client:
+    def interrupted(context):
+        raise RuntimeError("garp gate interrupted")
+
+    with TestClient(
+        create_app(**base, discovery_track_executor=interrupted)
+    ) as client:
         run_id = client.post(
             "/api/discoveries", json={"sync": True}
         ).json()["id"]
 
     with SessionLocal() as session:
         run = session.get(DiscoveryRun, run_id)
-        common = session.scalar(
-            select(DiscoveryCommonStage).where(
-                DiscoveryCommonStage.run_id == run_id
+        gate = session.scalar(
+            select(DiscoveryStage).where(
+                DiscoveryStage.run_id == run_id,
+                DiscoveryStage.track == "garp",
             )
         )
-        assert run is not None and common is not None
-        common.status = "confirmed"
-        common.confirmed_at = SNAPSHOT_AT
+        assert run is not None and gate is not None
+        assert (gate.stage, gate.status) == ("track_gate", "failed")
+        gate.status = "queued"
+        gate.error = None
+        gate.failure_kind = None
         run.status = "running"
-        session.add(
-            DiscoveryStage(
-                run_id=run_id,
-                track="garp",
-                stage="track_gate",
-                attempt=1,
-                status="queued",
-                total_count=0,
-                pass_count=0,
-                drop_count=0,
-                insufficient_count=0,
-                input_fingerprint=run.input_fingerprint,
-                ruler_version_id=run.garp_ruler_version_id,
-                algorithm_version=run.algorithm_version,
-                common_stage_id=common.id,
-                predecessor_stage_id=None,
-                predecessor_stage=None,
-                created_at=SNAPSHOT_AT,
-                updated_at=SNAPSHOT_AT,
-            )
-        )
         session.commit()
 
-    executed: list[int] = []
+    executed: list[str] = []
 
     def execute(context):
-        executed.append(context.stage_id)
+        executed.append(context.stage)
         return _passing_track_outcome(context)
 
     with TestClient(
@@ -4322,11 +4350,11 @@ def test_startup_resumes_confirmed_upstream_queued_stage_once(
     ) as client:
         assert client.get(
             f"/api/discoveries/{run_id}/tracks/garp/stages/track_gate"
-        ).json()["current"]["status"] == "waiting_confirmation"
-    assert len(executed) == 1
+        ).json()["current"]["status"] == "confirmed"
+    assert executed == ["track_gate", "competition"]
 
 
-def test_concurrent_create_and_confirm_are_idempotent(tmp_path: Path) -> None:
+def test_concurrent_create_is_idempotent(tmp_path: Path) -> None:
     from concurrent.futures import ThreadPoolExecutor
 
     from fastapi.testclient import TestClient
@@ -4361,17 +4389,6 @@ def test_concurrent_create_and_confirm_are_idempotent(tmp_path: Path) -> None:
         assert [response.status_code for response in creates] == [200, 200]
         run_ids = {response.json()["id"] for response in creates}
         assert len(run_ids) == 1
-        run_id = run_ids.pop()
-        confirms = list(
-            pool.map(
-                lambda _: client.post(
-                    f"/api/discoveries/{run_id}/stages/safety/confirm",
-                    json={"sync": True},
-                ),
-                range(2),
-            )
-        )
-        assert [response.status_code for response in confirms] == [200, 200]
 
     engine = init_db(db_path)
     SessionLocal = create_session_factory(engine)
@@ -4389,46 +4406,6 @@ def test_concurrent_create_and_confirm_are_idempotent(tmp_path: Path) -> None:
             "garp",
         }
     engine.dispose()
-
-
-def test_confirmation_lock_conflict_does_not_mutate_stage(
-    tmp_path: Path,
-) -> None:
-    from fastapi.testclient import TestClient
-    from sqlalchemy import select
-
-    from app.discovery_models import DiscoveryCommonStage
-    from app.main import create_app
-    from jobs.lock import JOB_TYPE_FUNNEL, release, try_acquire
-    from market.quotes import FakeQuoteClient
-
-    db_path = tmp_path / "discovery-lock-conflict.db"
-    _seed_api_snapshot(db_path)
-    app = create_app(
-        db_path=db_path,
-        quote_client=FakeQuoteClient(),
-        env_path=tmp_path / ".env",
-        allow_sync=True,
-        discovery_clock=lambda: SNAPSHOT_AT,
-    )
-    with TestClient(app) as client:
-        run_id = client.post(
-            "/api/discoveries", json={"sync": True}
-        ).json()["id"]
-        factory = app.state.session_factory
-        with factory() as owner:
-            assert try_acquire(owner, 999, JOB_TYPE_FUNNEL)
-            owner.commit()
-        response = client.post(
-            f"/api/discoveries/{run_id}/stages/safety/confirm", json={}
-        )
-        assert response.status_code == 409
-        assert response.json()["code"] == "JOB_LOCKED"
-        with factory() as session:
-            stage = session.scalar(select(DiscoveryCommonStage))
-            assert stage is not None and stage.status == "waiting_confirmation"
-            release(session, 999, JOB_TYPE_FUNNEL)
-            session.commit()
 
 
 def test_current_discovery_uses_china_week_and_allows_rollover(
@@ -4467,7 +4444,7 @@ def test_current_discovery_uses_china_week_and_allows_rollover(
         assert second["id"] != first["id"]
         current = client.get("/api/discoveries/current").json()
         assert current["id"] == second["id"]
-        assert current["status"] == "waiting_confirmation"
+        assert current["status"] == "failed"
 
     with app.state.session_factory() as session:
         assert session.scalar(
@@ -4705,56 +4682,6 @@ def test_create_dispatch_failure_retries_existing_queued_run(
 
         retried = client.post("/api/discoveries", json={})
         assert retried.status_code == 200
-        assert retried.json()["status"] == "waiting_confirmation"
-        assert len(starts) == 2
-
-
-def test_confirm_dispatch_failure_retries_confirmed_queued_work(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from fastapi.testclient import TestClient
-
-    from app.main import create_app
-    from jobs.lock import lock_status
-    from market.quotes import FakeQuoteClient
-
-    db_path = tmp_path / "confirm-dispatch-retry.db"
-    _seed_api_snapshot(db_path)
-    app = create_app(
-        db_path=db_path,
-        quote_client=FakeQuoteClient(),
-        env_path=tmp_path / ".env",
-        allow_sync=True,
-        discovery_clock=lambda: SNAPSHOT_AT,
-    )
-    starts: list[int] = []
-
-    def flaky_start(_app, target, args):
-        starts.append(1)
-        if len(starts) == 1:
-            return RuntimeError("thread unavailable")
-        target(*args)
-        return None
-
-    with TestClient(app) as client:
-        run_id = client.post(
-            "/api/discoveries", json={"sync": True}
-        ).json()["id"]
-        app.state.allow_sync = False
-        monkeypatch.setattr(
-            "app.discovery_routes._start_discovery_worker", flaky_start
-        )
-        first = client.post(
-            f"/api/discoveries/{run_id}/stages/safety/confirm", json={}
-        )
-        assert first.status_code == 500
-        with app.state.session_factory() as session:
-            assert lock_status(session) is None
-
-        retried = client.post(
-            f"/api/discoveries/{run_id}/stages/safety/confirm", json={}
-        )
-        assert retried.status_code == 200
         assert retried.json()["status"] == "failed"
         assert len(starts) == 2
 
@@ -4799,7 +4726,7 @@ def test_sync_flag_is_ignored_when_sync_mode_is_disabled(
         worker = pending.pop()
         worker.target(*worker.args)
         assert client.get("/api/discoveries/current").json()["status"] == (
-            "waiting_confirmation"
+            "failed"
         )
 
 
@@ -5066,22 +4993,24 @@ def test_all_discovery_mutations_reject_malformed_nonobjects(
             "/api/discoveries", json={"sync": True}
         ).json()["id"]
         paths = (
-            f"/api/discoveries/{run_id}/stages/safety/confirm",
+            f"/api/discoveries/{run_id}/stages/safety/retry",
             f"/api/discoveries/{run_id}/tracks/garp"
-            "/stages/track_gate/confirm",
+            "/stages/track_gate/retry",
+            f"/api/discoveries/{run_id}/recompute",
             f"/api/discoveries/{run_id}/abandon",
         )
         for path in paths:
             assert client.post(
                 path, content=body, headers=headers
             ).status_code == 400
+        assert client.get("/api/discoveries/current").json()["id"] == run_id
         assert client.get(
             f"/api/discoveries/{run_id}/stages/safety"
-        ).json()["current"]["status"] == "waiting_confirmation"
+        ).json()["current"]["attempt"] == 1
         with app.state.session_factory() as session:
             assert session.scalar(
                 select(func.count()).select_from(DiscoveryStage)
-            ) == 0
+            ) == 3
 
 
 def test_foreign_discovery_run_is_not_visible_or_mutable(
@@ -5137,7 +5066,7 @@ def test_foreign_discovery_run_is_not_visible_or_mutable(
             assert response.status_code == 404
 
 
-def test_abandon_prevents_later_confirmation_and_queue_mutation(
+def test_abandon_prevents_later_retry_and_queue_mutation(
     tmp_path: Path,
 ) -> None:
     from fastapi.testclient import TestClient
@@ -5164,16 +5093,17 @@ def test_abandon_prevents_later_confirmation_and_queue_mutation(
             f"/api/discoveries/{run_id}/abandon", json={}
         ).status_code == 200
         rejected = client.post(
-            f"/api/discoveries/{run_id}/stages/safety/confirm", json={}
+            f"/api/discoveries/{run_id}/tracks/garp/stages/track_gate/retry",
+            json={},
         )
         assert rejected.status_code == 409
         assert rejected.json()["code"] == "DISCOVERY_RUN_IMMUTABLE"
     with app.state.session_factory() as session:
         common = session.scalar(select(DiscoveryCommonStage))
-        assert common is not None and common.status == "waiting_confirmation"
+        assert common is not None and common.status == "confirmed"
         assert session.scalar(
             select(func.count()).select_from(DiscoveryStage)
-        ) == 0
+        ) == 3
 
 
 def test_startup_marks_running_transient_failed_without_retry(
@@ -5279,95 +5209,11 @@ def test_exact_discovery_endpoint_surface(tmp_path: Path) -> None:
             "POST",
             "/api/discoveries/{run_id}/tracks/{track}/stages/{stage}/retry",
         ),
-        (
-            "POST",
-            "/api/discoveries/{run_id}/tracks/{track}/stages/{stage}/reopen",
-        ),
         ("POST", "/api/discoveries/{run_id}/overrides"),
-        ("DELETE", "/api/discoveries/{run_id}/overrides/{override_id}"),
         ("POST", "/api/discoveries/{run_id}/decisions"),
         ("POST", "/api/discoveries/{run_id}/recompute"),
         ("POST", "/api/discoveries/{run_id}/abandon"),
     }
-
-
-def test_track_confirmation_duplicate_and_two_session_race(
-    tmp_path: Path,
-) -> None:
-    from concurrent.futures import ThreadPoolExecutor
-
-    from fastapi.testclient import TestClient
-    from sqlalchemy import func, select
-
-    from app.discovery_models import DiscoveryStage
-    from app.main import create_app
-    from app.models import RulerVersion
-    from discovery.snapshot import canonical_json
-    from market.quotes import FakeQuoteClient
-
-    db_path = tmp_path / "track-confirm-race.db"
-    _seed_api_snapshot(db_path)
-    engine = init_db(db_path)
-    SessionLocal = create_session_factory(engine)
-    with SessionLocal() as session:
-        for track in ("quality_discount", "deep_value", "garp"):
-            payload_json, digest = discovery_ruler_values(track)
-            session.add(
-                RulerVersion(
-                    user_id=1,
-                    scope=f"discovery:{track}",
-                    digest=digest,
-                    reason="并发测试",
-                    payload_json=payload_json,
-                    activated_at=SNAPSHOT_AT,
-                )
-            )
-        session.commit()
-    engine.dispose()
-
-    def execute(context):
-        return _passing_track_outcome(context)
-
-    app = create_app(
-        db_path=db_path,
-        quote_client=FakeQuoteClient(),
-        env_path=tmp_path / ".env",
-        allow_sync=True,
-        discovery_clock=lambda: SNAPSHOT_AT,
-        discovery_track_executor=execute,
-    )
-    with TestClient(app) as client:
-        run_id = client.post(
-            "/api/discoveries", json={"sync": True}
-        ).json()["id"]
-        client.post(
-            f"/api/discoveries/{run_id}/stages/safety/confirm",
-            json={"sync": True},
-        )
-        path = (
-            f"/api/discoveries/{run_id}/tracks/garp"
-            "/stages/track_gate/confirm"
-        )
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            responses = list(
-                pool.map(
-                    lambda _: client.post(path, json={"sync": True}),
-                    range(2),
-                )
-            )
-        assert [response.status_code for response in responses] == [200, 200]
-        assert client.post(path, json={"sync": True}).status_code == 200
-
-    with app.state.session_factory() as session:
-        assert session.scalar(
-            select(func.count())
-            .select_from(DiscoveryStage)
-            .where(
-                DiscoveryStage.run_id == run_id,
-                DiscoveryStage.track == "garp",
-                DiscoveryStage.stage == "competition",
-            )
-        ) == 1
 
 
 def test_checkpoint_security_set_mismatch_is_data_not_ready(
@@ -5601,7 +5447,7 @@ def test_mutation_bodies_reject_nonfinite_json_constants(
         )
         run_id = client.post("/api/discoveries", json={"sync": True}).json()["id"]
         for path in (
-            f"/api/discoveries/{run_id}/stages/safety/confirm",
+            f"/api/discoveries/{run_id}/stages/safety/retry",
             f"/api/discoveries/{run_id}/abandon",
         ):
             response = client.post(
@@ -5661,13 +5507,9 @@ def test_track_executor_failure_does_not_strand_sibling_tracks(
         discovery_track_executor=execute,
     )
     with TestClient(app) as client:
-        run_id = client.post("/api/discoveries", json={"sync": True}).json()["id"]
-        response = client.post(
-            f"/api/discoveries/{run_id}/stages/safety/confirm",
-            json={"sync": True},
-        )
+        response = client.post("/api/discoveries", json={"sync": True})
         assert response.status_code == 200
-        assert response.json()["status"] == "waiting_confirmation"
+        run_id = response.json()["id"]
     assert set(executed) == {"quality_discount", "deep_value", "garp"}
     with app.state.session_factory() as session:
         stages = {
@@ -5678,8 +5520,8 @@ def test_track_executor_failure_does_not_strand_sibling_tracks(
         }
         assert stages["deep_value"].status == "failed"
         assert stages["deep_value"].failure_kind == "permanent"
-        assert stages["quality_discount"].status == "waiting_confirmation"
-        assert stages["garp"].status == "waiting_confirmation"
+        assert stages["quality_discount"].status == "confirmed"
+        assert stages["garp"].status == "confirmed"
         assert lock_status(session) is None
 
 
@@ -5801,7 +5643,7 @@ def test_integrity_race_winner_redispatches_failed_original_queue(
         500,
     ]
     winner = next(response for response in responses if isinstance(response, dict))
-    assert winner["status"] == "waiting_confirmation"
+    assert winner["status"] == "failed"
     assert len(starts) == 2
 
 
@@ -6142,6 +5984,180 @@ def test_snapshot_versions_hash_exact_checkpoint_payload_content(
     assert (
         snapshots[0].versions.valuation_version
         == snapshots[1].versions.valuation_version
+    )
+
+
+def test_snapshot_keeps_annual_rows_but_versions_cover_interim(
+    tmp_path: Path,
+) -> None:
+    from app.models import DiscoveryDataCheckpoint
+    from discovery.company_payload import company_payload_digest
+    from discovery.snapshot import build_production_snapshot
+    from market.types import FinancialRow
+
+    snapshots = []
+    for interim_income in ("40", "41"):
+        path = tmp_path / f"interim-{interim_income}.db"
+        _seed_api_snapshot(path)
+        engine = init_db(path)
+        with create_session_factory(engine)() as session:
+            session.execute(
+                text(
+                    "DROP TRIGGER IF EXISTS "
+                    "trg_discovery_checkpoint_payload_immutable"
+                )
+            )
+            checkpoint = session.get(
+                DiscoveryDataCheckpoint, (1, "600000.SH")
+            )
+            payload_json = _api_payload(
+                SNAPSHOT_AT,
+                financial_rows=(
+                    FinancialRow(
+                        code="600000.SH",
+                        period="2025",
+                        period_type="annual",
+                        net_income=Decimal("100"),
+                        source_as_of="2026-03-31",
+                    ),
+                    FinancialRow(
+                        code="600000.SH",
+                        period="2025H1",
+                        period_type="interim",
+                        net_income=Decimal(interim_income),
+                        source_as_of="2025-08-31",
+                    ),
+                ),
+            )
+            checkpoint.payload_json = payload_json
+            checkpoint.payload_digest = company_payload_digest(payload_json)
+            session.commit()
+            snapshots.append(build_production_snapshot(session))
+        engine.dispose()
+    for snapshot in snapshots:
+        history = snapshot.companies[0].fields["financial_history"]
+        assert [row["period_type"] for row in history] == ["annual"]
+    assert (
+        snapshots[0].versions.financial_version
+        != snapshots[1].versions.financial_version
+    )
+
+
+def test_streamed_snapshot_versions_match_whole_value_hashes(
+    tmp_path: Path,
+) -> None:
+    from app.models import (
+        DiscoveryDataCheckpoint,
+        DiscoveryDataFill,
+        DiscoveryFillTradingDate,
+        DiscoveryUniverseSecurity,
+    )
+    from discovery.company_payload import (
+        company_payload_digest,
+        parse_company_payload,
+    )
+    from discovery.snapshot import _sha256, build_production_snapshot
+
+    db_path = tmp_path / "streamed-versions.db"
+    _seed_api_snapshot(db_path)
+    engine = init_db(db_path)
+    with create_session_factory(engine)() as session:
+        session.execute(
+            text(
+                "DROP TRIGGER IF EXISTS "
+                "trg_discovery_universe_security_insert_immutable"
+            )
+        )
+        fill = session.scalars(select(DiscoveryDataFill)).one()
+        template = session.scalars(select(DiscoveryUniverseSecurity)).one()
+        columns = DiscoveryUniverseSecurity.__table__.columns
+        done_text = _api_payload(SNAPSHOT_AT).replace("600000.SH", "600036.SH")
+        for code, status, text_value in (
+            ("000001.SZ", "failed", None),
+            ("600036.SH", "done", done_text),
+        ):
+            session.add(
+                DiscoveryUniverseSecurity(
+                    **{
+                        column.name: getattr(template, column.name)
+                        for column in columns
+                        if column.name != "code"
+                    },
+                    code=code,
+                )
+            )
+            session.add(
+                DiscoveryDataCheckpoint(
+                    fill_id=fill.id,
+                    code=code,
+                    status=status,
+                    attempts=1,
+                    next_retry_at=None,
+                    valuation_points=0 if text_value is None else 1,
+                    error=None if text_value else "boom",
+                    payload_json=text_value,
+                    payload_digest=(
+                        text_value and company_payload_digest(text_value)
+                    ),
+                    updated_at=SNAPSHOT_AT,
+                )
+            )
+        session.commit()
+
+        snapshot = build_production_snapshot(session)
+        cutoff = fill.updated_at.astimezone(timezone.utc)
+        checkpoints = session.scalars(
+            select(DiscoveryDataCheckpoint).order_by(DiscoveryDataCheckpoint.code)
+        ).all()
+        securities = session.scalars(
+            select(DiscoveryUniverseSecurity).order_by(
+                DiscoveryUniverseSecurity.code
+            )
+        ).all()
+        payloads = {
+            row.code: parse_company_payload(row.payload_json)
+            for row in checkpoints
+            if row.status == "done"
+        }
+        boundary = {
+            "fill_id": fill.id,
+            "cutoff": cutoff,
+            "checkpoints": [
+                {
+                    "code": row.code,
+                    "status": row.status,
+                    "valuation_points": row.valuation_points,
+                    "payload_json": (
+                        row.payload_json if row.status == "done" else None
+                    ),
+                }
+                for row in checkpoints
+            ],
+            "securities": [
+                {column.name: getattr(row, column.name) for column in columns}
+                for row in securities
+            ],
+            "trading_dates": tuple(
+                session.scalars(select(DiscoveryFillTradingDate.trade_date)).all()
+            ),
+        }
+    engine.dispose()
+    stamp = f"{fill.id}:{cutoff.isoformat()}"
+    assert len(snapshot.companies) == 3
+    assert snapshot.versions.data_version == (
+        f"discovery-fill:{stamp}:{_sha256(boundary)[:20]}"
+    )
+    assert snapshot.versions.financial_version == (
+        f"financial:fill:{stamp}:"
+        + _sha256(
+            {code: value["financial_rows"] for code, value in payloads.items()}
+        )[:20]
+    )
+    assert snapshot.versions.valuation_version == (
+        f"valuation:fill:{stamp}:"
+        + _sha256(
+            {code: value["valuation_points"] for code, value in payloads.items()}
+        )[:20]
     )
 
 

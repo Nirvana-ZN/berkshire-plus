@@ -1,6 +1,5 @@
 import json
 import subprocess
-from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -86,7 +85,7 @@ def _competition_metrics(track: str, code: str) -> dict[str, object]:
             **shared,
             "quality_branch": "nonfinancial",
             "pe_percentile": "20",
-            "roe_cv": "0.1",
+            "roe_downside_volatility": "0.1",
             "cash_conversion": "1.2",
             "valuation_pe_observations": "60",
             "roe_observations": "5",
@@ -251,29 +250,11 @@ def _advance_to_competition(client) -> int:
     run_id = client.post(
         "/api/discoveries", json={"sync": True}
     ).json()["id"]
-    assert client.post(
-        f"/api/discoveries/{run_id}/stages/safety/confirm",
-        json={"sync": True},
-    ).status_code == 200
-    assert client.post(
-        f"/api/discoveries/{run_id}/tracks/garp/stages/track_gate/confirm",
-        json={"sync": True},
-    ).status_code == 200
+    competition = client.get(
+        f"/api/discoveries/{run_id}/tracks/garp/stages/competition"
+    ).json()
+    assert competition["current"]["status"] == "confirmed"
     return run_id
-
-
-def _stage_expectation(payload: dict[str, object]) -> dict[str, object]:
-    current = payload["current"]
-    assert isinstance(current, dict)
-    return {
-        "expected_stage_id": current["id"],
-        "expected_stage_attempt": current["attempt"],
-        "expected_stage_status": current["status"],
-        "expected_input_fingerprint": current["input_fingerprint"],
-        "expected_ruler_version_id": current["ruler_version_id"],
-        "expected_stage_revision": current["stage_revision"],
-        "expected_mutation_version": current["mutation_version"],
-    }
 
 
 def test_competition_route_payload_matches_ui_parser(tmp_path) -> None:
@@ -298,255 +279,6 @@ def test_competition_route_payload_matches_ui_parser(tmp_path) -> None:
         check=False,
     )
     assert parsed.returncode == 0, parsed.stderr
-
-
-def test_forced_pass_cannot_promote_insufficient_evidence_to_adjudication(
-    tmp_path,
-) -> None:
-    from fastapi.testclient import TestClient
-
-    from discovery.snapshot import canonical_json
-    from jobs.discovery import TrackExecutionOutcome
-
-    app = _workflow_app(tmp_path)
-    with TestClient(app) as client:
-        original = app.state.discovery_track_executor
-
-        def adversarial(context):
-            outcome = original(context)
-            if context.track != "garp" or context.stage != "competition":
-                return outcome
-            code = context.candidate_codes[0]
-            target_metrics = json.loads(outcome.results[0].metrics_json)
-            target_metrics.update(
-                revenue_growth_observations="0",
-                deducted_profit_growth_observations="0",
-                roic_observations="0",
-            )
-            results = tuple(
-                replace(
-                    row,
-                    verdict="insufficient",
-                    reason="evidence_facts_insufficient",
-                    metrics_json=canonical_json(target_metrics),
-                )
-                if row.code == code
-                else row
-                for row in outcome.results
-            )
-            evidence = tuple(
-                row
-                for row in outcome.evidence
-                if row.code != code
-            ) + _competition_execution_evidence(
-                context, {code: target_metrics}
-            )
-            return TrackExecutionOutcome(
-                status=outcome.status,
-                results=results,
-                evidence=evidence,
-            )
-
-        app.state.discovery_track_executor = adversarial
-        run_id = _advance_to_competition(client)
-        path = (
-            f"/api/discoveries/{run_id}/tracks/garp/stages/competition"
-        )
-        reviewed = client.get(path).json()
-        code = reviewed["insufficient"][0]["code"]
-        override = client.post(
-            f"/api/discoveries/{run_id}/overrides",
-            json={
-                "track": "garp",
-                "stage": "competition",
-                "attempt": reviewed["current"]["attempt"],
-                **_stage_expectation(reviewed),
-                "code": code,
-                "action": "forced_pass",
-                "reason": "不得绕过证据门槛",
-            },
-        )
-        assert override.status_code == 200
-        refreshed = client.get(path).json()
-        rejected = client.post(
-            f"{path}/confirm",
-            json={"sync": True, **_stage_expectation(refreshed)},
-        )
-
-        assert rejected.status_code == 409
-        assert rejected.json()["code"] == "DISCOVERY_EVIDENCE_INSUFFICIENT"
-        assert client.get(
-            f"/api/discoveries/{run_id}/tracks/garp/stages/adjudication"
-        ).status_code == 404
-
-
-def test_adjudication_finalization_rechecks_exact_evidence_cards(
-    tmp_path,
-) -> None:
-    from fastapi.testclient import TestClient
-    from sqlalchemy import select
-
-    from app.discovery_models import DiscoveryEvidence
-
-    app = _workflow_app(tmp_path)
-    with TestClient(app) as client:
-        run_id = _advance_to_competition(client)
-        assert client.post(
-            f"/api/discoveries/{run_id}/tracks/garp"
-            "/stages/competition/confirm",
-            json={"sync": True},
-        ).status_code == 200
-        for index in range(6):
-            assert client.post(
-                f"/api/discoveries/{run_id}/decisions",
-                json={
-                    "track": "garp",
-                    "code": f"60000{index}.SH",
-                    "decision": "keep" if index < 3 else "exclude",
-                    "reason": "排除" if index >= 3 else None,
-                },
-            ).status_code == 200
-        with app.state.session_factory() as session:
-            fact = session.scalar(
-                select(DiscoveryEvidence)
-                .where(
-                    DiscoveryEvidence.run_id == run_id,
-                    DiscoveryEvidence.track == "garp",
-                    DiscoveryEvidence.code == "600000.SH",
-                    DiscoveryEvidence.kind == "fact",
-                )
-                .limit(1)
-            )
-            assert fact is not None
-            session.delete(fact)
-            session.commit()
-        adjudication = client.get(
-            f"/api/discoveries/{run_id}/tracks/garp"
-            "/stages/adjudication"
-        ).json()
-        rejected = client.post(
-            f"/api/discoveries/{run_id}/tracks/garp"
-            "/stages/adjudication/confirm",
-            json=_stage_expectation(adjudication),
-        )
-        assert rejected.status_code == 409
-        assert rejected.json()["code"] == "DISCOVERY_EVIDENCE_INSUFFICIENT"
-
-
-def test_override_between_review_and_confirm_rejects_stale_session(
-    tmp_path,
-) -> None:
-    from fastapi.testclient import TestClient
-
-    app = _workflow_app(tmp_path)
-    with TestClient(app) as reviewing, TestClient(app) as editing:
-        run_id = _advance_to_competition(reviewing)
-        path = (
-            f"/api/discoveries/{run_id}/tracks/garp"
-            "/stages/competition"
-        )
-        reviewed = reviewing.get(path).json()
-        changed = editing.post(
-            f"/api/discoveries/{run_id}/overrides",
-            json={
-                "track": "garp",
-                "stage": "competition",
-                "attempt": reviewed["current"]["attempt"],
-                **_stage_expectation(reviewed),
-                "code": "600005.SH",
-                "action": "forced_drop",
-                "reason": "第二会话更新",
-            },
-        )
-        assert changed.status_code == 200
-
-        stale = reviewing.post(
-            f"{path}/confirm",
-            json={"sync": True, **_stage_expectation(reviewed)},
-        )
-        assert stale.status_code == 409
-        assert stale.json()["code"] == "DISCOVERY_STAGE_VERSION_MISMATCH"
-        assert reviewing.get(path).json()["current"]["status"] == (
-            "waiting_confirmation"
-        )
-
-
-def test_concurrent_same_revision_overrides_have_one_winner(
-    tmp_path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import threading
-    from concurrent.futures import ThreadPoolExecutor
-
-    from fastapi.testclient import TestClient
-
-    from app import discovery_routes
-
-    app = _workflow_app(tmp_path)
-    with TestClient(app) as first, TestClient(app) as second:
-        run_id = _advance_to_competition(first)
-        stage_path = (
-            f"/api/discoveries/{run_id}/tracks/garp"
-            "/stages/competition"
-        )
-        reviewed = first.get(stage_path).json()
-        expectation = _stage_expectation(reviewed)
-        barrier = threading.Barrier(2)
-        original = discovery_routes._stage_precondition_rejection
-
-        def synchronize(session, payload, row):
-            rejection = original(session, payload, row)
-            if (
-                rejection is None
-                and payload.get("expected_mutation_version")
-                == expectation["expected_mutation_version"]
-            ):
-                barrier.wait(timeout=5)
-            return rejection
-
-        monkeypatch.setattr(
-            discovery_routes,
-            "_stage_precondition_rejection",
-            synchronize,
-        )
-
-        def save(client: TestClient, code: str):
-            return client.post(
-                f"/api/discoveries/{run_id}/overrides",
-                json={
-                    "track": "garp",
-                    "stage": "competition",
-                    "attempt": reviewed["current"]["attempt"],
-                    **expectation,
-                    "code": code,
-                    "action": "forced_drop",
-                    "reason": f"{code} concurrent update",
-                },
-            )
-
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            responses = [
-                pool.submit(save, first, "600004.SH"),
-                pool.submit(save, second, "600005.SH"),
-            ]
-            results = [future.result(timeout=10) for future in responses]
-
-        assert sorted(response.status_code for response in results) == [
-            200,
-            409,
-        ]
-        loser = next(response for response in results if response.status_code == 409)
-        assert loser.json()["code"] == "DISCOVERY_STAGE_VERSION_MISMATCH"
-        after = first.get(stage_path).json()
-        assert isinstance(after["current"]["stage_revision"], int)
-        assert (
-            after["current"]["stage_revision"]
-            > reviewed["current"]["stage_revision"]
-        )
-        persisted = after["overrides"]
-        assert len(persisted) == 1
-        winner = next(response for response in results if response.status_code == 200)
-        assert persisted[0]["code"] == winner.json()["code"]
 
 
 def test_abandon_rejects_stale_run_week_identity(tmp_path) -> None:
@@ -611,40 +343,10 @@ def test_prior_week_mutations_are_immutable_but_recompute_remains_allowed(
 
     with TestClient(app) as client:
         run_id = _advance_to_competition(client)
-        override = client.post(
-            f"/api/discoveries/{run_id}/overrides",
-            json={
-                "track": "garp",
-                "stage": "competition",
-                "code": "600005.SH",
-                "action": "forced_drop",
-                "reason": "W38 覆盖",
-            },
-        )
-        assert override.status_code == 200
-        override_id = override.json()["id"]
-        assert client.post(
-            f"/api/discoveries/{run_id}/tracks/garp"
-            "/stages/competition/confirm",
-            json={"sync": True},
-        ).status_code == 200
-        assert client.post(
-            f"/api/discoveries/{run_id}/decisions",
-            json={
-                "track": "garp",
-                "code": "600000.SH",
-                "decision": "keep",
-            },
-        ).status_code == 200
 
         now[0] = SNAPSHOT_AT + timedelta(days=7)
         before = database_dump()
         requests = [
-            (
-                "post",
-                f"/api/discoveries/{run_id}/stages/safety/confirm",
-                {"sync": True},
-            ),
             (
                 "post",
                 f"/api/discoveries/{run_id}/stages/safety/retry",
@@ -652,44 +354,8 @@ def test_prior_week_mutations_are_immutable_but_recompute_remains_allowed(
             ),
             (
                 "post",
-                f"/api/discoveries/{run_id}/tracks/garp/stages/competition/confirm",
-                {"sync": True},
-            ),
-            (
-                "post",
                 f"/api/discoveries/{run_id}/tracks/garp/stages/competition/retry",
                 {"sync": True},
-            ),
-            (
-                "post",
-                f"/api/discoveries/{run_id}/tracks/garp/stages/competition/reopen",
-                {"sync": True},
-            ),
-            (
-                "post",
-                f"/api/discoveries/{run_id}/overrides",
-                {
-                    "track": "garp",
-                    "stage": "competition",
-                    "code": "600004.SH",
-                    "action": "forced_drop",
-                    "reason": "W39 禁止",
-                },
-            ),
-            (
-                "delete",
-                f"/api/discoveries/{run_id}/overrides/{override_id}",
-                None,
-            ),
-            (
-                "post",
-                f"/api/discoveries/{run_id}/decisions",
-                {
-                    "track": "garp",
-                    "code": "600000.SH",
-                    "decision": "exclude",
-                    "reason": "W39 禁止",
-                },
             ),
             (
                 "post",
@@ -726,20 +392,9 @@ def test_prior_week_mutations_are_immutable_but_recompute_remains_allowed(
             assert session.get(
                 DiscoveryRun, replay_id
             ).replay_of_run_id == run_id
-        assert client.post(
-            f"/api/discoveries/{replay_id}/stages/safety/confirm",
-            json={"sync": True},
-        ).status_code == 200
-        assert client.post(
-            f"/api/discoveries/{replay_id}/overrides",
-            json={
-                "track": "garp",
-                "stage": "track_gate",
-                "code": "600000.SH",
-                "action": "forced_drop",
-                "reason": "W39 合法",
-            },
-        ).status_code == 200
+        assert client.get(
+            f"/api/discoveries/{replay_id}/stages/safety"
+        ).json()["current"]["status"] == "confirmed"
 
 
 def test_startup_and_duplicate_create_ignore_prior_week_queue(
@@ -789,7 +444,7 @@ def test_startup_and_duplicate_create_ignore_prior_week_queue(
             ).status == "queued"
             assert session.get(
                 DiscoveryCommonStage, current_stage_id
-            ).status == "waiting_confirmation"
+            ).status == "confirmed"
         duplicate = client.post(
             "/api/discoveries", json={"sync": True}
         )
@@ -804,14 +459,7 @@ def test_startup_and_duplicate_create_ignore_prior_week_queue(
 
 @pytest.mark.parametrize(
     "case",
-    [
-        "common_confirm",
-        "track_confirm",
-        "safety_retry",
-        "track_retry",
-        "reopen",
-        "abandon",
-    ],
+    ["safety_retry", "track_retry", "abandon"],
 )
 def test_locking_route_rollover_after_acquire_rolls_back_everything(
     tmp_path,
@@ -833,21 +481,14 @@ def test_locking_route_rollover_after_acquire_rolls_back_everything(
     app = _workflow_app(tmp_path, clock=lambda: now[0])
     db_path = tmp_path / "task6.db"
     with TestClient(app) as client:
-        if case in {"common_confirm", "safety_retry", "abandon"}:
+        if case in {"safety_retry", "abandon"}:
             run_id = client.post(
                 "/api/discoveries", json={"sync": True}
             ).json()["id"]
         else:
             run_id = _advance_to_competition(client)
 
-        if case == "common_confirm":
-            path = f"/api/discoveries/{run_id}/stages/safety/confirm"
-        elif case == "track_confirm":
-            path = (
-                f"/api/discoveries/{run_id}/tracks/garp"
-                "/stages/competition/confirm"
-            )
-        elif case == "safety_retry":
+        if case == "safety_retry":
             with app.state.session_factory() as session:
                 stage = session.scalar(
                     select(DiscoveryCommonStage).where(
@@ -875,16 +516,6 @@ def test_locking_route_rollover_after_acquire_rolls_back_everything(
             path = (
                 f"/api/discoveries/{run_id}/tracks/garp"
                 "/stages/competition/retry"
-            )
-        elif case == "reopen":
-            assert client.post(
-                f"/api/discoveries/{run_id}/tracks/garp"
-                "/stages/competition/confirm",
-                json={"sync": True},
-            ).status_code == 200
-            path = (
-                f"/api/discoveries/{run_id}/tracks/garp"
-                "/stages/competition/reopen"
             )
         else:
             path = f"/api/discoveries/{run_id}/abandon"
@@ -918,79 +549,6 @@ def test_locking_route_rollover_after_acquire_rolls_back_everything(
         with app.state.session_factory() as session:
             lock = session.get(JobLock, 1)
             assert lock is not None and lock.job_id is None
-
-
-@pytest.mark.parametrize(
-    "case",
-    ["override_create", "override_delete", "decision"],
-)
-def test_unlocked_route_rollover_at_commit_checkpoint_is_immutable(
-    tmp_path,
-    case: str,
-) -> None:
-    import sqlite3
-    from datetime import timedelta
-
-    from fastapi.testclient import TestClient
-
-    from tests.discovery_helpers import SNAPSHOT_AT
-
-    now = [SNAPSHOT_AT]
-    armed = [False]
-    calls = [0]
-
-    def clock():
-        if armed[0]:
-            calls[0] += 1
-            if calls[0] > 1:
-                return now[0] + timedelta(days=7)
-        return now[0]
-
-    app = _workflow_app(tmp_path, clock=clock)
-    db_path = tmp_path / "task6.db"
-    with TestClient(app) as client:
-        run_id = _advance_to_competition(client)
-        path = f"/api/discoveries/{run_id}/overrides"
-        payload = {
-            "track": "garp",
-            "stage": "competition",
-            "code": "600005.SH",
-            "action": "forced_drop",
-            "reason": "rollover",
-        }
-        method = "post"
-        if case == "override_delete":
-            override_id = client.post(path, json=payload).json()["id"]
-            path = (
-                f"/api/discoveries/{run_id}/overrides/{override_id}"
-            )
-            payload = None
-            method = "delete"
-        elif case == "decision":
-            assert client.post(
-                f"/api/discoveries/{run_id}/tracks/garp"
-                "/stages/competition/confirm",
-                json={"sync": True},
-            ).status_code == 200
-            path = f"/api/discoveries/{run_id}/decisions"
-            payload = {
-                "track": "garp",
-                "code": "600000.SH",
-                "decision": "keep",
-            }
-
-        with sqlite3.connect(db_path) as connection:
-            before = tuple(connection.iterdump())
-        armed[0] = True
-        response = client.request(
-            method.upper(),
-            path,
-            json=payload,
-        )
-        assert response.status_code == 409
-        assert response.json()["code"] == "historical_run_immutable"
-        with sqlite3.connect(db_path) as connection:
-            assert tuple(connection.iterdump()) == before
 
 
 def test_recompute_uses_fresh_target_week_at_commit(tmp_path) -> None:
@@ -1028,350 +586,7 @@ def test_recompute_uses_fresh_target_week_at_commit(tmp_path) -> None:
         assert response.json()["week_key"] == "2026-W39"
 
 
-def test_override_decision_and_adjudication_contract(tmp_path) -> None:
-    from fastapi.testclient import TestClient
-
-    app = _workflow_app(tmp_path)
-    with TestClient(app) as client:
-        run_id = _advance_to_competition(client)
-        path = f"/api/discoveries/{run_id}/overrides"
-        saved = client.post(
-            path,
-            json={
-                "track": "garp",
-                "stage": "competition",
-                "code": "600005.SH",
-                "action": "forced_drop",
-                "reason": "复核排除",
-            },
-        )
-        assert saved.status_code == 200
-        override_id = saved.json()["id"]
-        replaced = client.post(
-            path,
-            json={
-                "track": "garp",
-                "stage": "competition",
-                "code": "600005.SH",
-                "action": "forced_pass",
-                "reason": "复核恢复",
-            },
-        )
-        assert replaced.json()["id"] == override_id
-        assert client.delete(
-            f"/api/discoveries/{run_id}/overrides/{override_id}"
-        ).status_code == 200
-        frozen = client.post(
-            path,
-            json={
-                "track": "garp",
-                "stage": "competition",
-                "code": "600005.SH",
-                "action": "forced_drop",
-                "reason": "冻结排除",
-            },
-        )
-        assert frozen.status_code == 200
-        assert client.post(
-            f"/api/discoveries/{run_id}/tracks/garp"
-            "/stages/competition/confirm",
-            json={"sync": True},
-        ).status_code == 200
-        assert client.delete(
-            f"/api/discoveries/{run_id}/overrides/{frozen.json()['id']}"
-        ).status_code == 409
-
-        for index in range(5):
-            response = client.post(
-                f"/api/discoveries/{run_id}/decisions",
-                json={
-                    "track": "garp",
-                    "code": f"60000{index}.SH",
-                    "decision": "keep" if index < 3 else "exclude",
-                    "reason": "不保留" if index >= 3 else None,
-                    "note": "保留" if index < 3 else None,
-                },
-            )
-            assert response.status_code == 200
-        confirmed = client.post(
-            f"/api/discoveries/{run_id}/tracks/garp"
-            "/stages/adjudication/confirm",
-            json={},
-        )
-        assert confirmed.status_code == 200
-        adjudication = client.get(
-            f"/api/discoveries/{run_id}/tracks/garp"
-            "/stages/adjudication"
-        ).json()
-        assert adjudication["current"]["status"] == "confirmed"
-        assert len(adjudication["pass"]) == 3
-        assert len(adjudication["drop"]) == 2
-        assert client.post(
-            f"/api/discoveries/{run_id}/tracks/garp"
-            "/stages/adjudication/confirm",
-            json={},
-        ).status_code == 200
-
-
-@pytest.mark.parametrize(
-    ("keep_count", "expected_status", "confirm_status"),
-    [
-        (0, "insufficient_candidates", 200),
-        (1, "insufficient_candidates", 200),
-        (2, "insufficient_candidates", 200),
-        (3, "confirmed", 200),
-        (4, "confirmed", 200),
-        (5, "confirmed", 200),
-        (6, "waiting_confirmation", 409),
-    ],
-)
-def test_adjudication_keeper_bounds(
-    tmp_path, keep_count: int, expected_status: str, confirm_status: int
-) -> None:
-    from fastapi.testclient import TestClient
-
-    app = _workflow_app(tmp_path)
-    with TestClient(app) as client:
-        run_id = _advance_to_competition(client)
-        assert client.post(
-            f"/api/discoveries/{run_id}/tracks/garp"
-            "/stages/competition/confirm",
-            json={"sync": True},
-        ).status_code == 200
-        incomplete = client.post(
-            f"/api/discoveries/{run_id}/tracks/garp"
-            "/stages/adjudication/confirm",
-            json={},
-        )
-        assert incomplete.status_code == 409
-        assert incomplete.json()["code"] == "DISCOVERY_DECISIONS_INCOMPLETE"
-        for index in range(6):
-            assert client.post(
-                f"/api/discoveries/{run_id}/decisions",
-                json={
-                    "track": "garp",
-                    "code": f"60000{index}.SH",
-                    "decision": "keep" if index < keep_count else "exclude",
-                    "reason": "排除" if index >= keep_count else None,
-                },
-            ).status_code == 200
-        confirmed = client.post(
-            f"/api/discoveries/{run_id}/tracks/garp"
-            "/stages/adjudication/confirm",
-            json={},
-        )
-        assert confirmed.status_code == confirm_status
-        stage = client.get(
-            f"/api/discoveries/{run_id}/tracks/garp"
-            "/stages/adjudication"
-        ).json()
-        assert stage["current"]["status"] == expected_status
-        if keep_count == 6:
-            assert stage["pass"] == []
-
-
-def test_decision_exact_revision_is_idempotent_and_rejects_stale_update(
-    tmp_path,
-) -> None:
-    from concurrent.futures import ThreadPoolExecutor
-
-    from fastapi.testclient import TestClient
-
-    app = _workflow_app(tmp_path)
-    with TestClient(app) as client:
-        run_id = _advance_to_competition(client)
-        assert client.post(
-            f"/api/discoveries/{run_id}/tracks/garp"
-            "/stages/competition/confirm",
-            json={"sync": True},
-        ).status_code == 200
-        path = (
-            f"/api/discoveries/{run_id}/tracks/garp"
-            "/stages/adjudication"
-        )
-        reviewed = client.get(path).json()
-        payload = {
-            "track": "garp",
-            "code": "600000.SH",
-            "decision": "keep",
-            **_stage_expectation(reviewed),
-        }
-        first = client.post(
-            f"/api/discoveries/{run_id}/decisions", json=payload
-        )
-        repeated = client.post(
-            f"/api/discoveries/{run_id}/decisions", json=payload
-        )
-        stale = client.post(
-            f"/api/discoveries/{run_id}/decisions",
-            json=payload | {
-                "decision": "exclude",
-                "reason": "旧页面改判",
-            },
-        )
-
-        assert first.status_code == repeated.status_code == 200
-        assert first.json()["id"] == repeated.json()["id"]
-        assert stale.status_code == 409
-        assert stale.json()["code"] == "DISCOVERY_STAGE_VERSION_MISMATCH"
-        assert (
-            client.get(path).json()["current"]["stage_revision"]
-            > reviewed["current"]["stage_revision"]
-        )
-        reviewed = client.get(path).json()
-        concurrent_payload = {
-            "track": "garp",
-            "code": "600001.SH",
-            "decision": "keep",
-            **_stage_expectation(reviewed),
-        }
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            responses = list(
-                pool.map(
-                    lambda _: client.post(
-                        f"/api/discoveries/{run_id}/decisions",
-                        json=concurrent_payload,
-                    ),
-                    range(2),
-                )
-            )
-        assert [response.status_code for response in responses] == [200, 200]
-        assert len({response.json()["id"] for response in responses}) == 1
-
-
-@pytest.mark.parametrize(
-    ("keep_count", "expected_status"),
-    [
-        (0, "insufficient_candidates"),
-        (2, "insufficient_candidates"),
-        (3, "confirmed"),
-        (5, "confirmed"),
-    ],
-)
-def test_two_sessions_adjudication_confirm_is_idempotent(
-    tmp_path,
-    monkeypatch: pytest.MonkeyPatch,
-    keep_count: int,
-    expected_status: str,
-) -> None:
-    import asyncio
-    from concurrent.futures import ThreadPoolExecutor
-    from threading import Event, Lock
-
-    from fastapi.testclient import TestClient
-    from sqlalchemy import func, select
-    from starlette.requests import Request
-
-    from app import discovery_routes
-    from app.discovery_models import DiscoveryResult, DiscoveryStage
-
-    app = _workflow_app(tmp_path)
-    first_waiting = Event()
-    second_waiting = Event()
-    release_first = Event()
-    first_finished = Event()
-    guard = Lock()
-    calls = 0
-    with TestClient(app) as client:
-        run_id = _advance_to_competition(client)
-        assert client.post(
-            f"/api/discoveries/{run_id}/tracks/garp"
-            "/stages/competition/confirm",
-            json={"sync": True},
-        ).status_code == 200
-        for index in range(6):
-            assert client.post(
-                f"/api/discoveries/{run_id}/decisions",
-                json={
-                    "track": "garp",
-                    "code": f"60000{index}.SH",
-                    "decision": "keep" if index < keep_count else "exclude",
-                    "reason": "排除" if index >= keep_count else None,
-                },
-            ).status_code == 200
-
-        original = discovery_routes.acquire_discovery
-
-        def ordered_acquire(session, selected_run_id):
-            nonlocal calls
-            with guard:
-                calls += 1
-                call = calls
-            if call == 1:
-                first_waiting.set()
-                assert release_first.wait(5)
-            elif call == 2:
-                second_waiting.set()
-                assert first_finished.wait(5)
-            return original(session, selected_run_id)
-
-        monkeypatch.setattr(
-            discovery_routes, "acquire_discovery", ordered_acquire
-        )
-        endpoint = next(
-            route.endpoint
-            for route in discovery_routes.create_discovery_router().routes
-            if getattr(route, "path", None)
-            == "/api/discoveries/{run_id}/tracks/{track}"
-            "/stages/{stage}/confirm"
-        )
-
-        def invoke():
-            async def receive():
-                return {
-                    "type": "http.request",
-                    "body": b"{}",
-                    "more_body": False,
-                }
-
-            request = Request(
-                {"type": "http", "method": "POST", "app": app},
-                receive,
-            )
-            return asyncio.run(
-                endpoint(
-                    request,
-                    run_id,
-                    "garp",
-                    "adjudication",
-                )
-            )
-
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            first = pool.submit(invoke)
-            assert first_waiting.wait(5)
-            second = pool.submit(invoke)
-            assert second_waiting.wait(5)
-            release_first.set()
-            first_response = first.result(timeout=5)
-            first_finished.set()
-            second_response = second.result(timeout=5)
-        assert isinstance(first_response, dict)
-        assert isinstance(second_response, dict)
-
-    with app.state.session_factory() as session:
-        stage = session.scalar(
-            select(DiscoveryStage).where(
-                DiscoveryStage.run_id == run_id,
-                DiscoveryStage.track == "garp",
-                DiscoveryStage.stage == "adjudication",
-                DiscoveryStage.superseded_at.is_(None),
-            )
-        )
-        assert stage is not None and stage.status == expected_status
-        assert session.scalar(
-            select(func.count())
-            .select_from(DiscoveryResult)
-            .where(
-                DiscoveryResult.run_id == run_id,
-                DiscoveryResult.track == "garp",
-                DiscoveryResult.stage == "adjudication",
-                DiscoveryResult.attempt == stage.attempt,
-            )
-        ) == 6
-
-
-def test_retry_and_reopen_preserve_exact_attempt_chains(tmp_path) -> None:
+def test_retry_preserves_exact_attempt_chains(tmp_path) -> None:
     from fastapi.testclient import TestClient
     from sqlalchemy import select
 
@@ -1426,52 +641,17 @@ def test_retry_and_reopen_preserve_exact_attempt_chains(tmp_path) -> None:
         assert (
             competition_history["attempts"][1]["reopen_of_stage_id"] is None
         )
+        assert competition_history["current"]["status"] == "confirmed"
 
-        assert client.post(
-            f"/api/discoveries/{run_id}/tracks/garp"
-            "/stages/competition/confirm",
-            json={"sync": True},
-        ).status_code == 200
-        reopened = client.post(
-            f"/api/discoveries/{run_id}/tracks/garp/stages/track_gate/reopen",
-            json={"sync": True},
+        retry_confirmed = client.post(
+            f"/api/discoveries/{run_id}/tracks/garp/stages/track_gate/retry",
+            json={},
         )
-        assert reopened.status_code == 200
-        gate_history = client.get(
+        assert retry_confirmed.status_code == 409
+        assert retry_confirmed.json()["code"] == "DISCOVERY_RETRY_NOT_ALLOWED"
+        gate = client.get(
             f"/api/discoveries/{run_id}/tracks/garp/stages/track_gate"
         ).json()
-        assert [row["attempt"] for row in gate_history["attempts"]] == [1, 2]
-        assert gate_history["attempts"][0]["superseded"] is True
-        assert (
-            gate_history["attempts"][1]["reopen_of_stage_id"]
-            == gate_history["attempts"][0]["id"]
-        )
-        assert gate_history["attempts"][1]["retry_of_stage_id"] is None
-        assert gate_history["current"]["status"] == "waiting_confirmation"
-        assert client.post(
-            f"/api/discoveries/{run_id}/tracks/garp/stages/track_gate/reopen",
-            json={},
-        ).status_code == 409
-        retry_reopen = client.post(
-            f"/api/discoveries/{run_id}/tracks/garp/stages/track_gate/retry",
-            json={},
-        )
-        assert retry_reopen.status_code == 409
-        assert retry_reopen.json()["code"] == "DISCOVERY_RETRY_NOT_ALLOWED"
-        assert client.post(
-            f"/api/discoveries/{run_id}/tracks/garp"
-            "/stages/track_gate/confirm",
-            json={"sync": True},
-        ).status_code == 200
-        retry_confirmed_reopen = client.post(
-            f"/api/discoveries/{run_id}/tracks/garp/stages/track_gate/retry",
-            json={},
-        )
-        assert retry_confirmed_reopen.status_code == 409
-        assert (
-            retry_confirmed_reopen.json()["code"]
-            == "DISCOVERY_RETRY_NOT_ALLOWED"
-        )
         with app.state.session_factory() as session:
             chains = session.scalars(
                 select(DiscoveryStage)
@@ -1482,8 +662,9 @@ def test_retry_and_reopen_preserve_exact_attempt_chains(tmp_path) -> None:
                 )
                 .order_by(DiscoveryStage.attempt)
             ).all()
-            assert [row.attempt for row in chains] == [1, 2, 3]
-            assert chains[-1].predecessor_stage_id == gate_history["current"]["id"]
+            assert [row.attempt for row in chains] == [1, 2]
+            assert chains[-1].retry_of_stage_id == chains[0].id
+            assert chains[-1].predecessor_stage_id == gate["current"]["id"]
             assert session.scalar(
                 select(DiscoveryResult.id).where(
                     DiscoveryResult.run_id == run_id,
@@ -1574,142 +755,6 @@ def test_recompute_copies_frozen_inputs_without_mutating_source(tmp_path) -> Non
         ] == source_payloads
 
 
-def test_direct_adjudication_reopen_is_rejected(tmp_path) -> None:
-    from fastapi.testclient import TestClient
-
-    app = _workflow_app(tmp_path)
-    with TestClient(app) as client:
-        run_id = _advance_to_competition(client)
-        assert client.post(
-            f"/api/discoveries/{run_id}/tracks/garp"
-            "/stages/competition/confirm",
-            json={"sync": True},
-        ).status_code == 200
-        response = client.post(
-            f"/api/discoveries/{run_id}/tracks/garp"
-            "/stages/adjudication/reopen",
-            json={"sync": True},
-        )
-        assert response.status_code == 409
-        assert response.json()["code"] == "invalid_reopen_stage"
-
-
-def test_competition_reopen_preserves_old_decisions_and_starts_new_set(
-    tmp_path,
-) -> None:
-    from fastapi.testclient import TestClient
-    from sqlalchemy import func, select
-
-    from app.discovery_models import (
-        DiscoveryDecision,
-        DiscoveryEvidence,
-        DiscoveryResult,
-        DiscoveryStage,
-    )
-
-    app = _workflow_app(tmp_path)
-    with TestClient(app) as client:
-        run_id = _advance_to_competition(client)
-        assert client.post(
-            f"/api/discoveries/{run_id}/tracks/garp"
-            "/stages/competition/confirm",
-            json={"sync": True},
-        ).status_code == 200
-        assert client.post(
-            f"/api/discoveries/{run_id}/decisions",
-            json={
-                "track": "garp",
-                "code": "600000.SH",
-                "decision": "keep",
-                "note": "old",
-            },
-        ).status_code == 200
-        with app.state.session_factory() as session:
-            old_competition = session.scalar(
-                select(DiscoveryStage).where(
-                    DiscoveryStage.run_id == run_id,
-                    DiscoveryStage.track == "garp",
-                    DiscoveryStage.stage == "competition",
-                    DiscoveryStage.attempt == 1,
-                )
-            )
-            assert old_competition is not None
-            old_counts = (
-                session.scalar(
-                    select(func.count()).select_from(DiscoveryDecision)
-                ),
-                session.scalar(
-                    select(func.count()).select_from(DiscoveryEvidence)
-                ),
-                session.scalar(
-                    select(func.count()).select_from(DiscoveryResult)
-                ),
-            )
-        reopened = client.post(
-            f"/api/discoveries/{run_id}/tracks/garp"
-            "/stages/competition/reopen",
-            json={"sync": True},
-        )
-        assert reopened.status_code == 200
-        assert client.post(
-            f"/api/discoveries/{run_id}/tracks/garp"
-            "/stages/competition/confirm",
-            json={"sync": True},
-        ).status_code == 200
-        new_decision = client.post(
-            f"/api/discoveries/{run_id}/decisions",
-            json={
-                "track": "garp",
-                "code": "600000.SH",
-                "decision": "exclude",
-                "reason": "new",
-            },
-        )
-        assert new_decision.status_code == 200
-        assert new_decision.json()["competition_attempt"] == 2
-    with app.state.session_factory() as session:
-        assert (
-            session.scalar(
-                select(func.count()).select_from(DiscoveryDecision)
-            )
-            == old_counts[0] + 1
-        )
-        new_competition = session.scalar(
-            select(DiscoveryStage).where(
-                DiscoveryStage.run_id == run_id,
-                DiscoveryStage.track == "garp",
-                DiscoveryStage.stage == "competition",
-                DiscoveryStage.attempt == 2,
-            )
-        )
-        assert new_competition is not None
-        assert session.scalar(
-            select(func.count())
-            .select_from(DiscoveryEvidence)
-            .where(
-                DiscoveryEvidence.competition_stage_id == new_competition.id,
-                DiscoveryEvidence.competition_attempt == 2,
-            )
-        ) == 24
-        assert session.scalar(
-            select(func.count())
-            .select_from(DiscoveryEvidence)
-            .where(DiscoveryEvidence.competition_attempt == 1)
-        ) == old_counts[1]
-        assert (
-            session.scalar(
-                select(func.count()).select_from(DiscoveryResult)
-            )
-            > old_counts[2]
-        )
-        old = session.scalar(
-            select(DiscoveryDecision).where(
-                DiscoveryDecision.competition_attempt == 1
-            )
-        )
-        assert old is not None and old.keep_note == "old"
-
-
 def test_abandoned_historical_http_reads_artifacts_without_executor(
     tmp_path,
 ) -> None:
@@ -1721,30 +766,6 @@ def test_abandoned_historical_http_reads_artifacts_without_executor(
     app = _workflow_app(tmp_path)
     with TestClient(app) as client:
         run_id = _advance_to_competition(client)
-        override = client.post(
-            f"/api/discoveries/{run_id}/overrides",
-            json={
-                "track": "garp",
-                "stage": "competition",
-                "code": "600000.SH",
-                "action": "forced_pass",
-                "reason": "history",
-            },
-        ).json()
-        assert client.post(
-            f"/api/discoveries/{run_id}/tracks/garp"
-            "/stages/competition/confirm",
-            json={"sync": True},
-        ).status_code == 200
-        assert client.post(
-            f"/api/discoveries/{run_id}/decisions",
-            json={
-                "track": "garp",
-                "code": "600000.SH",
-                "decision": "keep",
-                "note": "history",
-            },
-        ).status_code == 200
         with app.state.session_factory() as session:
             competition = session.scalar(
                 select(DiscoveryStage).where(
@@ -1767,58 +788,17 @@ def test_abandoned_historical_http_reads_artifacts_without_executor(
             f"/api/discoveries/{run_id}/tracks/garp"
             "/stages/competition"
         ).json()
-        assert body["overrides"][0]["id"] == override["id"]
-        assert body["decisions"][0]["keep_note"] == "history"
+        assert body["current"]["status"] == "confirmed"
         assert body["evidence"]
         assert {
             row["competition_stage_id"] for row in body["evidence"]
         } == {competition_id}
-        paths = [
-            (
-                "post",
-                f"/api/discoveries/{run_id}/overrides",
-                {
-                    "track": "garp",
-                    "stage": "competition",
-                    "code": "600000.SH",
-                    "action": "forced_drop",
-                    "reason": "no",
-                },
-            ),
-            (
-                "post",
-                f"/api/discoveries/{run_id}/decisions",
-                {
-                    "track": "garp",
-                    "code": "600000.SH",
-                    "decision": "keep",
-                },
-            ),
-            (
-                "post",
-                f"/api/discoveries/{run_id}/tracks/garp/stages/competition/retry",
-                {},
-            ),
-            (
-                "post",
-                f"/api/discoveries/{run_id}/tracks/garp/stages/competition/reopen",
-                {},
-            ),
-            (
-                "post",
-                f"/api/discoveries/{run_id}/tracks/garp/stages/competition/confirm",
-                {},
-            ),
-        ]
-        for method, path, payload in paths:
-            response = getattr(client, method)(path, json=payload)
-            assert response.status_code == 409
-            assert response.json()["code"] == "DISCOVERY_RUN_IMMUTABLE"
-        deleted = client.delete(
-            f"/api/discoveries/{run_id}/overrides/{override['id']}"
+        response = client.post(
+            f"/api/discoveries/{run_id}/tracks/garp/stages/competition/retry",
+            json={},
         )
-        assert deleted.status_code == 409
-        assert deleted.json()["code"] == "DISCOVERY_RUN_IMMUTABLE"
+        assert response.status_code == 409
+        assert response.json()["code"] == "DISCOVERY_RUN_IMMUTABLE"
 
 
 def test_run_freezes_ruler_payloads_and_ledger_row_is_immutable(tmp_path) -> None:
@@ -2120,164 +1100,6 @@ def test_two_sessions_retry_one_exact_failed_origin(
         assert rows[1].reopen_of_stage_id is None
 
 
-def test_competition_reopen_contention_returns_new_attempt(tmp_path) -> None:
-    from threading import Event
-
-    from fastapi.testclient import TestClient
-    from sqlalchemy import select
-
-    from app.discovery_models import DiscoveryStage
-
-    app = _workflow_app(tmp_path)
-    entered = Event()
-    release = Event()
-    with TestClient(app) as client:
-        run_id = _advance_to_competition(client)
-        assert client.post(
-            f"/api/discoveries/{run_id}/tracks/garp"
-            "/stages/competition/confirm",
-            json={"sync": True},
-        ).status_code == 200
-        original = app.state.discovery_track_executor
-        with app.state.session_factory() as session:
-            selected = session.scalar(
-                select(DiscoveryStage).where(
-                    DiscoveryStage.run_id == run_id,
-                    DiscoveryStage.track == "garp",
-                    DiscoveryStage.stage == "competition",
-                    DiscoveryStage.superseded_at.is_(None),
-                )
-            )
-            assert selected is not None
-            selected_id = selected.id
-
-        def blocked(context):
-            entered.set()
-            assert release.wait(5)
-            return original(context)
-
-        app.state.discovery_track_executor = blocked
-        path = (
-            f"/api/discoveries/{run_id}/tracks/garp"
-            "/stages/competition/reopen"
-        )
-        assert client.post(path, json={}).status_code == 200
-        assert entered.wait(5)
-        with app.state.session_factory() as session:
-            latest = session.scalar(
-                select(DiscoveryStage)
-                .where(
-                    DiscoveryStage.run_id == run_id,
-                    DiscoveryStage.track == "garp",
-                    DiscoveryStage.stage == "competition",
-                    DiscoveryStage.superseded_at.is_(None),
-                )
-                .order_by(DiscoveryStage.attempt.desc())
-            )
-            assert latest is not None
-            assert latest.reopen_of_stage_id == selected_id
-            assert latest.retry_of_stage_id is None
-        assert client.post(path, json={}).status_code == 200
-        release.set()
-
-
-def test_two_sessions_reopen_one_exact_selected_origin(
-    tmp_path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import asyncio
-    from concurrent.futures import ThreadPoolExecutor
-    from threading import Barrier, Lock
-
-    from fastapi.testclient import TestClient
-    from sqlalchemy import select
-    from starlette.requests import Request
-
-    from app import discovery_routes
-    from app.discovery_models import DiscoveryStage
-
-    app = _workflow_app(tmp_path)
-    barrier = Barrier(2)
-    guard = Lock()
-    calls = 0
-    with TestClient(app) as client:
-        run_id = _advance_to_competition(client)
-        assert client.post(
-            f"/api/discoveries/{run_id}/tracks/garp"
-            "/stages/competition/confirm",
-            json={"sync": True},
-        ).status_code == 200
-        with app.state.session_factory() as session:
-            selected = session.scalar(
-                select(DiscoveryStage).where(
-                    DiscoveryStage.run_id == run_id,
-                    DiscoveryStage.track == "garp",
-                    DiscoveryStage.stage == "competition",
-                    DiscoveryStage.superseded_at.is_(None),
-                )
-            )
-            assert selected is not None
-            selected_id = selected.id
-
-        original = discovery_routes.acquire_discovery
-
-        def synchronized_acquire(session, selected_run_id):
-            nonlocal calls
-            with guard:
-                calls += 1
-                call = calls
-            if call <= 2:
-                barrier.wait(5)
-            return original(session, selected_run_id)
-
-        monkeypatch.setattr(
-            discovery_routes,
-            "acquire_discovery",
-            synchronized_acquire,
-        )
-        def invoke():
-            async def receive():
-                return {
-                    "type": "http.request",
-                    "body": b"{}",
-                    "more_body": False,
-                }
-
-            request = Request(
-                {"type": "http", "method": "POST", "app": app},
-                receive,
-            )
-            endpoint = next(
-                route.endpoint
-                for route in discovery_routes.create_discovery_router().routes
-                if getattr(route, "path", None)
-                == "/api/discoveries/{run_id}/tracks/{track}"
-                "/stages/{stage}/reopen"
-            )
-            return asyncio.run(
-                endpoint(request, run_id, "garp", "competition")
-            )
-
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            responses = [
-                future.result()
-                for future in [pool.submit(invoke), pool.submit(invoke)]
-            ]
-        assert all(isinstance(response, dict) for response in responses)
-    with app.state.session_factory() as session:
-        rows = session.scalars(
-            select(DiscoveryStage)
-            .where(
-                DiscoveryStage.run_id == run_id,
-                DiscoveryStage.track == "garp",
-                DiscoveryStage.stage == "competition",
-            )
-            .order_by(DiscoveryStage.attempt)
-        ).all()
-        assert len(rows) == 2
-        assert rows[1].reopen_of_stage_id == selected_id
-        assert rows[1].retry_of_stage_id is None
-
-
 def test_safety_retry_contention_returns_new_attempt(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2393,11 +1215,8 @@ def test_safety_retry_rejects_non_retryable_provenance(
 @pytest.mark.parametrize(
     "path",
     [
-        "/api/discoveries/1/overrides",
-        "/api/discoveries/1/decisions",
         "/api/discoveries/1/stages/safety/retry",
         "/api/discoveries/1/tracks/garp/stages/competition/retry",
-        "/api/discoveries/1/tracks/garp/stages/competition/reopen",
         "/api/discoveries/1/recompute",
     ],
 )

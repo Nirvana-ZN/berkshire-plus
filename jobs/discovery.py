@@ -35,10 +35,12 @@ from app.models import JobLock
 from discovery.aggregate import aggregate_run_status
 from discovery.builds import AVAILABLE_BUILDS, _is_build_available
 from discovery.common import CommonVerdict, classify_common
-from discovery.competition import CompetitionCandidate, rank_competition
+from discovery.competition import CompetitionCandidate, rank_borda_competition, rank_competition
 from discovery.constants import (
+    COMMON_READINESS_MIN,
     TRACKS,
     VERDICTS,
+    common_ready,
     NowProvider,
     aware_utc_now,
     china_week_key,
@@ -71,6 +73,129 @@ from jobs.lock import (
 
 
 _classify_common = classify_common
+
+TRACK_ORDER = ("quality_discount", "deep_value", "garp")
+
+
+def queue_next_track_stage(
+    session: Session,
+    run: DiscoveryRun,
+    *,
+    track: str,
+    stage: str,
+    parent: DiscoveryCommonStage | DiscoveryStage,
+    created_at: datetime,
+) -> DiscoveryStage:
+    """Queue the next attempt of one track layer under a confirmed parent."""
+
+    attempt = (
+        session.scalar(
+            select(func.max(DiscoveryStage.attempt)).where(
+                DiscoveryStage.run_id == run.id,
+                DiscoveryStage.track == track,
+                DiscoveryStage.stage == stage,
+            )
+        )
+        or 0
+    ) + 1
+    row = DiscoveryStage(
+        run_id=run.id,
+        track=track,
+        stage=stage,
+        attempt=attempt,
+        status="queued",
+        total_count=0,
+        pass_count=0,
+        drop_count=0,
+        insufficient_count=0,
+        error=None,
+        input_fingerprint=run.input_fingerprint,
+        ruler_version_id=getattr(run, f"{track}_ruler_version_id"),
+        algorithm_version=run.algorithm_version,
+        common_stage_id=(
+            parent.id if isinstance(parent, DiscoveryCommonStage) else None
+        ),
+        predecessor_stage_id=(
+            parent.id if isinstance(parent, DiscoveryStage) else None
+        ),
+        predecessor_stage=(
+            parent.stage if isinstance(parent, DiscoveryStage) else None
+        ),
+        failure_kind=None,
+        superseded_at=None,
+        created_at=created_at,
+        updated_at=created_at,
+    )
+    session.add(row)
+    return row
+
+
+def confirm_waiting_layers(
+    session: Session,
+    run: DiscoveryRun,
+    now: datetime,
+) -> bool:
+    """Seal leftover waiting layers and queue the next rule-only stage."""
+
+    queued = False
+    for common in session.scalars(
+        select(DiscoveryCommonStage).where(
+            DiscoveryCommonStage.run_id == run.id,
+            DiscoveryCommonStage.status == "waiting_confirmation",
+            DiscoveryCommonStage.superseded_at.is_(None),
+        )
+    ):
+        common.status = "confirmed"
+        common.confirmed_at = now
+        common.updated_at = now
+        has_child = session.scalar(
+            select(DiscoveryStage.id).where(
+                DiscoveryStage.run_id == run.id,
+                DiscoveryStage.common_stage_id == common.id,
+            ).limit(1)
+        )
+        if has_child is None:
+            for track in TRACK_ORDER:
+                queue_next_track_stage(
+                    session,
+                    run,
+                    track=track,
+                    stage="track_gate",
+                    parent=common,
+                    created_at=now,
+                )
+            queued = True
+    for stage in session.scalars(
+        select(DiscoveryStage).where(
+            DiscoveryStage.run_id == run.id,
+            DiscoveryStage.status == "waiting_confirmation",
+            DiscoveryStage.superseded_at.is_(None),
+        )
+    ):
+        stage.status = "confirmed"
+        stage.confirmed_at = now
+        stage.updated_at = now
+        if stage.stage != "track_gate":
+            continue
+        has_child = session.scalar(
+            select(DiscoveryStage.id).where(
+                DiscoveryStage.run_id == run.id,
+                DiscoveryStage.track == stage.track,
+                DiscoveryStage.stage == "competition",
+                DiscoveryStage.predecessor_stage_id == stage.id,
+            ).limit(1)
+        )
+        if has_child is None:
+            queue_next_track_stage(
+                session,
+                run,
+                track=stage.track,
+                stage="competition",
+                parent=stage,
+                created_at=now,
+            )
+            queued = True
+    return queued
 
 
 class TransientDiscoveryError(RuntimeError):
@@ -118,6 +243,7 @@ class TrackExecutionCandidate:
     rank: int | None
     override_action: str | None = None
     override_reason: str | None = None
+    extra_risk_flags: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -182,6 +308,125 @@ _TRACK_CLASSIFIERS = {
 }
 
 
+def _verdict_is_scored(verdict: object) -> bool:
+    """A listing-age screen is a decision, not missing market data.
+
+    Companies listed under five years stay insufficient on the card.
+    Counting them as unscored hides the rest of the track.
+    """
+
+    outcome = getattr(verdict, "verdict", None)
+    if outcome != "insufficient":
+        return True
+    return getattr(verdict, "primary_reason", None) == (
+        "listing_history_insufficient"
+    )
+
+
+def _dec_or_none(value: object) -> Decimal | None:
+    if value is None or value == "":
+        return None
+    try:
+        d = Decimal(str(value))
+        return d if d.is_finite() else None
+    except Exception:
+        return None
+
+
+def _competition_metrics(
+    company: FrozenCompanyInput,
+    raw_metrics: Mapping[str, object],
+    extra_flags: Sequence[str] = (),
+) -> dict[str, object]:
+    out = dict(raw_metrics)
+    flags = [str(f) for f in (raw_metrics.get("risk_flags") or ()) if f]
+    for ef in extra_flags:
+        if not ef:
+            continue
+        if str(ef).startswith("interim_yoy:"):
+            try:
+                out["_interim_yoy"] = float(str(ef).split(":", 1)[1])
+            except ValueError:
+                pass
+            continue
+        if ef not in flags:
+            flags.append(str(ef))
+    pb = _dec_or_none(company.fields.get("pb"))
+    roe_mean = _dec_or_none(raw_metrics.get("roe_mean"))
+    if pb is not None and pb > Decimal("8") and roe_mean is not None and roe_mean > Decimal("50"):
+        flags.append("thin_equity_high_pb")
+
+    hist = company.fields.get("financial_history") or ()
+    ann_vals: list[tuple[int, Mapping[str, object]]] = []
+    for row in hist:
+        if not isinstance(row, Mapping):
+            continue
+        p = str(row.get("period") or "")
+        vals = row.get("values")
+        if p.isdigit() and len(p) == 4 and isinstance(vals, Mapping):
+            ann_vals.append((int(p), vals))
+    ann_vals.sort(key=lambda x: x[0])
+
+    if ann_vals:
+        latest_vals = ann_vals[-1][1]
+        gw = _dec_or_none(latest_vals.get("goodwill"))
+        na = _dec_or_none(latest_vals.get("net_assets"))
+        if gw is not None and gw > 0 and na is not None and na > 0 and (gw / na) > Decimal("0.25"):
+            flags.append("goodwill_bloat")
+
+        is_fin = (
+            raw_metrics.get("branch") == "financial"
+            or raw_metrics.get("quality_branch") == "bank"
+            or "银行" in (company.industry or "")
+            or "保险" in (company.industry or "")
+            or "证券" in (company.industry or "")
+        )
+        if not is_fin:
+            l_ni = _dec_or_none(latest_vals.get("net_income"))
+            l_ocf = _dec_or_none(latest_vals.get("ocf"))
+            if l_ni is not None and l_ni > 0 and l_ocf is not None and (l_ocf / l_ni) < Decimal("0.40"):
+                flags.append("recent_ocf_collapse")
+            if len(ann_vals) >= 2:
+                v0, v1 = ann_vals[-1][1], ann_vals[-2][1]
+                ocf0, cap0 = _dec_or_none(v0.get("ocf")), _dec_or_none(v0.get("capex"))
+                ocf1, cap1 = _dec_or_none(v1.get("ocf")), _dec_or_none(v1.get("capex"))
+                if (
+                    ocf0 is not None
+                    and cap0 is not None
+                    and ocf1 is not None
+                    and cap1 is not None
+                    and (ocf0 - cap0) < 0
+                    and (ocf1 - cap1) < 0
+                ):
+                    flags.append("consecutive_negative_fcf")
+            fcf_5 = [
+                (_dec_or_none(v.get("ocf")) or Decimal("0"))
+                - (_dec_or_none(v.get("capex")) or Decimal("0"))
+                for _, v in ann_vals[-5:]
+                if _dec_or_none(v.get("ocf")) is not None and _dec_or_none(v.get("capex")) is not None
+            ]
+            if len(fcf_5) >= 3 and sum(fcf_5, Decimal("0")) < 0:
+                flags.append("negative_5y_fcf")
+
+        if len(ann_vals) >= 2:
+            dni_cur = _dec_or_none(ann_vals[-1][1].get("deducted_net_income"))
+            dni_prev = _dec_or_none(ann_vals[-2][1].get("deducted_net_income"))
+            if dni_cur is not None and dni_prev is not None and dni_prev > 0:
+                if (dni_cur - dni_prev) / dni_prev <= Decimal("-0.15"):
+                    flags.append("annual_deducted_drop")
+
+        roes = [
+            _dec_or_none(v.get("roe"))
+            for _, v in ann_vals[-4:]
+            if _dec_or_none(v.get("roe")) is not None
+        ]
+        if len(roes) == 4 and roes[0] > roes[1] > roes[2] > roes[3] and (roes[0] - roes[3]) >= Decimal("4"):  # type: ignore[operator]
+            flags.append("roe_step_down_3y")
+
+    out["risk_flags"] = tuple(dict.fromkeys(flags))
+    return out
+
+
 def builtin_track_executor(
     context: TrackExecutionContext,
 ) -> TrackExecutionOutcome:
@@ -220,12 +465,16 @@ def builtin_track_executor(
             candidate.code: _plain_metrics(candidate.metrics_json)
             for candidate in context.candidates
         }
-        ranked = rank_competition(
+        ranked = rank_borda_competition(
             tuple(
                 CompetitionCandidate(
                     code=candidate.code,
                     industry=companies[candidate.code].industry,
-                    metrics=metrics[candidate.code],
+                    metrics=_competition_metrics(
+                        companies[candidate.code],
+                        metrics[candidate.code],
+                        candidate.extra_risk_flags,
+                    ),
                 )
                 for candidate in context.candidates
             ),
@@ -297,7 +546,7 @@ def builtin_track_executor(
         classifier(companies[candidate.code], ruler)
         for candidate in context.candidates
     )
-    complete = sum(verdict.verdict != "insufficient" for verdict in verdicts)
+    complete = sum(_verdict_is_scored(verdict) for verdict in verdicts)
     coverage = bounded_ratio(complete, len(verdicts)) if verdicts else Decimal("1")
     if coverage is None:
         raise TrackExecutorContractError("quality coverage ratio is unavailable")
@@ -559,11 +808,32 @@ def execute_common_stage(
         stage.pass_count = counts["pass"]
         stage.drop_count = counts["drop"]
         stage.insufficient_count = counts["insufficient"]
-        stage.status = "waiting_confirmation"
-        stage.error = None
         stage.failure_kind = None
         stage.updated_at = completed_at
+        if not common_ready(counts["pass"], counts["drop"], len(verdicts)):
+            stage.status = "data_not_ready"
+            stage.error = (
+                f"共同排雷有结论的公司 {counts['pass'] + counts['drop']}/"
+                f"{len(verdicts)}，低于 {COMMON_READINESS_MIN}"
+            )
+            if not _commit_if_current(session, stage.run_id, now_provider):
+                return StageExecutionOutcome(stage_id, "historical", True)
+            return StageExecutionOutcome(
+                stage_id, "data_not_ready", True, processed=len(verdicts)
+            )
+        stage.status = "confirmed"
+        stage.confirmed_at = completed_at
+        stage.error = None
         session.flush()
+        for track in TRACK_ORDER:
+            queue_next_track_stage(
+                session,
+                run,
+                track=track,
+                stage="track_gate",
+                parent=stage,
+                created_at=completed_at,
+            )
         if not _commit_if_current(
             session,
             stage.run_id,
@@ -572,7 +842,7 @@ def execute_common_stage(
             return StageExecutionOutcome(stage_id, "historical", True)
         return StageExecutionOutcome(
             stage_id,
-            "waiting_confirmation",
+            "confirmed",
             True,
             processed=len(verdicts),
         )
@@ -741,7 +1011,7 @@ def _track_candidates(
             )
         )
     }
-    candidates = []
+    passed_rows = []
     for row in session.scalars(
         select(DiscoveryResult)
         .where(
@@ -760,6 +1030,40 @@ def _track_candidates(
         )
         if effective != "pass":
             continue
+        passed_rows.append((row, override, effective))
+
+    interim_flags_by_code: dict[str, tuple[str, ...]] = {}
+    if stage.stage == "competition" and passed_rows:
+        from app.models import Financial
+        from research.thesis import financial_drift
+
+        p_codes = [r.code for r, _, _ in passed_rows]
+        fins_by_code: dict[str, list[dict[str, object]]] = {}
+        for f_row in session.scalars(
+            select(Financial).where(Financial.code.in_(p_codes))
+        ).all():
+            fins_by_code.setdefault(f_row.code, []).append(
+                {
+                    "period": f_row.period,
+                    "period_type": f_row.period_type,
+                    "net_income": f_row.net_income,
+                    "deducted_net_income": f_row.deducted_net_income,
+                    "ocf": f_row.ocf,
+                }
+            )
+        for c_code, f_list in fins_by_code.items():
+            drift = financial_drift({}, f_list, since_baseline=False)
+            if drift is not None:
+                yoy_val = drift.get("deducted_net_income_yoy")
+                if yoy_val is None:
+                    yoy_val = drift.get("net_income_yoy")
+                flags_list = [f"interim_{reason}" for reason in (drift.get("reasons") or ())]
+                if yoy_val is not None:
+                    flags_list.append(f"interim_yoy:{yoy_val}")
+                interim_flags_by_code[c_code] = tuple(flags_list)
+
+    candidates = []
+    for row, override, effective in passed_rows:
         candidates.append(
             TrackExecutionCandidate(
                 code=row.code,
@@ -774,6 +1078,7 @@ def _track_candidates(
                 override_reason=(
                     None if override is None else override.reason
                 ),
+                extra_risk_flags=interim_flags_by_code.get(row.code, ()),
             )
         )
     return tuple(candidates)
@@ -1009,6 +1314,7 @@ def _execute_track_stage(
     stage_id: int,
     track_executor: TrackExecutor | None,
     now_provider: NowProvider,
+    preloaded: tuple[tuple[TrackExecutionCandidate, ...], FrozenRunInputs] | None = None,
 ) -> bool:
     """Run a pure callback, then validate and persist its immutable outcome."""
 
@@ -1058,7 +1364,15 @@ def _execute_track_stage(
             else "invalid_predecessor"
         )
         raise PermanentDiscoveryError(f"{code}: exact stage lineage is unavailable")
-    frozen = load_frozen_inputs(session, stage.run_id)
+    if preloaded is None:
+        candidates = _track_candidates(session, stage)
+        frozen = load_frozen_inputs(
+            session,
+            stage.run_id,
+            codes=(candidate.code for candidate in candidates),
+        )
+    else:
+        candidates, frozen = preloaded
     frozen_ruler = frozen.ruler_payloads.get(stage.track)
     if (
         not _is_build_available(stage.algorithm_version, AVAILABLE_BUILDS)
@@ -1169,7 +1483,7 @@ def _execute_track_stage(
             predecessor_stage=stage.predecessor_stage,
             frozen_inputs=frozen,
             ruler_payload=ruler_payload,
-            candidates=_track_candidates(session, stage),
+            candidates=candidates,
         )
         session.rollback()
         outcome = (
@@ -1267,7 +1581,21 @@ def _execute_track_stage(
             verdict: sum(row.verdict == verdict for row in outcome.results)
             for verdict in VERDICTS
         }
-        stage.status = outcome.status
+        # Discovery is rule-only: a finished layer is final and the next one
+        # queues in the same commit. Competition is the last layer.
+        finished = outcome.status == "waiting_confirmation"
+        stage.status = "confirmed" if finished else outcome.status
+        if finished:
+            stage.confirmed_at = completed_at
+            if stage.stage == "track_gate":
+                queue_next_track_stage(
+                    session,
+                    session.get(DiscoveryRun, stage.run_id),
+                    track=stage.track,
+                    stage="competition",
+                    parent=stage,
+                    created_at=completed_at,
+                )
         stage.total_count = len(outcome.results)
         stage.pass_count = counts["pass"]
         stage.drop_count = counts["drop"]
@@ -1460,6 +1788,9 @@ def drain_run_queue(
             run = session.get(DiscoveryRun, run_id)
             if not _run_is_mutable(run, now_provider):
                 return DrainOutcome(run_id, True, executed)
+            confirm_waiting_layers(session, run, _now(now_provider))
+            if not _commit_if_current(session, run_id, now_provider):
+                return DrainOutcome(run_id, True, executed)
             selected = _next_queued_stage(session, run_id)
             if selected is None:
                 return DrainOutcome(run_id, True, executed)
@@ -1474,15 +1805,24 @@ def drain_run_queue(
                     return DrainOutcome(run_id, True, executed)
                 if not outcome.claimed or outcome.status == "running":
                     raise QueueStalledError(f"common stage {stage_id} did not advance")
-                if outcome.status == "failed":
+                if outcome.status in {"failed", "data_not_ready"}:
                     return DrainOutcome(run_id, True, executed + 1)
             else:
                 stage = session.get(DiscoveryStage, stage_id)
                 if stage is None:
                     raise QueueStalledError(f"track stage {stage_id} disappeared")
+                preloaded = None
                 if stage.ruler_version_id is not None:
                     try:
-                        frozen = load_frozen_inputs(session, run_id)
+                        candidates = _track_candidates(session, stage)
+                        frozen = load_frozen_inputs(
+                            session,
+                            run_id,
+                            codes=(
+                                candidate.code for candidate in candidates
+                            ),
+                        )
+                        preloaded = (candidates, frozen)
                         ruler = frozen.ruler_payloads.get(stage.track)
                         if (
                             not isinstance(ruler, Mapping)
@@ -1550,6 +1890,7 @@ def drain_run_queue(
                             stage_id,
                             track_executor,
                             now_provider,
+                            preloaded=preloaded,
                         )
                         if not completed:
                             return DrainOutcome(run_id, True, executed)
@@ -1606,3 +1947,32 @@ def drain_run_queue(
             session.info.pop("discovery_lock_owner_token", None)
             if lease_token is not None:
                 _release_run_lock(session, run_id, lease_token)
+
+
+def drain_discovery_subprocess(
+    db_path: str, run_id: int, owner_token: str
+) -> None:
+    """Run one discovery drain outside the API process.
+
+    The API process must stay responsive while a stage canonicalizes the
+    frozen market. This entrypoint is spawned, opens its own connection,
+    and adopts the lock the parent already holds.
+    """
+
+    from pathlib import Path
+
+    from app.db import create_db_engine, create_session_factory
+
+    engine = create_db_engine(Path(db_path))
+    try:
+        factory = create_session_factory(engine)
+        with factory() as session:
+            drain_run_queue(
+                session,
+                run_id,
+                track_executor=builtin_track_executor,
+                lock_already_held=True,
+                owner_token=owner_token,
+            )
+    finally:
+        engine.dispose()

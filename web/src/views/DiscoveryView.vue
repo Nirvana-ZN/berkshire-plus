@@ -7,13 +7,16 @@ import {
   canAbandonRun,
   collectMetricKeys,
   candidateSurfacedReason,
+  formatEvidenceText,
   CURRENT_FETCH_TIMEOUT_MS,
   discoveryChangeLabels,
   keeperRange,
   latestStagesNeedPolling,
   matchesStagePointer,
   parseStageResponse,
+  preferredViewStage,
   renderMetricValue,
+  stageIsReachable,
   reviewedStageActions,
   stageAriaLabel,
   stageCacheKey,
@@ -57,6 +60,7 @@ const STAGE_STATUSES = [
 
 const TRACKS = ['quality_discount', 'deep_value', 'garp'] as const
 const TRACK_STAGES = ['track_gate', 'competition', 'adjudication'] as const
+const VISIBLE_TRACK_STAGES = ['track_gate', 'competition'] as const
 
 type DiscoveryRunStatus = (typeof DISCOVERY_RUN_STATUSES)[number]
 type StageStatus = DiscoveryStageStatus
@@ -162,6 +166,8 @@ interface StageSummary {
 
 interface StageCurrent {
   id: number
+  track: Track | null
+  stage: DiscoveryStageName
   attempt: number
   status: StageStatus
   error: string | null
@@ -188,6 +194,7 @@ interface AdjudicationCase {
   code: string
   name: string
   surfacedReason: string
+  overridden: boolean
   track: Track
   evidence: ParsedDiscoveryEvidence[]
   decision: ParsedDiscoveryDecision | null
@@ -275,6 +282,19 @@ const state = ref<ViewState>({ kind: 'loading' })
 const starting = ref(false)
 const mutating = ref(false)
 const actionError = ref('')
+const researchErrorCode = ref('')
+const fillStatus = ref<{
+  status: string
+  snapshotStatus: string | null
+  total: number
+  completed: number
+  failed: number
+  pending: number
+  lastError: string | null
+  dataAsOf: string | null
+} | null>(null)
+const fillStarting = ref(false)
+let fillTimer: ReturnType<typeof setInterval> | null = null
 const transitionAnnouncement = ref('')
 const stageViews = ref<StageView[]>([])
 const activeRunId = ref<number | null>(null)
@@ -309,6 +329,10 @@ let currentController: AbortController | null = null
 let mutationRequestSequence = 0
 let mutationController: AbortController | null = null
 const stageControllers = new Map<string, AbortController>()
+const stageTimeoutRetries = new Map<string, number>()
+const expandedGroups = ref<Record<string, boolean>>({})
+const activeStageFilter = ref<'all' | 'safety' | Track>('quality_discount')
+const STAGE_TIMEOUT_RETRY_LIMIT = 2
 const adjudicationControllers = new Map<Track, AbortController>()
 let adjudicationRequestSequence = 0
 
@@ -316,7 +340,11 @@ const announcement = computed(() => {
   if (starting.value) return '正在创建本周发现…'
   const current = state.value
   if (current.kind === 'loading') return '正在读取本周批次…'
-  if (current.kind === 'empty') return '本周尚未创建批次。可以开始本周发现。'
+  if (current.kind === 'empty') {
+    return fillBlocksStart.value
+      ? '全市场数据快照尚未完成，还不能开始本周发现。'
+      : '本周尚未创建批次。可以开始本周发现。'
+  }
   if (current.kind === 'error') return current.message
   const prefix = current.source === 'created' ? '本周发现创建成功。' : '本周批次已加载。'
   return `${prefix}状态：${STATUS_ZH[current.run.status]}`
@@ -484,7 +512,7 @@ function viewsForRun(run: DiscoveryRun): StageView[] {
       title: `${TRACK_ZH[track]} · ${STAGE_ZH[stage]}`,
       track,
       stage,
-      created: payload !== null || (selectedIsLatest && (pointer?.created ?? false)),
+      created: payload !== null || stageIsReachable(stage, pointer),
       status: payload?.current.status ?? (selectedIsLatest ? pointer?.status ?? 'queued' : 'queued'),
       payload,
       metricKeys: stageMetricKeysCache.value[cacheKey] ?? [],
@@ -608,9 +636,32 @@ function reviewedIdentityFor(view: StageView): StageReviewIdentity | null {
 function stageAvailable(track: Track, stage: TrackStage): boolean {
   const current = state.value
   if (current.kind !== 'ready') return false
-  const latest = current.run.tracks?.[track]
-  if (!latest?.created || !isTrackStage(latest.stage)) return false
-  return TRACK_STAGES.indexOf(stage) <= TRACK_STAGES.indexOf(latest.stage)
+  if (!VISIBLE_TRACK_STAGES.includes(stage as (typeof VISIBLE_TRACK_STAGES)[number])) {
+    return false
+  }
+  return stageIsReachable(stage, current.run.tracks?.[track])
+}
+
+function upstreamComputing(view: StageView): boolean {
+  const current = state.value
+  if (current.kind !== 'ready' || view.track === null) return false
+  const pointer = current.run.tracks?.[view.track]
+  if (!pointer?.created || !isTrackStage(pointer.stage)) return false
+  if (view.stage === 'safety') return false
+  const ahead = TRACK_STAGES.indexOf(pointer.stage) > TRACK_STAGES.indexOf(view.stage)
+  return ahead && shouldPollStage(true, pointer.status ?? 'queued')
+}
+
+async function selectTrackStage(track: Track, stage: TrackStage) {
+  if (!stageAvailable(track, stage)) return
+  selectedTrackStages.value = { ...selectedTrackStages.value, [track]: stage }
+  pinnedTrackStages.value = { ...pinnedTrackStages.value, [track]: true }
+  const current = state.value
+  if (current.kind !== 'ready') return
+  stageViews.value = viewsForRun(current.run)
+  const view = stageViews.value.find((item) => item.track === track && item.stage === stage)
+  if (view) await loadStage(view, current.run.id)
+  schedulePoll()
 }
 
 function stopPoll() {
@@ -666,10 +717,7 @@ function endMutation() {
     current.kind === 'error' ? CURRENT_RETRY_MS : CURRENT_REFRESH_MS,
   )
   if (current.kind === 'ready') {
-    void Promise.allSettled(
-      stageViews.value.map((view) => loadStage(view, current.run.id)),
-    )
-    void loadAdjudicationPayloads(current.run)
+    void loadStagesInOrder(current.run.id).then(() => loadAdjudicationPayloads(current.run))
   }
 }
 
@@ -722,6 +770,43 @@ function scheduleCurrentRefresh(delay = CURRENT_REFRESH_MS) {
   currentRefreshTimer = window.setTimeout(() => {
     if (mounted && !mutating.value) void readCurrent()
   }, delay)
+}
+
+function groupShown(view: StageView, group: string): boolean {
+  return expandedGroups.value[`${view.key}:${group}`] === true
+}
+
+function groupCollapsed(view: StageView, group: string): boolean {
+  if (groupShown(view, group)) return false
+  // Safety passes are the whole investable universe. Track passes stay open.
+  return group !== 'pass' || view.track === null
+}
+
+function showGroup(view: StageView, group: string) {
+  expandedGroups.value = {
+    ...expandedGroups.value,
+    [`${view.key}:${group}`]: true,
+  }
+}
+
+function scheduleStageRetry(
+  view: StageView,
+  runId: number,
+  cacheKey: string,
+  requestNumber: number,
+) {
+  const attempts = stageTimeoutRetries.get(cacheKey) ?? 0
+  if (attempts >= STAGE_TIMEOUT_RETRY_LIMIT) return
+  stageTimeoutRetries.set(cacheKey, attempts + 1)
+  window.setTimeout(() => {
+    if (
+      !mounted
+      || mutating.value
+      || activeRunId.value !== runId
+      || activeStageKey.value[cacheKey] !== requestNumber
+    ) return
+    void loadStage(view, runId)
+  }, STAGE_POLL_INTERVAL_MS)
 }
 
 async function loadStage(
@@ -806,6 +891,21 @@ async function loadStage(
     current.created = true
     current.status = payload.current.status
     current.error = ''
+    stageTimeoutRetries.delete(cacheKey)
+    if (
+      view.track !== null
+      && view.stage === 'competition'
+      && validateCandidateEvidence(payload).valid
+    ) {
+      adjudicationPayloads.value = {
+        ...adjudicationPayloads.value,
+        [view.track]: payload,
+      }
+      candidatePayloadStates.value = {
+        ...candidatePayloadStates.value,
+        [view.track]: { kind: 'ready' },
+      }
+    }
     return payload
   } catch (error) {
     if (!timedOut && error instanceof DOMException && error.name === 'AbortError') return null
@@ -821,6 +921,7 @@ async function loadStage(
       current.metricKeys = []
       current.error = timedOut ? '阶段读取超时，将在下一轮重试' : '无法读取阶段结果'
     }
+    if (timedOut) scheduleStageRetry(view, runId, cacheKey, requestNumber)
     return null
   } finally {
     cancelTimeout()
@@ -922,12 +1023,26 @@ function retryAdjudicationPayload(view: StageView) {
   }
 }
 
+// Stage payloads are CPU-bound on one server process: requested together, each
+// (and the /current refresh) waits for all the others and hits its timeout.
+async function loadStagesInOrder(runId: number) {
+  for (const view of [...stageViews.value]) {
+    if (!view.created || view.payload !== null) continue
+    await loadStage(view, runId).catch(() => null)
+  }
+}
+
 async function loadAdjudicationPayloads(run: DiscoveryRun) {
-  await Promise.allSettled(
-    TRACKS
-      .filter((track) => run.tracks?.[track]?.stage === 'adjudication')
-      .map((track) => loadAdjudicationPayload(track, run.id)),
-  )
+  for (const track of TRACKS.filter((item) => trackShowsCandidateCases(item, run))) {
+    if (adjudicationPayloads.value[track] || adjudicationControllers.has(track)) continue
+    const cached = stagePayloadCache.value[stageCacheKey(run.id, track, 'competition')]
+    if (cached && validateCandidateEvidence(cached).valid) {
+      adjudicationPayloads.value = { ...adjudicationPayloads.value, [track]: cached }
+      candidatePayloadStates.value = { ...candidatePayloadStates.value, [track]: { kind: 'ready' } }
+      continue
+    }
+    await loadAdjudicationPayload(track, run.id).catch(() => undefined)
+  }
 }
 
 async function applyRun(
@@ -946,15 +1061,21 @@ async function applyRun(
     adjudicationPayloads.value = {}
     candidatePayloadStates.value = {}
     for (const track of TRACKS) {
-      const latest = run.tracks?.[track]?.stage
-      selectedTrackStages.value[track] = isTrackStage(latest) ? latest : 'track_gate'
+      const pointer = run.tracks?.[track]
+      selectedTrackStages.value[track] = preferredViewStage(
+        isTrackStage(pointer?.stage) ? pointer.stage : null,
+        pointer?.status ?? null,
+      )
       pinnedTrackStages.value[track] = false
     }
   } else {
     for (const track of TRACKS) {
-      const latest = run.tracks?.[track]?.stage
-      if (!pinnedTrackStages.value[track] && isTrackStage(latest)) {
-        selectedTrackStages.value[track] = latest
+      const pointer = run.tracks?.[track]
+      if (!pinnedTrackStages.value[track]) {
+        selectedTrackStages.value[track] = preferredViewStage(
+          isTrackStage(pointer?.stage) ? pointer.stage : null,
+          pointer?.status ?? null,
+        )
       }
     }
   }
@@ -965,8 +1086,7 @@ async function applyRun(
   schedulePoll()
   scheduleCurrentRefresh()
   if (!mutating.value) {
-    void Promise.allSettled(stageViews.value.map((view) => loadStage(view, run.id)))
-    void loadAdjudicationPayloads(run)
+    void loadStagesInOrder(run.id).then(() => loadAdjudicationPayloads(run))
   }
 }
 
@@ -993,6 +1113,7 @@ async function readCurrent(source: 'loaded' | 'created' = 'loaded'): Promise<boo
       stageViews.value = []
       transitionAnnouncement.value = ''
       state.value = { kind: 'empty' }
+      watchFill()
       scheduleCurrentRefresh()
       return false
     }
@@ -1050,7 +1171,12 @@ async function startDiscovery() {
     const response = await fetch('/api/discoveries', { method: 'POST' })
     const body: unknown = await response.json()
     if (!response.ok) {
-      state.value = { kind: 'error', message: errorMessage(body, '无法开始本周发现') }
+      if (isRecord(body) && (body.code === 'DATA_NOT_READY' || body.code === 'JOB_LOCKED')) {
+        state.value = { kind: 'empty' }
+        watchFill()
+      } else {
+        state.value = { kind: 'error', message: errorMessage(body, '无法开始本周发现') }
+      }
     } else if (!isDiscoveryRun(body)) {
       state.value = { kind: 'error', message: '服务返回的本周批次数据无效' }
     } else {
@@ -1276,30 +1402,46 @@ function resultRows(view: StageView, key: 'pass' | 'drop' | 'insufficient'): Dis
   return view.payload?.[key] ?? []
 }
 
-function adjudicationCases(view: StageView): AdjudicationCase[] {
-  if (view.track === null || view.stage !== 'adjudication') return []
+function trackShowsCandidateCases(track: Track, run: DiscoveryRun): boolean {
+  const row = run.tracks?.[track]
+  if (!row) return false
+  if (row.stage === 'adjudication') return true
+  return row.stage === 'competition' && row.status === 'confirmed'
+}
+
+function showsCandidateCases(view: StageView): boolean {
+  if (view.track === null) return false
+  if (view.stage === 'adjudication') return true
+  return view.stage === 'competition' && view.status === 'confirmed'
+}
+
+function adjudicationCases(view: StageView, code?: string): AdjudicationCase[] {
+  if (view.track === null || !showsCandidateCases(view)) return []
   const payload = adjudicationPayloads.value[view.track]
   if (!payload) return []
-  return payload.pass.map((row) => {
-    const evidence = payload.evidence.filter(
-      (item) => item.code === row.code
-        && item.competition_stage_id === payload.current.id
-        && item.competition_attempt === payload.current.attempt,
-    )
-    return {
-      code: row.code,
-      name: row.name,
-      surfacedReason: candidateSurfacedReason(row, evidence),
-      track: view.track as Track,
-      evidence,
-      decision: payload.decisions.find(
+  return payload.pass
+    .filter((row) => code === undefined || row.code === code)
+    .map((row) => {
+      const evidence = payload.evidence.filter(
         (item) => item.code === row.code
           && item.competition_stage_id === payload.current.id
           && item.competition_attempt === payload.current.attempt,
-      ) ?? null,
-      change: payload.changes.find((item) => item.code === row.code) ?? null,
-    }
-  })
+      )
+      return {
+        code: row.code,
+        name: row.name,
+        surfacedReason: candidateSurfacedReason(row, evidence),
+        overridden: row.override?.action === 'forced_pass',
+        track: view.track as Track,
+        evidence,
+        decision: payload.decisions.find(
+          (item) => item.code === row.code
+            && item.competition_stage_id === payload.current.id
+            && item.competition_attempt === payload.current.attempt,
+        ) ?? null,
+        change: payload.changes.find((item) => item.code === row.code) ?? null,
+      }
+    })
 }
 
 function keeperCount(view: StageView): number {
@@ -1352,8 +1494,14 @@ function factEvidence(item: AdjudicationCase): ParsedDiscoveryEvidence[] {
 }
 
 function riskText(item: AdjudicationCase): string {
-  return item.evidence.find((evidence) => evidence.kind === 'risk')?.display_text
-    || '尚无结构化反方证据'
+  const risk = item.evidence.find((evidence) => evidence.kind === 'risk')?.display_text
+  return risk ? formatEvidenceText(risk) : '尚无结构化反方证据'
+}
+
+function caseRiskCount(item: AdjudicationCase): number {
+  const risk = item.evidence.find((evidence) => evidence.kind === 'risk')
+  if (!risk || risk.rule_id === `${item.track}.risk.none`) return 0
+  return risk.display_text.split('；').filter(Boolean).length
 }
 
 function freshnessText(item: AdjudicationCase): string {
@@ -1366,7 +1514,7 @@ function freshnessText(item: AdjudicationCase): string {
 
 function weeklyChangeText(view: StageView, item: AdjudicationCase): string {
   const change = weeklyChange(view, item)
-  return change ? discoveryChangeLabels(change) : '本周首次形成可裁决候选'
+  return change ? discoveryChangeLabels(change) : '无可比的上周记录（上周数据不完整或没有上周）'
 }
 
 function weeklyChange(
@@ -1396,7 +1544,8 @@ function weeklyReasonText(
   change: ParsedDiscoveryChange | null,
   side: 'previous' | 'current',
 ): string {
-  return change?.[`${side}_reason`] || '无'
+  const reason = change?.[`${side}_reason`]
+  return reason ? formatEvidenceText(reason) : '无'
 }
 
 async function saveDecision(
@@ -1481,24 +1630,34 @@ async function completeAdjudication(view: StageView) {
   }
 }
 
-async function startResearch(item: AdjudicationCase) {
+function canResearchPass(
+  view: StageView,
+  group: 'pass' | 'drop' | 'insufficient',
+  row: DiscoveryRow,
+): boolean {
+  return view.track !== null
+    && view.stage === 'competition'
+    && view.status === 'confirmed'
+    && group === 'pass'
+    && row.verdict === 'pass'
+}
+
+async function openDiscoveryResearch(track: string, code: string) {
   const current = state.value
-  if (
-    researchingCode.value
-    || current.kind !== 'ready'
-    || item.decision?.decision !== 'keep'
-  ) return
-  researchingCode.value = item.code
+  if (researchingCode.value || current.kind !== 'ready') return
+  researchingCode.value = code
   actionError.value = ''
+  researchErrorCode.value = ''
   try {
     const response = await fetch(`/api/discoveries/${current.run.id}/research`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ track: item.track, code: item.code }),
+      body: JSON.stringify({ track, code }),
     })
     const data: unknown = await response.json()
     if (!response.ok) {
       actionError.value = errorMessage(data, '无法加入本周深研')
+      researchErrorCode.value = code
       return
     }
     if (!isRecord(data) || nonNegativeInteger(data.id) === null || data.id === 0) {
@@ -1511,6 +1670,16 @@ async function startResearch(item: AdjudicationCase) {
   } finally {
     researchingCode.value = ''
   }
+}
+
+async function startResearch(item: AdjudicationCase) {
+  if (item.decision?.decision !== 'keep') return
+  await openDiscoveryResearch(item.track, item.code)
+}
+
+async function startTrackResearch(view: StageView, row: DiscoveryRow) {
+  if (!canResearchPass(view, 'pass', row) || !view.track) return
+  await openDiscoveryResearch(view.track, row.code)
 }
 
 function overrideResult(view: StageView, code: string): DiscoveryRow | undefined {
@@ -1551,10 +1720,110 @@ function formatTimestamp(value: string | null): string {
     : '不可用'
 }
 
+function shortVersion(value: string | null | undefined): string {
+  if (!value) return '不可用'
+  const parts = value.split(':')
+  if (parts.length >= 2) {
+    const head = parts[0]
+    const tail = parts[parts.length - 1]
+    const shortHash = tail && tail.length > 8 ? tail.slice(0, 6) : tail
+    return shortHash ? `${head} (${shortHash})` : head || value
+  }
+  return value.length > 24 ? `${value.slice(0, 20)}…` : value
+}
+
 function markerPosition(marker: ThresholdMarker): string {
   if (marker.status !== 'available' || marker.position === null) return '不可用'
   const position = Number(marker.position)
   return Number.isFinite(position) ? `${position}%` : '不可用'
+}
+
+const fillBlocksStart = computed(() => {
+  const fill = fillStatus.value
+  if (fill === null) return false
+  return !(fill.status === 'done' && fill.snapshotStatus === 'ready' && fill.total > 0)
+})
+
+const fillProgress = computed(() => {
+  const fill = fillStatus.value
+  if (fill === null) return ''
+  if (fill.total <= 0) {
+    return fill.status === 'running' || fill.status === 'paused'
+      ? '正在准备全市场名单。'
+      : ''
+  }
+  const label = fill.status === 'running'
+    ? '正在补数'
+    : fill.status === 'paused'
+      ? '补数已暂停'
+      : fill.status === 'done'
+        ? '快照已完成'
+        : '补数状态'
+  const reason = fill.status === 'paused' && fill.lastError ? `原因：${fill.lastError}。` : ''
+  const asOf = fill.dataAsOf ? `现有数据截至 ${fill.dataAsOf}。` : ''
+  return `${label}：完成 ${fill.completed} / ${fill.total}，失败 ${fill.failed}，待处理 ${fill.pending}。${reason}${asOf}`
+})
+
+const fillButtonLabel = computed(() => {
+  const status = fillStatus.value?.status
+  if (fillStarting.value || status === 'running') return '正在补数…'
+  return status === 'paused' ? '继续补数' : '更新全市场数据'
+})
+
+async function startFill() {
+  if (fillStarting.value) return
+  fillStarting.value = true
+  actionError.value = ''
+  try {
+    const response = await fetch('/api/discovery-data/fill', { method: 'POST' })
+    if (!response.ok) {
+      const body: unknown = await response.json().catch(() => null)
+      actionError.value = errorMessage(body, '无法开始补数')
+    }
+  } catch {
+    actionError.value = '无法开始补数'
+  } finally {
+    fillStarting.value = false
+    watchFill()
+  }
+}
+
+async function loadFillStatus() {
+  try {
+    const response = await fetch('/api/discovery-data/status')
+    if (!response.ok) return
+    const body: unknown = await response.json()
+    if (!isRecord(body) || typeof body.status !== 'string') return
+    const total = nonNegativeInteger(body.total)
+    const completed = nonNegativeInteger(body.completed)
+    const failed = nonNegativeInteger(body.failed)
+    const pending = nonNegativeInteger(body.pending)
+    if (total === null || completed === null || failed === null || pending === null) return
+    const sourceAsOf = isRecord(body.readiness) && isRecord(body.readiness.source_as_of)
+      ? body.readiness.source_as_of
+      : null
+    fillStatus.value = {
+      status: body.status,
+      snapshotStatus: typeof body.snapshot_status === 'string' ? body.snapshot_status : null,
+      total,
+      completed,
+      failed,
+      pending,
+      lastError: typeof body.last_error === 'string' ? body.last_error : null,
+      dataAsOf: typeof sourceAsOf?.security === 'string' ? sourceAsOf.security : null,
+    }
+  } catch {
+    // Progress is context for the empty state; a missed poll can retry.
+  }
+}
+
+function watchFill() {
+  void loadFillStatus()
+  if (fillTimer !== null) return
+  fillTimer = setInterval(() => {
+    if (!mounted || state.value.kind !== 'empty') return
+    void loadFillStatus()
+  }, 8000)
 }
 
 onMounted(() => {
@@ -1575,6 +1844,10 @@ onBeforeUnmount(() => {
   activeRunId.value = null
   stopPoll()
   stopCurrentRefresh()
+  if (fillTimer !== null) {
+    clearInterval(fillTimer)
+    fillTimer = null
+  }
 })
 </script>
 
@@ -1582,7 +1855,7 @@ onBeforeUnmount(() => {
   <section>
     <div class="toolbar">
       <h1>每周发现</h1>
-      <p class="muted">按固定尺子筛选，再逐层确认。</p>
+      <p class="muted">按固定尺子逐层筛选；下游重算时，已完成的轨道筛选仍可查看与评估。</p>
     </div>
 
     <p role="status" aria-live="polite" aria-atomic="true">{{ announcement }}</p>
@@ -1592,8 +1865,18 @@ onBeforeUnmount(() => {
 
     <div v-if="state.kind === 'empty'" class="panel">
       <h2>本周尚未创建批次</h2>
-      <p class="muted">创建后将从共同排雷开始。</p>
-      <button type="button" :disabled="starting" @click="startDiscovery">
+      <p v-if="fillBlocksStart" role="alert">全市场数据快照尚未完成，还不能开始本周发现。</p>
+      <p v-else class="muted">创建后将从共同排雷开始。</p>
+      <p v-if="fillProgress" class="muted">{{ fillProgress }}</p>
+      <p v-if="actionError" role="alert">{{ actionError }}</p>
+      <button
+        type="button"
+        :disabled="fillStarting || fillStatus?.status === 'running'"
+        @click="startFill"
+      >
+        {{ fillButtonLabel }}
+      </button>
+      <button type="button" :disabled="starting || fillBlocksStart" @click="startDiscovery">
         {{ starting ? '正在开始…' : '开始本周发现' }}
       </button>
     </div>
@@ -1606,21 +1889,61 @@ onBeforeUnmount(() => {
 
     <template v-else-if="state.kind === 'ready'">
       <div class="panel run-summary">
-        <h2>本周批次</h2>
-        <p>周次：{{ state.run.week_key }}　状态：{{ STATUS_ZH[state.run.status] }}</p>
-        <p>
-          快照时间：{{ formatTimestamp(state.run.snapshot_at) }}　
-          数据版本：{{ state.run.data_version || '不可用' }}　
-          财务版本：{{ state.run.financial_version || '不可用' }}　
-          估值版本：{{ state.run.valuation_version || '不可用' }}
-        </p>
+        <div class="toolbar">
+          <h2>本周批次</h2>
+          <span class="badge badge-info">{{ state.run.week_key }}</span>
+          <span
+            class="badge"
+            :class="state.run.status === 'completed' ? 'badge-pass' : state.run.status === 'failed' ? 'badge-fail' : 'badge-warn'"
+          >
+            状态：{{ STATUS_ZH[state.run.status] }}
+          </span>
+          <button type="button" :disabled="mutating" @click="readCurrent()">刷新状态</button>
+        </div>
+        <div class="run-meta-bar">
+          <span>快照时间：<strong>{{ formatTimestamp(state.run.snapshot_at) }}</strong></span>
+          <span :title="state.run.data_version || '不可用'">
+            数据版本：<code>{{ shortVersion(state.run.data_version) }}</code>
+          </span>
+          <span :title="state.run.financial_version || '不可用'">
+            财务版本：<code>{{ shortVersion(state.run.financial_version) }}</code>
+          </span>
+          <span :title="state.run.valuation_version || '不可用'">
+            估值版本：<code>{{ shortVersion(state.run.valuation_version) }}</code>
+          </span>
+        </div>
         <p v-if="state.run.error" role="alert">{{ state.run.error }}</p>
       </div>
 
       <p v-if="actionError" role="alert">{{ actionError }}</p>
 
+      <div class="stage-tabs" role="tablist" aria-label="发现层级切换">
+        <button
+          v-for="tabView in stageViews"
+          :key="'tab-' + tabView.key"
+          type="button"
+          class="stage-tab"
+          :class="{ active: activeStageFilter === (tabView.track ?? 'safety') }"
+          @click="activeStageFilter = tabView.track ?? 'safety'"
+        >
+          <span>{{ tabView.track ? TRACK_ZH[tabView.track] : '共同排雷' }}</span>
+          <span v-if="tabView.payload" class="stage-tab-count">
+            {{ tabView.payload.summary.counts.pass }}
+          </span>
+        </button>
+        <button
+          type="button"
+          class="stage-tab"
+          :class="{ active: activeStageFilter === 'all' }"
+          @click="activeStageFilter = 'all'"
+        >
+          全部展开
+        </button>
+      </div>
+
       <article
         v-for="view in stageViews"
+        v-show="activeStageFilter === 'all' || activeStageFilter === (view.track ?? 'safety')"
         :key="view.key"
         class="panel stage-panel"
         :aria-busy="mutating
@@ -1631,7 +1954,12 @@ onBeforeUnmount(() => {
       >
         <div class="toolbar">
           <h2 :id="`discovery-stage-${view.key.replace(':', '-')}`">{{ view.title }}</h2>
-          <p class="muted">状态：{{ STAGE_STATUS_ZH[view.status] }}</p>
+          <span
+            class="badge"
+            :class="view.status === 'confirmed' ? 'badge-pass' : view.status === 'failed' || view.status === 'data_not_ready' || view.status === 'ruler_not_ready' ? 'badge-fail' : 'badge-warn'"
+          >
+            状态：{{ STAGE_STATUS_ZH[view.status] }}
+          </span>
           <label v-if="view.track" class="stage-selector">
             查看阶段
             <select
@@ -1639,7 +1967,7 @@ onBeforeUnmount(() => {
               @change="onStageSelection(view.track)"
             >
               <option
-                v-for="stage in TRACK_STAGES"
+                v-for="stage in VISIBLE_TRACK_STAGES"
                 :key="stage"
                 :value="stage"
                 :disabled="!stageAvailable(view.track, stage)"
@@ -1655,8 +1983,18 @@ onBeforeUnmount(() => {
         <p v-if="!view.created" class="muted">
           等待前置阶段确认。
         </p>
+        <p v-else-if="upstreamComputing(view)" class="notice">
+          后续阶段仍在计算。最终候选出来之前，不能从本层进入深研。
+        </p>
         <p v-else-if="view.status === 'queued' || view.status === 'running'" class="muted">
           正在生成本层结果，完成后会自动停止刷新。
+          <template v-if="view.track && view.stage === 'competition'">
+            可先
+            <button type="button" @click="selectTrackStage(view.track, 'track_gate')">
+              查看轨道筛选
+            </button>
+            通过名单并评估。
+          </template>
         </p>
         <p v-else-if="view.status === 'data_not_ready' || view.status === 'ruler_not_ready'">
           本层只读且不可重试；请放弃本批次并重新创建。
@@ -1664,145 +2002,6 @@ onBeforeUnmount(() => {
         <p v-else-if="view.status === 'failed'" class="muted">
           仅瞬时失败可重试；永久失败请放弃后重新创建。
         </p>
-        <section
-          v-if="view.stage === 'adjudication' && view.track"
-          class="adjudication"
-          :aria-label="`${view.title}候选案例`"
-        >
-          <div class="keeper-summary">
-            <h3>候选案例</h3>
-            <p>
-              已保留 {{ keeperCount(view) }} / 5
-              <span v-if="keeperCount(view) < 3" class="candidate-warning">
-                · 候选不足，不显示为成功
-              </span>
-              <span v-else-if="keeperRange(keeperCount(view)) === 'valid'">
-                · 保留数量应为 3–5 家
-              </span>
-            </p>
-            <p
-              v-if="keeperRange(keeperCount(view)) === 'over-limit'"
-              class="candidate-error"
-              role="alert"
-            >
-              超过 5 家上限。请先排除 {{ keeperCount(view) - 5 }} 家，
-              将保留数降至 5 家后再完成。
-            </p>
-          </div>
-
-          <article
-            v-for="caseItem in adjudicationCases(view)"
-            :key="`${caseItem.track}:${caseItem.code}`"
-            class="case-card"
-            :aria-labelledby="`case-${caseItem.track}-${caseItem.code}`"
-          >
-            <div class="toolbar">
-              <h3 :id="`case-${caseItem.track}-${caseItem.code}`">
-                {{ caseItem.name }}（{{ caseItem.code }}）
-              </h3>
-              <strong class="research-verdict">{{ researchVerdict(caseItem) }}</strong>
-            </div>
-            <dl>
-              <div><dt>轨道</dt><dd>{{ TRACK_ZH[caseItem.track] }}</dd></div>
-              <div><dt>入围原因</dt><dd>{{ caseItem.surfacedReason }}</dd></div>
-              <div>
-                <dt>关键证据</dt>
-                <dd>
-                  <ul>
-                    <li v-for="evidence in factEvidence(caseItem)" :key="evidence.id">
-                      {{ evidence.display_text }}
-                    </li>
-                  </ul>
-                </dd>
-              </div>
-              <div><dt>风险与反方证据</dt><dd>{{ riskText(caseItem) }}</dd></div>
-              <div><dt>数据缺口与新鲜度</dt><dd>{{ freshnessText(caseItem) }}</dd></div>
-              <div><dt>变化分类</dt><dd>{{ weeklyChangeText(view, caseItem) }}</dd></div>
-              <div>
-                <dt>上周状态</dt>
-                <dd>{{ weeklyStateText(weeklyChange(view, caseItem), 'previous') }}</dd>
-              </div>
-              <div>
-                <dt>本周状态</dt>
-                <dd>{{ weeklyStateText(weeklyChange(view, caseItem), 'current') }}</dd>
-              </div>
-              <div>
-                <dt>上周理由</dt>
-                <dd>{{ weeklyReasonText(weeklyChange(view, caseItem), 'previous') }}</dd>
-              </div>
-              <div>
-                <dt>本周理由</dt>
-                <dd>{{ weeklyReasonText(weeklyChange(view, caseItem), 'current') }}</dd>
-              </div>
-            </dl>
-            <div v-if="view.status === 'waiting_confirmation'" class="case-actions">
-              <button
-                type="button"
-                :disabled="mutating"
-                :aria-label="`保留 ${caseItem.name} 为候选`"
-                @click="saveDecision(view, caseItem, 'keep')"
-              >
-                保留为候选
-              </button>
-              <label>
-                排除理由
-                <input
-                  v-model="exclusionReasons[draftKey(caseItem)]"
-                  type="text"
-                  name="exclusion_reason"
-                  :required="caseItem.decision?.decision === 'exclude'"
-                />
-              </label>
-              <button
-                type="button"
-                :disabled="mutating || !exclusionReason(caseItem).trim()"
-                :aria-label="`排除 ${caseItem.name}`"
-                @click="saveDecision(view, caseItem, 'exclude')"
-              >
-                排除
-              </button>
-            </div>
-            <button
-              v-if="caseItem.decision?.decision === 'keep'
-                && (view.status === 'confirmed' || view.status === 'insufficient_candidates')"
-              type="button"
-              :disabled="!!researchingCode"
-              @click="startResearch(caseItem)"
-            >
-              {{ researchingCode === caseItem.code ? '正在创建深研…' : '加入本周深研' }}
-            </button>
-          </article>
-
-          <p v-if="casesLoading(view)" class="muted">
-            正在读取候选案例…
-          </p>
-          <div v-if="candidatePayloadError(view)" role="alert">
-            <p>{{ candidatePayloadError(view) }}</p>
-            <button type="button" @click="retryAdjudicationPayload(view)">
-              重试候选案例
-            </button>
-          </div>
-          <p v-else-if="casesLoaded(view) && !adjudicationCases(view).length" class="muted">
-            本轨道没有可保留候选，可明确以候选不足完成。
-          </p>
-          <button
-            v-if="view.status === 'waiting_confirmation'"
-            type="button"
-            :disabled="mutating || !canCompleteAdjudication(view)"
-            @click="completeAdjudication(view)"
-          >
-            {{
-              keeperRange(keeperCount(view)) === 'over-limit'
-                ? '请先将候选降至 5 家'
-                : keeperCount(view) >= 3
-                  ? '完成本轨道裁决'
-                  : '以候选不足完成'
-            }}
-          </button>
-          <p v-if="view.status === 'insufficient_candidates'" class="candidate-warning">
-            候选不足：本轨道已明确结束，但未达到 3 家，不视为成功。
-          </p>
-        </section>
 
         <section v-if="view.payload?.changes.length" class="weekly-changes">
           <h3>本周变化</h3>
@@ -1852,12 +2051,11 @@ onBeforeUnmount(() => {
             </div>
             <div>
               <h3>计数</h3>
-              <p>
-                输入 {{ view.payload.summary.counts.input }} ·
-                通过 {{ view.payload.summary.counts.pass }} ·
-                淘汰 {{ view.payload.summary.counts.drop }} ·
-                数据不足 {{ view.payload.summary.counts.insufficient }} ·
-                人工覆盖 {{ view.payload.summary.counts.overrides }}
+              <p class="count-strip">
+                <span class="count-chip">输入 <strong>{{ view.payload.summary.counts.input }}</strong></span>
+                <span class="count-chip count-pass">通过 <strong>{{ view.payload.summary.counts.pass }}</strong></span>
+                <span class="count-chip count-drop">淘汰 <strong>{{ view.payload.summary.counts.drop }}</strong></span>
+                <span class="count-chip count-insuf">数据不足 <strong>{{ view.payload.summary.counts.insufficient }}</strong></span>
               </p>
             </div>
           </section>
@@ -1908,11 +2106,20 @@ onBeforeUnmount(() => {
           <div
             v-for="group in RESULT_GROUPS"
             :key="group.key"
-            class="table-wrap"
+            class="table-wrap result-group-wrap"
             tabindex="0"
             :aria-label="stageAriaLabel(view.title, `${group.title}，可横向滚动`)"
           >
-            <table>
+            <button
+              v-if="groupCollapsed(view, group.key)"
+              type="button"
+              class="expand-btn"
+              :class="`expand-${group.key}`"
+              @click="showGroup(view, group.key)"
+            >
+              展开{{ group.title }}（{{ resultRows(view, group.key).length }}）
+            </button>
+            <table v-else>
               <caption>{{ view.title }} · {{ group.title }}</caption>
               <thead>
                 <tr>
@@ -1927,91 +2134,136 @@ onBeforeUnmount(() => {
                 </tr>
               </thead>
               <tbody>
-                <tr v-for="row in resultRows(view, group.key)" :key="row.code">
-                  <td>{{ row.name }}</td>
-                  <td>{{ row.code }}</td>
-                  <td>{{ verdictLabel(row.original_verdict) }}</td>
-                  <td>{{ verdictLabel(row.verdict) }}</td>
-                  <td>{{ row.reason || '—' }}</td>
-                  <td>{{ row.rank ?? '—' }}</td>
-                  <td>{{ row.metrics_unavailable_reason || '可用' }}</td>
-                  <td v-for="metric in view.metricKeys" :key="metric">
-                    {{ formatValue(row.metrics[metric]) }}
-                  </td>
-                </tr>
+                <template v-for="row in resultRows(view, group.key)" :key="row.code">
+                  <tr>
+                    <td>
+                      {{ row.name }}
+                      <button
+                        v-if="canResearchPass(view, group.key, row)"
+                        type="button"
+                        :disabled="!!researchingCode"
+                        :aria-label="`评估 ${row.name}，继续深度研究`"
+                        @click="startTrackResearch(view, row)"
+                      >
+                        {{ researchingCode === row.code ? '正在创建深研…' : '评估' }}
+                      </button>
+                      <p
+                        v-if="researchErrorCode === row.code && actionError"
+                        role="alert"
+                      >
+                        {{ actionError }}
+                      </p>
+                    </td>
+                    <td>{{ row.code }}</td>
+                    <td>{{ verdictLabel(row.original_verdict) }}</td>
+                    <td>{{ verdictLabel(row.verdict) }}</td>
+                    <td>{{ row.reason ? formatEvidenceText(row.reason) : '—' }}</td>
+                    <td>{{ row.rank ?? '—' }}</td>
+                    <td>{{ row.metrics_unavailable_reason || '可用' }}</td>
+                    <td v-for="metric in view.metricKeys" :key="metric">
+                      {{ formatValue(row.metrics[metric]) }}
+                    </td>
+                  </tr>
+                  <template v-if="group.key === 'pass' && showsCandidateCases(view) && view.track">
+                    <tr
+                      v-for="caseItem in adjudicationCases(view, row.code)"
+                      :key="`${caseItem.track}:${caseItem.code}`"
+                      class="case-row"
+                    >
+                      <td :colspan="7 + view.metricKeys.length">
+                        <details class="case-details">
+                          <summary>
+                            候选案例 · {{ caseItem.name }}（{{ caseItem.code }}）· {{ researchVerdict(caseItem) }}
+                            <span
+                              class="badge"
+                              :class="caseRiskCount(caseItem) > 0 ? 'badge-warn' : 'badge-pass'"
+                            >
+                              {{ caseRiskCount(caseItem) > 0 ? `${caseRiskCount(caseItem)} 项风险提示` : '无反方风险' }}
+                            </span>
+                          </summary>
+                          <article
+                            class="case-card"
+                            :aria-labelledby="`case-${caseItem.track}-${caseItem.code}`"
+                          >
+                            <div class="toolbar">
+                              <h3 :id="`case-${caseItem.track}-${caseItem.code}`">
+                                {{ caseItem.name }}（{{ caseItem.code }}）
+                              </h3>
+                              <strong class="research-verdict">{{ researchVerdict(caseItem) }}</strong>
+                            </div>
+                            <dl>
+                              <div><dt>轨道</dt><dd>{{ TRACK_ZH[caseItem.track] }}</dd></div>
+                              <div v-if="caseItem.overridden">
+                                <dt>入围原因</dt><dd>{{ caseItem.surfacedReason }}</dd>
+                              </div>
+                              <div>
+                                <dt>关键证据</dt>
+                                <dd>
+                                  <ul>
+                                    <li v-for="evidence in factEvidence(caseItem)" :key="evidence.id">
+                                      {{ formatEvidenceText(evidence.display_text) }}
+                                    </li>
+                                  </ul>
+                                </dd>
+                              </div>
+                              <div><dt>风险与反方证据</dt><dd>{{ riskText(caseItem) }}</dd></div>
+                              <div><dt>数据缺口与新鲜度</dt><dd>{{ freshnessText(caseItem) }}</dd></div>
+                              <div><dt>变化分类</dt><dd>{{ weeklyChangeText(view, caseItem) }}</dd></div>
+                              <div>
+                                <dt>上周状态</dt>
+                                <dd>{{ weeklyStateText(weeklyChange(view, caseItem), 'previous') }}</dd>
+                              </div>
+                              <div>
+                                <dt>本周状态</dt>
+                                <dd>{{ weeklyStateText(weeklyChange(view, caseItem), 'current') }}</dd>
+                              </div>
+                              <div>
+                                <dt>上周理由</dt>
+                                <dd>{{ weeklyReasonText(weeklyChange(view, caseItem), 'previous') }}</dd>
+                              </div>
+                              <div>
+                                <dt>本周理由</dt>
+                                <dd>{{ weeklyReasonText(weeklyChange(view, caseItem), 'current') }}</dd>
+                              </div>
+                            </dl>
+                            <button
+                              v-if="caseItem.decision?.decision === 'keep'"
+                              type="button"
+                              :disabled="!!researchingCode"
+                              @click="startResearch(caseItem)"
+                            >
+                              {{ researchingCode === caseItem.code ? '正在创建深研…' : '加入本周深研' }}
+                            </button>
+                          </article>
+                        </details>
+                      </td>
+                    </tr>
+                  </template>
+                </template>
                 <tr v-if="!resultRows(view, group.key).length">
                   <td :colspan="7 + view.metricKeys.length">暂无{{ group.title }}</td>
                 </tr>
               </tbody>
             </table>
+            <template v-if="group.key === 'pass' && showsCandidateCases(view) && view.track">
+              <p v-if="casesLoading(view)" class="muted">
+                正在读取候选案例…
+              </p>
+              <div v-if="candidatePayloadError(view)" role="alert">
+                <p>{{ candidatePayloadError(view) }}</p>
+                <button type="button" @click="retryAdjudicationPayload(view)">
+                  重试候选案例
+                </button>
+              </div>
+              <p v-else-if="casesLoaded(view) && !adjudicationCases(view).length" class="muted">
+                本轨道没有案例卡。
+              </p>
+            </template>
           </div>
 
-          <div
-            class="table-wrap"
-            tabindex="0"
-            :aria-label="stageAriaLabel(view.title, '人工覆盖记录，可横向滚动')"
-          >
-            <table>
-              <caption>{{ view.title }} · 人工覆盖记录</caption>
-              <thead>
-                <tr>
-                  <th>名称</th>
-                  <th>代码</th>
-                  <th>覆盖方向</th>
-                  <th>原判定</th>
-                  <th>有效判定</th>
-                  <th>覆盖理由</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr v-for="override in view.payload.overrides" :key="override.id">
-                  <td>{{ overrideResult(view, override.code)?.name || override.code }}</td>
-                  <td>{{ override.code }}</td>
-                  <td>{{ overrideDirection(override) }}</td>
-                  <td>{{ overrideVerdict(view, override.code, true) }}</td>
-                  <td>{{ overrideVerdict(view, override.code, false) }}</td>
-                  <td>{{ override.reason }}</td>
-                </tr>
-                <tr v-if="!view.payload.overrides.length">
-                  <td colspan="6">暂无人工覆盖记录</td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-
-          <form
-            v-if="view.track && actionsFor(view).override"
-            class="inline-form override-form"
-            @submit.prevent="saveOverride(view)"
-          >
-            <label>
-              覆盖代码
-              <input v-model="overrideCode" type="text" name="override_code" required />
-            </label>
-            <label>
-              覆盖动作
-              <select v-model="overrideAction" name="override_action">
-                <option value="forced_pass">改为通过</option>
-                <option value="forced_drop">改为淘汰</option>
-              </select>
-            </label>
-            <label>
-              覆盖理由
-              <input v-model="overrideReason" type="text" name="override_reason" required />
-            </label>
-            <button type="submit" :disabled="mutating">保存人工覆盖</button>
-          </form>
         </template>
 
         <div class="stage-actions">
-          <button
-            v-if="actionsFor(view).confirm"
-            type="button"
-            :disabled="mutating"
-            @click="stageMutation(view, 'confirm')"
-          >
-            确认本层
-          </button>
           <button
             v-if="actionsFor(view).retry"
             type="button"
@@ -2020,9 +2272,6 @@ onBeforeUnmount(() => {
           >
             重试本层
           </button>
-          <span v-if="view.stage !== 'adjudication'" class="muted">
-            仅在等待确认时可确认。
-          </span>
         </div>
       </article>
 
@@ -2055,56 +2304,194 @@ onBeforeUnmount(() => {
   margin-bottom: 0.35rem;
 }
 
+.run-meta-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 1.25rem;
+  font-size: 0.85rem;
+  color: #464139;
+  background: #faf8f3;
+  border: 1px solid #e8e2d5;
+  padding: 0.45rem 0.75rem;
+}
+
+.run-meta-bar code {
+  font-size: 0.8rem;
+  background: #efeae0;
+  padding: 0.05rem 0.35rem;
+  border-radius: 2px;
+  color: #2c2925;
+}
+
+.stage-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  margin: 0.65rem 0;
+}
+
+.stage-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.36rem 0.78rem;
+  border-radius: 3px;
+  border: 1px solid #d0c8b8;
+  background: #fff;
+  color: #3b3730;
+  font-size: 0.9rem;
+}
+
+.stage-tab-count {
+  font-variant-numeric: tabular-nums;
+  font-size: 0.78rem;
+  background: #f1ece2;
+  color: #5c564c;
+  padding: 0.05rem 0.38rem;
+  border-radius: 2px;
+}
+
+.stage-tab.active {
+  background: #1b5e4a;
+  border-color: #1b5e4a;
+  color: #fff;
+  font-weight: 600;
+}
+
+.stage-tab.active .stage-tab-count {
+  background: rgba(255, 255, 255, 0.2);
+  color: #fff;
+}
+
 .stage-panel h2,
 .stage-panel h3 {
   margin-top: 0;
 }
 
 .stage-panel h3 {
-  font-size: 1rem;
-  margin-bottom: 0.35rem;
+  font-size: 0.92rem;
+  color: #464139;
+  margin-bottom: 0.4rem;
 }
 
 .stage-selector {
   display: flex;
   align-items: center;
   gap: 0.4rem;
-  font-size: 0.9rem;
+  font-size: 0.88rem;
 }
 
 .stage-summary {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 0.75rem;
+  grid-template-columns: 1.4fr 0.9fr 1.1fr;
+  gap: 0.65rem;
 }
 
 .stage-summary > div,
 .summary-details {
   border: 1px solid #e4ddd0;
-  padding: 0.7rem;
+  background: #faf8f3;
+  padding: 0.65rem 0.85rem;
 }
 
 .stage-summary p,
 .stage-summary ul {
   margin: 0;
+  font-size: 0.88rem;
+}
+
+.stage-summary ul {
+  padding-left: 1.1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.count-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.count-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  background: #fff;
+  border: 1px solid #ddd5c5;
+  padding: 0.2rem 0.5rem;
+  border-radius: 2px;
+  font-size: 0.84rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.count-pass {
+  background: #e3f1ec;
+  border-color: #b7dccf;
+  color: #1b5e4a;
+}
+
+.count-drop {
+  background: #fbeaea;
+  border-color: #e6b8b8;
+  color: #9f1d1d;
+}
+
+.count-insuf {
+  background: #fdf3e6;
+  border-color: #ead0ad;
+  color: #8a4b08;
+}
+
+.result-group-wrap {
+  display: inline-block;
+  margin-right: 0.5rem;
+}
+
+.result-group-wrap:has(table) {
+  display: block;
+  margin-right: 0;
+}
+
+.expand-btn {
+  font-weight: 600;
+}
+
+.expand-pass {
+  border-color: #b7dccf;
+  background: #f2f9f6;
+  color: #1b5e4a;
+}
+
+.expand-drop {
+  border-color: #e2dad0;
+  background: #faf8f3;
+  color: #5c564c;
+}
+
+.expand-insufficient {
+  border-color: #ead0ad;
+  background: #fdfaf4;
+  color: #8a4b08;
 }
 
 .summary-details {
-  margin: 0.75rem 0;
+  margin: 0.65rem 0;
 }
 
 .summary-details summary {
   cursor: pointer;
   font-weight: 600;
+  font-size: 0.88rem;
 }
 
 .summary-details h3 {
-  margin-top: 0.85rem;
+  margin-top: 0.75rem;
 }
 
 .table-wrap {
   overflow-x: auto;
-  margin: 0.5rem 0 1rem;
+  margin: 0.45rem 0 0.75rem;
 }
 
 caption {
@@ -2128,18 +2515,30 @@ td {
   flex-wrap: wrap;
   align-items: center;
   gap: 0.6rem;
-  margin-top: 0.75rem;
+  margin-top: 0.5rem;
 }
 
-.keeper-summary {
-  border-bottom: 1px solid #e4ddd0;
-  margin-bottom: 0.75rem;
+.case-row td {
+  white-space: normal;
+}
+
+.case-details {
+  position: sticky;
+  left: 0;
+  max-width: min(58rem, calc(100vw - 4rem));
+}
+
+.case-details > summary {
+  cursor: pointer;
+  font-weight: 600;
 }
 
 .case-card {
-  border: 1px solid #e4ddd0;
-  padding: 0.85rem;
-  margin: 0.75rem 0;
+  border: 1px solid #d8d2c4;
+  border-left: 3px solid #1b5e4a;
+  background: #faf8f3;
+  padding: 0.85rem 1rem;
+  margin: 0.65rem 0;
 }
 
 .case-card dl,

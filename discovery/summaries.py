@@ -88,13 +88,13 @@ def _attribute(row: object, name: str) -> object:
 def _canonical_decimal(value: Decimal) -> str:
     if not value.is_finite():
         raise DiscoverySummaryError("persisted discovery metric is non-finite")
-    digits = value.as_tuple().digits
-    exponent = value.as_tuple().exponent
+    _, digits, exponent = value.as_tuple()
+    adjusted = value.adjusted()
     if (
         not isinstance(exponent, int)
         or len(digits) > DISCOVERY_DECIMAL_COMPONENT_LIMIT
         or abs(exponent) > DISCOVERY_DECIMAL_COMPONENT_LIMIT
-        or abs(value.adjusted()) > DISCOVERY_DECIMAL_COMPONENT_LIMIT
+        or abs(adjusted) > DISCOVERY_DECIMAL_COMPONENT_LIMIT
     ):
         raise DiscoverySummaryError("persisted discovery metric is too large")
     if value.is_zero():
@@ -102,12 +102,10 @@ def _canonical_decimal(value: Decimal) -> str:
     sign_length = int(value.is_signed())
     if exponent >= 0:
         fixed_length = sign_length + len(digits) + exponent
-    elif value.adjusted() >= 0:
+    elif adjusted >= 0:
         fixed_length = sign_length + len(digits) + 1
     else:
-        fixed_length = (
-            sign_length + 2 + (-value.adjusted() - 1) + len(digits)
-        )
+        fixed_length = sign_length + 2 + (-adjusted - 1) + len(digits)
     if fixed_length > SUMMARY_DECIMAL_OUTPUT_LIMIT:
         raise DiscoverySummaryError("persisted discovery metric is too large")
     text = format(value, "f")

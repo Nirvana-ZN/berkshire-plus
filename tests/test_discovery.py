@@ -98,7 +98,6 @@ def test_discovery_view_guides_stages_with_typed_structured_results() -> None:
         "通过",
         "淘汰",
         "数据不足",
-        "人工覆盖",
         "本层固定规则",
         "尺子版本/改因",
         "计数",
@@ -115,7 +114,6 @@ def test_discovery_view_guides_stages_with_typed_structured_results() -> None:
     assert "interface StageSummary" in page
     assert "/stages/safety" in page
     assert "/tracks/${view.track}/stages/${view.stage}" in page
-    assert "/overrides" in page
     assert "activeRunId" in page
     assert "activeStageKey" in page
     assert "AbortController" in page
@@ -137,9 +135,6 @@ def test_discovery_view_requires_override_reason_and_terminal_guidance() -> None
         encoding="utf-8"
     )
 
-    assert 'overrideReason.value.trim()' in page
-    assert 'name="override_reason"' in page
-    assert "仅在等待确认时可确认" in page
     assert "仅瞬时失败可重试" in page
     assert "放弃本批次并重新创建" in page
     assert "Number.isFinite" in page
@@ -163,11 +158,10 @@ def test_discovery_view_review_guards_and_adjudication() -> None:
     assert "通过结果" in page
     assert "淘汰结果" in page
     assert "数据不足结果" in page
-    assert "人工覆盖记录" in page
     assert "stageAriaLabel" in page
     assert "stage !== 'adjudication'" in helper
     apply_run = page[page.index("async function applyRun") : page.index("async function readCurrent")]
-    assert apply_run.index("schedulePoll()") < apply_run.index("void Promise.allSettled")
+    assert apply_run.index("schedulePoll()") < apply_run.index("void loadStagesInOrder")
     assert "if (stageControllers.has(cacheKey)) {" in page
     assert "armStageFetchTimeout" in page
     assert "reviewedStageActions" in page
@@ -214,22 +208,16 @@ def test_discovery_view_renders_actionable_case_cards() -> None:
         "变化分类",
         "值得深研",
         "观察",
-        "排除",
-        "保留为候选",
         "加入本周深研",
-        "已保留",
         "候选不足",
     ):
         assert label in page
     assert "尚无结构化反方证据" in page
-    assert 'v-for="caseItem in adjudicationCases(view)"' in page
-    assert 'name="exclusion_reason"' in page
-    assert "exclusionReason(caseItem).trim()" in page
-    assert "/decisions" in page
+    assert 'v-for="caseItem in adjudicationCases(view, row.code)"' in page
+    assert '<details class="case-details">' in page
     assert "/research" in page
     assert "stageExpectation(validated.identity)" in page
     assert "keeperCount(view)" in page
-    assert "keeperCount(view) >= 3" in page
     assert "router.push(`/research/${data.id}`)" in page
     assert "买入" not in page
     assert "卖出" not in page
@@ -254,7 +242,6 @@ def test_candidate_cards_fail_closed_with_retry_and_scoped_drafts() -> None:
     assert "kind: 'error'" in loader
     assert "@click=\"retryAdjudicationPayload(view)\"" in page
     assert "候选案例不可用于裁决" in page
-    assert "draftKey(caseItem)" in page
     assert "`${item.track}:${item.code}`" in page
     assert "change.classifications" in helper
     assert "weeklyChangeText(view, caseItem)" in page
@@ -265,10 +252,7 @@ def test_case_cards_enforce_keeper_limit_and_show_weekly_details() -> None:
         encoding="utf-8"
     )
 
-    assert "keeperRange(keeperCount(view)) === 'over-limit'" in page
-    assert "请先排除" in page
-    assert "将保留数降至 5 家" in page
-    assert "!canCompleteAdjudication(view)" in page
+    assert "keeperRange(keeperCount(view)) === 'over-limit'" not in page
     assert "已达到 3 家最低候选数" not in page
     assert "通过候选竞争固定尺子" not in page
     assert "candidateSurfacedReason(row" in page

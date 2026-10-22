@@ -25,7 +25,7 @@ from discovery.company_payload import SCHEMA_VERSION as COMPANY_PAYLOAD_SCHEMA_V
 from discovery.field_dictionary import FIELD_DICTIONARY
 from discovery.industry import IndustryBranch, classify_industry_branch
 from discovery.quality_contract import quality_branch_data_contract
-from market.cheap import CheapRow, security_state_eligible
+from market.universe import UniverseRow, security_state_eligible
 
 QUALITY_DISCOUNT = "quality_discount"
 DEEP_VALUE = "deep_value"
@@ -199,7 +199,7 @@ def _sector_policies(
 
 def _persisted_universe(
     session: Session, as_of: date
-) -> tuple[list[CheapRow], tuple[str, ...], datetime | None]:
+) -> tuple[list[UniverseRow], tuple[str, ...], datetime | None]:
     end = datetime.combine(
         as_of + timedelta(days=1), time.min, tzinfo=timezone.utc
     )
@@ -222,11 +222,8 @@ def _persisted_universe(
     checkpoint_count = (
         select(func.count())
         .select_from(DiscoveryDataCheckpoint)
-        .where(
-            DiscoveryDataCheckpoint.fill_id
-            == DiscoveryUniverseSecurity.fill_id
-        )
-        .correlate(DiscoveryUniverseSecurity)
+        .where(DiscoveryDataCheckpoint.fill_id == latest_fill)
+        .correlate(None)
         .scalar_subquery()
     )
     records = session.execute(
@@ -274,7 +271,7 @@ def _persisted_universe(
     ):
         return [], (), None
     rows = [
-        CheapRow(
+        UniverseRow(
             code=row.code,
             name=row.name,
             price=None,
@@ -351,30 +348,36 @@ def _financial_history(
     if not codes:
         return histories, None
     source_dates: list[str] = []
-    rows = session.execute(
-        select(
-            Financial,
-            FinancialFieldProvenance.field,
-        )
-        .outerjoin(
-            FinancialFieldProvenance,
-            and_(
-                FinancialFieldProvenance.code == Financial.code,
-                FinancialFieldProvenance.period == Financial.period,
-                FinancialFieldProvenance.period_type
-                == Financial.period_type,
+    # Plain column rows: joining whole Financial entities to provenance
+    # decoded ~40 columns per provenance row and took ~40 s at full market.
+    strict = set(
+        map(tuple, session.execute(
+            select(
+                FinancialFieldProvenance.code,
+                FinancialFieldProvenance.period,
+                FinancialFieldProvenance.field,
+            ).where(
+                FinancialFieldProvenance.period_type == "annual",
                 FinancialFieldProvenance.source == "discovery",
                 FinancialFieldProvenance.field.in_(_FINANCIAL_FIELDS),
-            ),
-        )
-        .where(
+                FinancialFieldProvenance.code.in_(codes),
+            )
+        ))
+    )
+    rows = session.execute(
+        select(
+            Financial.code,
+            Financial.period,
+            Financial.source_as_of,
+            *(getattr(Financial, field) for field in _FINANCIAL_FIELDS),
+        ).where(
             Financial.period_type == "annual",
             Financial.code.in_(codes),
         )
     )
-    for financial, strict_field in rows:
-        period_end = _period_end(financial.period)
-        source_date = _source_date(financial.source_as_of)
+    for code, period_name, source_as_of, *values in rows:
+        period_end = _period_end(period_name)
+        source_date = _source_date(source_as_of)
         if (
             period_end is None
             or source_date is None
@@ -382,13 +385,14 @@ def _financial_history(
             or source_date > as_of
         ):
             continue
-        period = histories[financial.code].setdefault(
-            financial.period,
+        period = histories[code].setdefault(
+            period_name,
             {field: None for field in _FINANCIAL_FIELDS},
         )
-        if strict_field is not None:
-            period[strict_field] = getattr(financial, strict_field)
-        source_dates.append(financial.source_as_of)
+        for field, value in zip(_FINANCIAL_FIELDS, values):
+            if (code, period_name, field) in strict:
+                period[field] = value
+        source_dates.append(source_as_of)
     return histories, max(source_dates, default=None)
 
 

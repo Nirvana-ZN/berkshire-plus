@@ -477,6 +477,153 @@ def test_only_final_kept_candidate_with_evidence_can_start(
             assert session.scalar(select(func.count()).select_from(ResearchJob)) == 0
 
 
+def test_track_gate_pass_cannot_start_research_before_finalists(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        discovery_routes,
+        "_dispatch_discovery_research",
+        _finish_dispatch,
+    )
+    app = _app(tmp_path)
+    code = "600519.SH"
+    with TestClient(app) as client:
+        with app.state.session_factory() as session:
+            run = _run(session)
+            freeze_inputs(
+                session,
+                run,
+                [
+                    CompanySnapshotInput(
+                        code=code,
+                        name="贵州茅台",
+                        industry="制造业",
+                        security_status={},
+                        fields={},
+                        sources={},
+                        as_of={
+                            "security": "2026-09-17",
+                            "financial": "2026-09-17",
+                            "valuation": "2026-09-17",
+                        },
+                    )
+                ],
+                SnapshotVersions(
+                    data_version=run.data_version,
+                    financial_version=run.financial_version,
+                    valuation_version=run.valuation_version,
+                    ruler_version_ids={
+                        track: getattr(run, f"{track}_ruler_version_id")
+                        for track in TRACKS
+                    },
+                    algorithm_version=run.algorithm_version,
+                ),
+                {"SH": ["2026-09-17"]},
+                snapshot_at=NOW,
+            )
+            common = DiscoveryCommonStage(
+                run_id=run.id,
+                attempt=1,
+                status="confirmed",
+                total_count=1,
+                pass_count=1,
+                drop_count=0,
+                insufficient_count=0,
+                error=None,
+                confirmed_at=NOW,
+                input_fingerprint=run.input_fingerprint,
+                algorithm_version=run.algorithm_version,
+                failure_kind=None,
+                superseded_at=None,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+            session.add(common)
+            session.flush()
+            gate = DiscoveryStage(
+                run_id=run.id,
+                track="quality_discount",
+                stage="track_gate",
+                attempt=1,
+                status="waiting_confirmation",
+                total_count=1,
+                pass_count=1,
+                drop_count=0,
+                insufficient_count=0,
+                error=None,
+                confirmed_at=None,
+                input_fingerprint=run.input_fingerprint,
+                ruler_version_id=run.quality_discount_ruler_version_id,
+                algorithm_version=run.algorithm_version,
+                common_stage_id=common.id,
+                predecessor_stage_id=None,
+                predecessor_stage=None,
+                failure_kind=None,
+                superseded_at=None,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+            session.add(gate)
+            session.flush()
+            session.add(
+                DiscoveryResult(
+                    run_id=run.id,
+                    track="quality_discount",
+                    stage="track_gate",
+                    attempt=gate.attempt,
+                    code=code,
+                    verdict="pass",
+                    reason="passed the gate",
+                    metrics_json="{}",
+                    rank=1,
+                    created_at=NOW,
+                )
+            )
+            session.commit()
+            run_id = run.id
+        response = _post(client, run_id, "quality_discount", code)
+        assert response.status_code == 409
+        assert response.json()["code"] == "DISCOVERY_CANDIDATE_NOT_RESEARCHABLE"
+        with app.state.session_factory() as session:
+            assert session.scalar(select(func.count()).select_from(ResearchJob)) == 0
+
+
+def test_confirmed_competition_finalist_can_be_researched_without_adjudication(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        discovery_routes,
+        "_dispatch_discovery_research",
+        _finish_dispatch,
+    )
+    app = _app(tmp_path)
+    code = "600519.SH"
+    with TestClient(app) as client:
+        with app.state.session_factory() as session:
+            run = _run(session)
+            _seed_finalists(session, run, {"quality_discount": [code]})
+            session.execute(
+                DiscoveryResult.__table__.delete().where(
+                    DiscoveryResult.run_id == run.id,
+                    DiscoveryResult.stage == "adjudication",
+                )
+            )
+            session.execute(
+                DiscoveryStage.__table__.delete().where(
+                    DiscoveryStage.run_id == run.id,
+                    DiscoveryStage.stage == "adjudication",
+                )
+            )
+            session.commit()
+            run_id = run.id
+        response = _post(client, run_id, "quality_discount", code)
+        assert response.status_code == 200
+        with app.state.session_factory() as session:
+            job = session.scalar(select(ResearchJob))
+            assert job is not None
+            assert job.code == code
+
+
 def test_created_job_has_provenance_and_does_not_add_watchlist(
     tmp_path: Path, monkeypatch
 ) -> None:

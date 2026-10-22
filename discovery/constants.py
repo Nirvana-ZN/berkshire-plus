@@ -2,6 +2,7 @@
 
 from collections.abc import Callable
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 
 NowProvider = Callable[[], datetime]
 
@@ -92,3 +93,14 @@ RUN_TERMINAL_STATUSES = frozenset(
 )
 VERDICTS = frozenset({"pass", "drop", "insufficient"})
 FAILURE_KINDS = frozenset({"transient", "permanent"})
+
+# A normal week leaves ~1% of the market insufficient; W39/W40 left 28%/59%
+# because prices were dated off the trading calendar.
+COMMON_READINESS_MIN = Decimal("0.95")
+# ChinaBond 10-year yield (%); refresh before each recalibration.
+TREASURY_YIELD = "1.69"
+TREASURY_YIELD_DATE = "2026-10-08"
+
+
+def common_ready(pass_count: int, drop_count: int, total_count: int) -> bool:
+    return Decimal(pass_count + drop_count) >= COMMON_READINESS_MIN * total_count

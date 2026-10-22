@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from datetime import date
 import hashlib
 import json
+import threading
+from types import SimpleNamespace
 from typing import Iterable
 
 from sqlalchemy import select
@@ -14,11 +16,12 @@ from sqlalchemy.orm import Session
 from app.discovery_models import (
     DiscoveryCommonStage,
     DiscoveryDecision,
+    DiscoveryInputSnapshot,
     DiscoveryResult,
     DiscoveryRun,
     DiscoveryStage,
 )
-from discovery.constants import TRACKS
+from discovery.constants import TRACKS, common_ready
 from discovery.snapshot import canonical_json, load_frozen_inputs
 
 
@@ -26,6 +29,15 @@ VERDICTS = frozenset({"pass", "drop", "insufficient"})
 DECISIONS = frozenset({"keep", "exclude"})
 TERMINAL_ADJUDICATION = frozenset({"confirmed", "insufficient_candidates"})
 _TRACK_ORDER = {track: index for index, track in enumerate(TRACKS)}
+# (database, run_id, code, stored input_fingerprint) -> (name, data fingerprint).
+# (database, run_id, run input_fingerprint) -> run lineage from a full check.
+# ponytail: process-wide and never evicted; they only hold selected companies
+# (tens per track-week) and one small entry per run. A changed stored
+# fingerprint misses the cache and re-runs the full frozen-input check, but a
+# row whose JSON changes without its fingerprint is only caught after a restart.
+_COMPANY_FACTS: dict[tuple[str, int, str, str], tuple[str, str]] = {}
+_RUN_LINEAGE: dict[tuple[str, int, str | None], SimpleNamespace] = {}
+_FILL_LOCK = threading.Lock()
 
 
 class CorruptDiscoveryHistory(ValueError):
@@ -400,41 +412,78 @@ def _validate_track_lineage(
     return parent
 
 
+def _common_complete(session: Session, run: DiscoveryRun) -> bool:
+    stage = session.scalars(
+        select(DiscoveryCommonStage)
+        .where(
+            DiscoveryCommonStage.run_id == run.id,
+            DiscoveryCommonStage.superseded_at.is_(None),
+        )
+        .order_by(DiscoveryCommonStage.attempt.desc(), DiscoveryCommonStage.id.desc())
+    ).first()
+    return stage is not None and common_ready(
+        stage.pass_count, stage.drop_count, stage.total_count
+    )
+
+
+def _readable_stage(
+    session: Session,
+    run: DiscoveryRun,
+    track: str,
+    stage_name: str,
+) -> DiscoveryStage | None:
+    stage = session.scalars(
+        select(DiscoveryStage)
+        .where(
+            DiscoveryStage.run_id == run.id,
+            DiscoveryStage.track == track,
+            DiscoveryStage.stage == stage_name,
+            DiscoveryStage.superseded_at.is_(None),
+        )
+        .order_by(DiscoveryStage.attempt.desc(), DiscoveryStage.id.desc())
+    ).first()
+    readable = (
+        TERMINAL_ADJUDICATION
+        if stage_name == "adjudication"
+        else {"waiting_confirmation", "confirmed"}
+    )
+    if stage is None or stage.status not in readable:
+        return None
+    return stage
+
+
+def _passing_codes(
+    session: Session, stage: DiscoveryStage
+) -> set[str]:
+    return set(
+        session.scalars(
+            select(DiscoveryResult.code).where(
+                DiscoveryResult.run_id == stage.run_id,
+                DiscoveryResult.track == stage.track,
+                DiscoveryResult.stage == stage.stage,
+                DiscoveryResult.attempt == stage.attempt,
+                DiscoveryResult.verdict == "pass",
+            )
+        )
+    )
+
+
 def _completed_track_rows(
     session: Session,
     run: DiscoveryRun,
     track: str,
     stage_name: str,
+    codes: set[str] | None = None,
 ) -> tuple[PersistedCompanyResult, ...] | None:
-    """Return an exact persisted track state, or None for unsafe lineage."""
+    """Return an exact persisted track state, or None for unsafe lineage.
+
+    ``codes`` limits the returned rows; every result is still validated.
+    """
 
     try:
-        stage = session.scalars(
-            select(DiscoveryStage)
-            .where(
-                DiscoveryStage.run_id == run.id,
-                DiscoveryStage.track == track,
-                DiscoveryStage.stage == stage_name,
-                DiscoveryStage.superseded_at.is_(None),
-            )
-            .order_by(DiscoveryStage.attempt.desc(), DiscoveryStage.id.desc())
-        ).first()
-        readable = (
-            TERMINAL_ADJUDICATION
-            if stage_name == "adjudication"
-            else {"waiting_confirmation", "confirmed"}
-        )
-        if stage is None or stage.status not in readable:
+        stage = _readable_stage(session, run, track, stage_name)
+        if stage is None:
             return None
-        frozen = load_frozen_inputs(session, run.id)
-        parent = _validate_track_lineage(
-            session, run, track, stage, frozen
-        )
-        companies = {row.code: row for row in frozen.companies}
-        if (
-            len(companies) != len(frozen.companies)
-        ):
-            raise CorruptDiscoveryHistory("persisted stage lineage is corrupt")
         results = session.scalars(
             select(DiscoveryResult)
             .where(
@@ -446,6 +495,50 @@ def _completed_track_rows(
             .order_by(DiscoveryResult.code, DiscoveryResult.id)
         ).all()
         result_by_code = {row.code: row for row in results}
+        wanted = (
+            set(result_by_code) if codes is None else codes & set(result_by_code)
+        )
+        stored = dict(
+            session.execute(
+                select(
+                    DiscoveryInputSnapshot.code,
+                    DiscoveryInputSnapshot.input_fingerprint,
+                ).where(
+                    DiscoveryInputSnapshot.run_id == run.id,
+                    DiscoveryInputSnapshot.code.in_(sorted(wanted)),
+                )
+            ).all()
+        )
+        database = str(session.get_bind().url)
+
+        def facts_key(code: str) -> tuple[str, int, str, str]:
+            return (database, run.id, code, stored.get(code, ""))
+
+        # Page polls reach here; checking and parsing a full-market run's
+        # frozen inputs took seconds per request, so do each once, and
+        # don't let concurrent cold polls parse the same companies twice.
+        run_key = (database, run.id, run.input_fingerprint)
+
+        def missing() -> set[str]:
+            return {code for code in wanted if facts_key(code) not in _COMPANY_FACTS}
+
+        if missing() or run_key not in _RUN_LINEAGE:
+            with _FILL_LOCK:
+                if missing() or run_key not in _RUN_LINEAGE:
+                    frozen = load_frozen_inputs(session, run.id, codes=missing())
+                    for company in frozen.companies:
+                        _COMPANY_FACTS[facts_key(company.code)] = (
+                            company.name,
+                            _data_fingerprint(company),
+                        )
+                    _RUN_LINEAGE[run_key] = SimpleNamespace(
+                        input_fingerprint=frozen.input_fingerprint,
+                        algorithm_version=frozen.algorithm_version,
+                        ruler_version_ids=dict(frozen.ruler_version_ids),
+                    )
+        parent = _validate_track_lineage(
+            session, run, track, stage, _RUN_LINEAGE[run_key]
+        )
         if len(result_by_code) != len(results) or stage.total_count != len(results):
             raise CorruptDiscoveryHistory("persisted results are corrupt")
         decisions = ()
@@ -499,11 +592,14 @@ def _completed_track_rows(
                 _json_value(row.metrics_json)
         rows = []
         for result in results:
-            company = companies.get(result.code)
-            if company is None:
+            if result.code not in wanted:
+                continue
+            facts = _COMPANY_FACTS.get(facts_key(result.code))
+            if facts is None:
                 raise CorruptDiscoveryHistory(
                     "persisted result has no frozen company"
                 )
+            name, data_fingerprint = facts
             decision = decision_by_code.get(result.code)
             rows.append(
                 PersistedCompanyResult(
@@ -512,9 +608,9 @@ def _completed_track_rows(
                     track=track,
                     stage=stage_name,
                     code=result.code,
-                    name=company.name,
-                    input_fingerprint=_data_fingerprint(company),
-                    frozen_input_fingerprint=company.input_fingerprint,
+                    name=name,
+                    input_fingerprint=data_fingerprint,
+                    frozen_input_fingerprint=stored[result.code],
                     ruler_version_id=stage.ruler_version_id,
                     verdict=result.verdict,
                     reason=(
@@ -569,20 +665,37 @@ def load_weekly_changes(
         selected_by_week[run.week_key] = run
     selected_by_week[current.week_key] = current
     ordered_runs = tuple(
-        selected_by_week[key] for key in sorted(selected_by_week)
+        selected_by_week[key]
+        for key in sorted(selected_by_week)
+        if _common_complete(session, selected_by_week[key])
     )
-    if len(ordered_runs) < 2:
+    if current not in ordered_runs or len(ordered_runs) < 2:
         return ()
     requested = TRACKS if track is None else (track,)
     changes: list[WeeklyChange] = []
     for selected_track in requested:
+        stages = {
+            run.id: _readable_stage(session, run, selected_track, stage)
+            for run in ordered_runs
+        }
+        if stages[current.id] is None:
+            continue
+        # Only a company selected in some week can become a change, and
+        # page polls land here: frozen inputs of a full-market week took
+        # seconds to parse per track, so load just the selected ones.
+        selected: set[str] = set()
+        for row in stages.values():
+            if row is not None:
+                selected |= _passing_codes(session, row)
         rows: list[PersistedCompanyResult] = []
         run_order = []
         current_loaded = False
         for run in ordered_runs:
             run_order.append((run.week_key, run.id))
+            if stages[run.id] is None:
+                continue
             persisted = _completed_track_rows(
-                session, run, selected_track, stage
+                session, run, selected_track, stage, selected
             )
             if persisted is not None:
                 rows.extend(persisted)

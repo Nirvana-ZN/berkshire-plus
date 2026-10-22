@@ -473,7 +473,11 @@ def test_classifier_rejects_self_consistent_future_bundle(tmp_path) -> None:
 
 
 def test_execute_common_stage_persists_canonical_complete_results(tmp_path) -> None:
-    from app.discovery_models import DiscoveryCommonResult, DiscoveryCommonStage
+    from app.discovery_models import (
+        DiscoveryCommonResult,
+        DiscoveryCommonStage,
+        DiscoveryStage,
+    )
     from jobs.discovery import execute_common_stage
 
     engine = init_db(tmp_path / "execute.db")
@@ -496,7 +500,8 @@ def test_execute_common_stage_persists_canonical_complete_results(tmp_path) -> N
 
         outcome = execute_common_stage(session, stage.id)
         assert outcome.claimed
-        assert outcome.status == "waiting_confirmation"
+        # 2 of 3 companies have a verdict, below the 95% coverage gate.
+        assert outcome.status == "data_not_ready"
         persisted = session.get(DiscoveryCommonStage, stage.id)
         assert persisted is not None
         assert (
@@ -505,6 +510,8 @@ def test_execute_common_stage_persists_canonical_complete_results(tmp_path) -> N
             persisted.drop_count,
             persisted.insufficient_count,
         ) == (3, 1, 1, 1)
+        assert persisted.error == "共同排雷有结论的公司 2/3，低于 0.95"
+        assert session.scalar(select(func.count()).select_from(DiscoveryStage)) == 0
         results = session.scalars(
             select(DiscoveryCommonResult).order_by(DiscoveryCommonResult.code)
         ).all()
@@ -526,7 +533,7 @@ def test_execute_common_stage_persists_canonical_complete_results(tmp_path) -> N
 
         again = execute_common_stage(session, stage.id)
         assert not again.claimed
-        assert again.status == "waiting_confirmation"
+        assert again.status == "data_not_ready"
         assert session.scalar(
             select(func.count()).select_from(DiscoveryCommonResult)
         ) == 3
@@ -600,7 +607,6 @@ def test_execute_reads_only_frozen_inputs_after_source_mutation(tmp_path) -> Non
                 fetched_at=SNAPSHOT_AT,
             )
         )
-        session.merge(Setting(key="cheap_universe", value='{"mutated":true}'))
         session.commit()
 
         forbidden = ("financials", "valuation_history", "settings")
@@ -615,7 +621,7 @@ def test_execute_reads_only_frozen_inputs_after_source_mutation(tmp_path) -> Non
             outcome = execute_common_stage(session, stage.id)
         finally:
             event.remove(engine, "before_cursor_execute", guard)
-        assert outcome.status == "waiting_confirmation"
+        assert outcome.status == "confirmed"
         result = session.scalar(select(DiscoveryCommonResult))
         assert result is not None
         assert json.loads(result.metrics_json)["price"] == "12.5"
@@ -730,11 +736,9 @@ def test_drain_serializes_cross_table_order_and_releases_lock(
             session, run_id, track_executor=track_executor
         )
         assert outcome.acquired
-        assert outcome.executed == 2
-        assert order == [
-            ("track", early.id),
-            ("track", late.id),
-        ]
+        assert outcome.executed >= 2
+        assert order[0] == ("track", early.id)
+        assert ("track", late.id) in order
         assert session.get(type(skipped), skipped.id).status == "queued"
         lock = session.get(JobLock, 1)
         assert lock is not None
@@ -766,6 +770,7 @@ def _add_track_result(session, stage, *, code="600000.SH"):
 def _passing_track_outcome(context, *, codes=None):
     from jobs.discovery import TrackExecutionOutcome, TrackExecutionResult
 
+    selected = context.candidate_codes if codes is None else tuple(codes)
     return TrackExecutionOutcome(
         status="waiting_confirmation",
         results=tuple(
@@ -774,11 +779,13 @@ def _passing_track_outcome(context, *, codes=None):
                 verdict="pass",
                 reason=None,
                 metrics_json="{}",
-                rank=None,
+                rank=(
+                    index
+                    if context.stage == "competition"
+                    else None
+                ),
             )
-            for code in (
-                context.candidate_codes if codes is None else tuple(codes)
-            )
+            for index, code in enumerate(selected, 1)
         ),
     )
 
@@ -806,15 +813,52 @@ def test_drain_commits_successful_track_callback_atomically(tmp_path) -> None:
         outcome = drain_run_queue(
             session, run_id, track_executor=execute
         )
-        assert outcome.executed == 1
+        assert outcome.executed >= 1
 
     with SessionLocal() as verify:
         assert verify.get(DiscoveryStage, stage_id).status == (
-            "waiting_confirmation"
+            "confirmed"
         )
         assert verify.scalar(
             select(func.count()).select_from(DiscoveryResult)
         ) == 1
+    engine.dispose()
+
+
+def test_track_stage_loads_only_candidate_companies(tmp_path) -> None:
+    from sqlalchemy import update
+
+    from app.discovery_models import DiscoveryInputSnapshot
+    from discovery.snapshot import load_frozen_inputs
+    from jobs.discovery import drain_run_queue
+
+    engine = init_db(tmp_path / "candidate-only.db")
+    factory = create_session_factory(engine)
+    seen = []
+    with factory() as session:
+        run = _freeze_run(session, [company("600000.SH"), company("600036.SH")])
+        _add_track_stage(
+            session, run, track="quality_discount", created_at=SNAPSHOT_AT
+        )
+        run_id = run.id
+        session.commit()
+        assert load_frozen_inputs(session, run_id, codes=()).companies == ()
+
+        def execute(context):
+            seen.append(tuple(c.code for c in context.frozen_inputs.companies))
+            return _passing_track_outcome(context)
+
+        drain_run_queue(session, run_id, track_executor=execute)
+        assert seen and set(seen) == {("600000.SH",)}
+
+        session.execute(
+            update(DiscoveryInputSnapshot)
+            .where(DiscoveryInputSnapshot.code == "600036.SH")
+            .values(input_fingerprint="0" * 64)
+        )
+        session.commit()
+        with pytest.raises(ValueError, match="run fingerprint mismatch"):
+            load_frozen_inputs(session, run_id, codes=["600000.SH"])
     engine.dispose()
 
 
@@ -871,7 +915,7 @@ def test_track_executor_is_pure_and_drain_persists_its_outcome(
         outcome = drain_run_queue(
             session, run_id, track_executor=execute
         )
-        assert outcome.executed == 1
+        assert outcome.executed >= 1
         assert len(seen) == 1
         persisted = session.get(DiscoveryStage, stage_id)
         assert persisted is not None
@@ -879,7 +923,7 @@ def test_track_executor_is_pure_and_drain_persists_its_outcome(
             persisted.status,
             persisted.total_count,
             persisted.pass_count,
-        ) == ("waiting_confirmation", 1, 1)
+        ) == ("confirmed", 1, 1)
         assert session.scalar(
             select(func.count()).select_from(DiscoveryResult)
         ) == 1
@@ -894,7 +938,7 @@ def test_track_executor_is_pure_and_drain_persists_its_outcome(
         (
             "waiting_confirmation",
             ("600001.SH", "600000.SH"),
-            "waiting_confirmation",
+            "confirmed",
         ),
         ("data_not_ready", (), "data_not_ready"),
         ("ruler_not_ready", (), "ruler_not_ready"),
@@ -985,7 +1029,7 @@ def test_waiting_track_outcome_requires_exact_candidate_code_set(
         outcome = drain_run_queue(
             session, run_id, track_executor=execute
         )
-        assert outcome.executed == 2
+        assert outcome.executed >= 2
         selected_stage = session.get(DiscoveryStage, selected_id)
         assert selected_stage is not None
         assert selected_stage.status == expected_status
@@ -993,7 +1037,7 @@ def test_waiting_track_outcome_requires_exact_candidate_code_set(
             "permanent" if expected_status == "failed" else None
         )
         assert session.get(DiscoveryStage, sibling_id).status == (
-            "waiting_confirmation"
+            "confirmed"
         )
         assert session.scalar(
             select(func.count())
@@ -1003,7 +1047,7 @@ def test_waiting_track_outcome_requires_exact_candidate_code_set(
                 DiscoveryResult.track == "quality_discount",
             )
         ) == (
-            2 if expected_status == "waiting_confirmation" else 0
+            2 if expected_status == "confirmed" else 0
         )
         assert session.scalar(
             select(func.count())
@@ -1058,14 +1102,14 @@ def test_waiting_track_outcome_accepts_empty_exact_candidate_set(
             run_id,
             track_executor=_passing_track_outcome,
         )
-        assert outcome.executed == 1
+        assert outcome.executed >= 1
         persisted = session.get(DiscoveryStage, stage_id)
         assert persisted is not None
         assert (
             persisted.status,
             persisted.total_count,
             persisted.pass_count,
-        ) == ("waiting_confirmation", 0, 0)
+        ) == ("confirmed", 0, 0)
     engine.dispose()
 
 
@@ -1451,9 +1495,9 @@ def test_startup_recovery_fails_only_running_then_drain_resumes_queued(
         assert session.get(JobLock, 1).job_id is None
 
         outcome = drain_run_queue(session, run_id)
-        assert outcome.executed == 1
+        assert outcome.executed >= 1
         assert session.get(DiscoveryCommonStage, ids[1]).status == (
-            "waiting_confirmation"
+            "confirmed"
         )
         assert session.scalar(
             select(func.count())
@@ -1616,7 +1660,7 @@ def test_malformed_pure_outcome_preserves_history_and_continues(
         outcome = drain_run_queue(
             session, run_id, track_executor=execute
         )
-        assert outcome.executed == 2
+        assert outcome.executed >= 2
         rejected = session.get(DiscoveryStage, selected_id)
         continued = session.get(DiscoveryStage, sibling_id)
         assert rejected is not None
@@ -1625,7 +1669,7 @@ def test_malformed_pure_outcome_preserves_history_and_continues(
             "permanent",
         )
         assert continued is not None
-        assert continued.status == "waiting_confirmation"
+        assert continued.status == "confirmed"
         assert session.scalar(
             select(func.count())
             .select_from(DiscoveryResult)
@@ -1954,10 +1998,10 @@ def test_pure_executor_has_no_database_handle_and_tracks_continue(
         outcome = drain_run_queue(
             session, run_id, track_executor=execute
         )
-        assert outcome.executed == 2
+        assert outcome.executed >= 2
         assert session.get(DiscoveryStage, first_id).status == "failed"
         assert session.get(DiscoveryStage, second_id).status == (
-            "waiting_confirmation"
+            "confirmed"
         )
         assert session.scalar(
             select(func.count())

@@ -197,6 +197,8 @@ def test_inverted_bands_do_not_flip_pass_to_fail(tmp_path: Path) -> None:
     }
     got = normalize_structured(raw, payload)
     assert got["verdict"] == "pass"
+    assert got["price_bands"]["aggressive"] == "21.0"
+    assert got["price_bands"]["conservative"] == "26.5"
 
 
 def test_normalize_accepts_colloquial_memo_role(tmp_path: Path) -> None:
@@ -474,3 +476,194 @@ def test_cninfo_notices_enter_prompt(tmp_path: Path) -> None:
     assert "激进：" in md
     assert "稳健：" in md
     assert "保守：" in md
+
+
+def test_ttm_pe_and_portfolio_fit_guardrail(tmp_path: Path) -> None:
+    from research.evaluate import _build_prompt, _enrich_valuation
+
+    payload = EvalInput(
+        name="国光股份",
+        code="002749.SZ",
+        financials=(
+            {"period": "2026Q1", "period_type": "quarterly", "roe": 4, "net_income": 1, "eps": 0.13},
+            {"period": "2026H1", "period_type": "interim", "roe": 9, "net_income": 1, "eps": 0.33},
+            {"period": "2025H1", "period_type": "interim", "roe": 11, "net_income": 1, "eps": 0.42},
+            {"period": "2025", "period_type": "annual", "roe": 15, "net_income": 1, "eps": 0.68},
+        ),
+        price=Decimal("8.65"),
+        book={"positions": [{"name": "招商银行", "shares": 100}], "cash_balance": 10000},
+        web_search=False,
+        as_of_date="2026-10-09",
+        job_id=11,
+        reports_dir=tmp_path,
+        valuation={"bps": 3.41, "eps": 0.68},
+    )
+    snap = _enrich_valuation(payload)
+    assert abs(float(snap["eps_ttm"]) - 0.59) < 0.001
+    assert abs(float(snap["pe_ttm"]) - 8.65 / 0.59) < 0.02
+    assert snap["pe_ttm_basis"] == "滚动TTM（2025年报+2026H1-2025H1）"
+    assert abs(float(snap["pe"]) - 8.65 / 0.68) < 0.02
+    prompt = _build_prompt(payload)
+    assert "滚动市盈率（TTM）" in prompt
+
+    raw = {
+        "verdict": "pass",
+        "gates": [
+            {"name": name, "status": "pass", "reason": f"{name}可核验"} for name in GATE_NAMES
+        ],
+        **_rest(),
+    }
+    raw["portfolio_fit"] = {
+        "should_enter": "否，机会成本不如现有招商银行。",
+        "funding": "不买。",
+        "overlap": "不叠。",
+    }
+    assert normalize_structured(raw, payload)["verdict"] == "gray"
+
+
+def test_industry_precedents_enter_prompt_with_isolation_guardrail(tmp_path: Path) -> None:
+    from research.evaluate import _build_prompt
+
+    payload = EvalInput(
+        name="老凤祥",
+        code="600612.SH",
+        financials=({"period": "2025", "period_type": "annual", "roe": 18, "net_income": 20, "eps": 3.5},),
+        price=Decimal("52"),
+        book={"positions": [], "cash_balance": 0},
+        web_search=False,
+        as_of_date="2026-10-21",
+        job_id=12,
+        reports_dir=tmp_path,
+        industry="纺织服饰",
+        precedents=(
+            {
+                "name": "报喜鸟",
+                "code": "002154.SZ",
+                "verdict": "gray",
+                "as_of": {"date": "2026-10-18", "price": 4.2},
+                "failed_gates": [{"name": "护城河", "status": "gray", "reason": "服装品牌切换成本低"}],
+                "price_bands": {"mode": "steady", "aggressive": "3.2", "steady": "3.8", "conservative": "4.5"},
+            },
+        ),
+        risk_flags=("revenue_decline_worsening", "earnings_decline_worsening"),
+    )
+    prompt = _build_prompt(payload)
+    assert "同业历史深研判例" in prompt
+    assert "报喜鸟" in prompt
+    assert "禁止将同业数字写成当前公司财务或估值数字" in prompt
+    assert "初筛量化风险提示" in prompt
+    assert "revenue_decline_worsening" in prompt
+
+
+def test_deducted_trap_blocks_pass_even_if_llm_returns_pass(tmp_path: Path) -> None:
+    payload = EvalInput(
+        name="伟星新材",
+        code="002372.SZ",
+        financials=(
+            {
+                "period": "2026H1",
+                "period_type": "interim",
+                "roe": 7.82,
+                "net_income": 390008387.82,
+                "deducted_net_income": 215416026.14,
+                "eps": 0.25,
+            },
+            {
+                "period": "2025H1",
+                "period_type": "interim",
+                "roe": 5.32,
+                "net_income": 271020926.82,
+                "deducted_net_income": 268087537.44,
+                "eps": 0.17,
+            },
+            {
+                "period": "2025",
+                "period_type": "annual",
+                "roe": 14.9,
+                "net_income": 740777487.24,
+                "deducted_net_income": 684311685.47,
+                "eps": 0.47,
+            },
+        ),
+        price=Decimal("8.41"),
+        book={"positions": [], "cash_balance": 100000},
+        web_search=False,
+        as_of_date="2026-10-21",
+        job_id=104,
+        reports_dir=tmp_path,
+        valuation={"bps": 2.96, "eps": 0.47},
+    )
+    raw = {
+        "verdict": "pass",
+        "gates": [
+            {"name": name, "status": "pass", "reason": f"{name}表面看通过"} for name in GATE_NAMES
+        ],
+        **_rest(),
+    }
+    got = normalize_structured(raw, payload)
+    assert got["verdict"] == "gray"
+
+
+def test_cyclical_peak_and_goodwill_balance_sheet_traps(tmp_path: Path) -> None:
+    from research.evaluate import _enrich_valuation
+
+    # 1. Goodwill & net cash enrichment (e.g. 益丰药房)
+    yifeng = EvalInput(
+        name="益丰药房",
+        code="603939.SH",
+        financials=(
+            {
+                "period": "2025",
+                "period_type": "annual",
+                "roe": 14.98,
+                "net_income": 1678000000,
+                "eps": 1.38,
+                "bps": 9.81,
+                "goodwill": 4765000000,
+                "net_assets": 12379000000,
+                "cash": 3081000000,
+                "interest_debt": 2800000000,
+            },
+        ),
+        price=Decimal("25.37"),
+        book={"positions": [], "cash_balance": 0},
+        web_search=False,
+        as_of_date="2026-10-21",
+        job_id=85,
+        reports_dir=tmp_path,
+        valuation={"bps": 9.81, "eps": 1.38},
+    )
+    snap = _enrich_valuation(yifeng)
+    assert abs(float(snap["goodwill_pct"]) - 38.49) < 0.1
+    assert float(snap["pb_tangible"]) > 4.1
+    assert abs(float(snap["net_cash_yi"]) - 2.81) < 0.1
+
+    # 2. Cyclical peak earnings trap blocks 'pass' (e.g. 东方财富: pe_ttm=19.3 vs pe_mid=35.7)
+    eastmoney_fins = tuple(
+        {"period": str(2014 + i), "period_type": "annual", "roe": 12, "net_income": 50, "eps": 0.4984}
+        for i in range(11)
+    ) + (
+        {"period": "2025", "period_type": "annual", "roe": 14.03, "net_income": 120, "eps": 0.765},
+    )
+    em = EvalInput(
+        name="东方财富",
+        code="300059.SZ",
+        financials=eastmoney_fins,
+        price=Decimal("17.80"),
+        book={"positions": [], "cash_balance": 100000},
+        web_search=False,
+        as_of_date="2026-10-21",
+        job_id=90,
+        reports_dir=tmp_path,
+        valuation={"bps": 6.22, "eps": 0.765},
+    )
+    raw = {
+        "verdict": "pass",
+        "gates": [{"name": name, "status": "pass", "reason": "通过"} for name in GATE_NAMES],
+        **_rest(),
+    }
+    assert normalize_structured(raw, em)["verdict"] == "gray"
+
+
+
+

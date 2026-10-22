@@ -1,0 +1,2062 @@
+{
+  "algorithm_build": "discovery-v5",
+  "approval_ready": true,
+  "blocked_reasons": [],
+  "branch_coverage": {
+    "nonfinancial": {
+      "acquisition_cash_paid": {
+        "present": 4714,
+        "ratio": "0.989605430632159524819686041578277471361900721255833686890114552397114977",
+        "total": 4714,
+        "trusted": 4665
+      },
+      "asset_disposal_gain": {
+        "present": 4392,
+        "ratio": "0.931692829868476877386508273228680526092490453966907085277895630038184132",
+        "total": 4714,
+        "trusted": 4392
+      },
+      "deducted_net_income": {
+        "present": 4714,
+        "ratio": "0.989393296563428086550700042426813746287653797199830292745014849384811201",
+        "total": 4714,
+        "trusted": 4664
+      },
+      "goodwill": {
+        "present": 4714,
+        "ratio": "0.989605430632159524819686041578277471361900721255833686890114552397114977",
+        "total": 4714,
+        "trusted": 4665
+      },
+      "gross_margin": {
+        "present": 4713,
+        "ratio": "0.988756894357233771743742044972422571064913025031820110309715740347899873",
+        "total": 4714,
+        "trusted": 4661
+      },
+      "impairment_loss": {
+        "present": 4712,
+        "ratio": "0.999575731862537123462028001697072549851506151887993211709800593975392448",
+        "total": 4714,
+        "trusted": 4712
+      },
+      "interest_debt": {
+        "present": 4714,
+        "ratio": "0.989605430632159524819686041578277471361900721255833686890114552397114977",
+        "total": 4714,
+        "trusted": 4665
+      },
+      "net_income": {
+        "present": 4714,
+        "ratio": "0.989605430632159524819686041578277471361900721255833686890114552397114977",
+        "total": 4714,
+        "trusted": 4665
+      },
+      "net_margin": {
+        "present": 4714,
+        "ratio": "0.988969028425965210012728044123886296139159949087823504454815443360203649",
+        "total": 4714,
+        "trusted": 4662
+      },
+      "ocf": {
+        "present": 4714,
+        "ratio": "0.989605430632159524819686041578277471361900721255833686890114552397114977",
+        "total": 4714,
+        "trusted": 4665
+      },
+      "other_income": {
+        "present": 4711,
+        "ratio": "0.999363597793805685193042002545608824777259227831989817564700890963088672",
+        "total": 4714,
+        "trusted": 4711
+      },
+      "revenue": {
+        "present": 4714,
+        "ratio": "0.988544760288502333474756045820958845990666100975816716164616037335596097",
+        "total": 4714,
+        "trusted": 4660
+      },
+      "roe": {
+        "present": 4713,
+        "ratio": "0.990241832838353839626644039032668646584641493423843869325413661434026305",
+        "total": 4714,
+        "trusted": 4668
+      },
+      "roic": {
+        "present": 0,
+        "ratio": "0",
+        "total": 4714,
+        "trusted": 0
+      },
+      "shares": {
+        "present": 4714,
+        "ratio": "0.989605430632159524819686041578277471361900721255833686890114552397114977",
+        "total": 4714,
+        "trusted": 4665
+      },
+      "valuation_pe": {
+        "present": 4560,
+        "ratio": "0.384174798472634705133644463300806109461179465422146796775562155282138311",
+        "total": 4714,
+        "trusted": 1811
+      }
+    }
+  },
+  "candidate_counts": {
+    "base": {
+      "branches": {
+        "nonfinancial": {
+          "drop": 4258,
+          "insufficient": 439,
+          "pass": 17
+        },
+        "unsupported_bank": {
+          "drop": 0,
+          "insufficient": 42,
+          "pass": 0
+        },
+        "unsupported_cyclical": {
+          "drop": 0,
+          "insufficient": 388,
+          "pass": 0
+        },
+        "unsupported_insurance": {
+          "drop": 0,
+          "insufficient": 5,
+          "pass": 0
+        },
+        "unsupported_other_financial": {
+          "drop": 0,
+          "insufficient": 26,
+          "pass": 0
+        }
+      },
+      "drop": 4258,
+      "insufficient": 900,
+      "pass": 17
+    },
+    "conservative": {
+      "branches": {
+        "nonfinancial": {
+          "drop": 4327,
+          "insufficient": 384,
+          "pass": 3
+        },
+        "unsupported_bank": {
+          "drop": 0,
+          "insufficient": 42,
+          "pass": 0
+        },
+        "unsupported_cyclical": {
+          "drop": 0,
+          "insufficient": 388,
+          "pass": 0
+        },
+        "unsupported_insurance": {
+          "drop": 0,
+          "insufficient": 5,
+          "pass": 0
+        },
+        "unsupported_other_financial": {
+          "drop": 0,
+          "insufficient": 26,
+          "pass": 0
+        }
+      },
+      "drop": 4327,
+      "insufficient": 845,
+      "pass": 3
+    },
+    "relaxed": {
+      "branches": {
+        "nonfinancial": {
+          "drop": 4146,
+          "insufficient": 521,
+          "pass": 47
+        },
+        "unsupported_bank": {
+          "drop": 0,
+          "insufficient": 42,
+          "pass": 0
+        },
+        "unsupported_cyclical": {
+          "drop": 0,
+          "insufficient": 388,
+          "pass": 0
+        },
+        "unsupported_insurance": {
+          "drop": 0,
+          "insufficient": 5,
+          "pass": 0
+        },
+        "unsupported_other_financial": {
+          "drop": 0,
+          "insufficient": 26,
+          "pass": 0
+        }
+      },
+      "drop": 4146,
+      "insufficient": 982,
+      "pass": 47
+    }
+  },
+  "distributions": {
+    "metrics": {
+      "acquisition_cash_to_revenue": {
+        "max": "1.245636571529043054342578702928117113118406986476039558335403999151593105588449239762248",
+        "min": "0",
+        "p25": "0",
+        "p50": "0",
+        "p75": "0.003154764123787886120962726147205481761966389466097258560614487706259583457571861315997974"
+      },
+      "allowed_latest_annual_staleness_years": {
+        "max": "1",
+        "min": "1",
+        "p25": "1",
+        "p50": "1",
+        "p75": "1"
+      },
+      "capped_growth": {
+        "max": "0.25",
+        "min": "0.000026018907106263628438906831363525229431145379389",
+        "p25": "0.067357573279667953566465948382550641044482770377906",
+        "p50": "0.1470910336941828205775076615457310972511561333176855",
+        "p75": "0.25"
+      },
+      "cash_conversion": {
+        "max": "17.7899320400168749395293221589911227244182375273690502",
+        "min": "-8.68445366831923038579402969315980138062215070160508408",
+        "p25": "0.80988533635462553548060373137356338190178754673443609",
+        "p50": "1.14947765339077238359129081335087946013592750111966215",
+        "p75": "1.640761187690574471364828255437691600925925796779872875"
+      },
+      "cash_conversion_available_count": {
+        "max": "5",
+        "min": "4",
+        "p25": "5",
+        "p50": "5",
+        "p75": "5"
+      },
+      "cash_conversion_observations": {
+        "max": "5",
+        "min": "0",
+        "p25": "3",
+        "p50": "5",
+        "p75": "5"
+      },
+      "cash_conversion_window_end_year": {
+        "max": "2025",
+        "min": "2024",
+        "p25": "2025",
+        "p50": "2025",
+        "p75": "2025"
+      },
+      "cash_conversion_window_start_year": {
+        "max": "2021",
+        "min": "2020",
+        "p25": "2021",
+        "p50": "2021",
+        "p75": "2021"
+      },
+      "current_pe": {
+        "max": "124273.67188705",
+        "min": "0.35041221",
+        "p25": "22.9442883025",
+        "p50": "43.07654617",
+        "p75": "93.9126639075"
+      },
+      "deducted_profit_cagr": {
+        "max": "3.52043548538040921798054990829772830474056156683266773",
+        "min": "-0.759052288241729180147597821905311705135069863178071165758543",
+        "p25": "-0.16016863464810079701757190367354444433033599435650322",
+        "p50": "-0.005363962781959152179627297661563255710542729429225517",
+        "p75": "0.14286981845197942090639060893801834448703859976510495"
+      },
+      "deducted_profit_cagr_periods": {
+        "max": "4",
+        "min": "4",
+        "p25": "4",
+        "p50": "4",
+        "p75": "4"
+      },
+      "deducted_profit_consistent_growth_periods": {
+        "max": "4",
+        "min": "0",
+        "p25": "0",
+        "p50": "1",
+        "p75": "2"
+      },
+      "deducted_profit_growth_observations": {
+        "max": "5",
+        "min": "4",
+        "p25": "5",
+        "p50": "5",
+        "p75": "5"
+      },
+      "deducted_profit_growth_slowdown": {
+        "max": "3.0505093923031224932490910368869388365620319465800759331526153403741292229271832463026",
+        "min": "0",
+        "p25": "0",
+        "p50": "0.060087609920699137417339542228516585207063782769688855400882440305771857942590662294",
+        "p75": "0.267574313672580297556595736500766632107684570831041068208473941383717574192235345278"
+      },
+      "dilution_available_count": {
+        "max": "5",
+        "min": "4",
+        "p25": "5",
+        "p50": "5",
+        "p75": "5"
+      },
+      "dilution_observations": {
+        "max": "5",
+        "min": "4",
+        "p25": "5",
+        "p50": "5",
+        "p75": "5"
+      },
+      "dilution_rate": {
+        "max": "0.489945989050226136634134729826231849559628659842894548916924541775767674363246846",
+        "min": "-0.04574246834245165494241957910267239171424172960798669489626467827573252079584661",
+        "p25": "0",
+        "p50": "0",
+        "p75": "0"
+      },
+      "dilution_window_end_year": {
+        "max": "2025",
+        "min": "2024",
+        "p25": "2025",
+        "p50": "2025",
+        "p75": "2025"
+      },
+      "dilution_window_start_year": {
+        "max": "2021",
+        "min": "2020",
+        "p25": "2021",
+        "p50": "2021",
+        "p75": "2021"
+      },
+      "goodwill_increase_to_revenue": {
+        "max": "6.207073045438234342138189932550419920225362757893469058140268026675820811935632156316239",
+        "min": "0",
+        "p25": "0",
+        "p50": "0",
+        "p75": "0"
+      },
+      "gross_margin_change": {
+        "max": "102.802152327",
+        "min": "-160.1859778258",
+        "p25": "-7.8585544046",
+        "p50": "-2.2818007409",
+        "p75": "2.13674123515"
+      },
+      "growth_available_count": {
+        "max": "5",
+        "min": "1",
+        "p25": "5",
+        "p50": "5",
+        "p75": "5"
+      },
+      "growth_drivers_available_count": {
+        "max": "5",
+        "min": "1",
+        "p25": "5",
+        "p50": "5",
+        "p75": "5"
+      },
+      "growth_drivers_observations": {
+        "max": "5",
+        "min": "1",
+        "p25": "5",
+        "p50": "5",
+        "p75": "5"
+      },
+      "growth_drivers_window_end_year": {
+        "max": "2025",
+        "min": "2024",
+        "p25": "2025",
+        "p50": "2025",
+        "p75": "2025"
+      },
+      "growth_drivers_window_start_year": {
+        "max": "2021",
+        "min": "2020",
+        "p25": "2021",
+        "p50": "2021",
+        "p75": "2021"
+      },
+      "growth_window_end_year": {
+        "max": "2025",
+        "min": "2024",
+        "p25": "2025",
+        "p50": "2025",
+        "p75": "2025"
+      },
+      "growth_window_start_year": {
+        "max": "2021",
+        "min": "2020",
+        "p25": "2021",
+        "p50": "2021",
+        "p75": "2021"
+      },
+      "impairment_share": {
+        "max": "181.44822982766634207823246603232568515947180375302053066933460678432330592000426499188398587",
+        "min": "0.0000335003491414222326269545661057342813238413962424108321238611632318720060217459243521565419",
+        "p25": "0.08886091633936221639288529423861562708279505970206225946343235574362814739572412709497881",
+        "p50": "0.27527894305618635570738575608693189762516792673998976288194925775096938179566170510124",
+        "p75": "0.708147205689006922202605983831167076799761045020570322924169717478705506093688646892725"
+      },
+      "interest_debt_increase_to_revenue": {
+        "max": "16.50820370643263271798186803971511253193220203742828294323046799890658655494087641118855",
+        "min": "0",
+        "p25": "0",
+        "p50": "0.0301545209821352591438941884173103695591081141379612087795996188193795210414113022710713",
+        "p75": "0.2112515431638568360659865405836125443776603636564835963491106980642012724631766567486297"
+      },
+      "latest_deducted_profit_growth": {
+        "max": "152.9073322856235117165803430631525937073958274219054764361362475574166282004935884",
+        "min": "-259.95669275787389956095944209613489941113174394900409983064929876097033865600014529",
+        "p25": "-0.407265984723619363179402822384922483263927940036858799354214025688262816393293059878",
+        "p50": "-0.0441385440971233760702482754840936132943911913152028658408072406580708295846324288548",
+        "p75": "0.2608950230450624450755255209954115947282496431429966116535218023043254673307271508161"
+      },
+      "latest_fiscal_year": {
+        "max": "2025",
+        "min": "2024",
+        "p25": "2025",
+        "p50": "2025",
+        "p75": "2025"
+      },
+      "latest_fiscal_year_staleness": {
+        "max": "1",
+        "min": "0",
+        "p25": "0",
+        "p50": "0",
+        "p75": "0"
+      },
+      "latest_revenue_growth": {
+        "max": "9.870474673078211689291707174620231088043397932560809011851214676328659077736391958161",
+        "min": "-0.93186460525754635990783279966171599806841764130937336024264582768992428578346726703613022",
+        "p25": "-0.0786251380153878618389425090078157520468680198214072750427242725328458051051022875483991",
+        "p50": "0.033308115239633703406238781528506202060453315860865284244320087307951916807207829278086",
+        "p75": "0.154424944834644203186088975324622735993084608755669297819546389360251647134922929576795"
+      },
+      "margin_available_count": {
+        "max": "5",
+        "min": "0",
+        "p25": "5",
+        "p50": "5",
+        "p75": "5"
+      },
+      "margin_observations": {
+        "max": "5",
+        "min": "0",
+        "p25": "5",
+        "p50": "5",
+        "p75": "5"
+      },
+      "margin_window_end_year": {
+        "max": "2025",
+        "min": "2024",
+        "p25": "2025",
+        "p50": "2025",
+        "p75": "2025"
+      },
+      "margin_window_start_year": {
+        "max": "2021",
+        "min": "2020",
+        "p25": "2021",
+        "p50": "2021",
+        "p75": "2021"
+      },
+      "net_margin_change": {
+        "max": "5135481.652373376",
+        "min": "-2119.6985904429",
+        "p25": "-12.30403999925",
+        "p50": "-3.5587147392",
+        "p75": "1.25250972"
+      },
+      "non_core_income_proxy_share": {
+        "max": "66.08987427839513645594666148765922573733277356809109501887598705426970207840997370274847",
+        "min": "0.00015471681937561638517051423076669314423659030264351111857584764106433722489749473903916",
+        "p25": "0.059130362056632421289423418230990494586577168432351982326558617041308934596707007047164",
+        "p50": "0.1412111613739085412664237438254609269332804840261046087079090097017061712280521948766",
+        "p75": "0.34511170435912957187049009210111738613106587606502968456303230064709263912395104279380005"
+      },
+      "pe_percentile": {
+        "max": "100",
+        "min": "0",
+        "p25": "22.91666666666666666666666666666667",
+        "p50": "56.66666666666666666666666666666667",
+        "p75": "83.33333333333333333333333333333333"
+      },
+      "peg": {
+        "max": "31048.18765833272408304771000232449523174050150157510811523644844143307994935943970505428854139508743633141996556492245475460725",
+        "min": "0.02915634277116446528009058164705175066149766280434794572966568517431886341597989504393612318640345524650437497544005723549166523",
+        "p25": "1.23414460817157134827526188560353589912246687158742310727301834344009956576397346511630731285623642131186135111837743175327772115",
+        "p50": "2.5396168936551567638670568020039939788457665131757751214534056802580333998073875537089527164165026283453332511097901792946945935",
+        "p75": "5.9893525582180153955809000631705535705064714238517612819316432998143583709203473281497476519956877540004106314191147136570676172"
+      },
+      "quality_adjustments_available_count": {
+        "max": "1",
+        "min": "0",
+        "p25": "1",
+        "p50": "1",
+        "p75": "1"
+      },
+      "quality_adjustments_observations": {
+        "max": "1",
+        "min": "0",
+        "p25": "1",
+        "p50": "1",
+        "p75": "1"
+      },
+      "quality_adjustments_window_end_year": {
+        "max": "2025",
+        "min": "2024",
+        "p25": "2025",
+        "p50": "2025",
+        "p75": "2025"
+      },
+      "quality_adjustments_window_start_year": {
+        "max": "2025",
+        "min": "2024",
+        "p25": "2025",
+        "p50": "2025",
+        "p75": "2025"
+      },
+      "return_on_capital": {
+        "max": "610.374",
+        "min": "-1131.916",
+        "p25": "0.776",
+        "p50": "6.233",
+        "p75": "11.0835"
+      },
+      "return_on_capital_available_count": {
+        "max": "5",
+        "min": "4",
+        "p25": "5",
+        "p50": "5",
+        "p75": "5"
+      },
+      "return_on_capital_window_end_year": {
+        "max": "2025",
+        "min": "2024",
+        "p25": "2025",
+        "p50": "2025",
+        "p75": "2025"
+      },
+      "return_on_capital_window_start_year": {
+        "max": "2021",
+        "min": "2020",
+        "p25": "2021",
+        "p50": "2021",
+        "p75": "2021"
+      },
+      "revenue_cagr": {
+        "max": "14.688182617051337362609416353582732003649599150422228",
+        "min": "-0.6104210714257487274689576398364475098666280818248121454",
+        "p25": "-0.046416291241214828577234848345764132395985044321256315",
+        "p50": "0.030823484839084612483230748565828211325045236763493978",
+        "p75": "0.10992122252079523464785482677389748532471960963902458"
+      },
+      "revenue_cagr_periods": {
+        "max": "4",
+        "min": "4",
+        "p25": "4",
+        "p50": "4",
+        "p75": "4"
+      },
+      "revenue_consistent_growth_periods": {
+        "max": "4",
+        "min": "0",
+        "p25": "1",
+        "p50": "2",
+        "p75": "3"
+      },
+      "revenue_growth_observations": {
+        "max": "5",
+        "min": "1",
+        "p25": "5",
+        "p50": "5",
+        "p75": "5"
+      },
+      "revenue_growth_slowdown": {
+        "max": "14.313315705449335447119436207575604475758911869250236067949265664297666630974053179341",
+        "min": "0",
+        "p25": "0",
+        "p50": "0.005998747749752703495641173161367981546740439920915016440362191490795416459720209279665",
+        "p75": "0.09304613871865017773098736236476927994954589047954428069577125481177103417501618979289"
+      },
+      "roe_fallback_observations": {
+        "max": "5",
+        "min": "0",
+        "p25": "5",
+        "p50": "5",
+        "p75": "5"
+      },
+      "roic_observations": {
+        "max": "0",
+        "min": "0",
+        "p25": "0",
+        "p50": "0",
+        "p75": "0"
+      },
+      "valuation_pe_observations": {
+        "max": "61",
+        "min": "0",
+        "p25": "30",
+        "p50": "50",
+        "p75": "61"
+      }
+    },
+    "missing_reasons": {
+      "deducted_profit_growth_insufficient": 377,
+      "field_domain_invalid": 3,
+      "industry_branch_bank_unsupported": 42,
+      "industry_branch_insurance_unsupported": 5,
+      "industry_branch_other_financial_unsupported": 26,
+      "industry_cyclical_unsupported": 388,
+      "missing_trusted_acquisition_cash_paid": 49,
+      "missing_trusted_asset_disposal_gain": 322,
+      "missing_trusted_deducted_net_income": 50,
+      "missing_trusted_goodwill": 49,
+      "missing_trusted_gross_margin": 53,
+      "missing_trusted_impairment_loss": 2,
+      "missing_trusted_interest_debt": 49,
+      "missing_trusted_net_income": 49,
+      "missing_trusted_net_margin": 52,
+      "missing_trusted_ocf": 49,
+      "missing_trusted_other_income": 3,
+      "missing_trusted_return_on_capital": 46,
+      "missing_trusted_revenue": 54,
+      "missing_trusted_shares": 49,
+      "missing_trusted_valuation_pe": 2903,
+      "quality_adjustments_insufficient": 5,
+      "revenue_growth_insufficient": 52,
+      "revenue_negative": 3,
+      "valuation_pe_insufficient": 2
+    },
+    "valid_valuation_months": {
+      "pb": null,
+      "pe": {
+        "max": "61",
+        "min": "0",
+        "p25": "30",
+        "p50": "50",
+        "p75": "61"
+      }
+    },
+    "valuation_ratio_methods": {
+      "PE_TTM/PB_MRQ": {
+        "companies": 5175,
+        "points": 297889
+      }
+    }
+  },
+  "field_coverage": {
+    "acquisition_cash_to_revenue": {
+      "present": 4659,
+      "ratio": "0.90028985507246376811594202898550724637681159420289855072463768115942029",
+      "total": 5175
+    },
+    "allowed_latest_annual_staleness_years": {
+      "present": 4711,
+      "ratio": "0.910338164251207729468599033816425120772946859903381642512077294685990338",
+      "total": 5175
+    },
+    "capped_growth": {
+      "present": 1416,
+      "ratio": "0.273623188405797101449275362318840579710144927536231884057971014492753623",
+      "total": 5175
+    },
+    "cash_conversion": {
+      "present": 2638,
+      "ratio": "0.509758454106280193236714975845410628019323671497584541062801932367149758",
+      "total": 5175
+    },
+    "cash_conversion_available_count": {
+      "present": 4711,
+      "ratio": "0.910338164251207729468599033816425120772946859903381642512077294685990338",
+      "total": 5175
+    },
+    "cash_conversion_observations": {
+      "present": 4711,
+      "ratio": "0.910338164251207729468599033816425120772946859903381642512077294685990338",
+      "total": 5175
+    },
+    "cash_conversion_window_end_year": {
+      "present": 4711,
+      "ratio": "0.910338164251207729468599033816425120772946859903381642512077294685990338",
+      "total": 5175
+    },
+    "cash_conversion_window_start_year": {
+      "present": 4711,
+      "ratio": "0.910338164251207729468599033816425120772946859903381642512077294685990338",
+      "total": 5175
+    },
+    "current_pe": {
+      "present": 3260,
+      "ratio": "0.629951690821256038647342995169082125603864734299516908212560386473429952",
+      "total": 5175
+    },
+    "deducted_profit_cagr": {
+      "present": 2884,
+      "ratio": "0.557294685990338164251207729468599033816425120772946859903381642512077295",
+      "total": 5175
+    },
+    "deducted_profit_cagr_periods": {
+      "present": 4711,
+      "ratio": "0.910338164251207729468599033816425120772946859903381642512077294685990338",
+      "total": 5175
+    },
+    "deducted_profit_consistent_growth_periods": {
+      "present": 4661,
+      "ratio": "0.900676328502415458937198067632850241545893719806763285024154589371980676",
+      "total": 5175
+    },
+    "deducted_profit_growth_observations": {
+      "present": 4711,
+      "ratio": "0.910338164251207729468599033816425120772946859903381642512077294685990338",
+      "total": 5175
+    },
+    "deducted_profit_growth_slowdown": {
+      "present": 2669,
+      "ratio": "0.515748792270531400966183574879227053140096618357487922705314009661835749",
+      "total": 5175
+    },
+    "dilution_available_count": {
+      "present": 4711,
+      "ratio": "0.910338164251207729468599033816425120772946859903381642512077294685990338",
+      "total": 5175
+    },
+    "dilution_observations": {
+      "present": 4711,
+      "ratio": "0.910338164251207729468599033816425120772946859903381642512077294685990338",
+      "total": 5175
+    },
+    "dilution_rate": {
+      "present": 4662,
+      "ratio": "0.90086956521739130434782608695652173913043478260869565217391304347826087",
+      "total": 5175
+    },
+    "dilution_window_end_year": {
+      "present": 4711,
+      "ratio": "0.910338164251207729468599033816425120772946859903381642512077294685990338",
+      "total": 5175
+    },
+    "dilution_window_start_year": {
+      "present": 4711,
+      "ratio": "0.910338164251207729468599033816425120772946859903381642512077294685990338",
+      "total": 5175
+    },
+    "field_domain_valid": {
+      "present": 5172,
+      "ratio": "0.99942028985507246376811594202898550724637681159420289855072463768115942",
+      "total": 5175
+    },
+    "goodwill_increase_to_revenue": {
+      "present": 4659,
+      "ratio": "0.90028985507246376811594202898550724637681159420289855072463768115942029",
+      "total": 5175
+    },
+    "gross_margin_change": {
+      "present": 4659,
+      "ratio": "0.90028985507246376811594202898550724637681159420289855072463768115942029",
+      "total": 5175
+    },
+    "growth_available_count": {
+      "present": 4711,
+      "ratio": "0.910338164251207729468599033816425120772946859903381642512077294685990338",
+      "total": 5175
+    },
+    "growth_drivers_available_count": {
+      "present": 4711,
+      "ratio": "0.910338164251207729468599033816425120772946859903381642512077294685990338",
+      "total": 5175
+    },
+    "growth_drivers_observations": {
+      "present": 4711,
+      "ratio": "0.910338164251207729468599033816425120772946859903381642512077294685990338",
+      "total": 5175
+    },
+    "growth_drivers_window_end_year": {
+      "present": 4711,
+      "ratio": "0.910338164251207729468599033816425120772946859903381642512077294685990338",
+      "total": 5175
+    },
+    "growth_drivers_window_start_year": {
+      "present": 4711,
+      "ratio": "0.910338164251207729468599033816425120772946859903381642512077294685990338",
+      "total": 5175
+    },
+    "growth_window_end_year": {
+      "present": 4711,
+      "ratio": "0.910338164251207729468599033816425120772946859903381642512077294685990338",
+      "total": 5175
+    },
+    "growth_window_start_year": {
+      "present": 4711,
+      "ratio": "0.910338164251207729468599033816425120772946859903381642512077294685990338",
+      "total": 5175
+    },
+    "impairment_share": {
+      "present": 4387,
+      "ratio": "0.847729468599033816425120772946859903381642512077294685990338164251207729",
+      "total": 5175
+    },
+    "interest_debt_increase_to_revenue": {
+      "present": 4659,
+      "ratio": "0.90028985507246376811594202898550724637681159420289855072463768115942029",
+      "total": 5175
+    },
+    "latest_deducted_profit_growth": {
+      "present": 3236,
+      "ratio": "0.625314009661835748792270531400966183574879227053140096618357487922705314",
+      "total": 5175
+    },
+    "latest_fiscal_year": {
+      "present": 4711,
+      "ratio": "0.910338164251207729468599033816425120772946859903381642512077294685990338",
+      "total": 5175
+    },
+    "latest_fiscal_year_staleness": {
+      "present": 4711,
+      "ratio": "0.910338164251207729468599033816425120772946859903381642512077294685990338",
+      "total": 5175
+    },
+    "latest_revenue_growth": {
+      "present": 4659,
+      "ratio": "0.90028985507246376811594202898550724637681159420289855072463768115942029",
+      "total": 5175
+    },
+    "margin_available_count": {
+      "present": 4711,
+      "ratio": "0.910338164251207729468599033816425120772946859903381642512077294685990338",
+      "total": 5175
+    },
+    "margin_observations": {
+      "present": 4711,
+      "ratio": "0.910338164251207729468599033816425120772946859903381642512077294685990338",
+      "total": 5175
+    },
+    "margin_window_end_year": {
+      "present": 4711,
+      "ratio": "0.910338164251207729468599033816425120772946859903381642512077294685990338",
+      "total": 5175
+    },
+    "margin_window_start_year": {
+      "present": 4711,
+      "ratio": "0.910338164251207729468599033816425120772946859903381642512077294685990338",
+      "total": 5175
+    },
+    "net_margin_change": {
+      "present": 4659,
+      "ratio": "0.90028985507246376811594202898550724637681159420289855072463768115942029",
+      "total": 5175
+    },
+    "non_core_income_proxy_share": {
+      "present": 4387,
+      "ratio": "0.847729468599033816425120772946859903381642512077294685990338164251207729",
+      "total": 5175
+    },
+    "pe_percentile": {
+      "present": 3260,
+      "ratio": "0.629951690821256038647342995169082125603864734299516908212560386473429952",
+      "total": 5175
+    },
+    "peg": {
+      "present": 1391,
+      "ratio": "0.268792270531400966183574879227053140096618357487922705314009661835748792",
+      "total": 5175
+    },
+    "quality_adjustments_available_count": {
+      "present": 4711,
+      "ratio": "0.910338164251207729468599033816425120772946859903381642512077294685990338",
+      "total": 5175
+    },
+    "quality_adjustments_observations": {
+      "present": 4711,
+      "ratio": "0.910338164251207729468599033816425120772946859903381642512077294685990338",
+      "total": 5175
+    },
+    "quality_adjustments_window_end_year": {
+      "present": 4711,
+      "ratio": "0.910338164251207729468599033816425120772946859903381642512077294685990338",
+      "total": 5175
+    },
+    "quality_adjustments_window_start_year": {
+      "present": 4711,
+      "ratio": "0.910338164251207729468599033816425120772946859903381642512077294685990338",
+      "total": 5175
+    },
+    "return_on_capital": {
+      "present": 4668,
+      "ratio": "0.902028985507246376811594202898550724637681159420289855072463768115942029",
+      "total": 5175
+    },
+    "return_on_capital_available_count": {
+      "present": 4711,
+      "ratio": "0.910338164251207729468599033816425120772946859903381642512077294685990338",
+      "total": 5175
+    },
+    "return_on_capital_window_end_year": {
+      "present": 4711,
+      "ratio": "0.910338164251207729468599033816425120772946859903381642512077294685990338",
+      "total": 5175
+    },
+    "return_on_capital_window_start_year": {
+      "present": 4711,
+      "ratio": "0.910338164251207729468599033816425120772946859903381642512077294685990338",
+      "total": 5175
+    },
+    "revenue_cagr": {
+      "present": 4659,
+      "ratio": "0.90028985507246376811594202898550724637681159420289855072463768115942029",
+      "total": 5175
+    },
+    "revenue_cagr_periods": {
+      "present": 4711,
+      "ratio": "0.910338164251207729468599033816425120772946859903381642512077294685990338",
+      "total": 5175
+    },
+    "revenue_consistent_growth_periods": {
+      "present": 4659,
+      "ratio": "0.90028985507246376811594202898550724637681159420289855072463768115942029",
+      "total": 5175
+    },
+    "revenue_growth_observations": {
+      "present": 4711,
+      "ratio": "0.910338164251207729468599033816425120772946859903381642512077294685990338",
+      "total": 5175
+    },
+    "revenue_growth_slowdown": {
+      "present": 4659,
+      "ratio": "0.90028985507246376811594202898550724637681159420289855072463768115942029",
+      "total": 5175
+    },
+    "roe_fallback_observations": {
+      "present": 4711,
+      "ratio": "0.910338164251207729468599033816425120772946859903381642512077294685990338",
+      "total": 5175
+    },
+    "roic_observations": {
+      "present": 4711,
+      "ratio": "0.910338164251207729468599033816425120772946859903381642512077294685990338",
+      "total": 5175
+    },
+    "valuation_pe_observations": {
+      "present": 4711,
+      "ratio": "0.910338164251207729468599033816425120772946859903381642512077294685990338",
+      "total": 5175
+    }
+  },
+  "field_domain_policy": "garp-domain-v2",
+  "hypotheses": {
+    "base": {
+      "algorithm_version": "discovery-v5",
+      "fields": [
+        "revenue_cagr",
+        "deducted_profit_cagr",
+        "revenue_consistent_growth_periods",
+        "deducted_profit_consistent_growth_periods",
+        "latest_revenue_growth",
+        "latest_deducted_profit_growth",
+        "revenue_growth_slowdown",
+        "deducted_profit_growth_slowdown",
+        "return_on_capital",
+        "return_metric_label",
+        "cash_conversion",
+        "dilution_rate",
+        "interest_debt_increase_to_revenue",
+        "goodwill_increase_to_revenue",
+        "acquisition_cash_to_revenue",
+        "gross_margin_change",
+        "net_margin_change",
+        "impairment_share",
+        "non_core_income_proxy_share",
+        "capped_growth",
+        "peg",
+        "pe_percentile",
+        "current_pe",
+        "code"
+      ],
+      "formulas": {
+        "acquisition_cash_to_revenue": "sum(max(0,annual.acquisition_cash_paid))/sum(annual.revenue)",
+        "capped_growth": "min(deducted_profit_cagr,peg_growth_cap)",
+        "cash_conversion": "sum(annual.ocf)/sum(annual.net_income)|annual.net_income>0",
+        "current_pe": "current.pe",
+        "deducted_profit_cagr": "cagr(exact_annual.deducted_net_income,deducted_profit_cagr_periods)",
+        "deducted_profit_consistent_growth_periods": "count(exact_annual.deducted_net_income_yoy>=deducted_profit_period_growth_min)",
+        "deducted_profit_growth_slowdown": "max(0,deducted_profit_cagr-latest_deducted_profit_growth)",
+        "dilution_rate": "latest(annual.shares)/earliest(annual.shares)-1",
+        "goodwill_increase_to_revenue": "max(0,latest(annual.goodwill)-earliest(annual.goodwill))/latest(annual.revenue)",
+        "gross_margin_change": "latest(annual.gross_margin)-earliest(annual.gross_margin)",
+        "impairment_share": "copy_abs(latest(annual.impairment_loss))/copy_abs(latest(annual.deducted_net_income))",
+        "interest_debt_increase_to_revenue": "max(0,latest(annual.interest_debt)-earliest(annual.interest_debt))/latest(annual.revenue)",
+        "latest_deducted_profit_growth": "latest(annual.deducted_net_income_yoy)",
+        "latest_revenue_growth": "latest(annual.revenue_yoy)",
+        "net_margin_change": "latest(annual.net_margin)-earliest(annual.net_margin)",
+        "non_core_income_proxy_share": "(copy_abs(latest(annual.other_income))+copy_abs(latest(annual.asset_disposal_gain)))/copy_abs(latest(annual.deducted_net_income))",
+        "pe_percentile": "percentile_rank(current.pe,monthly.pe)",
+        "peg": "current.pe/(capped_growth*100)",
+        "return_metric_label": "label(primary(annual.roic,fallback=annual.roe))",
+        "return_on_capital": "mean(primary(annual.roic,fallback=annual.roe))",
+        "revenue_cagr": "cagr(exact_annual.revenue,revenue_cagr_periods)",
+        "revenue_consistent_growth_periods": "count(exact_annual.revenue_yoy>=revenue_period_growth_min)",
+        "revenue_growth_slowdown": "max(0,revenue_cagr-latest_revenue_growth)"
+      },
+      "industry_version": "eastmoney:push2delay:clist:f100:v1",
+      "min_observations": {
+        "cash_conversion": 5,
+        "deducted_profit_growth": 5,
+        "dilution": 2,
+        "growth_drivers": 5,
+        "latest_growth": 2,
+        "margin": 2,
+        "quality_adjustments": 1,
+        "revenue_growth": 5,
+        "roe_fallback": 3,
+        "roic": 3,
+        "sustained_profit_growth": 3,
+        "sustained_revenue_growth": 3,
+        "valuation_pe": 60
+      },
+      "missing_policy": {
+        "acquisition_cash_to_revenue": "insufficient",
+        "capped_growth": "insufficient",
+        "cash_conversion": "insufficient",
+        "code": "insufficient",
+        "current_pe": "insufficient",
+        "deducted_profit_cagr": "insufficient",
+        "deducted_profit_consistent_growth_periods": "insufficient",
+        "deducted_profit_growth_slowdown": "insufficient",
+        "dilution_rate": "insufficient",
+        "goodwill_increase_to_revenue": "insufficient",
+        "gross_margin_change": "insufficient",
+        "impairment_share": "insufficient",
+        "interest_debt_increase_to_revenue": "insufficient",
+        "latest_deducted_profit_growth": "insufficient",
+        "latest_revenue_growth": "insufficient",
+        "net_margin_change": "insufficient",
+        "non_core_income_proxy_share": "insufficient",
+        "pe_percentile": "insufficient",
+        "peg": "insufficient",
+        "return_metric_label": "insufficient",
+        "return_on_capital": "insufficient",
+        "revenue_cagr": "insufficient",
+        "revenue_consistent_growth_periods": "insufficient",
+        "revenue_growth_slowdown": "insufficient"
+      },
+      "order": [
+        [
+          "deducted_profit_consistent_growth_periods",
+          "desc",
+          "nulls_last"
+        ],
+        [
+          "peg",
+          "asc",
+          "nulls_last"
+        ],
+        [
+          "return_on_capital",
+          "desc",
+          "nulls_last"
+        ],
+        [
+          "cash_conversion",
+          "desc",
+          "nulls_last"
+        ],
+        [
+          "code",
+          "asc",
+          "nulls_last"
+        ]
+      ],
+      "scope": "weekly-discovery",
+      "sector_branches": {
+        "branch_policies": {
+          "bank": "unsupported",
+          "insurance": "unsupported",
+          "nonfinancial": "nonfinancial",
+          "other_financial": "unsupported",
+          "unknown": "insufficient"
+        },
+        "common": {
+          "annual_observations": {
+            "cash_conversion": 5,
+            "dilution": 5,
+            "growth": 5,
+            "growth_drivers": 5,
+            "margin": 5,
+            "quality_adjustments": 1,
+            "return_on_capital": 5
+          },
+          "cagr_periods": {
+            "deducted_profit": 4,
+            "revenue": 4
+          },
+          "field_domain_policy": "garp-domain-v2",
+          "latest_annual_staleness_years": 1,
+          "valuation_ratio_method": "PE_TTM/PB_MRQ"
+        },
+        "nonfinancial": {
+          "evidence_fields": [
+            "revenue_cagr",
+            "deducted_profit_cagr",
+            "return_on_capital",
+            "peg"
+          ],
+          "excluded_industries": [
+            "光伏设备",
+            "养殖业",
+            "冶钢原料",
+            "化学原料",
+            "小金属",
+            "工业金属",
+            "普钢",
+            "煤炭开采",
+            "特钢Ⅱ",
+            "能源金属",
+            "航运港口",
+            "装修建材",
+            "贵金属"
+          ],
+          "gate_order": [
+            "revenue_growth",
+            "deducted_profit_growth",
+            "sustained_growth",
+            "growth_slowdown",
+            "return_on_capital",
+            "cash_conversion",
+            "dilution",
+            "interest_debt_trend",
+            "goodwill_trend",
+            "acquisition_cash_trend",
+            "gross_margin",
+            "net_margin",
+            "impairment",
+            "non_core_income_proxy",
+            "peg",
+            "valuation"
+          ],
+          "return_metric_policy": "roic_then_roe"
+        }
+      },
+      "thresholds": {
+        "acquisition_cash_to_revenue_max": "0.1",
+        "cash_conversion_min": "0.8",
+        "deducted_profit_cagr_min": "0.1",
+        "deducted_profit_growth_slowdown_max": "0.1",
+        "deducted_profit_period_growth_min": "0.05",
+        "dilution_rate_max": "0.05",
+        "goodwill_increase_to_revenue_max": "0.1",
+        "gross_margin_deterioration_max": "2",
+        "impairment_share_max": "0.2",
+        "interest_debt_increase_to_revenue_max": "0.2",
+        "net_margin_deterioration_max": "2",
+        "non_core_income_proxy_share_max": "0.2",
+        "pe_max": "35",
+        "pe_percentile_max": "70",
+        "peg_growth_cap": "0.25",
+        "peg_max": "1.5",
+        "readiness_min": "0.8",
+        "return_on_capital_min": "10",
+        "revenue_cagr_min": "0.08",
+        "revenue_growth_slowdown_max": "0.1",
+        "revenue_period_growth_min": "0.05"
+      },
+      "track": "garp"
+    },
+    "conservative": {
+      "algorithm_version": "discovery-v5",
+      "fields": [
+        "revenue_cagr",
+        "deducted_profit_cagr",
+        "revenue_consistent_growth_periods",
+        "deducted_profit_consistent_growth_periods",
+        "latest_revenue_growth",
+        "latest_deducted_profit_growth",
+        "revenue_growth_slowdown",
+        "deducted_profit_growth_slowdown",
+        "return_on_capital",
+        "return_metric_label",
+        "cash_conversion",
+        "dilution_rate",
+        "interest_debt_increase_to_revenue",
+        "goodwill_increase_to_revenue",
+        "acquisition_cash_to_revenue",
+        "gross_margin_change",
+        "net_margin_change",
+        "impairment_share",
+        "non_core_income_proxy_share",
+        "capped_growth",
+        "peg",
+        "pe_percentile",
+        "current_pe",
+        "code"
+      ],
+      "formulas": {
+        "acquisition_cash_to_revenue": "sum(max(0,annual.acquisition_cash_paid))/sum(annual.revenue)",
+        "capped_growth": "min(deducted_profit_cagr,peg_growth_cap)",
+        "cash_conversion": "sum(annual.ocf)/sum(annual.net_income)|annual.net_income>0",
+        "current_pe": "current.pe",
+        "deducted_profit_cagr": "cagr(exact_annual.deducted_net_income,deducted_profit_cagr_periods)",
+        "deducted_profit_consistent_growth_periods": "count(exact_annual.deducted_net_income_yoy>=deducted_profit_period_growth_min)",
+        "deducted_profit_growth_slowdown": "max(0,deducted_profit_cagr-latest_deducted_profit_growth)",
+        "dilution_rate": "latest(annual.shares)/earliest(annual.shares)-1",
+        "goodwill_increase_to_revenue": "max(0,latest(annual.goodwill)-earliest(annual.goodwill))/latest(annual.revenue)",
+        "gross_margin_change": "latest(annual.gross_margin)-earliest(annual.gross_margin)",
+        "impairment_share": "copy_abs(latest(annual.impairment_loss))/copy_abs(latest(annual.deducted_net_income))",
+        "interest_debt_increase_to_revenue": "max(0,latest(annual.interest_debt)-earliest(annual.interest_debt))/latest(annual.revenue)",
+        "latest_deducted_profit_growth": "latest(annual.deducted_net_income_yoy)",
+        "latest_revenue_growth": "latest(annual.revenue_yoy)",
+        "net_margin_change": "latest(annual.net_margin)-earliest(annual.net_margin)",
+        "non_core_income_proxy_share": "(copy_abs(latest(annual.other_income))+copy_abs(latest(annual.asset_disposal_gain)))/copy_abs(latest(annual.deducted_net_income))",
+        "pe_percentile": "percentile_rank(current.pe,monthly.pe)",
+        "peg": "current.pe/(capped_growth*100)",
+        "return_metric_label": "label(primary(annual.roic,fallback=annual.roe))",
+        "return_on_capital": "mean(primary(annual.roic,fallback=annual.roe))",
+        "revenue_cagr": "cagr(exact_annual.revenue,revenue_cagr_periods)",
+        "revenue_consistent_growth_periods": "count(exact_annual.revenue_yoy>=revenue_period_growth_min)",
+        "revenue_growth_slowdown": "max(0,revenue_cagr-latest_revenue_growth)"
+      },
+      "industry_version": "eastmoney:push2delay:clist:f100:v1",
+      "min_observations": {
+        "cash_conversion": 5,
+        "deducted_profit_growth": 5,
+        "dilution": 2,
+        "growth_drivers": 5,
+        "latest_growth": 2,
+        "margin": 2,
+        "quality_adjustments": 1,
+        "revenue_growth": 5,
+        "roe_fallback": 3,
+        "roic": 3,
+        "sustained_profit_growth": 3,
+        "sustained_revenue_growth": 3,
+        "valuation_pe": 60
+      },
+      "missing_policy": {
+        "acquisition_cash_to_revenue": "insufficient",
+        "capped_growth": "insufficient",
+        "cash_conversion": "insufficient",
+        "code": "insufficient",
+        "current_pe": "insufficient",
+        "deducted_profit_cagr": "insufficient",
+        "deducted_profit_consistent_growth_periods": "insufficient",
+        "deducted_profit_growth_slowdown": "insufficient",
+        "dilution_rate": "insufficient",
+        "goodwill_increase_to_revenue": "insufficient",
+        "gross_margin_change": "insufficient",
+        "impairment_share": "insufficient",
+        "interest_debt_increase_to_revenue": "insufficient",
+        "latest_deducted_profit_growth": "insufficient",
+        "latest_revenue_growth": "insufficient",
+        "net_margin_change": "insufficient",
+        "non_core_income_proxy_share": "insufficient",
+        "pe_percentile": "insufficient",
+        "peg": "insufficient",
+        "return_metric_label": "insufficient",
+        "return_on_capital": "insufficient",
+        "revenue_cagr": "insufficient",
+        "revenue_consistent_growth_periods": "insufficient",
+        "revenue_growth_slowdown": "insufficient"
+      },
+      "order": [
+        [
+          "deducted_profit_consistent_growth_periods",
+          "desc",
+          "nulls_last"
+        ],
+        [
+          "peg",
+          "asc",
+          "nulls_last"
+        ],
+        [
+          "return_on_capital",
+          "desc",
+          "nulls_last"
+        ],
+        [
+          "cash_conversion",
+          "desc",
+          "nulls_last"
+        ],
+        [
+          "code",
+          "asc",
+          "nulls_last"
+        ]
+      ],
+      "scope": "weekly-discovery",
+      "sector_branches": {
+        "branch_policies": {
+          "bank": "unsupported",
+          "insurance": "unsupported",
+          "nonfinancial": "nonfinancial",
+          "other_financial": "unsupported",
+          "unknown": "insufficient"
+        },
+        "common": {
+          "annual_observations": {
+            "cash_conversion": 5,
+            "dilution": 5,
+            "growth": 5,
+            "growth_drivers": 5,
+            "margin": 5,
+            "quality_adjustments": 1,
+            "return_on_capital": 5
+          },
+          "cagr_periods": {
+            "deducted_profit": 4,
+            "revenue": 4
+          },
+          "field_domain_policy": "garp-domain-v2",
+          "latest_annual_staleness_years": 1,
+          "valuation_ratio_method": "PE_TTM/PB_MRQ"
+        },
+        "nonfinancial": {
+          "evidence_fields": [
+            "revenue_cagr",
+            "deducted_profit_cagr",
+            "return_on_capital",
+            "peg"
+          ],
+          "excluded_industries": [
+            "光伏设备",
+            "养殖业",
+            "冶钢原料",
+            "化学原料",
+            "小金属",
+            "工业金属",
+            "普钢",
+            "煤炭开采",
+            "特钢Ⅱ",
+            "能源金属",
+            "航运港口",
+            "装修建材",
+            "贵金属"
+          ],
+          "gate_order": [
+            "revenue_growth",
+            "deducted_profit_growth",
+            "sustained_growth",
+            "growth_slowdown",
+            "return_on_capital",
+            "cash_conversion",
+            "dilution",
+            "interest_debt_trend",
+            "goodwill_trend",
+            "acquisition_cash_trend",
+            "gross_margin",
+            "net_margin",
+            "impairment",
+            "non_core_income_proxy",
+            "peg",
+            "valuation"
+          ],
+          "return_metric_policy": "roic_then_roe"
+        }
+      },
+      "thresholds": {
+        "acquisition_cash_to_revenue_max": "0.05",
+        "cash_conversion_min": "1",
+        "deducted_profit_cagr_min": "0.12",
+        "deducted_profit_growth_slowdown_max": "0.08",
+        "deducted_profit_period_growth_min": "0.06",
+        "dilution_rate_max": "0",
+        "goodwill_increase_to_revenue_max": "0.05",
+        "gross_margin_deterioration_max": "1",
+        "impairment_share_max": "0.1",
+        "interest_debt_increase_to_revenue_max": "0.1",
+        "net_margin_deterioration_max": "1",
+        "non_core_income_proxy_share_max": "0.1",
+        "pe_max": "30",
+        "pe_percentile_max": "60",
+        "peg_growth_cap": "0.2",
+        "peg_max": "1.2",
+        "readiness_min": "0.9",
+        "return_on_capital_min": "12",
+        "revenue_cagr_min": "0.1",
+        "revenue_growth_slowdown_max": "0.08",
+        "revenue_period_growth_min": "0.06"
+      },
+      "track": "garp"
+    },
+    "relaxed": {
+      "algorithm_version": "discovery-v5",
+      "fields": [
+        "revenue_cagr",
+        "deducted_profit_cagr",
+        "revenue_consistent_growth_periods",
+        "deducted_profit_consistent_growth_periods",
+        "latest_revenue_growth",
+        "latest_deducted_profit_growth",
+        "revenue_growth_slowdown",
+        "deducted_profit_growth_slowdown",
+        "return_on_capital",
+        "return_metric_label",
+        "cash_conversion",
+        "dilution_rate",
+        "interest_debt_increase_to_revenue",
+        "goodwill_increase_to_revenue",
+        "acquisition_cash_to_revenue",
+        "gross_margin_change",
+        "net_margin_change",
+        "impairment_share",
+        "non_core_income_proxy_share",
+        "capped_growth",
+        "peg",
+        "pe_percentile",
+        "current_pe",
+        "code"
+      ],
+      "formulas": {
+        "acquisition_cash_to_revenue": "sum(max(0,annual.acquisition_cash_paid))/sum(annual.revenue)",
+        "capped_growth": "min(deducted_profit_cagr,peg_growth_cap)",
+        "cash_conversion": "sum(annual.ocf)/sum(annual.net_income)|annual.net_income>0",
+        "current_pe": "current.pe",
+        "deducted_profit_cagr": "cagr(exact_annual.deducted_net_income,deducted_profit_cagr_periods)",
+        "deducted_profit_consistent_growth_periods": "count(exact_annual.deducted_net_income_yoy>=deducted_profit_period_growth_min)",
+        "deducted_profit_growth_slowdown": "max(0,deducted_profit_cagr-latest_deducted_profit_growth)",
+        "dilution_rate": "latest(annual.shares)/earliest(annual.shares)-1",
+        "goodwill_increase_to_revenue": "max(0,latest(annual.goodwill)-earliest(annual.goodwill))/latest(annual.revenue)",
+        "gross_margin_change": "latest(annual.gross_margin)-earliest(annual.gross_margin)",
+        "impairment_share": "copy_abs(latest(annual.impairment_loss))/copy_abs(latest(annual.deducted_net_income))",
+        "interest_debt_increase_to_revenue": "max(0,latest(annual.interest_debt)-earliest(annual.interest_debt))/latest(annual.revenue)",
+        "latest_deducted_profit_growth": "latest(annual.deducted_net_income_yoy)",
+        "latest_revenue_growth": "latest(annual.revenue_yoy)",
+        "net_margin_change": "latest(annual.net_margin)-earliest(annual.net_margin)",
+        "non_core_income_proxy_share": "(copy_abs(latest(annual.other_income))+copy_abs(latest(annual.asset_disposal_gain)))/copy_abs(latest(annual.deducted_net_income))",
+        "pe_percentile": "percentile_rank(current.pe,monthly.pe)",
+        "peg": "current.pe/(capped_growth*100)",
+        "return_metric_label": "label(primary(annual.roic,fallback=annual.roe))",
+        "return_on_capital": "mean(primary(annual.roic,fallback=annual.roe))",
+        "revenue_cagr": "cagr(exact_annual.revenue,revenue_cagr_periods)",
+        "revenue_consistent_growth_periods": "count(exact_annual.revenue_yoy>=revenue_period_growth_min)",
+        "revenue_growth_slowdown": "max(0,revenue_cagr-latest_revenue_growth)"
+      },
+      "industry_version": "eastmoney:push2delay:clist:f100:v1",
+      "min_observations": {
+        "cash_conversion": 5,
+        "deducted_profit_growth": 5,
+        "dilution": 2,
+        "growth_drivers": 5,
+        "latest_growth": 2,
+        "margin": 2,
+        "quality_adjustments": 1,
+        "revenue_growth": 5,
+        "roe_fallback": 3,
+        "roic": 3,
+        "sustained_profit_growth": 3,
+        "sustained_revenue_growth": 3,
+        "valuation_pe": 60
+      },
+      "missing_policy": {
+        "acquisition_cash_to_revenue": "insufficient",
+        "capped_growth": "insufficient",
+        "cash_conversion": "insufficient",
+        "code": "insufficient",
+        "current_pe": "insufficient",
+        "deducted_profit_cagr": "insufficient",
+        "deducted_profit_consistent_growth_periods": "insufficient",
+        "deducted_profit_growth_slowdown": "insufficient",
+        "dilution_rate": "insufficient",
+        "goodwill_increase_to_revenue": "insufficient",
+        "gross_margin_change": "insufficient",
+        "impairment_share": "insufficient",
+        "interest_debt_increase_to_revenue": "insufficient",
+        "latest_deducted_profit_growth": "insufficient",
+        "latest_revenue_growth": "insufficient",
+        "net_margin_change": "insufficient",
+        "non_core_income_proxy_share": "insufficient",
+        "pe_percentile": "insufficient",
+        "peg": "insufficient",
+        "return_metric_label": "insufficient",
+        "return_on_capital": "insufficient",
+        "revenue_cagr": "insufficient",
+        "revenue_consistent_growth_periods": "insufficient",
+        "revenue_growth_slowdown": "insufficient"
+      },
+      "order": [
+        [
+          "deducted_profit_consistent_growth_periods",
+          "desc",
+          "nulls_last"
+        ],
+        [
+          "peg",
+          "asc",
+          "nulls_last"
+        ],
+        [
+          "return_on_capital",
+          "desc",
+          "nulls_last"
+        ],
+        [
+          "cash_conversion",
+          "desc",
+          "nulls_last"
+        ],
+        [
+          "code",
+          "asc",
+          "nulls_last"
+        ]
+      ],
+      "scope": "weekly-discovery",
+      "sector_branches": {
+        "branch_policies": {
+          "bank": "unsupported",
+          "insurance": "unsupported",
+          "nonfinancial": "nonfinancial",
+          "other_financial": "unsupported",
+          "unknown": "insufficient"
+        },
+        "common": {
+          "annual_observations": {
+            "cash_conversion": 5,
+            "dilution": 5,
+            "growth": 5,
+            "growth_drivers": 5,
+            "margin": 5,
+            "quality_adjustments": 1,
+            "return_on_capital": 5
+          },
+          "cagr_periods": {
+            "deducted_profit": 4,
+            "revenue": 4
+          },
+          "field_domain_policy": "garp-domain-v2",
+          "latest_annual_staleness_years": 1,
+          "valuation_ratio_method": "PE_TTM/PB_MRQ"
+        },
+        "nonfinancial": {
+          "evidence_fields": [
+            "revenue_cagr",
+            "deducted_profit_cagr",
+            "return_on_capital",
+            "peg"
+          ],
+          "excluded_industries": [
+            "光伏设备",
+            "养殖业",
+            "冶钢原料",
+            "化学原料",
+            "小金属",
+            "工业金属",
+            "普钢",
+            "煤炭开采",
+            "特钢Ⅱ",
+            "能源金属",
+            "航运港口",
+            "装修建材",
+            "贵金属"
+          ],
+          "gate_order": [
+            "revenue_growth",
+            "deducted_profit_growth",
+            "sustained_growth",
+            "growth_slowdown",
+            "return_on_capital",
+            "cash_conversion",
+            "dilution",
+            "interest_debt_trend",
+            "goodwill_trend",
+            "acquisition_cash_trend",
+            "gross_margin",
+            "net_margin",
+            "impairment",
+            "non_core_income_proxy",
+            "peg",
+            "valuation"
+          ],
+          "return_metric_policy": "roic_then_roe"
+        }
+      },
+      "thresholds": {
+        "acquisition_cash_to_revenue_max": "0.15",
+        "cash_conversion_min": "0.7",
+        "deducted_profit_cagr_min": "0.08",
+        "deducted_profit_growth_slowdown_max": "0.15",
+        "deducted_profit_period_growth_min": "0.03",
+        "dilution_rate_max": "0.1",
+        "goodwill_increase_to_revenue_max": "0.15",
+        "gross_margin_deterioration_max": "3",
+        "impairment_share_max": "0.3",
+        "interest_debt_increase_to_revenue_max": "0.3",
+        "net_margin_deterioration_max": "3",
+        "non_core_income_proxy_share_max": "0.3",
+        "pe_max": "40",
+        "pe_percentile_max": "80",
+        "peg_growth_cap": "0.3",
+        "peg_max": "1.8",
+        "readiness_min": "0.7",
+        "return_on_capital_min": "8",
+        "revenue_cagr_min": "0.06",
+        "revenue_growth_slowdown_max": "0.15",
+        "revenue_period_growth_min": "0.03"
+      },
+      "track": "garp"
+    }
+  },
+  "hypothesis_labels": {
+    "base": "calibration hypothesis; never a runtime fallback",
+    "conservative": "calibration hypothesis; never a runtime fallback",
+    "relaxed": "calibration hypothesis; never a runtime fallback"
+  },
+  "industry_versions": [
+    "eastmoney:push2delay:clist:f100:v1"
+  ],
+  "note": "Evidence-only proposal. No ruler was activated; activation requires explicit approval and a nonblank reason.",
+  "proposal": {
+    "algorithm_version": "discovery-v5",
+    "fields": [
+      "revenue_cagr",
+      "deducted_profit_cagr",
+      "revenue_consistent_growth_periods",
+      "deducted_profit_consistent_growth_periods",
+      "latest_revenue_growth",
+      "latest_deducted_profit_growth",
+      "revenue_growth_slowdown",
+      "deducted_profit_growth_slowdown",
+      "return_on_capital",
+      "return_metric_label",
+      "cash_conversion",
+      "dilution_rate",
+      "interest_debt_increase_to_revenue",
+      "goodwill_increase_to_revenue",
+      "acquisition_cash_to_revenue",
+      "gross_margin_change",
+      "net_margin_change",
+      "impairment_share",
+      "non_core_income_proxy_share",
+      "capped_growth",
+      "peg",
+      "pe_percentile",
+      "current_pe",
+      "code"
+    ],
+    "formulas": {
+      "acquisition_cash_to_revenue": "sum(max(0,annual.acquisition_cash_paid))/sum(annual.revenue)",
+      "capped_growth": "min(deducted_profit_cagr,peg_growth_cap)",
+      "cash_conversion": "sum(annual.ocf)/sum(annual.net_income)|annual.net_income>0",
+      "current_pe": "current.pe",
+      "deducted_profit_cagr": "cagr(exact_annual.deducted_net_income,deducted_profit_cagr_periods)",
+      "deducted_profit_consistent_growth_periods": "count(exact_annual.deducted_net_income_yoy>=deducted_profit_period_growth_min)",
+      "deducted_profit_growth_slowdown": "max(0,deducted_profit_cagr-latest_deducted_profit_growth)",
+      "dilution_rate": "latest(annual.shares)/earliest(annual.shares)-1",
+      "goodwill_increase_to_revenue": "max(0,latest(annual.goodwill)-earliest(annual.goodwill))/latest(annual.revenue)",
+      "gross_margin_change": "latest(annual.gross_margin)-earliest(annual.gross_margin)",
+      "impairment_share": "copy_abs(latest(annual.impairment_loss))/copy_abs(latest(annual.deducted_net_income))",
+      "interest_debt_increase_to_revenue": "max(0,latest(annual.interest_debt)-earliest(annual.interest_debt))/latest(annual.revenue)",
+      "latest_deducted_profit_growth": "latest(annual.deducted_net_income_yoy)",
+      "latest_revenue_growth": "latest(annual.revenue_yoy)",
+      "net_margin_change": "latest(annual.net_margin)-earliest(annual.net_margin)",
+      "non_core_income_proxy_share": "(copy_abs(latest(annual.other_income))+copy_abs(latest(annual.asset_disposal_gain)))/copy_abs(latest(annual.deducted_net_income))",
+      "pe_percentile": "percentile_rank(current.pe,monthly.pe)",
+      "peg": "current.pe/(capped_growth*100)",
+      "return_metric_label": "label(primary(annual.roic,fallback=annual.roe))",
+      "return_on_capital": "mean(primary(annual.roic,fallback=annual.roe))",
+      "revenue_cagr": "cagr(exact_annual.revenue,revenue_cagr_periods)",
+      "revenue_consistent_growth_periods": "count(exact_annual.revenue_yoy>=revenue_period_growth_min)",
+      "revenue_growth_slowdown": "max(0,revenue_cagr-latest_revenue_growth)"
+    },
+    "industry_version": "eastmoney:push2delay:clist:f100:v1",
+    "min_observations": {
+      "cash_conversion": 5,
+      "deducted_profit_growth": 5,
+      "dilution": 2,
+      "growth_drivers": 5,
+      "latest_growth": 2,
+      "margin": 2,
+      "quality_adjustments": 1,
+      "revenue_growth": 5,
+      "roe_fallback": 3,
+      "roic": 3,
+      "sustained_profit_growth": 3,
+      "sustained_revenue_growth": 3,
+      "valuation_pe": 60
+    },
+    "missing_policy": {
+      "acquisition_cash_to_revenue": "insufficient",
+      "capped_growth": "insufficient",
+      "cash_conversion": "insufficient",
+      "code": "insufficient",
+      "current_pe": "insufficient",
+      "deducted_profit_cagr": "insufficient",
+      "deducted_profit_consistent_growth_periods": "insufficient",
+      "deducted_profit_growth_slowdown": "insufficient",
+      "dilution_rate": "insufficient",
+      "goodwill_increase_to_revenue": "insufficient",
+      "gross_margin_change": "insufficient",
+      "impairment_share": "insufficient",
+      "interest_debt_increase_to_revenue": "insufficient",
+      "latest_deducted_profit_growth": "insufficient",
+      "latest_revenue_growth": "insufficient",
+      "net_margin_change": "insufficient",
+      "non_core_income_proxy_share": "insufficient",
+      "pe_percentile": "insufficient",
+      "peg": "insufficient",
+      "return_metric_label": "insufficient",
+      "return_on_capital": "insufficient",
+      "revenue_cagr": "insufficient",
+      "revenue_consistent_growth_periods": "insufficient",
+      "revenue_growth_slowdown": "insufficient"
+    },
+    "order": [
+      [
+        "deducted_profit_consistent_growth_periods",
+        "desc",
+        "nulls_last"
+      ],
+      [
+        "peg",
+        "asc",
+        "nulls_last"
+      ],
+      [
+        "return_on_capital",
+        "desc",
+        "nulls_last"
+      ],
+      [
+        "cash_conversion",
+        "desc",
+        "nulls_last"
+      ],
+      [
+        "code",
+        "asc",
+        "nulls_last"
+      ]
+    ],
+    "scope": "weekly-discovery",
+    "sector_branches": {
+      "branch_policies": {
+        "bank": "unsupported",
+        "insurance": "unsupported",
+        "nonfinancial": "nonfinancial",
+        "other_financial": "unsupported",
+        "unknown": "insufficient"
+      },
+      "common": {
+        "annual_observations": {
+          "cash_conversion": 5,
+          "dilution": 5,
+          "growth": 5,
+          "growth_drivers": 5,
+          "margin": 5,
+          "quality_adjustments": 1,
+          "return_on_capital": 5
+        },
+        "cagr_periods": {
+          "deducted_profit": 4,
+          "revenue": 4
+        },
+        "field_domain_policy": "garp-domain-v2",
+        "latest_annual_staleness_years": 1,
+        "valuation_ratio_method": "PE_TTM/PB_MRQ"
+      },
+      "nonfinancial": {
+        "evidence_fields": [
+          "revenue_cagr",
+          "deducted_profit_cagr",
+          "return_on_capital",
+          "peg"
+        ],
+        "excluded_industries": [
+          "光伏设备",
+          "养殖业",
+          "冶钢原料",
+          "化学原料",
+          "小金属",
+          "工业金属",
+          "普钢",
+          "煤炭开采",
+          "特钢Ⅱ",
+          "能源金属",
+          "航运港口",
+          "装修建材",
+          "贵金属"
+        ],
+        "gate_order": [
+          "revenue_growth",
+          "deducted_profit_growth",
+          "sustained_growth",
+          "growth_slowdown",
+          "return_on_capital",
+          "cash_conversion",
+          "dilution",
+          "interest_debt_trend",
+          "goodwill_trend",
+          "acquisition_cash_trend",
+          "gross_margin",
+          "net_margin",
+          "impairment",
+          "non_core_income_proxy",
+          "peg",
+          "valuation"
+        ],
+        "return_metric_policy": "roic_then_roe"
+      }
+    },
+    "thresholds": {
+      "acquisition_cash_to_revenue_max": "0.1",
+      "cash_conversion_min": "0.8",
+      "deducted_profit_cagr_min": "0.1",
+      "deducted_profit_growth_slowdown_max": "0.1",
+      "deducted_profit_period_growth_min": "0.05",
+      "dilution_rate_max": "0.05",
+      "goodwill_increase_to_revenue_max": "0.1",
+      "gross_margin_deterioration_max": "2",
+      "impairment_share_max": "0.2",
+      "interest_debt_increase_to_revenue_max": "0.2",
+      "net_margin_deterioration_max": "2",
+      "non_core_income_proxy_share_max": "0.2",
+      "pe_max": "35",
+      "pe_percentile_max": "70",
+      "peg_growth_cap": "0.25",
+      "peg_max": "1.5",
+      "readiness_min": "0.8",
+      "return_on_capital_min": "10",
+      "revenue_cagr_min": "0.08",
+      "revenue_growth_slowdown_max": "0.1",
+      "revenue_period_growth_min": "0.05"
+    },
+    "track": "garp"
+  },
+  "proposed_readiness_threshold": "0.8",
+  "provenance_coverage": {
+    "acquisition_cash_paid": {
+      "present": 4714,
+      "ratio": "0.989605430632159524819686041578277471361900721255833686890114552397114977",
+      "sources": [
+        "discovery"
+      ],
+      "total": 4714,
+      "trusted": 4665
+    },
+    "asset_disposal_gain": {
+      "present": 4392,
+      "ratio": "0.931692829868476877386508273228680526092490453966907085277895630038184132",
+      "sources": [
+        "discovery"
+      ],
+      "total": 4714,
+      "trusted": 4392
+    },
+    "deducted_net_income": {
+      "present": 4714,
+      "ratio": "0.989393296563428086550700042426813746287653797199830292745014849384811201",
+      "sources": [
+        "discovery"
+      ],
+      "total": 4714,
+      "trusted": 4664
+    },
+    "goodwill": {
+      "present": 4714,
+      "ratio": "0.989605430632159524819686041578277471361900721255833686890114552397114977",
+      "sources": [
+        "discovery"
+      ],
+      "total": 4714,
+      "trusted": 4665
+    },
+    "gross_margin": {
+      "present": 4713,
+      "ratio": "0.988756894357233771743742044972422571064913025031820110309715740347899873",
+      "sources": [
+        "discovery"
+      ],
+      "total": 4714,
+      "trusted": 4661
+    },
+    "impairment_loss": {
+      "present": 4712,
+      "ratio": "0.999575731862537123462028001697072549851506151887993211709800593975392448",
+      "sources": [
+        "discovery"
+      ],
+      "total": 4714,
+      "trusted": 4712
+    },
+    "interest_debt": {
+      "present": 4714,
+      "ratio": "0.989605430632159524819686041578277471361900721255833686890114552397114977",
+      "sources": [
+        "discovery"
+      ],
+      "total": 4714,
+      "trusted": 4665
+    },
+    "net_income": {
+      "present": 4714,
+      "ratio": "0.989605430632159524819686041578277471361900721255833686890114552397114977",
+      "sources": [
+        "discovery"
+      ],
+      "total": 4714,
+      "trusted": 4665
+    },
+    "net_margin": {
+      "present": 4714,
+      "ratio": "0.988969028425965210012728044123886296139159949087823504454815443360203649",
+      "sources": [
+        "discovery"
+      ],
+      "total": 4714,
+      "trusted": 4662
+    },
+    "ocf": {
+      "present": 4714,
+      "ratio": "0.989605430632159524819686041578277471361900721255833686890114552397114977",
+      "sources": [
+        "discovery"
+      ],
+      "total": 4714,
+      "trusted": 4665
+    },
+    "other_income": {
+      "present": 4711,
+      "ratio": "0.999363597793805685193042002545608824777259227831989817564700890963088672",
+      "sources": [
+        "discovery"
+      ],
+      "total": 4714,
+      "trusted": 4711
+    },
+    "revenue": {
+      "present": 4714,
+      "ratio": "0.988544760288502333474756045820958845990666100975816716164616037335596097",
+      "sources": [
+        "discovery"
+      ],
+      "total": 4714,
+      "trusted": 4660
+    },
+    "roe": {
+      "present": 4713,
+      "ratio": "0.990241832838353839626644039032668646584641493423843869325413661434026305",
+      "sources": [
+        "discovery"
+      ],
+      "total": 4714,
+      "trusted": 4668
+    },
+    "roic": {
+      "present": 0,
+      "ratio": "0",
+      "sources": [],
+      "total": 4714,
+      "trusted": 0
+    },
+    "shares": {
+      "present": 4714,
+      "ratio": "0.989605430632159524819686041578277471361900721255833686890114552397114977",
+      "sources": [
+        "discovery"
+      ],
+      "total": 4714,
+      "trusted": 4665
+    },
+    "valuation_pe": {
+      "present": 4560,
+      "ratio": "0.384174798472634705133644463300806109461179465422146796775562155282138311",
+      "sources": [
+        "valuation"
+      ],
+      "total": 4714,
+      "trusted": 1811
+    }
+  },
+  "return_metric_coverage": {
+    "policy": "roic_then_roe",
+    "roe_fallback": {
+      "companies": 4668,
+      "observations": 23370,
+      "ratio": "0.990241832838353839626644039032668646584641493423843869325413661434026305",
+      "total": 4714
+    },
+    "roic": {
+      "companies": 0,
+      "observations": 0,
+      "ratio": "0",
+      "total": 4714
+    },
+    "selected_labels": {
+      "insufficient": {
+        "count": 3,
+        "ratio": "0.000636402206194314806957997454391175222740772168010182435299109036911327959",
+        "total": 4714
+      },
+      "roe_fallback": {
+        "count": 4711,
+        "ratio": "0.999363597793805685193042002545608824777259227831989817564700890963088672",
+        "total": 4714
+      },
+      "roic": {
+        "count": 0,
+        "ratio": "0",
+        "total": 4714
+      }
+    }
+  },
+  "schema_version": 1,
+  "source_as_of": {
+    "fill": "2026-10-09 02:01:23.528839+00:00",
+    "financial": "2026-09-30",
+    "request_snapshot_at": "2026-10-09T02:01:23.528839+00:00",
+    "security": "2026-10-08",
+    "valuation": "2026-10-08",
+    "valuation_fetched_at": "2026-10-09 02:01:23.235922+00:00"
+  },
+  "source_coverage": {
+    "fill": {
+      "present": 5175,
+      "ratio": "1",
+      "total": 5175
+    },
+    "financial": {
+      "present": 5175,
+      "ratio": "1",
+      "total": 5175
+    },
+    "price": {
+      "present": 5175,
+      "ratio": "1",
+      "total": 5175
+    },
+    "security": {
+      "present": 5175,
+      "ratio": "1",
+      "total": 5175
+    },
+    "valuation": {
+      "present": 5175,
+      "ratio": "1",
+      "total": 5175
+    }
+  },
+  "status": "ready",
+  "track": "garp",
+  "universe": {
+    "branches": {
+      "nonfinancial": 4714,
+      "unsupported_bank": 42,
+      "unsupported_cyclical": 388,
+      "unsupported_insurance": 5,
+      "unsupported_other_financial": 26
+    },
+    "eligible": 5175,
+    "fill_id": 9,
+    "scope": "latest_completed_full_market_fill",
+    "snapshot_bytes": 579449967,
+    "total": 5175
+  }
+}

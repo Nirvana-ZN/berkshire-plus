@@ -2,13 +2,13 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from inspect import signature
 from math import ceil
 from time import sleep
 from typing import Protocol
 
-from sqlalchemy import delete, or_, select, update
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.orm import Session
 
@@ -33,7 +33,13 @@ from discovery.company_payload import (
 )
 from discovery.constants import CHINA_MARKET_TIMEZONE, china_market_date
 from discovery.field_dictionary import FIELD_DICTIONARY
-from jobs.lock import JOB_TYPE_DISCOVERY_DATA, lock_status, release, try_acquire
+from jobs.lock import (
+    FILL_RESTART_PAUSE,
+    JOB_TYPE_DISCOVERY_DATA,
+    lock_status,
+    release,
+    try_acquire,
+)
 from market.types import (
     DiscoveryCompanyData,
     DiscoveryCompanyError,
@@ -55,9 +61,11 @@ FILL_CHUNK = 20
 
 @dataclass(frozen=True)
 class RequestPolicy:
-    requests_per_second: float = 0.5
+    # A full-market fill is ~55k requests (~10.5 per company); 1/s finished
+    # two fills without East Money throttling.
+    requests_per_second: float = 1.0
     max_attempts: int = 3
-    daily_budget: int = 1000
+    daily_budget: int = 120_000
     max_runtime_seconds: float = 15 * 60
     retry_delay_seconds: float = 5 * 60
 
@@ -364,11 +372,56 @@ def start_discovery_data_fill(
     return active, True
 
 
+def fill_resume_delay(
+    session: Session, fill_id: int, now: datetime
+) -> float | None:
+    """Seconds until a paused fill can progress unattended; None keeps it paused."""
+    fill = session.get(DiscoveryDataFill, fill_id)
+    if fill is None or fill.status != "paused":
+        return None
+    stamp = _aware_utc(now)
+    if (
+        fill.budget_day == _policy_day(stamp)
+        and fill.daily_requests >= fill.daily_budget
+    ):
+        return None
+    if fill.last_error in ("maximum run time reached", FILL_RESTART_PAUSE):
+        return 0.0
+    counts = _checkpoint_counts(session, fill.id)
+    if counts["pending"] or counts["running"]:
+        # Stopped with work left for another reason (universe, crash): a person
+        # should see the error before it retries.
+        return None
+    retry_at = session.scalar(
+        select(func.min(DiscoveryDataCheckpoint.next_retry_at)).where(
+            DiscoveryDataCheckpoint.fill_id == fill.id,
+            DiscoveryDataCheckpoint.status == "retryable",
+        )
+    )
+    if retry_at is None:
+        return None
+    return max((_aware_utc(retry_at) - stamp).total_seconds(), 0.0)
+
+
 def _reset_budget_day(fill: DiscoveryDataFill, now: datetime) -> None:
     day = _policy_day(now)
     if fill.budget_day != day:
         fill.budget_day = day
         fill.daily_requests = 0
+
+
+# Intraday the exchange calendar already lists today, but daily valuations only
+# appear after the close (~15:15 Beijing on 2026-09-22); a fill started then
+# would pin early companies to a price that does not exist yet.
+# ponytail: fixed cutoff with margin, not a probe of the publication itself.
+_VALUATION_PUBLISHED_AT = time(16, 0)
+
+
+def _completed_session_date(now: datetime) -> date:
+    local = _aware_utc(now).astimezone(CHINA_MARKET_TIMEZONE)
+    if local.time() < _VALUATION_PUBLISHED_AT:
+        return local.date() - timedelta(days=1)
+    return local.date()
 
 
 def _initialize_checkpoints(
@@ -404,15 +457,15 @@ def _initialize_checkpoints(
         session.commit()
         return False
     try:
-        fetch = getattr(market, "fetch_cheap_universe")
-        as_of = china_market_date(request_gate.clock.now())
+        fetch = getattr(market, "fetch_universe")
+        as_of = _completed_session_date(request_gate.clock.now())
         rows = list(
             fetch(before_request=request_gate, as_of=as_of)
             if _supports_keyword(fetch, "as_of")
             else fetch(before_request=request_gate)
         )
-        if hasattr(market, "_last_cheap_trading_dates"):
-            trading_dates = list(market._last_cheap_trading_dates)
+        if hasattr(market, "_last_universe_trading_dates"):
+            trading_dates = list(market._last_universe_trading_dates)
         else:
             fetch_dates = getattr(market, "fetch_trading_dates")
             end = as_of.isoformat()

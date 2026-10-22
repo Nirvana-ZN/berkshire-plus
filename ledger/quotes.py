@@ -9,7 +9,14 @@ import re
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import Instrument, PositionTarget, Quote
+from app.models import (
+    DiscoveryUniverseSecurity,
+    Instrument,
+    PositionTarget,
+    Quote,
+    ResearchJob,
+    Watchlist,
+)
 from ledger.positions import LOCAL_USER_ID, PositionRow
 from ledger.rules import LIGHT_NONE, lights_for
 
@@ -84,12 +91,7 @@ def project_positions(
         row.name: row
         for row in session.scalars(select(Quote).where(Quote.user_id == user_id)).all()
     }
-    instruments = {
-        row.name: row
-        for row in session.scalars(
-            select(Instrument).where(Instrument.user_id == user_id)
-        ).all()
-    }
+    codes_by_name = instrument_code_by_name(session, user_id=user_id)
     targets = _target_map(session, user_id=user_id)
     priced: list[tuple[PositionRow, Quote | None, Decimal | None]] = []
     market_values: list[Decimal | None] = []
@@ -124,12 +126,11 @@ def project_positions(
             pnl = market_value - row.cost
         if market_value is not None and denominator > 0:
             weight = market_value / denominator
-        instrument = instruments.get(row.name)
         code = None
         if quote is not None and quote.code:
             code = quote.code
-        elif instrument is not None:
-            code = instrument.code
+        elif row.name in codes_by_name:
+            code = codes_by_name[row.name]
         target = targets.get(row.name)
         no_target = target is None
         deviation = None
@@ -377,10 +378,101 @@ def apply_refresh(
 def instrument_code_by_name(
     session: Session, *, user_id: int = LOCAL_USER_ID
 ) -> dict[str, str]:
-    rows = session.scalars(
+    mapping: dict[str, str] = {}
+    for name, code in session.execute(
+        select(ResearchJob.name, ResearchJob.code)
+        .where(ResearchJob.user_id == user_id)
+        .order_by(ResearchJob.id)
+    ).all():
+        if code and is_a_share_code(code):
+            mapping[name] = code
+    for name, code in session.execute(
+        select(Watchlist.name, Watchlist.code)
+        .where(Watchlist.user_id == user_id)
+        .order_by(Watchlist.id)
+    ).all():
+        if code and is_a_share_code(code):
+            mapping[name] = code
+    for row in session.scalars(select(Quote).where(Quote.user_id == user_id)).all():
+        if row.code and is_a_share_code(row.code):
+            mapping[row.name] = row.code
+    for row in session.scalars(
         select(Instrument).where(Instrument.user_id == user_id)
+    ).all():
+        mapping[row.name] = row.code
+    return mapping
+
+
+def quote_targets(
+    session: Session, held_names: Sequence[str], *, user_id: int = LOCAL_USER_ID
+) -> list[tuple[str, str | None]]:
+    mapping = instrument_code_by_name(session, user_id=user_id)
+    targets: dict[str, str | None] = {}
+    for name in held_names:
+        code = mapping.get(name)
+        if code is None:
+            found = session.scalars(
+                select(DiscoveryUniverseSecurity.code)
+                .where(DiscoveryUniverseSecurity.name == name)
+                .order_by(DiscoveryUniverseSecurity.fill_id.desc())
+            ).first()
+            if found and is_a_share_code(found):
+                code = found
+        targets[name] = code
+    researched = session.execute(
+        select(ResearchJob.name, ResearchJob.code)
+        .where(ResearchJob.user_id == user_id, ResearchJob.status == "done")
+        .order_by(ResearchJob.id.desc())
     ).all()
-    return {row.name: row.code for row in rows}
+    for name, code in researched:
+        if not targets.get(name):
+            targets[name] = code
+    return list(targets.items())
+
+
+def suggest_instruments(
+    session: Session,
+    query: str = "",
+    *,
+    limit: int = 15,
+    user_id: int = LOCAL_USER_ID,
+) -> list[dict[str, str]]:
+    q = (query or "").strip()
+    q_upper = q.upper()
+    mapping = instrument_code_by_name(session, user_id=user_id)
+    results: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for name, code in mapping.items():
+        if not q or q in name or q_upper in code.upper():
+            results.append({"name": name, "code": code})
+            seen.add(name)
+            if len(results) >= limit:
+                return results
+    if q:
+        latest_fill = session.scalars(
+            select(DiscoveryUniverseSecurity.fill_id)
+            .order_by(DiscoveryUniverseSecurity.fill_id.desc())
+            .limit(1)
+        ).first()
+        if latest_fill is not None:
+            uni_rows = session.execute(
+                select(DiscoveryUniverseSecurity.name, DiscoveryUniverseSecurity.code)
+                .where(
+                    DiscoveryUniverseSecurity.fill_id == latest_fill,
+                    (
+                        DiscoveryUniverseSecurity.name.contains(q)
+                        | DiscoveryUniverseSecurity.code.contains(q_upper)
+                    ),
+                )
+                .limit(limit * 2)
+            ).all()
+            for name, code in uni_rows:
+                if name not in seen and code and is_a_share_code(code):
+                    results.append({"name": name, "code": code})
+                    seen.add(name)
+                    if len(results) >= limit:
+                        break
+    return results
 
 
 def lookup_saved_instrument(

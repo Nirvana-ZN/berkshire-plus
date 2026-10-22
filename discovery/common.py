@@ -9,12 +9,12 @@ from decimal import Decimal, InvalidOperation
 from math import isfinite
 from types import MappingProxyType
 
-from discovery.builds import BUILD_VERSION
+from discovery.builds import BUILD_VERSION, RETIRED_BUILDS
 from discovery.snapshot import FrozenCompanyInput, FrozenValue
 from ledger.quotes import is_a_share_code
-from market.cheap import (
+from market.universe import (
     SUSPENSION_MAX_TRADING_DAYS,
-    CheapRow,
+    UniverseRow,
     security_state_eligible,
 )
 
@@ -29,8 +29,8 @@ class CommonSafetyContract:
 
 COMMON_SAFETY_CONTRACTS: Mapping[str, CommonSafetyContract] = MappingProxyType(
     {
-        BUILD_VERSION: CommonSafetyContract(
-            algorithm_version=BUILD_VERSION,
+        version: CommonSafetyContract(
+            algorithm_version=version,
             price_floor=Decimal("0"),
             suspension_max_trading_days=SUSPENSION_MAX_TRADING_DAYS,
             rules=(
@@ -64,6 +64,8 @@ COMMON_SAFETY_CONTRACTS: Mapping[str, CommonSafetyContract] = MappingProxyType(
                 }
             ),
         )
+        # The common stage is unchanged since v2; retired batches stay readable.
+        for version in (BUILD_VERSION, *sorted(RETIRED_BUILDS))
     }
 )
 
@@ -376,7 +378,7 @@ def classify_common(
             parsed_price=parsed_price,
         )
 
-    row = CheapRow(
+    row = UniverseRow(
         code=code,
         name=company.name,
         price=parsed_price,

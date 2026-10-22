@@ -17,7 +17,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 from app.models import RulerVersion
-from discovery.builds import AVAILABLE_BUILDS
+from discovery.builds import AVAILABLE_BUILDS, RETIRED_BUILDS
 from discovery.industry import classify_industry_branch
 from discovery.quality_contract import quality_ruler_branch_policies
 from discovery.tracks import SCOPE_TRACKS, TRACKS, scope_for_track, track_for_scope
@@ -54,13 +54,16 @@ _NULL_ORDERS = frozenset({"nulls_first", "nulls_last"})
 QUALITY_DISCOUNT_FIELDS = (
     "listing_years",
     "roe_mean",
-    "roe_cv",
+    "roe_downside_volatility",
+    "roe_recent_ratio",
     "positive_net_income_observations",
     "latest_net_income",
     "latest_net_assets",
     "cash_conversion",
     "dilution_rate",
     "debt_to_equity",
+    "cash_to_assets",
+    "interest_debt_to_assets",
     "interest_coverage",
     "margin_change",
     "pe_percentile",
@@ -69,6 +72,9 @@ QUALITY_DISCOUNT_FIELDS = (
     "pb_median_ratio",
     "normalized_earnings",
     "normalized_pe",
+    "earnings_yield",
+    "deducted_profit_cagr",
+    "peg",
     "bank_capital_adequacy",
     "bank_core_tier1_capital_adequacy",
     "bank_npl",
@@ -76,25 +82,30 @@ QUALITY_DISCOUNT_FIELDS = (
 )
 QUALITY_DISCOUNT_ORDER = (
     ("pe_percentile", "asc", "nulls_last"),
-    ("roe_cv", "asc", "nulls_last"),
+    ("roe_downside_volatility", "asc", "nulls_last"),
     ("cash_conversion", "desc", "nulls_last"),
     ("code", "asc", "nulls_last"),
 )
 QUALITY_DISCOUNT_FORMULAS = MappingProxyType(
     {
         "roe_mean": "mean(annual.roe)",
-        "roe_cv": "coefficient_of_variation(annual.roe)",
+        "roe_downside_volatility": "downside_volatility(annual.roe)",
+        "roe_recent_ratio": "mean(recent.roe)/mean(annual.roe)",
         "positive_net_income_observations": (
             "count(annual.net_income>0)"
         ),
         "latest_net_income": "latest(annual.net_income)",
         "latest_net_assets": "latest(annual.net_assets)",
         "cash_conversion": (
-            "cash_conversion(annual.ocf,annual.net_income>0)"
+            "sum(annual.ocf)/sum(annual.net_income)|annual.net_income>0"
         ),
         "dilution_rate": "latest(annual.shares)/earliest(annual.shares)-1",
         "debt_to_equity": (
             "latest(annual.interest_debt)/latest(annual.net_assets)"
+        ),
+        "cash_to_assets": "latest(annual.cash)/latest(annual.total_assets)",
+        "interest_debt_to_assets": (
+            "latest(annual.interest_debt)/latest(annual.total_assets)"
         ),
         "interest_coverage": "latest(annual.interest_coverage)",
         "margin_change": (
@@ -110,6 +121,9 @@ QUALITY_DISCOUNT_FORMULAS = MappingProxyType(
         "normalized_pe": (
             "current.price*latest(annual.shares)/normalized_earnings"
         ),
+        "earnings_yield": "100/current.pe",
+        "deducted_profit_cagr": "cagr(annual.deducted_net_income,growth)",
+        "peg": "current.pe/(min(deducted_profit_cagr,peg_growth_cap)*100)",
         "bank_capital_adequacy": "latest(annual.capital_adequacy)",
         "bank_core_tier1_capital_adequacy": (
             "latest(annual.core_tier1_capital_adequacy)"
@@ -121,7 +135,10 @@ QUALITY_DISCOUNT_THRESHOLDS = frozenset(
     {
         "listing_years_min",
         "roe_mean_min",
-        "roe_cv_max",
+        "roe_downside_volatility_max",
+        "roe_recent_ratio_min",
+        "cash_to_assets_min",
+        "interest_debt_to_assets_min",
         "net_income_positive_min",
         "net_assets_positive_min",
         "cash_conversion_min",
@@ -135,6 +152,10 @@ QUALITY_DISCOUNT_THRESHOLDS = frozenset(
         "pb_median_ratio_max",
         "normalized_pe_max",
         "normalized_earnings_min",
+        "treasury_yield",
+        "earnings_yield_spread_min",
+        "peg_growth_cap",
+        "peg_release_max",
         "bank_roe_min",
         "bank_capital_adequacy_min",
         "bank_core_tier1_min",
@@ -145,6 +166,7 @@ QUALITY_DISCOUNT_THRESHOLDS = frozenset(
 QUALITY_DISCOUNT_MINIMUMS = frozenset(
     {
         "roe",
+        "roe_recent",
         "positive_net_income",
         "net_assets",
         "cash_conversion",
@@ -155,6 +177,7 @@ QUALITY_DISCOUNT_MINIMUMS = frozenset(
         "valuation_pe",
         "valuation_pb",
         "normalized_earnings",
+        "growth",
         "bank_roe",
         "bank_capital",
         "bank_npl",
@@ -182,6 +205,7 @@ _QUALITY_COMMON_CONFIG_KEYS = frozenset(
 _QUALITY_LOOKBACK_KEYS = frozenset(
     {
         "roe",
+        "roe_recent",
         "profitability",
         "cash_conversion",
         "dilution",
@@ -190,6 +214,7 @@ _QUALITY_LOOKBACK_KEYS = frozenset(
         "interest_coverage",
         "margin",
         "normalized_earnings",
+        "growth",
         "bank_capital",
         "bank_npl",
     }
@@ -208,14 +233,17 @@ _QUALITY_GATE_SETS = MappingProxyType({
             "listing_age",
             "roe_mean",
             "roe_stability",
+            "roe_trend",
             "profitability",
             "positive_equity",
             "cash_conversion",
             "dilution",
             "leverage",
             "interest_coverage",
+            "cash_debt",
             "margin",
             "valuation",
+            "absolute_valuation",
         }
     ),
     "cyclical": frozenset(
@@ -229,6 +257,7 @@ _QUALITY_GATE_SETS = MappingProxyType({
             "dilution",
             "leverage",
             "interest_coverage",
+            "cash_debt",
             "margin",
             "normalized_earnings_positive",
             "cyclical_valuation",
@@ -249,12 +278,16 @@ DEEP_VALUE_FIELDS = (
     "listing_years",
     "normalized_earnings",
     "normalized_pe",
+    "normalized_pe_bucket",
     "cumulative_fcf",
     "normalized_fcf",
     "net_debt_to_normalized_fcf",
+    "cash_to_assets",
+    "interest_debt_to_assets",
     "interest_coverage",
     "dilution_rate",
     "revenue_decline",
+    "earnings_decline",
     "one_time_profit_share",
     "impairment_share",
     "non_core_income_proxy_share",
@@ -272,11 +305,18 @@ DEEP_VALUE_FORMULAS = MappingProxyType(
         "normalized_pe": (
             "current.price*latest(annual.shares)/normalized_earnings"
         ),
+        "normalized_pe_bucket": (
+            "min(floor(normalized_pe*4/normalized_pe_max),3)"
+        ),
         "cumulative_fcf": "sum(annual.ocf-annual.capex)",
         "normalized_fcf": "median(annual.ocf-annual.capex)",
         "net_debt_to_normalized_fcf": (
             "(latest(annual.interest_debt)-latest(annual.cash))/"
             "normalized_fcf"
+        ),
+        "cash_to_assets": "latest(annual.cash)/latest(annual.total_assets)",
+        "interest_debt_to_assets": (
+            "latest(annual.interest_debt)/latest(annual.total_assets)"
         ),
         "interest_coverage": "latest(annual.interest_coverage)",
         "dilution_rate": (
@@ -286,19 +326,22 @@ DEEP_VALUE_FORMULAS = MappingProxyType(
             "max(0,(earliest(annual.revenue)-latest(annual.revenue))/"
             "earliest(annual.revenue))"
         ),
+        "earnings_decline": (
+            "max(0,(normalized_earnings-latest(annual.deducted_net_income))/"
+            "normalized_earnings)"
+        ),
         "one_time_profit_share": (
-            "max(0,latest(annual.net_income)-"
-            "latest(annual.deducted_net_income))/"
-            "copy_abs(normalized_earnings)"
+            "sum(max(0,annual.net_income-annual.deducted_net_income))/"
+            "(copy_abs(normalized_earnings)*count(annual))"
         ),
         "impairment_share": (
-            "copy_abs(latest(annual.impairment_loss))/"
-            "copy_abs(normalized_earnings)"
+            "sum(copy_abs(annual.impairment_loss))/"
+            "(copy_abs(normalized_earnings)*count(annual))"
         ),
         "non_core_income_proxy_share": (
-            "(copy_abs(latest(annual.other_income))+"
-            "copy_abs(latest(annual.asset_disposal_gain)))/"
-            "copy_abs(normalized_earnings)"
+            "sum(copy_abs(annual.other_income)+"
+            "copy_abs(annual.asset_disposal_gain))/"
+            "(copy_abs(normalized_earnings)*count(annual))"
         ),
         "pb_percentile": "percentile_rank(current.pb,monthly.pb)",
         "pb_median_ratio": "current.pb/median(monthly.pb)",
@@ -311,9 +354,10 @@ DEEP_VALUE_FORMULAS = MappingProxyType(
     }
 )
 DEEP_VALUE_ORDER = (
-    ("normalized_pe", "asc", "nulls_last"),
+    ("normalized_pe_bucket", "asc", "nulls_last"),
     ("pb_percentile", "asc", "nulls_last"),
     ("net_debt_to_normalized_fcf", "asc", "nulls_last"),
+    ("normalized_pe", "asc", "nulls_last"),
     ("code", "asc", "nulls_last"),
 )
 DEEP_VALUE_THRESHOLDS = frozenset(
@@ -324,9 +368,12 @@ DEEP_VALUE_THRESHOLDS = frozenset(
         "cumulative_fcf_min",
         "normalized_fcf_min",
         "net_debt_to_normalized_fcf_max",
+        "cash_to_assets_min",
+        "interest_debt_to_assets_min",
         "interest_coverage_min",
         "dilution_rate_max",
         "revenue_decline_max",
+        "earnings_decline_max",
         "one_time_profit_share_max",
         "impairment_share_max",
         "non_core_income_proxy_share_max",
@@ -420,8 +467,10 @@ _DEEP_GATE_SETS = MappingProxyType(
                 "positive_cumulative_fcf",
                 "net_debt",
                 "interest_coverage",
+                "cash_debt",
                 "dilution",
                 "revenue_decline",
+                "earnings_decline",
                 "one_time_profit",
                 "impairment",
                 "non_core_income_proxy",
@@ -495,7 +544,7 @@ GARP_FORMULAS = MappingProxyType(
             "label(primary(annual.roic,fallback=annual.roe))"
         ),
         "cash_conversion": (
-            "cash_conversion(annual.ocf,annual.net_income>0)"
+            "sum(annual.ocf)/sum(annual.net_income)|annual.net_income>0"
         ),
         "dilution_rate": (
             "latest(annual.shares)/earliest(annual.shares)-1"
@@ -509,7 +558,7 @@ GARP_FORMULAS = MappingProxyType(
             "latest(annual.revenue)"
         ),
         "acquisition_cash_to_revenue": (
-            "sum(annual.acquisition_cash_paid)/sum(annual.revenue)"
+            "sum(max(0,annual.acquisition_cash_paid))/sum(annual.revenue)"
         ),
         "gross_margin_change": (
             "latest(annual.gross_margin)-earliest(annual.gross_margin)"
@@ -533,11 +582,10 @@ GARP_FORMULAS = MappingProxyType(
     }
 )
 GARP_ORDER = (
-    ("cash_conversion", "desc", "nulls_last"),
-    ("return_on_capital", "desc", "nulls_last"),
     ("deducted_profit_consistent_growth_periods", "desc", "nulls_last"),
     ("peg", "asc", "nulls_last"),
-    ("pe_percentile", "asc", "nulls_last"),
+    ("return_on_capital", "desc", "nulls_last"),
+    ("cash_conversion", "desc", "nulls_last"),
     ("code", "asc", "nulls_last"),
 )
 GARP_THRESHOLDS = frozenset(
@@ -582,7 +630,7 @@ GARP_MINIMUMS = frozenset(
         "valuation_pe",
     }
 )
-GARP_FIELD_DOMAIN_POLICY = "garp-domain-v1"
+GARP_FIELD_DOMAIN_POLICY = "garp-domain-v2"
 _GARP_COMMON_KEYS = frozenset(
     {
         "valuation_ratio_method",
@@ -1173,6 +1221,7 @@ def validate_quality_discount_ruler(ruler: TrackRuler) -> TrackRuler:
         raise ValueError("quality discount observation minimum exceeds work bounds")
     observation_windows = {
         "roe": "roe",
+        "roe_recent": "roe_recent",
         "bank_roe": "roe",
         "positive_net_income": "profitability",
         "net_assets": "positive_equity",
@@ -1182,6 +1231,7 @@ def validate_quality_discount_ruler(ruler: TrackRuler) -> TrackRuler:
         "interest_coverage": "interest_coverage",
         "margin": "margin",
         "normalized_earnings": "normalized_earnings",
+        "growth": "growth",
         "bank_capital": "bank_capital",
         "bank_npl": "bank_npl",
     }
@@ -1192,6 +1242,10 @@ def validate_quality_discount_ruler(ruler: TrackRuler) -> TrackRuler:
         raise ValueError(
             "quality discount observation minimum exceeds its calendar window"
         )
+    if ruler.min_observations["growth"] < 2:
+        raise ValueError("quality discount growth needs two endpoints")
+    if parsed_thresholds["peg_growth_cap"] <= 0:
+        raise ValueError("quality discount PEG growth cap must be positive")
     if parsed_thresholds["normalized_earnings_min"] != 0:
         raise ValueError(
             "quality discount normalized earnings threshold must be exactly zero"
@@ -1300,6 +1354,8 @@ def validate_deep_value_ruler(ruler: TrackRuler) -> TrackRuler:
         raise ValueError("deep value readiness threshold exceeds one")
     if thresholds["pb_percentile_max"] > 100:
         raise ValueError("deep value percentile threshold exceeds 100")
+    if thresholds["normalized_pe_max"] <= 0:
+        raise ValueError("deep value normalized PE maximum must be positive")
     for key in (
         "normalized_earnings_min",
         "cumulative_fcf_min",
@@ -1407,7 +1463,12 @@ def validate_garp_ruler(ruler: TrackRuler) -> TrackRuler:
     if (
         not isinstance(config, Mapping)
         or set(config)
-        != {"gate_order", "return_metric_policy", "evidence_fields"}
+        != {
+            "gate_order",
+            "return_metric_policy",
+            "evidence_fields",
+            "excluded_industries",
+        }
         or config["return_metric_policy"] != "roic_then_roe"
         or tuple(config["evidence_fields"])
         != (
@@ -1418,6 +1479,17 @@ def validate_garp_ruler(ruler: TrackRuler) -> TrackRuler:
         )
     ):
         raise ValueError("GARP nonfinancial branch policy is invalid")
+    excluded = config["excluded_industries"]
+    if (
+        isinstance(excluded, (str, bytes))
+        or not isinstance(excluded, Sequence)
+        or any(
+            type(label) is not str or not label or label != label.strip()
+            for label in excluded
+        )
+        or list(excluded) != sorted(set(excluded))
+    ):
+        raise ValueError("GARP excluded industries must be sorted unique labels")
     gates = config["gate_order"]
     if (
         isinstance(gates, (str, bytes))
@@ -1547,7 +1619,10 @@ def validate_ruler_version(
             row.payload_json,
             allow_retired_algorithm=allow_retired_algorithm,
         )
-        ruler = _validate_track_semantics(ruler)
+        # Retired payloads were semantically validated at activation; the
+        # digest check below still proves they are the activated bytes.
+        if ruler.algorithm_version not in RETIRED_BUILDS:
+            ruler = _validate_track_semantics(ruler)
     except (TypeError, ValueError) as error:
         raise ValueError(
             "persisted discovery ruler integrity mismatch"
