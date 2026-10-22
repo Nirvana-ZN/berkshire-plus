@@ -155,3 +155,42 @@ def test_historical_reload_distinguishes_validated_archive_from_live_response(st
     with Session(store) as session:
         assert load_evidence_as_of(session, live.code, cutoff) == ()
         assert load_evidence_as_of(session, live.code, cutoff, historical=True) == (archive,)
+
+
+def test_coverage_created_after_cutoff_cannot_certify_old_reports(store):
+    from discovery.evidence_store import append_coverage, append_evidence, load_coverage
+    row = identity(evidence('2020', inventory='10'),
+                   published_at=datetime(2020, 4, 1, tzinfo=timezone.utc),
+                   observed_at=datetime(2020, 4, 2, tzinfo=timezone.utc))
+    window = CoverageWindow(row.code, 'financial', date(2020, 1, 1), date(2020, 12, 31), True, (row.evidence_id,))
+    with Session(store) as session:
+        append_evidence(session, row)
+        append_coverage(session, window)
+        session.commit()
+        assert load_coverage(session, row.code) == (window,)
+        assert load_coverage(session, row.code, cutoff=datetime(2021, 1, 1, tzinfo=timezone.utc)) == ()
+
+
+@pytest.mark.parametrize(('published', 'observed', 'archive_verified'), [
+    (datetime(3000, 1, 1, tzinfo=timezone.utc), datetime(2020, 4, 2, tzinfo=timezone.utc), False),
+    (datetime(2020, 4, 1, tzinfo=timezone.utc), datetime(3000, 1, 1, tzinfo=timezone.utc), True),
+])
+def test_coverage_references_cannot_become_visible_before_production_availability(store, published, observed, archive_verified):
+    from discovery.evidence_store import append_coverage, append_evidence, load_coverage
+    row = identity(evidence('2020', inventory='10'), published_at=published,
+                   observed_at=observed, archive_verified=archive_verified)
+    window = CoverageWindow(row.code, 'financial', date(2020, 1, 1), date(2020, 12, 31), True, (row.evidence_id,))
+    cutoff = datetime(2999, 1, 1, tzinfo=timezone.utc)
+    with Session(store) as session:
+        append_evidence(session, row)
+        append_coverage(session, window)
+        session.commit()
+        assert load_coverage(session, row.code) == (window,)
+        assert load_coverage(session, row.code, cutoff=cutoff) == ()
+        assert load_coverage(session, row.code, cutoff=datetime(3000, 1, 1, tzinfo=timezone.utc)) == (window,)
+
+
+def test_coverage_cutoff_requires_timezone(store):
+    from discovery.evidence_store import load_coverage
+    with Session(store) as session, pytest.raises(ValueError, match='timezone'):
+        load_coverage(session, '000001.SZ', cutoff=datetime(2026, 10, 1))

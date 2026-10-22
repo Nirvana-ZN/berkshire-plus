@@ -81,7 +81,7 @@ Run `uv run python -m scripts.import_selection_evidence --db PATH --input PATH -
 
 The unchanged T01 DTO preserves provenance in reserved values keys: `_report_location` (physical page/table or provider report/row), `_verification` (human receipt JSON), `_archive_verification_source` (optional descriptive text, no trust). These are metadata strings, not financial values. Calculation code must ignore reserved keys. They participate in canonical identity. Caller-supplied reserved keys inside values are rejected; use explicit metadata inputs.
 
-CoverageWindow complete=false explicitly retains failed/incomplete scope. Coverage is an explicit repository operation; the raw-response parser never infers absence of events.
+CoverageWindow complete=false explicitly retains failed/incomplete scope. Coverage is an explicit repository operation; the raw-response parser never infers absence of events. `load_coverage(..., cutoff=aware_datetime)` returns only windows created by that cutoff whose referenced evidence was available under production availability rules. It never applies a historical archive override. Omitting cutoff is an inventory read and must not certify a past decision.
 
 ## Outstanding source blockers
 

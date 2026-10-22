@@ -105,7 +105,37 @@ def append_coverage(session: Session, window: CoverageWindow) -> str:
     return digest
 
 
-def load_coverage(session: Session, code: str) -> tuple[CoverageWindow, ...]:
-    rows = session.scalars(select(FundamentalCoverage).where(FundamentalCoverage.code == code).order_by(FundamentalCoverage.id))
-    return tuple(CoverageWindow(row.code, row.kind, row.start_date, row.end_date, row.complete,
-                               tuple(json.loads(row.evidence_ids_json))) for row in rows)
+def load_coverage(
+    session: Session,
+    code: str,
+    *,
+    cutoff: datetime | None = None,
+) -> tuple[CoverageWindow, ...]:
+    """Read inventory, or coverage knowable at a production decision cutoff.
+
+    Coverage has its own first-observation boundary: old report dates cannot
+    backdate a newly recorded completeness assertion. Archive overrides belong
+    to a separately validated historical path, not this production reader.
+    """
+    query = select(FundamentalCoverage).where(FundamentalCoverage.code == code)
+    if cutoff is not None:
+        _aware(cutoff)
+        query = query.where(FundamentalCoverage.created_at <= cutoff)
+    windows = [
+        (row, tuple(json.loads(row.evidence_ids_json)))
+        for row in session.scalars(query.order_by(FundamentalCoverage.id))
+    ]
+    if cutoff is not None:
+        referenced_ids = {evidence_id for _, ids in windows for evidence_id in ids}
+        available_ids = set(session.scalars(
+            select(FundamentalEvidence.evidence_id).where(
+                FundamentalEvidence.evidence_id.in_(referenced_ids),
+                FundamentalEvidence.code == code,
+                FundamentalEvidence.available_at <= cutoff,
+            )
+        )) if referenced_ids else set()
+        windows = [(row, ids) for row, ids in windows if set(ids) <= available_ids]
+    return tuple(
+        CoverageWindow(row.code, row.kind, row.start_date, row.end_date, row.complete, ids)
+        for row, ids in windows
+    )
