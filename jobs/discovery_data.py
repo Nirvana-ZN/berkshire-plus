@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
-from dataclasses import dataclass
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
 from inspect import signature
 from math import ceil
+from pathlib import Path
 from time import sleep
 from typing import Protocol
 
@@ -33,6 +34,7 @@ from discovery.company_payload import (
 )
 from discovery.constants import CHINA_MARKET_TIMEZONE, china_market_date
 from discovery.field_dictionary import FIELD_DICTIONARY
+from discovery.evidence_store import append_evidence, append_coverage, load_evidence_as_of, load_coverage
 from jobs.lock import (
     FILL_RESTART_PAUSE,
     JOB_TYPE_DISCOVERY_DATA,
@@ -243,10 +245,12 @@ def _snapshot_parts(
         ):
             return False
         try:
-            parse_company_payload(
+            payload = parse_company_payload(
                 row.payload_json,
                 expected_code=row.code,
             )
+            if payload['schema_version'] != COMPANY_PAYLOAD_SCHEMA_VERSION:
+                return False
         except (TypeError, ValueError):
             return False
         return True
@@ -789,6 +793,12 @@ def _persist_company(
         for row in (*result.financial_rows, *result.valuation_points)
     ):
         raise ValueError(f"{checkpoint.code} result code mismatch")
+    for record in result.evidence_records:
+        append_evidence(session, record)
+    for window in result.coverage:
+        append_coverage(session, window)
+    result = replace(result, evidence_records=load_evidence_as_of(session, result.code, now),
+                     coverage=load_coverage(session, result.code, cutoff=now))
     payload_json = serialize_company_payload(result, captured_at=now)
     payload_digest = company_payload_digest(payload_json)
     persist_discovery_financials(session, result.financial_rows)
@@ -809,6 +819,9 @@ def execute_discovery_data_fill(
     *,
     policy: RequestPolicy = DEFAULT_POLICY,
     clock: FillClock | None = None,
+    selection_fundamentals: bool = False,
+    selection_source_dir: Path | None = None,
+    operating_policy: Mapping[str, object] | None = None,
 ) -> None:
     timer = clock or SystemClock()
     run_started = _aware_utc(timer.now())
@@ -884,16 +897,24 @@ def execute_discovery_data_fill(
                     )
                     fetch = market.fetch_discovery_data
                     supports_security_state = _supports_security_state(fetch)
+                    selection_kwargs = {}
+                    if selection_fundamentals:
+                        if not _supports_keyword(fetch, 'selection_fundamentals'):
+                            raise ValueError('market adapter does not support schema4 evidence fetching')
+                        selection_kwargs['selection_fundamentals'] = True
+                        selection_kwargs['selection_source_dir'] = selection_source_dir
                     if supports_security_state:
                         result = fetch(
                             checkpoint.code,
                             before_request=request_gate,
                             security_state=frozen_security.state,
+                            **selection_kwargs,
                         )
                     else:
                         result = fetch(
                             checkpoint.code,
                             before_request=request_gate,
+                            **selection_kwargs,
                         )
                 except DiscoveryRequestStopped:
                     stop = True
@@ -927,6 +948,8 @@ def execute_discovery_data_fill(
                         )
                     try:
                         if failure is None:
+                            if operating_policy is not None:
+                                result = replace(result, operating_policy=operating_policy)
                             if frozen_security is not None:
                                 _revalidate_frozen_security(
                                     session, frozen_security

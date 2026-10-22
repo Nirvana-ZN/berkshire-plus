@@ -339,6 +339,12 @@ def _competition_metrics(
     extra_flags: Sequence[str] = (),
 ) -> dict[str, object]:
     out = dict(raw_metrics)
+    operating = company.fields.get('operating_result')
+    if isinstance(operating, Mapping):
+        out['operating_result'] = operating
+        out['operating_policy'] = company.fields.get('operating_policy')
+        out['fundamental_fingerprint'] = company.fields.get('fundamental_fingerprint')
+        out['freeze_new_positions'] = operating.get('state') in {'deteriorating', 'unknown'}
     flags = [str(f) for f in (raw_metrics.get("risk_flags") or ()) if f]
     for ef in extra_flags:
         if not ef:
@@ -462,7 +468,9 @@ def builtin_track_executor(
                 "competition candidates do not match frozen companies"
             )
         metrics = {
-            candidate.code: _plain_metrics(candidate.metrics_json)
+            candidate.code: _competition_metrics(
+                companies[candidate.code], _plain_metrics(candidate.metrics_json),
+                candidate.extra_risk_flags)
             for candidate in context.candidates
         }
         ranked = rank_borda_competition(
@@ -470,11 +478,7 @@ def builtin_track_executor(
                 CompetitionCandidate(
                     code=candidate.code,
                     industry=companies[candidate.code].industry,
-                    metrics=_competition_metrics(
-                        companies[candidate.code],
-                        metrics[candidate.code],
-                        candidate.extra_risk_flags,
-                    ),
+                    metrics=metrics[candidate.code],
                 )
                 for candidate in context.candidates
             ),
@@ -492,7 +496,6 @@ def builtin_track_executor(
             )
             for row in ranked
         }
-        candidates = {candidate.code: candidate for candidate in context.candidates}
         return TrackExecutionOutcome(
             status="waiting_confirmation",
             results=tuple(
@@ -510,7 +513,7 @@ def builtin_track_executor(
                         and cards[row.code].verdict == "insufficient"
                         else row.reason
                     ),
-                    metrics_json=candidates[row.code].metrics_json,
+                    metrics_json=canonical_json(metrics[row.code]),
                     rank=row.rank,
                 )
                 for row in ranked
@@ -1034,33 +1037,16 @@ def _track_candidates(
 
     interim_flags_by_code: dict[str, tuple[str, ...]] = {}
     if stage.stage == "competition" and passed_rows:
-        from app.models import Financial
-        from research.thesis import financial_drift
-
-        p_codes = [r.code for r, _, _ in passed_rows]
-        fins_by_code: dict[str, list[dict[str, object]]] = {}
-        for f_row in session.scalars(
-            select(Financial).where(Financial.code.in_(p_codes))
-        ).all():
-            fins_by_code.setdefault(f_row.code, []).append(
-                {
-                    "period": f_row.period,
-                    "period_type": f_row.period_type,
-                    "net_income": f_row.net_income,
-                    "deducted_net_income": f_row.deducted_net_income,
-                    "ocf": f_row.ocf,
-                }
-            )
-        for c_code, f_list in fins_by_code.items():
-            drift = financial_drift({}, f_list, since_baseline=False)
-            if drift is not None:
-                yoy_val = drift.get("deducted_net_income_yoy")
-                if yoy_val is None:
-                    yoy_val = drift.get("net_income_yoy")
-                flags_list = [f"interim_{reason}" for reason in (drift.get("reasons") or ())]
-                if yoy_val is not None:
-                    flags_list.append(f"interim_yoy:{yoy_val}")
-                interim_flags_by_code[c_code] = tuple(flags_list)
+        frozen = load_frozen_inputs(session, stage.run_id)
+        for company in frozen.companies:
+            result = company.fields.get('operating_result')
+            if isinstance(result, Mapping):
+                if result.get('state') == 'deteriorating':
+                    period = str(result.get('period') or '')
+                    flag = 'annual_operating_deterioration' if len(period) == 4 else 'interim_deterioration'
+                    interim_flags_by_code[company.code] = (flag,)
+                elif result.get('state') == 'unknown':
+                    interim_flags_by_code[company.code] = ('operating_unknown',)
 
     candidates = []
     for row, override, effective in passed_rows:

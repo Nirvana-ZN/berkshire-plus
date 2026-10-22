@@ -3678,6 +3678,7 @@ def _api_payload(
     *,
     financial_rows=None,
     valuation_points=None,
+    code: str = '600000.SH',
 ) -> str:
     from discovery.company_payload import serialize_company_payload
     from market.types import (
@@ -3691,7 +3692,7 @@ def _api_payload(
     rows = (
         (
             FinancialRow(
-                code="600000.SH",
+                code=code,
                 period="2025",
                 period_type="annual",
                 net_income=Decimal("100"),
@@ -3704,7 +3705,7 @@ def _api_payload(
     points = (
         (
             ValuationPoint(
-                code="600000.SH",
+                code=code,
                 month="2026-09",
                 trade_date="2026-09-17",
                 pe=Decimal("8"),
@@ -3719,9 +3720,9 @@ def _api_payload(
     )
     return serialize_company_payload(
         DiscoveryCompanyData(
-            code="600000.SH",
+            code=code,
             security_state=SecurityState(
-                code="600000.SH",
+                code=code,
                 name="浦发银行",
                 industry="银行",
                 exchange="SH",
@@ -6071,7 +6072,9 @@ def test_streamed_snapshot_versions_match_whole_value_hashes(
         fill = session.scalars(select(DiscoveryDataFill)).one()
         template = session.scalars(select(DiscoveryUniverseSecurity)).one()
         columns = DiscoveryUniverseSecurity.__table__.columns
-        done_text = _api_payload(SNAPSHOT_AT).replace("600000.SH", "600036.SH")
+        # Generate the second issuer's own identity-bearing schema4 content.
+        # Text replacement would leave its embedded fundamental digest invalid.
+        done_text = _api_payload(SNAPSHOT_AT, code="600036.SH")
         for code, status, text_value in (
             ("000001.SZ", "failed", None),
             ("600036.SH", "done", done_text),
@@ -6150,7 +6153,12 @@ def test_streamed_snapshot_versions_match_whole_value_hashes(
     assert snapshot.versions.financial_version == (
         f"financial:fill:{stamp}:"
         + _sha256(
-            {code: value["financial_rows"] for code, value in payloads.items()}
+            {code: {key: value[key] for key in (
+                'financial_rows', 'schema_version', 'annual_evidence', 'interim_history',
+                'capital_events', 'fundamental_extensions', 'coverage', 'evidence_ids',
+                'current_mcap', 'fundamental_fingerprint', 'decision_cutoff_at',
+                'operating_policy', 'operating_result',
+            )} for code, value in payloads.items()}
         )[:20]
     )
     assert snapshot.versions.valuation_version == (

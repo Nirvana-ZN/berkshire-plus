@@ -1,6 +1,7 @@
 """Immutable evidence repository and point-in-time availability rules."""
 
 from datetime import datetime, timedelta, timezone
+from collections.abc import Sequence
 from decimal import Decimal, InvalidOperation
 from hashlib import sha256
 import json
@@ -107,6 +108,15 @@ def load_evidence_as_of(session: Session, code: str, cutoff: datetime, *, histor
         record = _record(item)
         if available_at(record, historical=historical) <= cutoff:
             visible.append(record)
+    return select_evidence_as_of(visible, code=code, cutoff=cutoff, historical=historical)
+
+
+def select_evidence_as_of(records: Sequence[EvidenceRecord], *, code: str,
+                          cutoff: datetime, historical: bool = False) -> tuple[EvidenceRecord, ...]:
+    """Shared pure cutoff-before-version boundary for repository and snapshots."""
+    _aware(cutoff)
+    visible = list({row.evidence_id: row for row in records
+                    if row.code == code and available_at(row, historical=historical) <= cutoff}.values())
     # Unreviewed action corrections/withdrawals remain visible as raw evidence,
     # but cannot hide the verified fact that the action parser still needs.
     superseded = {row.supersedes_id for row in visible

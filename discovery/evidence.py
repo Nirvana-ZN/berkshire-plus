@@ -908,6 +908,21 @@ def _missing_risk(
     return None
 
 
+def _operating_risk(track, metrics, dates):
+    result = metrics.get('operating_result')
+    if not isinstance(result, Mapping) or result.get('state') not in {'deteriorating', 'unknown'}:
+        return None
+    unknown = result['state'] == 'unknown'
+    return _item(
+        kind='risk', category=None if unknown else 'worsening_trend',
+        rule_id=f'{track}.risk.operating.{result["state"]}',
+        inputs={'operating_result': result, 'operating_policy': metrics.get('operating_policy'),
+                'fundamental_fingerprint': metrics.get('fundamental_fingerprint')},
+        text='当期经营证据不足，待补充核验' if unknown else '当期经营恶化信号，进入研究待核并冻结新增仓位',
+        as_of=dates['financial'], completeness='partial' if unknown else 'complete',
+    )
+
+
 def build_evidence_card(
     code: str,
     metrics: Mapping[str, object],
@@ -930,6 +945,7 @@ def build_evidence_card(
     risks = tuple(
         item
         for item in (
+            _operating_risk(track, metrics, dates),
             _threshold_risk(track, metrics, ruler, dates),
             _flag_risk(track, metrics, ruler, dates),
             _missing_risk(track, metrics, ruler, dates),

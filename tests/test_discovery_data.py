@@ -307,6 +307,7 @@ def test_legacy_then_discovery_updates_only_owned_financial_fields(tmp_path) -> 
         roe=Decimal("15"),
         net_income=Decimal("100"),
         revenue=Decimal("999"),
+        deducted_net_income=Decimal("80"),
     )
     discovery = FinancialRow(
         code=legacy.code,
@@ -315,6 +316,7 @@ def test_legacy_then_discovery_updates_only_owned_financial_fields(tmp_path) -> 
         roe=None,
         net_income=Decimal("101"),
         revenue=Decimal("1000.01"),
+        deducted_net_income=Decimal("81"),
         other_income=Decimal("5"),
     )
     with Session(engine) as session:
@@ -324,7 +326,10 @@ def test_legacy_then_discovery_updates_only_owned_financial_fields(tmp_path) -> 
             Financial, (legacy.code, legacy.period, legacy.period_type)
         )
         assert stored is not None
-        assert stored.revenue is None
+        # Legacy research owns these reported amounts until reviewed discovery
+        # provenance takes ownership (jobs.funnel, commit 3c6a063).
+        assert stored.revenue == Decimal("999")
+        assert stored.deducted_net_income == Decimal("80")
 
         persist_discovery_financials(session, [discovery])
         session.commit()
@@ -332,6 +337,14 @@ def test_legacy_then_discovery_updates_only_owned_financial_fields(tmp_path) -> 
         assert stored.roe == Decimal("15")
         assert stored.net_income == Decimal("101")
         assert stored.revenue == Decimal("1000.01")
+        assert stored.deducted_net_income == Decimal("81")
+        for field in ('revenue', 'deducted_net_income'):
+            assert session.get(FinancialFieldProvenance,
+                               (legacy.code, legacy.period, legacy.period_type, field, 'discovery')) is not None
+        persist_financials(session, [replace(legacy, revenue=Decimal('1'), deducted_net_income=Decimal('2'))])
+        session.flush()
+        assert stored.revenue == Decimal('1000.01')
+        assert stored.deducted_net_income == Decimal('81')
         assert stored.other_income == Decimal("5")
 
         persist_discovery_financials(
@@ -3653,8 +3666,16 @@ def test_discovery_company_payload_round_trips_exact_strict_bundle() -> None:
     from discovery.company_payload import company_payload_digest
 
     assert company_payload_digest(encoded) == (
-        "360375e659a0b75374bf2daec37a170fe8bd9f37ae9c4f217ce01c3ca9e019d7"
+        "c7ad423400378e5bd10710198e6c4cd20e2b0037e86b5fe30208c6ffeef831f6"
     )
+    # The unchanged schema3 bytes remain readable, with their original identity.
+    old_keys = {'schema_version', 'captured_at', 'code', 'security_state',
+                'source_as_of', 'financial_rows', 'valuation_points'}
+    old_payload = {key: value for key, value in parsed.items() if key in old_keys}
+    old_payload['schema_version'] = 3
+    old_text = json.dumps(old_payload, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+    assert company_payload_digest(old_text) == '360375e659a0b75374bf2daec37a170fe8bd9f37ae9c4f217ce01c3ca9e019d7'
+    assert parse_company_payload(old_text) == old_payload
     row = parsed["financial_rows"][0]
     assert row["values"]["revenue"] == "337532000000.123456789012345678"
     assert row["values"]["net_income"] is None

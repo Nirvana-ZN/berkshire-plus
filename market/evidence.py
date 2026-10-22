@@ -122,6 +122,10 @@ def parse_source_evidence(payload: Mapping[str, object]) -> EvidenceRecord:
                 values[key] = _text(value, key) if value is not None else None
             else:
                 values[key] = _decimal(value)
+        if payload.get('kind') == 'company_profile':
+            # A narrowly typed categorical boundary: callers still cannot inject
+            # reserved values or self-certify classification through raw values.
+            values['_industry'] = _text(payload.get('industry'), 'industry')
         published = _time(payload.get('published_at'), 'published_at')
         updated = _time(payload['source_updated_at'], 'source_updated_at') if payload.get('source_updated_at') is not None else None
         status = payload.get('status', 'untrusted')

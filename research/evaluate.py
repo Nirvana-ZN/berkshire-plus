@@ -7,6 +7,9 @@ from dataclasses import dataclass, replace
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
+from collections.abc import Mapping
+from discovery.fundamental_types import FundamentalSnapshot
+from discovery.fundamentals import deducted_pe, operating_state, plain
 
 from research.llm import LLMClient
 from research.search import fetch_hits
@@ -74,6 +77,8 @@ class EvalInput:
     notices: tuple[dict[str, Any], ...] = ()
     precedents: tuple[dict[str, Any], ...] = ()
     risk_flags: tuple[str, ...] = ()
+    fundamentals: FundamentalSnapshot | None = None
+    operating_policy: Mapping[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -344,6 +349,16 @@ def _enrich_valuation(payload: EvalInput) -> dict[str, Any]:
             raw["pe_mid"] = _json_optional(price / mid_eps)
             raw["pe_mid_basis"] = f"中周期对照（现价/{mid_years}年年报EPS中位数）"
     _enrich_balance_sheet_traps(raw, payload.financials)
+    if payload.fundamentals is not None:
+        for key in ('eps_deducted_ttm', 'pe_deducted_ttm', 'pe_deducted_ttm_basis'):
+            raw.pop(key, None)
+        metric = deducted_pe(payload.fundamentals)
+        raw['deducted_pe_result'] = plain(metric)
+        if metric.value is not None:
+            raw['pe_deducted_ttm'] = str(metric.value)
+            raw['pe_deducted_ttm_basis'] = '冻结当日市值/可比扣非利润TTM'
+        raw['operating_result'] = plain(operating_state(payload.fundamentals, payload.operating_policy or {}))
+        raw['fundamental_fingerprint'] = payload.fundamentals.fingerprint
     return raw
 
 

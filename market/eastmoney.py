@@ -4,6 +4,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import date, datetime, timezone
 from hashlib import sha256
+from pathlib import Path
 import json
 from decimal import Decimal, InvalidOperation
 from threading import Event
@@ -12,7 +13,7 @@ from urllib.parse import quote
 
 from discovery.constants import china_market_date
 from discovery.field_dictionary import FIELD_DICTIONARY, SELECTION_FIELD_DICTIONARY
-from discovery.fundamental_types import EvidenceRecord
+from discovery.fundamental_types import EvidenceRecord, evidence_identity
 from market.universe import (
     INDUSTRY_MAPPING_VERSION,
     UniverseRow,
@@ -557,6 +558,57 @@ def parse_selection_report_response(
     return tuple(records)
 
 
+def parse_fundamental_report_response(
+    raw_response: bytes, *, code: str, report: str, observed_at: datetime,
+    source_url: str,
+) -> tuple[EvidenceRecord, ...]:
+    """Retain actual provider publication and bytes identity, without basis trust.
+
+    The provider does not certify stable consolidation scope across versions.
+    These observations therefore require review before selection calculations.
+    Extension columns remain separate from the legacy field contract.
+    """
+    from market.evidence import _time, _decimal
+    from discovery.fundamentals import classification_evidence
+
+    payload = json.loads(raw_response, parse_float=Decimal)
+    if not isinstance(payload, dict) or payload.get('success') is False:
+        raise ValueError('provider report failed')
+    result = payload.get('result')
+    if not isinstance(result, dict) or not isinstance(result.get('data'), list):
+        raise ValueError('provider report data missing')
+    digest = sha256(raw_response).hexdigest()
+    records = []
+    for index, raw in enumerate(result['data']):
+        if not isinstance(raw, dict) or raw.get('SECUCODE') != code:
+            raise ValueError('provider report code mismatch')
+        period = _report_kind(raw, strict=True)
+        if period is None or not raw.get('NOTICE_DATE'):
+            # UPDATE_DATE/fetch time must never become a publication timestamp.
+            continue
+        published = _time(raw['NOTICE_DATE'], 'NOTICE_DATE', provider=True)
+        updated = _time(raw['UPDATE_DATE'], 'UPDATE_DATE', provider=True) if raw.get('UPDATE_DATE') else None
+        for dictionary, group in ((FIELD_DICTIONARY, 'legacy'), (SELECTION_FIELD_DICTIONARY, 'extensions')):
+            values = {name: _decimal(raw.get(spec.field)) for name, spec in dictionary.items()
+                      if spec.report == report and isinstance(spec.field, str)
+                      and (group == 'extensions' or spec.trusted)}
+            if not values:
+                continue
+            status = 'untrusted' if any(value is not None for value in values.values()) else 'missing'
+            values.update({'_report_location': f'{report}; result.data[{index}]; {group}',
+                           '_basis_status': 'unverified', '_source': 'eastmoney'})
+            if isinstance(raw.get('INDUSTRY_NAME'), str):
+                values['_industry'] = raw['INDUSTRY_NAME']
+            row = EvidenceRecord('pending', code, 'financial', period[0], published,
+                                  observed_at, updated, source_url, digest, values,
+                                  status, 'unverified-consolidation-basis', date_only=True)
+            row = replace(row, evidence_id=evidence_identity(row))
+            records.append(row)
+            if group == 'legacy' and isinstance(raw.get('INDUSTRY_NAME'), str):
+                records.append(classification_evidence(row, industry=raw['INDUSTRY_NAME'], version=INDUSTRY_MAPPING_VERSION))
+    return tuple(records)
+
+
 def parse_current_market_cap_response(
     raw_response: bytes, *, code: str, market_date: date,
     observed_at: datetime, source_url: str,
@@ -1075,7 +1127,11 @@ class EastMoneyClient:
         before_request: DiscoveryPreRequest | None = None,
         security_state: SecurityState | None = None,
         as_of: date | None = None,
+        selection_fundamentals: bool = False,
+        selection_source_dir: Path | None = None,
     ) -> DiscoveryCompanyData:
+        if selection_fundamentals and selection_source_dir is None:
+            raise ValueError("selection_source_dir is required to retain raw evidence bytes")
         normalized = (code or "").strip().upper()
         started = self._request_count
         scoped_attempts = 0
@@ -1197,12 +1253,22 @@ class EastMoneyClient:
         financial_dates = [
             row.source_as_of for row in financials if row.source_as_of
         ]
+        evidence_records = ()
+        market_cap = None
+        if selection_fundamentals:
+            evidence_records = self.fetch_fundamental_evidence(
+                normalized, source_dir=selection_source_dir, before_request=request_gate)
+            market_cap = self.fetch_current_market_cap(
+                normalized, market_date=date.fromisoformat(security.last_trade_date),
+                before_request=request_gate)
         return DiscoveryCompanyData(
             code=normalized,
             security_state=security,
             financial_rows=tuple(financials),
             valuation_points=tuple(valuations),
             request_count=request_count(),
+            evidence_records=evidence_records,
+            current_market_cap=market_cap,
             source_as_of=DiscoverySourceAsOf(
                 security=security.industry_as_of,
                 valuation=max(
@@ -1211,6 +1277,32 @@ class EastMoneyClient:
                 financial=max(financial_dates, default=None),
             ),
         )
+
+    def fetch_fundamental_evidence(
+        self, code: str, *, source_dir: Path,
+        before_request: DiscoveryPreRequest | None = None,
+    ) -> tuple[EvidenceRecord, ...]:
+        """Opt-in schema4 source capture; each exact response is content-addressed."""
+        source_dir = Path(source_dir)
+        source_dir.mkdir(parents=True, exist_ok=True)
+        records = []
+        reports = sorted({spec.report for spec in FIELD_DICTIONARY.values() if spec.report})
+        for report in reports:
+            filt = f'(SECUCODE="{code}")'
+            url = (f'{FINANCIALS_URL}?reportName={report}&columns=ALL&pageNumber=1'
+                   f'&pageSize=50&sortColumns=REPORT_DATE&sortTypes=-1&filter={quote(filt)}')
+            raw = self._get_json_direct_retry(url, before_request=before_request, raw_response=True)
+            observed = datetime.now(timezone.utc)
+            digest = sha256(raw).hexdigest()
+            path = source_dir / f'{digest}.json'
+            if path.exists():
+                if path.read_bytes() != raw:
+                    raise ValueError('retained source digest conflict')
+            else:
+                path.write_bytes(raw)
+            records.extend(parse_fundamental_report_response(raw, code=code, report=report,
+                           observed_at=observed, source_url=url))
+        return tuple(records)
 
     def fetch_listed_years(self, codes: Sequence[str]) -> dict[str, int]:
         years: dict[str, int] = {}

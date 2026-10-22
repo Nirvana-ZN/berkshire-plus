@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from collections.abc import Mapping
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Callable
+from discovery.fundamental_types import EvidenceRecord, CoverageWindow
 
 DiscoveryPreRequest = Callable[[], None]
 
@@ -248,3 +250,7 @@ class DiscoveryCompanyData:
     valuation_points: tuple[ValuationPoint, ...]
     request_count: int
     source_as_of: DiscoverySourceAsOf
+    evidence_records: tuple[EvidenceRecord, ...] = ()
+    coverage: tuple[CoverageWindow, ...] = ()
+    current_market_cap: CurrentMarketCap | None = None
+    operating_policy: Mapping[str, object] = field(default_factory=dict)
