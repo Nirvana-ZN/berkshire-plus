@@ -213,10 +213,17 @@ def _calculate(candidates, contract):
                     dimension["contribution"] = str(contribution)
                     contributions.append(contribution)
                 scores[row.code] = numerator / denominator if effective else Decimal("0.5")
-            # Reconcile only the final contribution's rounding residual. Extra
-            # digits preserve the exact audit identity for finite Decimals.
-            with localcontext(_context(_PRECISION + len(str(len(effective))) + 1)):
-                if effective:
+            # Align all operands' decimal places before summing/subtracting;
+            # contribution exponents can differ even with the same precision.
+            # Allow carry digits for every term, preserving the exact identity.
+            if effective:
+                operands = (scores[row.code], *contributions[:-1])
+                lowest = min(value.as_tuple().exponent for value in operands)
+                highest = max(value.adjusted() for value in operands)
+                precision = max(
+                    _PRECISION, highest - lowest + len(str(len(operands))) + 2,
+                )
+                with localcontext(_context(precision)):
                     last = item["dimensions"][effective[-1]]
                     last["contribution"] = str(
                         scores[row.code] - sum(contributions[:-1], Decimal(0))

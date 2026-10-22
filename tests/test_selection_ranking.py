@@ -208,3 +208,22 @@ def test_cross_branch_recurring_rank_ties_use_code_only_at_the_end():
     assert D(audit["a1"]["rank_score"]) == D(audit["z1"]["rank_score"]) == D("0.3333333333333333333333333333333333")
     assert D(audit["a2"]["rank_score"]) == D(audit["z2"]["rank_score"]) == D("0.6666666666666666666666666666666667")
     assert [v.code for v in rank_candidates(rows, config)] == ["a0", "z0", "a1", "z1", "a2", "z2", "a3", "z3"]
+
+
+def test_thousand_peer_contributions_sum_exactly_across_different_exponents():
+    rows = tuple(
+        candidate(f"{i:04d}", x=D(i), y=D(999 if i == 1 else 1 if i == 999 else i))
+        for i in range(1000)
+    )
+    audit = ranking_audit(rows, contract())
+    # Candidate 0001 has exact occupied rank offsets 1 and 999, so the
+    # independently calculated average is 1000 / (999 * 2), rounded once.
+    assert audit["0001"]["rank_score"] == "0.5005005005005005005005005005005005"
+    with localcontext() as context:
+        context.prec = 128
+        for item in audit.values():
+            emitted_sum = sum(D(d["contribution"]) for d in item["dimensions"].values())
+            assert emitted_sum == D(item["rank_score"])
+    assert [(v.code, v.rank) for v in rank_candidates(rows, contract()) if v.code in {"0001", "0500", "0999"}] == [
+        ("0001", 500), ("0500", 501), ("0999", 502),
+    ]
