@@ -16,6 +16,7 @@ from ledger.exposure import (capture_review_input, exact_book_weights,
 
 from app.models import (
     PortfolioReview,
+    Quote,
     ResearchArtifact,
     ResearchJob,
     ScreenRun,
@@ -71,7 +72,15 @@ def _json_optional(value: Decimal | None) -> int | float | None:
     return float(number)
 
 
-def snapshot_to_dict(book: BookSnapshot) -> dict[str, object]:
+def _quote_observation_time(value: datetime | None) -> str | None:
+    """Quote.updated_at is a legacy UTC recording time, not exchange event time."""
+    if value is None:
+        return None
+    aware = value.replace(tzinfo=timezone.utc) if value.utcoffset() is None else value
+    return aware.astimezone(timezone.utc).isoformat()
+
+
+def snapshot_to_dict(book: BookSnapshot, *, quote_observed_at: dict[str, datetime] | None = None) -> dict[str, object]:
     return {
         "positions": [
             {
@@ -89,6 +98,8 @@ def snapshot_to_dict(book: BookSnapshot) -> dict[str, object]:
                 "exposure_weight": str(row.weight) if row.weight is not None else None,
                 "exposure_target": str(row.target) if row.target is not None else None,
                 "exposure_price": str(row.price) if row.price is not None else None,
+                "exposure_price_observed_at": _quote_observation_time((quote_observed_at or {}).get(row.name)),
+                "exposure_price_source": row.source,
             }
             for row in book.positions
         ],
@@ -312,7 +323,9 @@ def _run_one(
             refresh_held_quotes(session, quote_client)
             positions, cash = load_positions(session)
             book = project_book(session, positions, cash)
-            snapshot = snapshot_to_dict(book)
+            quote_observed_at = {quote.name: quote.updated_at for quote in session.scalars(
+                select(Quote).where(Quote.user_id == row.user_id))}
+            snapshot = snapshot_to_dict(book, quote_observed_at=quote_observed_at)
             names = [str(item['name']) for item in snapshot['positions'] if item.get('name')]
             if _review_depth(row) == 'eval_first':
                 _evaluate_missing_theses(session, names, llm=llm, quote_client=quote_client,

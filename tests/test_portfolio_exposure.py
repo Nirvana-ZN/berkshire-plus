@@ -235,7 +235,7 @@ def test_local_cli_defaults_read_only_and_apply_select_reaches_actual_positions(
 def test_review_capture_survives_failure_label_revision_and_missing_source(tmp_path, monkeypatch):
     from sqlalchemy import select
     from sqlalchemy.orm import Session
-    from app.models import PortfolioReview
+    from app.models import PortfolioReview, Quote
     from app.selection_models import ReviewExposureCapture
     from jobs.review import _run_one
     from ledger.exposure import append_exposure_version, select_exposure_version
@@ -277,6 +277,13 @@ def test_review_capture_survives_failure_label_revision_and_missing_source(tmp_p
             for row in frozen['snapshot']['positions']:
                 key = row['code'] or f"name:{row['name']}"
                 assert D(frozen['exposure_context']['weights'][key]) == D(row['exposure_weight'])
+                quote = session.get(Quote, (1, row['name']))
+                assert row['exposure_price_observed_at'] == quote.updated_at.replace(tzinfo=timezone.utc).isoformat()
+                assert row['exposure_price_source'] == quote.source
+                # Later quote changes cannot relabel the retained price/date on retry.
+                quote.price = D('99')
+                quote.updated_at = datetime(2026, 10, 25, 6)
+                quote.stale = True
             data['mappings'][record.code]['labels'] = ['exports']
             second = append_exposure_version(session, user_id=1, payload=data, supersedes_id=first)
             select_exposure_version(session, user_id=1, version_id=second)
@@ -445,3 +452,47 @@ def test_source_loss_retains_missing_status_and_confirmed_zero_weight(exposure_d
         assert report['mapping_status'][source.code]['source_states'][source.evidence_id] == 'missing'
         assert report['current_totals'] == {'unknown': '0'}
         assert report['complete'] is True
+
+
+@pytest.mark.parametrize('price,stale,observed,reason,price_day', [
+    ('7', True, '2026-10-22T20:00:00+00:00', 'stale_quote', '2026-10-23'),
+    ('7', False, '2026-10-22T12:00:00+00:00', 'quote_date_mismatch', '2026-10-22'),
+    (None, False, '2026-10-22T20:00:00+00:00', 'unusable_quote', '2026-10-23'),
+    ('0', False, '2026-10-22T20:00:00+00:00', 'unusable_quote', '2026-10-23'),
+    ('-1', False, '2026-10-22T20:00:00+00:00', 'unusable_quote', '2026-10-23'),
+    ('NaN', False, '2026-10-22T20:00:00+00:00', 'unusable_quote', '2026-10-23'),
+    ('Infinity', False, '2026-10-22T20:00:00+00:00', 'unusable_quote', '2026-10-23'),
+    ('7', False, None, 'quote_date_missing', None),
+    ('7', False, '2026-10-23T01:00:00', 'quote_date_missing', None),
+    ('7', False, '2026-10-23T08:00:00+00:00', 'quote_time_after_cutoff', '2026-10-23'),
+    ('7', False, '2026-10-22T20:00:00+00:00', None, '2026-10-23'),
+])
+def test_opportunity_cost_preserves_holding_quote_date_and_freshness(tmp_path, price, stale, observed, reason, price_day):
+    from review.run import ReviewInput, _opportunity_cost, render_markdown
+    row = {'name': 'Synthetic', 'code': '600036.SH', 'price': price, 'exposure_price': price,
+           'stale': stale, 'exposure_price_observed_at': observed, 'exposure_price_source': 'manual'}
+    benchmark = {'status': 'available', 'reason': None, 'data': {
+        'code': '510000.SH', 'as_of_date': '2026-10-23', 'broad_market_basis': 'synthetic broad market',
+        'fee_rate': '.005', 'valuation_basis': 'PE trailing', 'valuation_multiple': '12',
+        'earnings_assumption': 'synthetic declaration', 'confidence': 'B',
+        'common_risks': ['property'], 'evidence_ids': ['synthetic']}}
+    payload = ReviewInput(snapshot={'positions': [row]}, evaluations={}, funnel_names=(),
+        as_of_date='2026-10-23', review_id=1, reports_dir=tmp_path,
+        exposure_context={'comparison': benchmark, 'labels': {}, 'cutoff_at': '2026-10-23T06:00:00+00:00'})
+    result = _opportunity_cost(payload)
+    holding = result['holdings'][0]
+    assert holding['as_of_date'] == price_day
+    assert holding['comparison_date'] == '2026-10-23'
+    assert holding['price_stale'] is stale
+    assert holding['price_source'] == 'manual'
+    assert holding['price_observed_at'] == (observed if price_day else None)
+    assert holding['price_reason'] == reason
+    assert holding['current_price'] == ('7' if reason is None else None)
+    assert holding['price_status'] == ('available' if reason is None else 'unavailable')
+    markdown = render_markdown({'opportunity_cost': result}, as_of_date=payload.as_of_date, snapshot=payload.snapshot)
+    if reason is None:
+        assert '同日可用报价 7' in markdown
+        assert '报价记录日期 2026-10-23' in markdown
+    else:
+        assert '持仓报价不可用' in markdown and reason in markdown
+        assert '当日价格 7' not in markdown and '同日可用报价 7' not in markdown

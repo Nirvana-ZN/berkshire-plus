@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,7 @@ from typing import Any
 from research.llm import LLMClient
 from research.thesis import dynamic_sizing, is_overvalued
 from ledger.exposure import exposure_report, proposal_priority, read_exposure_context
+from discovery.constants import CHINA_MARKET_TIMEZONE
 
 ACTIONS = frozenset({"hold", "add", "cut", "sell", "unknown"})
 ACTION_ALIASES = {
@@ -219,12 +221,47 @@ def _opportunity_cost(payload):
     if comparison['status'] == 'available':
         for row in _snapshot_positions(payload.snapshot):
             data = (payload.evaluations.get(row['name']) or {}).get('structured') or {}
-            rows.append({'name': row['name'], 'as_of_date': payload.as_of_date,
-                         'current_price': row.get('exposure_price'),
+            rows.append({'name': row['name'], **_comparison_price(row, payload),
                          'valuation': data.get('valuation_scenarios'), 'data_grade': data.get('data_grade', 'C'),
                          'fees': None,
                          'common_risks': (payload.exposure_context or {}).get('labels', {}).get(row.get('code')) or ['unknown']})
     return {**comparison, 'holdings': rows, 'return_comparison': 'assumptions_only_no_reproducible_return'}
+
+
+def _aware_observation(value):
+    try:
+        observed = datetime.fromisoformat(value)
+        if observed.utcoffset() is not None:
+            return observed.astimezone(timezone.utc)
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def _comparison_price(row, payload):
+    observed = _aware_observation(row.get('exposure_price_observed_at'))
+    cutoff = _aware_observation((payload.exposure_context or {}).get('cutoff_at'))
+    day = observed.astimezone(CHINA_MARKET_TIMEZONE).date().isoformat() if observed else None
+    number = _as_decimal(row.get('exposure_price'))
+    stale = bool(row.get('stale'))
+    reason = None
+    if stale:
+        reason = 'stale_quote'
+    elif number is None or number <= 0:
+        reason = 'unusable_quote'
+    elif observed is None:
+        reason = 'quote_date_missing'
+    elif cutoff is None:
+        reason = 'quote_cutoff_missing'
+    elif observed > cutoff:
+        reason = 'quote_time_after_cutoff'
+    elif day != payload.as_of_date:
+        reason = 'quote_date_mismatch'
+    return {'comparison_date': payload.as_of_date, 'as_of_date': day,
+            'price_observed_at': observed.isoformat() if observed else None,
+            'price_source': row.get('exposure_price_source'), 'price_stale': stale,
+            'price_status': 'unavailable' if reason else 'available', 'price_reason': reason,
+            'current_price': None if reason else str(number)}
 
 
 def normalize_portfolio_actions(
@@ -337,7 +374,10 @@ def render_markdown(
                       f"声明盈利假设：{data['earnings_assumption']}；研究置信度：{data['confidence']}",
                       f"共同风险：{'、'.join(data['common_risks'])}；证据：{'、'.join(data['evidence_ids'])}"])
         for item in comparison['holdings']:
-            lines.append(f"- {item['name']}：当日价格 {item['current_price']}；费用假设未提供；信息等级 {item['data_grade']}；共同风险 {item['common_risks']}；"
+            price = (f"同日可用报价 {item['current_price']}" if item['price_status'] == 'available'
+                     else f"持仓报价不可用（{item['price_reason']}）")
+            lines.append(f"- {item['name']}：{price}；报价记录日期 {item['as_of_date'] or '未知'}（记录时间，不代表交易所事件时间）；"
+                         f"费用假设未提供；信息等级 {item['data_grade']}；共同风险 {item['common_risks']}；"
                          f"冻结估值事实与声明假设 {json.dumps(item['valuation'], ensure_ascii=False) if item['valuation'] else '缺少可复算估值'}")
     lines.extend(['仅作事实与声明假设对照；没有可复算的收益模型，不显示预期超额收益数字。', '', '## 组合建议', ''])
     if not actions:
