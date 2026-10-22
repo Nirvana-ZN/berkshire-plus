@@ -137,15 +137,9 @@ def _known_industry(industry: str | None) -> bool:
     )
 
 
-def rank_competition(
-    candidates: Sequence[CompetitionCandidate],
-    order: Sequence[Sequence[str]],
-    *,
-    industry_cap: int = 2,
-    total_cap: int = 15,
-) -> tuple[CompetitionVerdict, ...]:
-    """Rank entrants from the ruler order, then apply deterministic caps."""
-
+def _validated_candidates(
+    candidates: Sequence[CompetitionCandidate], industry_cap: int, total_cap: int,
+) -> tuple[CompetitionCandidate, ...]:
     if type(industry_cap) is not int or industry_cap < 1:
         raise ValueError("industry_cap must be a positive integer")
     if type(total_cap) is not int or total_cap < 1:
@@ -161,13 +155,17 @@ def rank_competition(
     if len(codes) != len(set(codes)):
         raise ValueError("competition candidate codes must be unique")
 
-    ruler_order = _validated_order(order)
-    eligible = sorted(
-        (row for row in rows if _known_industry(row.industry)),
-        key=cmp_to_key(lambda left, right: _candidate_compare(
-            ruler_order, left, right
-        )),
-    )
+    return rows
+
+
+def _apply_caps(
+    eligible: Sequence[CompetitionCandidate],
+    rows: Sequence[CompetitionCandidate],
+    industry_cap: int,
+    total_cap: int,
+) -> tuple[CompetitionVerdict, ...]:
+    """Apply the shared post-ranking industry/track limits unchanged."""
+
     industries: Counter[str] = Counter()
     selected = 0
     verdicts = []
@@ -190,6 +188,26 @@ def rank_competition(
     return tuple(verdicts)
 
 
+def rank_competition(
+    candidates: Sequence[CompetitionCandidate],
+    order: Sequence[Sequence[str]],
+    *,
+    industry_cap: int = 2,
+    total_cap: int = 15,
+) -> tuple[CompetitionVerdict, ...]:
+    """Rank entrants from the ruler order, then apply deterministic caps."""
+
+    rows = _validated_candidates(candidates, industry_cap, total_cap)
+    ruler_order = _validated_order(order)
+    eligible = sorted(
+        (row for row in rows if _known_industry(row.industry)),
+        key=cmp_to_key(lambda left, right: _candidate_compare(
+            ruler_order, left, right
+        )),
+    )
+    return _apply_caps(eligible, rows, industry_cap, total_cap)
+
+
 def rank_borda_competition(
     candidates: Sequence[CompetitionCandidate],
     order: Sequence[Sequence[str]],
@@ -199,21 +217,7 @@ def rank_borda_competition(
 ) -> tuple[CompetitionVerdict, ...]:
     """Rank entrants by equal-weight Borda rank sum across ruler dimensions, breaking ties lexicographically."""
 
-    if type(industry_cap) is not int or industry_cap < 1:
-        raise ValueError("industry_cap must be a positive integer")
-    if type(total_cap) is not int or total_cap < 1:
-        raise ValueError("total_cap must be a positive integer")
-    rows = tuple(candidates)
-    if any(type(row) is not CompetitionCandidate for row in rows):
-        raise TypeError("competition candidates must be immutable DTOs")
-    if any(not isinstance(row.metrics, Mapping) for row in rows):
-        raise TypeError("competition candidate metrics must be mappings")
-    codes = [row.code for row in rows]
-    if any(type(code) is not str or not code for code in codes):
-        raise ValueError("competition candidate codes must be nonblank")
-    if len(codes) != len(set(codes)):
-        raise ValueError("competition candidate codes must be unique")
-
+    rows = _validated_candidates(candidates, industry_cap, total_cap)
     ruler_order = _validated_order(order)
     dims = tuple(item for item in ruler_order if item[0] != "code")
     if len(dims) <= 1:
@@ -251,24 +255,5 @@ def rank_borda_competition(
             row.code,
         ),
     )
-    industries: Counter[str] = Counter()
-    selected = 0
-    verdicts = []
-    for rank, row in enumerate(eligible, 1):
-        assert row.industry is not None
-        industries[row.industry] += 1
-        if industries[row.industry] > industry_cap:
-            verdict, reason = "drop", "industry_cap_exceeded"
-        elif selected >= total_cap:
-            verdict, reason = "drop", "total_cap_exceeded"
-        else:
-            verdict, reason = "pass", None
-            selected += 1
-        verdicts.append(CompetitionVerdict(row.code, verdict, reason, rank))
-    verdicts.extend(
-        CompetitionVerdict(row.code, "insufficient", "industry_unknown", None)
-        for row in sorted(rows, key=lambda item: item.code)
-        if not _known_industry(row.industry)
-    )
-    return tuple(verdicts)
+    return _apply_caps(eligible, rows, industry_cap, total_cap)
 

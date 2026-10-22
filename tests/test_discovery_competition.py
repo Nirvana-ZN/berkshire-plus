@@ -123,3 +123,33 @@ def test_borda_competition_breaks_single_metric_lexicographic_bottleneck() -> No
     assert [r.code for r in lex] == ["000001.SZ", "000002.SZ", "000003.SZ"]
     assert [r.code for r in borda] == ["000002.SZ", "000003.SZ", "000001.SZ"]
 
+
+def test_branch_ranker_reuses_caps_and_unknown_industry_exclusion() -> None:
+    from decimal import Decimal
+
+    from discovery.ranking import rank_candidates, ranking_audit
+
+    rows = tuple(CompetitionCandidate(str(i), industry, {
+        "ranking_branch": "bank", "operating_state": "stable",
+        "verified_risk_types": [], "pb": Decimal(i),
+    }) for i, industry in enumerate(("banking", "banking", "banking", "other", "third", "未知")))
+    config = {
+        "branch_orders": {"bank": (("pb", "asc"),)},
+        "risk_policy": {"operating_states": {
+            "improving": "clear", "stable": "clear", "unknown": "unknown", "deteriorating": "deteriorating",
+        }, "verified_risk_types": {}},
+        "industry_cap": 2, "total_cap": 3,
+    }
+    verdicts = rank_candidates(rows, config)
+    assert [(v.code, v.verdict, v.reason, v.rank) for v in verdicts] == [
+        ("0", "pass", None, 1), ("1", "pass", None, 2),
+        ("2", "drop", "industry_cap_exceeded", 3), ("3", "pass", None, 4),
+        ("4", "drop", "total_cap_exceeded", 5), ("5", "insufficient", "industry_unknown", None),
+    ]
+    audit = ranking_audit(rows, config)
+    assert audit["2"]["cap_exclusion_reason"] == "industry_cap_exceeded"
+    assert audit["4"]["cap_exclusion_reason"] == "total_cap_exceeded"
+    assert audit["5"]["rank"] is None
+    assert audit["5"]["effective_dimensions"] == []
+    assert audit["4"]["dimensions"]["pb"]["rank_pct"] == "1"
+
