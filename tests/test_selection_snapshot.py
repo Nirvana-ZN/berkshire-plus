@@ -390,6 +390,9 @@ def test_freeze_reuses_trusted_action_supersession_and_coverage_references():
     restored = fundamentals_from_payload(snapshot_payload(snapshot), code=original.code)
     assert restored == snapshot
     assert restored.actions[0].shares_after == Decimal('80')
+    from discovery.fundamentals import coverage_reference_records
+    assert coverage_reference_records(restored)[original.evidence_id] == original
+    assert all(row.evidence_id != original.evidence_id for row in restored.extensions)
 
 
 def test_supplied_fill_coverage_survives_its_checkpoint_capture(tmp_path):
@@ -407,18 +410,50 @@ def test_supplied_fill_coverage_survives_its_checkpoint_capture(tmp_path):
     bundle = bundle_with_evidence()
     receipt = identified(replace(evidence('2026'), kind='capital_event_coverage',
                                   values={'scope': 'all_capital_actions', 'complete': 'true'}))
+    successor = identified(replace(receipt, supersedes_id=receipt.evidence_id,
+                                   source_url='https://example.test/corrected-coverage'))
     window = CoverageWindow(bundle.code, 'capital_event', date(2025, 1, 1), date(2026, 9, 30), True, (receipt.evidence_id,))
-    bundle = replace(bundle, evidence_records=bundle.evidence_records + (receipt,), coverage=(window,))
+    bundle = replace(bundle, evidence_records=bundle.evidence_records + (receipt, successor), coverage=(window,))
     engine = init_db(tmp_path / 'supplied-coverage.db')
     with Session(engine) as session:
         fill = _fill(session, [bundle.code], now=CUTOFF)
         checkpoint = session.get(DiscoveryDataCheckpoint, (fill.id, bundle.code))
         _persist_company(session, checkpoint, bundle, CUTOFF)
         payload = parse_company_payload(checkpoint.payload_json)
-        assert fundamentals_from_payload(payload, code=bundle.code).coverage == (window,)
+        snapshot = fundamentals_from_payload(payload, code=bundle.code)
+        assert snapshot.coverage == (window,)
+        from discovery.fundamentals import coverage_reference_records
+        assert coverage_reference_records(snapshot)[receipt.evidence_id] == receipt
         stored = session.scalar(select(FundamentalCoverage))
         assert stored.created_at == CUTOFF
         assert checkpoint.updated_at == CUTOFF
         assert payload['operating_policy']['calendar_complete'] is True
         assert payload['operating_policy']['calendar_coverage_end'] == '2026-10-31'
     engine.dispose()
+
+
+def test_coverage_proof_is_exact_referenced_only_and_never_a_current_financial_fact():
+    from datetime import date
+    from discovery.fundamental_types import CoverageWindow
+    from discovery.fundamentals import coverage_reference_evidence, coverage_reference_records, fundamentals_from_payload, snapshot_payload
+    old = evidence('2025', revenue='100')
+    new = identified(replace(old, values={'revenue': '200'}, supersedes_id=old.evidence_id))
+    unrelated = evidence('2024', revenue='999')
+    window = CoverageWindow(old.code, 'capital_event', date(2024, 1, 1), date(2025, 1, 1), True, (old.evidence_id,))
+    wrapper = coverage_reference_evidence(old)
+    snapshot = freeze_fundamentals((new, wrapper, coverage_reference_evidence(unrelated)), (), (window,),
+                                  code=old.code, cutoff_at=CUTOFF, current_mcap=None)
+    assert snapshot.annuals == (new,)
+    assert snapshot.extensions == (wrapper,)
+    assert coverage_reference_records(snapshot)[old.evidence_id] == old
+    assert fundamentals_from_payload(snapshot_payload(snapshot), code=old.code) == snapshot
+    altered = json.loads(wrapper.values['record'])
+    altered['status'] = 'untrusted'  # A new outer hash cannot change the original identity.
+    corrupted = identified(replace(wrapper, values={'record': json.dumps(altered)}))
+    with pytest.raises(ValueError, match='coverage reference'):
+        freeze_fundamentals((new, corrupted), (), (window,), code=old.code, cutoff_at=CUTOFF, current_mcap=None)
+    for changed in (identified(replace(old, code='600000.SH')),
+                    identified(replace(old, observed_at=CUTOFF + timedelta(seconds=1)))):
+        with pytest.raises(ValueError, match='company/cutoff'):
+            freeze_fundamentals((new, coverage_reference_evidence(changed)), (), (window,),
+                                code=old.code, cutoff_at=CUTOFF, current_mcap=None)

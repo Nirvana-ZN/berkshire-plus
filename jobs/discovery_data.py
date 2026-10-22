@@ -34,7 +34,9 @@ from discovery.company_payload import (
 )
 from discovery.constants import CHINA_MARKET_TIMEZONE, china_market_date
 from discovery.field_dictionary import FIELD_DICTIONARY
-from discovery.evidence_store import append_evidence, append_coverage, load_evidence_as_of, load_coverage
+from discovery.evidence_store import (append_evidence, append_coverage, load_evidence_as_of,
+                                      load_coverage, load_coverage_references)
+from discovery.fundamentals import coverage_reference_evidence
 from jobs.lock import (
     FILL_RESTART_PAUSE,
     JOB_TYPE_DISCOVERY_DATA,
@@ -797,8 +799,12 @@ def _persist_company(
         append_evidence(session, record)
     for window in result.coverage:
         append_coverage(session, window, captured_at=now)
-    result = replace(result, evidence_records=load_evidence_as_of(session, result.code, now),
-                     coverage=load_coverage(session, result.code, cutoff=now))
+    selected = load_evidence_as_of(session, result.code, now)
+    windows = load_coverage(session, result.code, cutoff=now)
+    selected_ids = {row.evidence_id for row in selected}
+    references = load_coverage_references(session, result.code, now, windows)
+    result = replace(result, evidence_records=selected + tuple(coverage_reference_evidence(row)
+        for row in references if row.evidence_id not in selected_ids), coverage=windows)
     payload_json = serialize_company_payload(result, captured_at=now)
     payload_digest = company_payload_digest(payload_json)
     persist_discovery_financials(session, result.financial_rows)

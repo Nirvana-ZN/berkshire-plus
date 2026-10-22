@@ -478,11 +478,89 @@ def evidence_from_payload(value: Mapping[str, object]) -> EvidenceRecord:
     return record
 
 
+def coverage_reference_evidence(record: EvidenceRecord) -> EvidenceRecord:
+    """Freeze an original source verbatim without making it a current fact."""
+    if record.kind == 'coverage_reference' or evidence_identity(record) != record.evidence_id:
+        raise ValueError('invalid coverage reference identity')
+    encoded = json.dumps(plain(record), ensure_ascii=False, sort_keys=True,
+                         separators=(',', ':'), allow_nan=False)
+    wrapper = replace(record, evidence_id='pending', kind='coverage_reference',
+                      supersedes_id=None, values={'record': encoded})
+    return replace(wrapper, evidence_id=evidence_identity(wrapper))
+
+
+def _coverage_reference_original(wrapper: EvidenceRecord) -> EvidenceRecord:
+    try:
+        original = evidence_from_payload(json.loads(wrapper.values['record']))
+        if coverage_reference_evidence(original) != wrapper:
+            raise ValueError('coverage reference differs from original source')
+        return original
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError('invalid frozen coverage reference') from error
+
+
+def _coverage_reference_closure(records, reference_ids):
+    """Proof dependencies only; authoritative fact selection remains separate."""
+    retained = set(reference_ids) & records.keys()
+    while True:
+        added = {key for key, row in records.items() if row.supersedes_id in retained
+                 and (row.kind, row.period) == (records[row.supersedes_id].kind,
+                                                records[row.supersedes_id].period)} - retained
+        if not added:
+            return retained
+        retained.update(added)
+
+
+def coverage_reference_records(snapshot: FundamentalSnapshot) -> dict[str, EvidenceRecord]:
+    """Return frozen original proof records, retaining their actual status."""
+    result = {}
+    for row in snapshot.annuals + snapshot.interims + snapshot.extensions:
+        original = _coverage_reference_original(row) if row.kind == 'coverage_reference' else row
+        if original.code != snapshot.code or available_at(original) > snapshot.cutoff_at:
+            raise ValueError('coverage reference company/cutoff mismatch')
+        result[original.evidence_id] = original
+    return result
+
+
+def verified_coverage_sources(snapshot: FundamentalSnapshot, window: CoverageWindow) -> tuple[bool, tuple[str, ...]]:
+    """Verify original source trust and any reviewed receipt revision/revocation."""
+    records = coverage_reference_records(snapshot)
+    ids = _coverage_reference_closure(records, window.evidence_ids)
+    audit_ids = tuple(sorted(ids | set(window.evidence_ids)))
+    if not window.evidence_ids or any(key not in records or records[key].status != 'verified'
+                                      for key in window.evidence_ids):
+        return False, audit_ids
+    # Untrusted successors cannot erase a verified withdrawal. The shared
+    # selector determines the latest verified source versions at this cutoff.
+    receipts = select_evidence_as_of(tuple(records[key] for key in ids
+        if records[key].kind == 'capital_event_coverage' and records[key].status == 'verified'),
+        code=snapshot.code, cutoff=snapshot.cutoff_at)
+    required = {field for key in window.evidence_ids if records[key].kind == 'capital_event_coverage'
+                for field in ('scope', 'complete', 'start', 'end') if field in records[key].values}
+    for receipt in receipts:
+        values = receipt.values
+        if (not required <= values.keys() or values.get('stage') in {'withdrawn', 'revoked'}
+                or values.get('scope', 'all_capital_actions') != 'all_capital_actions'
+                or values.get('complete', 'true') != 'true'):
+            return False, audit_ids
+        try:
+            if (('start' in values and date.fromisoformat(values['start']) > window.start)
+                    or ('end' in values and date.fromisoformat(values['end']) < window.end)):
+                return False, audit_ids
+        except (TypeError, ValueError):
+            return False, audit_ids
+    return True, audit_ids
+
+
 def freeze_fundamentals(records: Sequence[EvidenceRecord], actions: Sequence[CapitalEvent],
                         coverage: Sequence[CoverageWindow], *, code: str,
                         cutoff_at: datetime, current_mcap: Decimal | None) -> FundamentalSnapshot:
     if current_mcap is not None and (not isinstance(current_mcap, Decimal) or not current_mcap.is_finite() or current_mcap <= 0):
         raise ValueError('current_mcap must be a finite positive Decimal')
+    proofs = tuple(_coverage_reference_original(row) for row in records if row.kind == 'coverage_reference')
+    if any(row.code != code or available_at(row) > cutoff_at for row in proofs):
+        raise ValueError('coverage reference company/cutoff mismatch')
+    records = tuple(row for row in records if row.kind != 'coverage_reference')
     selected = select_evidence_as_of(records, code=code, cutoff=cutoff_at)
     if any(evidence_identity(row) != row.evidence_id for row in selected):
         raise ValueError('evidence identity mismatch')
@@ -514,6 +592,12 @@ def freeze_fundamentals(records: Sequence[EvidenceRecord], actions: Sequence[Cap
     # be selected as current facts to retain the verified coverage assertion.
     windows = tuple(sorted((window for window in coverage if window.code == code and not set(window.evidence_ids) & unavailable_ids),
                            key=lambda window: (window.kind, window.start, window.end, window.complete, window.evidence_ids)))
+    proof_records = {row.evidence_id: row for row in (*records, *proofs)
+                     if row.code == code and available_at(row) <= cutoff_at}
+    referenced = _coverage_reference_closure(proof_records, {key for window in windows for key in window.evidence_ids})
+    selected_ids = {row.evidence_id for row in selected}
+    extensions.extend(coverage_reference_evidence(proof_records[key]) for key in sorted(referenced - selected_ids))
+    extensions.sort(key=lambda row: (row.kind, row.period, available_at(row), row.evidence_id))
     data = dict(code=code, cutoff_at=cutoff_at, annuals=tuple(annuals), interims=tuple(interims),
                 actions=selected_actions, extensions=tuple(extensions), coverage=windows, current_mcap=current_mcap)
     return FundamentalSnapshot(**data, fingerprint=_digest(data))

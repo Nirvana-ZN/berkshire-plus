@@ -40,6 +40,24 @@ def test_append_is_idempotent_and_reloads_aware_utc(store):
         assert session.execute(text('SELECT count(*) FROM fundamental_evidence')).scalar_one() == 1
 
 
+def test_coverage_proofs_load_original_status_and_successor_chain_at_cutoff(store):
+    from discovery.evidence_store import append_evidence, load_evidence_as_of, load_coverage_references
+    original = identity(evidence('2025'), kind='capital_event_coverage', status='untrusted')
+    middle = identity(original, status='verified', supersedes_id=original.evidence_id,
+                      observed_at=original.observed_at + timedelta(days=1))
+    latest = identity(middle, supersedes_id=middle.evidence_id, observed_at=middle.observed_at + timedelta(days=1))
+    future = identity(latest, supersedes_id=latest.evidence_id, observed_at=latest.observed_at + timedelta(days=1))
+    unrelated = identity(original, period='2024')
+    window = CoverageWindow(original.code, 'capital_event', date(2024, 1, 1), date(2025, 1, 1), True, (original.evidence_id,))
+    with Session(store) as session:
+        for record in (original, middle, latest, future, unrelated):
+            append_evidence(session, record)
+        refs = load_coverage_references(session, original.code, latest.observed_at, (window,))
+        assert {row.evidence_id: row for row in refs} == {row.evidence_id: row for row in (original, middle, latest)}
+        assert load_evidence_as_of(session, original.code, latest.observed_at) == tuple(
+            sorted((unrelated, latest), key=lambda row: (row.kind, row.period, row.observed_at, row.evidence_id)))
+
+
 def test_conflicting_or_noncanonical_identity_cannot_be_inserted(store):
     from discovery.evidence_store import append_evidence
     row = evidence('2025', inventory='100')

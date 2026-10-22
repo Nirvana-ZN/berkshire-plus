@@ -1646,7 +1646,8 @@ def classify(company: FrozenCompanyInput, ruler: TrackRuler) -> TrackVerdict:
                 != latest.price
             ):
                 raise _SnapshotInvalid("current valuation mismatch")
-        annual = annual_values(snapshot, windows['normalized_earnings'].end_year) if snapshot is not None and quality_branch == 'cyclical' else None
+        window = windows.get('normalized_earnings')
+        annual = annual_values(snapshot, window.end_year if window is not None else None) if snapshot is not None and quality_branch == 'cyclical' else None
         decimal_metrics, counts, calculation_audit = _metric_values(
             company,
             ruler,

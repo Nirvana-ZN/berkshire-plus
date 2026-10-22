@@ -1020,7 +1020,8 @@ def classify(company: FrozenCompanyInput, ruler: TrackRuler) -> TrackVerdict:
             ):
                 raise _SnapshotInvalid("current valuation mismatch")
 
-        annual = annual_values(snapshot, windows['normalized_earnings'].end_year) if snapshot is not None and branch != 'financial' else None
+        window = windows.get('normalized_earnings')
+        annual = annual_values(snapshot, window.end_year if window is not None else None) if snapshot is not None and branch != 'financial' else None
         calculated, counts = (
             _financial_metrics(company, ruler, windows, valuations)
             if branch == "financial"

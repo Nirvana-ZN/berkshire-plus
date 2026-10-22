@@ -323,3 +323,102 @@ def test_summary_and_diff_preserve_status_and_shadow_meaning():
     assert summary['risk_states'] == {'unknown': 2}
     assert _track_threshold('roic_gross_min', frozenset({'roic_gross_5y'})) == ('roic_gross_5y', 'gte')
 
+
+@pytest.mark.parametrize('track', ['deep_value', 'quality_discount'])
+def test_empty_annual_history_is_insufficient_with_missing_window(track):
+    from discovery.tracks.deep_value import classify as deep
+    from discovery.tracks.quality_discount import classify as quality
+    from tests.test_discovery_tracks_deep_value import _company as deep_company
+    from tests.test_discovery_tracks_quality import frozen_company
+    base = deep_company() if track == 'deep_value' else frozen_company(industry='煤炭')
+    item = company(base, cap='200')
+    item = replace(item, fields={**item.fields, 'financial_history': ()})
+    result = {'deep_value': deep, 'quality_discount': quality}[track](item, candidate(track))
+    assert result.verdict == 'insufficient'
+    metric = result.metrics['metric_results']['normalized_earnings']
+    assert metric['status'] == 'missing'
+    assert metric['reason'] == 'financial_window_missing'
+
+
+def revised_coverage_company(*, original_status='verified', successor_status='verified', changes=None):
+    from datetime import timedelta
+    from discovery.fundamentals import fundamentals_from_payload
+    item = company(cap='200')
+    snapshot = fundamentals_from_payload(item.fields, code=item.code)
+    window = snapshot.coverage[0]
+    original = next(row for row in snapshot.extensions if row.evidence_id in window.evidence_ids)
+    original = replace(original, status=original_status, values={'scope': 'all_capital_actions',
+        'complete': 'true', 'start': window.start.isoformat(), 'end': window.end.isoformat(), 'evidence_ids': '[]'})
+    original = replace(original, evidence_id=evidence_identity(original))
+    successor = replace(original, supersedes_id=original.evidence_id, status=successor_status,
+                        observed_at=original.observed_at + timedelta(days=1),
+                        values={**original.values, **(changes or {})})
+    successor = replace(successor, evidence_id=evidence_identity(successor))
+    records = tuple(row for row in snapshot.annuals + snapshot.interims + snapshot.extensions
+                    if row.evidence_id not in window.evidence_ids) + (original, successor)
+    snapshot = freeze_fundamentals(records, (), (replace(window, evidence_ids=(original.evidence_id,)),),
+                                  code=item.code, cutoff_at=snapshot.cutoff_at, current_mcap=snapshot.current_mcap)
+    return replace(item, fields={**item.fields, **snapshot_payload(snapshot)}), original, successor
+
+
+@pytest.mark.parametrize('original_status,expected', [('verified', 'verified'), ('untrusted', 'missing')])
+def test_coverage_uses_original_source_status_after_verified_revision(original_status, expected):
+    from discovery.tracks.garp import classify
+    item, original, successor = revised_coverage_company(original_status=original_status)
+    result = classify(item, candidate())
+    metric = result.metrics['metric_results']['economic_dilution']
+    assert metric['status'] == expected
+    assert original.evidence_id in metric['evidence_ids']
+    if expected == 'verified':
+        assert result.verdict == 'pass'
+        assert metric['value'] == '0'
+
+
+@pytest.mark.parametrize('changes', [{'complete': 'false'}, {'scope': 'buybacks_only'}, {'start': '2024-01-01'}])
+def test_verified_coverage_revision_cannot_resurrect_revoked_assertion(changes):
+    from discovery.tracks.garp import classify
+    item, original, successor = revised_coverage_company(changes=changes)
+    metric = classify(item, candidate()).metrics['metric_results']['economic_dilution']
+    assert metric['status'] == 'missing'
+    assert metric['reason'] == 'capital_actions_incomplete_coverage'
+    assert {original.evidence_id, successor.evidence_id} <= set(metric['evidence_ids'])
+
+
+def test_multistep_verified_revocation_survives_later_untrusted_correction():
+    from datetime import timedelta
+    from discovery.fundamentals import fundamentals_from_payload
+    from discovery.tracks.garp import classify
+    item, original, middle = revised_coverage_company()
+    snapshot = fundamentals_from_payload(item.fields, code=item.code)
+    revoked = replace(middle, supersedes_id=middle.evidence_id,
+                      observed_at=middle.observed_at + timedelta(days=1),
+                      values={**middle.values, 'complete': 'false'})
+    revoked = replace(revoked, evidence_id=evidence_identity(revoked))
+    untrusted = replace(revoked, supersedes_id=revoked.evidence_id, status='untrusted',
+                        observed_at=revoked.observed_at + timedelta(days=1),
+                        values={**revoked.values, 'complete': 'true'})
+    untrusted = replace(untrusted, evidence_id=evidence_identity(untrusted))
+    snapshot = freeze_fundamentals(snapshot.annuals + snapshot.interims + snapshot.extensions + (revoked, untrusted),
+                                  (), snapshot.coverage, code=item.code, cutoff_at=snapshot.cutoff_at,
+                                  current_mcap=snapshot.current_mcap)
+    item = replace(item, fields={**item.fields, **snapshot_payload(snapshot)})
+    metric = classify(item, candidate()).metrics['metric_results']['economic_dilution']
+    assert metric['status'] == 'missing'
+    assert {original.evidence_id, middle.evidence_id, revoked.evidence_id, untrusted.evidence_id} <= set(metric['evidence_ids'])
+
+
+def test_legacy_frozen_coverage_ids_without_proof_stay_unavailable():
+    from discovery.fundamentals import fundamentals_from_payload
+    from discovery.tracks.garp import classify
+    item, original, successor = revised_coverage_company()
+    snapshot = fundamentals_from_payload(item.fields, code=item.code)
+    # Existing payloads cannot be enriched from a successor or a live repository.
+    snapshot = freeze_fundamentals(tuple(row for row in snapshot.annuals + snapshot.interims + snapshot.extensions
+                                        if row.kind != 'coverage_reference'), (), snapshot.coverage,
+                                  code=item.code, cutoff_at=snapshot.cutoff_at, current_mcap=snapshot.current_mcap)
+    payload = snapshot_payload(snapshot)
+    assert snapshot_payload(fundamentals_from_payload(payload, code=item.code)) == payload
+    item = replace(item, fields={**item.fields, **payload})
+    metric = classify(item, candidate()).metrics['metric_results']['economic_dilution']
+    assert metric['status'] == 'missing'
+

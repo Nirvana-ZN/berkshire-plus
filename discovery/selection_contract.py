@@ -17,7 +17,7 @@ from discovery.field_dictionary import FIELD_DICTIONARY, SELECTION_FIELD_DICTION
 from discovery.fundamental_types import MetricResult
 from discovery.fundamentals import (
     _arithmetic, _fact, _facts_calculation, _on_basis, deducted_peg, deducted_valuation, fundamentals_from_payload,
-    period_order, plain,
+    period_order, plain, verified_coverage_sources,
 )
 from discovery.metrics import median
 
@@ -254,6 +254,9 @@ def _cap(snapshot, company):
 
 def annual_values(snapshot, end_year, *, years=5):
     """One exact normalization, reused by traps, cash metrics and valuation."""
+    if end_year is None:
+        return {name: MetricResult(None, 'missing', 'financial_window_missing', ())
+                for name in ('normalized_earnings', 'normalized_fcf', 'cumulative_fcf')}
     periods = tuple(str(year) for year in range(end_year - years + 1, end_year + 1))
     rows = snapshot.annuals
     earnings = _facts_calculation(rows, [('deducted_net_income', period) for period in periods],
@@ -275,16 +278,16 @@ def _dilution(snapshot, window):
                 for name in ('economic_dilution', 'gross_issuance_rate', 'cancellation_rate', 'bridge_error')}
     start, end = date(window.start_year, 12, 31), date(window.end_year, 12, 31)
     endpoints = [_fact(snapshot.annuals, 'shares', str(year))[0] for year in (window.start_year, window.end_year)]
-    records = {row.evidence_id: row for row in snapshot.extensions + snapshot.annuals + snapshot.interims}
     assertions = [row for row in snapshot.coverage if row.kind == 'capital_event'
                   and row.start <= end and row.end >= start]
+    proof = {row: verified_coverage_sources(snapshot, row) for row in assertions}
     coverage = [row for row in assertions if row.complete
                 and row.start <= start and row.end >= end and row.evidence_ids
-                and all(key in records and records[key].status == 'verified' for key in row.evidence_ids)]
+                and proof[row][0]]
     actions = tuple(action for action in snapshot.actions
                     if start < action.effective_at.astimezone(CHINA_MARKET_TIMEZONE).date() <= end)
     results = capital_change_audit(*(item.value for item in endpoints), actions, coverage_complete=bool(coverage))
-    ids = {key for item in endpoints for key in item.evidence_ids} | {key for row in assertions for key in row.evidence_ids}
+    ids = {key for item in endpoints for key in item.evidence_ids} | {key for row in assertions for key in proof[row][1]}
     unavailable = next((item for item in endpoints if item.status == 'untrusted'), None)
     requirements = [('shares', str(year)) for year in (window.start_year, window.end_year)]
     return {name: replace(unavailable if unavailable else _on_basis(snapshot.annuals, requirements, result),
@@ -347,7 +350,7 @@ def apply_metrics(company, ruler, branch, windows, calculated, counts, audit, *,
             if applicable:
                 needed_fields = {'cash': 'cash', 'restricted_cash': 'restricted_cash', 'debt': 'interest_debt'}
                 requirements = [(needed_fields[name], latest) for name in dependencies[key] if name in needed_fields]
-                if 'fcf' in dependencies[key] and annual is not None:
+                if 'fcf' in dependencies[key] and windows.get('fcf') is not None:
                     end = windows['fcf'].end_year
                     requirements += [(field, str(year)) for year in range(end - 4, end + 1) for field in ('ocf', 'capex')]
                 results[key] = _on_basis(rows, requirements, results[key])
@@ -375,7 +378,8 @@ def apply_metrics(company, ruler, branch, windows, calculated, counts, audit, *,
         metric_labels={'pe_percentile': '普通 PE 历史位置', 'current_pe': '当前普通 PE',
                        **{name: spec.label for name, spec in registered_metrics(ruler.track).items()}})
     if annual is not None and applicable:
-        end = windows['normalized_earnings'].end_year
+        window = windows.get('normalized_earnings')
+        end = window.end_year if window is not None else None
         audit['normalization_sensitivity'] = {str(years): plain(annual_values(snapshot, end, years=years))
                                              for years in ruler.metric_contract['normalized_sensitivity_years']}
 

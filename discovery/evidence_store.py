@@ -111,6 +111,29 @@ def load_evidence_as_of(session: Session, code: str, cutoff: datetime, *, histor
     return select_evidence_as_of(visible, code=code, cutoff=cutoff, historical=historical)
 
 
+def load_coverage_references(session: Session, code: str, cutoff: datetime,
+                             windows: Sequence[CoverageWindow]) -> tuple[EvidenceRecord, ...]:
+    """Load original coverage sources and their visible revision proof chains.
+
+    This does not select current facts or infer original trust from successors.
+    Capture freezes these records as proof extensions, never financial inputs.
+    """
+    _aware(cutoff)
+    frontier = {key for window in windows if window.code == code for key in window.evidence_ids}
+    records = {}
+    while frontier:
+        query = select(FundamentalEvidence).where(
+            FundamentalEvidence.code == code, FundamentalEvidence.available_at <= cutoff,
+            (FundamentalEvidence.evidence_id.in_(frontier)
+             | FundamentalEvidence.supersedes_id.in_(frontier)))
+        loaded = (_record(row) for row in session.scalars(query))
+        found = {row.evidence_id: row for row in loaded}
+        found = {key: row for key, row in found.items() if available_at(row) <= cutoff}
+        frontier = set(found) - set(records)
+        records.update(found)
+    return tuple(records[key] for key in sorted(records))
+
+
 def select_evidence_as_of(records: Sequence[EvidenceRecord], *, code: str,
                           cutoff: datetime, historical: bool = False) -> tuple[EvidenceRecord, ...]:
     """Shared pure cutoff-before-version boundary for repository and snapshots."""
