@@ -194,3 +194,43 @@ def test_coverage_cutoff_requires_timezone(store):
     from discovery.evidence_store import load_coverage
     with Session(store) as session, pytest.raises(ValueError, match='timezone'):
         load_coverage(session, '000001.SZ', cutoff=datetime(2026, 10, 1))
+
+
+@pytest.mark.parametrize(('field', 'value'), [
+    ('inventory', 'NaN'),
+    ('inventory', 'sNaN'),
+    ('inventory', 'Infinity'),
+    ('inventory', '-Infinity'),
+    ('inventory', 'not-a-number'),
+    ('revenue', 'NaN'),
+    ('roe', 'not-a-number'),
+])
+def test_direct_append_rejects_nonfinite_or_nonnumeric_registered_financial_values(store, field, value):
+    from discovery.evidence_store import append_evidence
+    row = evidence('2025', **{field: value})
+    with Session(store) as session, pytest.raises(ValueError, match=field):
+        append_evidence(session, row)
+    with store.connect() as conn:
+        assert conn.execute(text('SELECT count(*) FROM fundamental_evidence')).scalar_one() == 0
+
+
+def test_direct_append_preserves_exact_numeric_strings_nulls_and_text_metadata(store):
+    from discovery.evidence_store import append_evidence, load_evidence_as_of
+    row = identity(evidence('2025'), values={
+        'inventory': '0.00', 'restricted_cash': None, 'revenue': '9007199254740993.01',
+        'disclosure_text': 'No non-operating occupation reported.',
+        '_report_location': 'physical page 12; consolidated balance sheet',
+        '_verification': 'Human review; literal NaN is provenance text here.',
+    })
+    with Session(store) as session:
+        assert append_evidence(session, row) == row.evidence_id
+        session.commit()
+    with Session(store) as session:
+        loaded, = load_evidence_as_of(session, row.code, row.observed_at)
+        assert loaded == row
+        assert loaded.evidence_id == row.evidence_id
+        assert loaded.values['inventory'] == '0.00'
+        assert loaded.values['restricted_cash'] is None
+        assert loaded.values['revenue'] == '9007199254740993.01'
+        assert loaded.values['disclosure_text'] == 'No non-operating occupation reported.'
+        assert loaded.values['_verification'] == 'Human review; literal NaN is provenance text here.'

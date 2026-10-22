@@ -1,6 +1,7 @@
 """Immutable evidence repository and point-in-time availability rules."""
 
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from hashlib import sha256
 import json
 
@@ -9,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.selection_models import FundamentalCoverage, FundamentalEvidence
 from discovery.constants import CHINA_MARKET_TIMEZONE
+from discovery.field_dictionary import FIELD_DICTIONARY, SELECTION_FIELD_DICTIONARY
 from discovery.fundamental_types import CoverageWindow, EvidenceRecord, evidence_identity
 
 
@@ -43,9 +45,28 @@ def _record(row: FundamentalEvidence) -> EvidenceRecord:
     )
 
 
+def _validate_numeric_values(record: EvidenceRecord) -> None:
+    """Validate registered amounts without rewriting identity-bearing strings.
+
+    Generic evidence text and reserved provenance metadata are not financial
+    fields. The repository enforces the numeric contract independently of any
+    market-layer parser, including for trusted internal callers.
+    """
+    for field, value in record.values.items():
+        if value is None or (field not in FIELD_DICTIONARY and field not in SELECTION_FIELD_DICTIONARY):
+            continue
+        try:
+            amount = Decimal(value)
+        except InvalidOperation as exc:
+            raise ValueError(f'{field} must contain a finite exact decimal') from exc
+        if not amount.is_finite():
+            raise ValueError(f'{field} must contain a finite exact decimal')
+
+
 def append_evidence(session: Session, record: EvidenceRecord) -> str:
     if evidence_identity(record) != record.evidence_id:
         raise ValueError('evidence identity conflicts with canonical content')
+    _validate_numeric_values(record)
     existing = session.get(FundamentalEvidence, record.evidence_id)
     if existing is not None:
         if evidence_identity(_record(existing)) != record.evidence_id:
