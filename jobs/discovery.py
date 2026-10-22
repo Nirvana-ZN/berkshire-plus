@@ -174,6 +174,7 @@ def confirm_waiting_layers(
             DiscoveryStage.superseded_at.is_(None),
         )
     ):
+        _register_competition_publication(session, stage, now)
         stage.status = "confirmed"
         stage.confirmed_at = now
         stage.updated_at = now
@@ -198,6 +199,14 @@ def confirm_waiting_layers(
             )
             queued = True
     return queued
+
+
+def _register_competition_publication(session: Session, stage: DiscoveryStage, now: datetime) -> None:
+    """Freeze the three variants before the first confirmed result is visible."""
+    from discovery.builds import CANDIDATE_BUILD_VERSION
+    if stage.stage == "competition" and stage.algorithm_version == CANDIDATE_BUILD_VERSION:
+        from tracking.cohorts import publish_track_cohorts
+        publish_track_cohorts(session, stage_id=stage.id, published_at=now)
 
 
 class TransientDiscoveryError(RuntimeError):
@@ -1606,6 +1615,8 @@ def _execute_track_stage(
         # Discovery is rule-only: a finished layer is final and the next one
         # queues in the same commit. Competition is the last layer.
         finished = outcome.status == "waiting_confirmation"
+        if finished:
+            _register_competition_publication(session, stage, completed_at)
         stage.status = "confirmed" if finished else outcome.status
         if finished:
             stage.confirmed_at = completed_at

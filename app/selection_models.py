@@ -2,7 +2,7 @@
 
 from datetime import date, datetime
 
-from sqlalchemy import Boolean, CheckConstraint, Date, DDL, ForeignKey, Index, String, Text, event
+from sqlalchemy import Boolean, CheckConstraint, Date, DDL, ForeignKey, Index, String, Text, UniqueConstraint, event
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
@@ -62,6 +62,86 @@ class ResearchAssumption(Base):
     payload_json: Mapped[str] = mapped_column(Text, nullable=False)
     evidence_ids_json: Mapped[str] = mapped_column(Text, nullable=False)
     digest: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+
+
+class StrategyExperiment(Base):
+    __tablename__ = 'strategy_experiments'
+    __table_args__ = (CheckConstraint("kind IN ('prospective','retrospective_observation')"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    registered_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+    kind: Mapped[str] = mapped_column(String, nullable=False)
+    protocol_version: Mapped[str] = mapped_column(String, nullable=False)
+    config_json: Mapped[str] = mapped_column(Text, nullable=False)
+    config_hash: Mapped[str] = mapped_column(String, nullable=False)
+    registration_hash: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+
+
+class StrategyCohort(Base):
+    __tablename__ = 'strategy_cohorts'
+    __table_args__ = (
+        UniqueConstraint('experiment_id', 'run_id', 'track', 'variant_id'),
+        CheckConstraint("variant_id IN ('full_selected','no_operating_selected','all_passed')"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    experiment_id: Mapped[int] = mapped_column(ForeignKey('strategy_experiments.id', ondelete='RESTRICT'), nullable=False)
+    run_id: Mapped[int] = mapped_column(ForeignKey('discovery_runs.id', ondelete='RESTRICT'), nullable=False)
+    track: Mapped[str] = mapped_column(String, nullable=False)
+    variant_id: Mapped[str] = mapped_column(String, nullable=False)
+    # Legacy runs have no immutable publication receipt; do not invent one.
+    published_run_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    registered_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+    manifest_json: Mapped[str] = mapped_column(Text, nullable=False)
+    input_hash: Mapped[str] = mapped_column(String, nullable=False)
+    state: Mapped[str] = mapped_column(String, nullable=False)
+
+
+class StrategyMember(Base):
+    __tablename__ = 'strategy_members'
+
+    cohort_id: Mapped[int] = mapped_column(ForeignKey('strategy_cohorts.id', ondelete='RESTRICT'), primary_key=True)
+    code: Mapped[str] = mapped_column(String, primary_key=True)
+    initial_weight: Mapped[str] = mapped_column(Text, nullable=False)
+    gate_result_id: Mapped[int] = mapped_column(ForeignKey('discovery_results.id', ondelete='RESTRICT'), nullable=False)
+    selection_reason: Mapped[str] = mapped_column(Text, nullable=False)
+
+
+def strategy_guard_statements():
+    """Shared by metadata creation and idempotent initialization of existing DBs."""
+    for model in (StrategyExperiment, StrategyCohort, StrategyMember):
+        table = model.__table__
+        changed = ' OR '.join(f'NEW.{column.name} IS NOT OLD.{column.name}'
+                              for column in table.columns if column.name != 'state')
+        yield (f'CREATE TRIGGER IF NOT EXISTS trg_{table.name}_immutable '
+               f'BEFORE UPDATE ON {table.name} WHEN {changed} '
+               "BEGIN SELECT RAISE(ABORT, 'strategy registration is immutable'); END")
+        yield (f'CREATE TRIGGER IF NOT EXISTS trg_{table.name}_delete '
+               f'BEFORE DELETE ON {table.name} '
+               "BEGIN SELECT RAISE(ABORT, 'strategy registration is append-only'); END")
+        if model is StrategyExperiment:
+            duplicate = 'id = NEW.id OR registration_hash = NEW.registration_hash'
+        elif model is StrategyCohort:
+            duplicate = ('id = NEW.id OR (experiment_id = NEW.experiment_id AND run_id = NEW.run_id '
+                         'AND track = NEW.track AND variant_id = NEW.variant_id)')
+        else:
+            duplicate = 'cohort_id = NEW.cohort_id AND code = NEW.code'
+        yield (f'CREATE TRIGGER IF NOT EXISTS trg_{table.name}_replace '
+               f'BEFORE INSERT ON {table.name} WHEN EXISTS '
+               f'(SELECT 1 FROM {table.name} WHERE {duplicate}) '
+               "BEGIN SELECT RAISE(ABORT, 'strategy registration is immutable'); END")
+    yield ("CREATE TRIGGER IF NOT EXISTS trg_strategy_members_manifest "
+           "BEFORE INSERT ON strategy_members WHEN NOT EXISTS ("
+           "SELECT 1 FROM strategy_cohorts c, json_each(c.manifest_json, '$.members') m "
+           "WHERE c.id = NEW.cohort_id AND json_extract(m.value, '$.code') = NEW.code "
+           "AND json_extract(m.value, '$.weight') = NEW.initial_weight "
+           "AND json_extract(m.value, '$.gate_result_id') = NEW.gate_result_id "
+           "AND json_extract(m.value, '$.selection_reason') = NEW.selection_reason) "
+           "BEGIN SELECT RAISE(ABORT, 'strategy membership is immutable'); END")
+
+
+for _statement in strategy_guard_statements():
+    event.listen(Base.metadata, 'after_create', DDL(_statement).execute_if(dialect='sqlite'))
 
 
 # Triggers also protect direct SQL and INSERT OR REPLACE (which otherwise may

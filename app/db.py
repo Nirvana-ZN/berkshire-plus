@@ -1122,6 +1122,12 @@ def init_db(db_path: Path | None = None) -> Engine:
 
     engine = create_db_engine(db_path)
     Base.metadata.create_all(engine)
+    # Repair missing guards on existing registration tables without rewriting
+    # historical rows. Metadata creation installs the same guards for new DBs.
+    from sqlalchemy import text
+    with engine.begin() as conn:
+        for statement in _selection_models.strategy_guard_statements():
+            conn.execute(text(statement))
     _ensure_ruler_scope(engine)
     _ensure_discovery_snapshot_columns(engine)
     _ensure_discovery_lineage(engine)
