@@ -140,9 +140,11 @@ def select_evidence_as_of(records: Sequence[EvidenceRecord], *, code: str,
     _aware(cutoff)
     visible = list({row.evidence_id: row for row in records
                     if row.code == code and available_at(row, historical=historical) <= cutoff}.values())
-    # Unreviewed action corrections/withdrawals remain visible as raw evidence,
-    # but cannot hide the verified fact that the action parser still needs.
+    # Unreviewed protected-source corrections remain visible as raw evidence,
+    # but cannot hide verified facts that downstream validation still needs.
     def authoritative(row):
+        if row.kind == 'company_profile':
+            return row.status == 'verified'
         if row.kind == 'capital_event':
             return row.status == 'verified' and row.values.get('stage') in {'implemented', 'withdrawn'}
         if row.kind in {'dividend', 'buyback', 'equity_financing', 'buyback_trade'}:
@@ -153,7 +155,7 @@ def select_evidence_as_of(records: Sequence[EvidenceRecord], *, code: str,
             return row.status == 'verified' and row.values.get('stage') in {None, 'withdrawn', 'revoked'}
         return True
 
-    protected = {'capital_event', 'dividend', 'buyback', 'equity_financing',
+    protected = {'company_profile', 'capital_event', 'dividend', 'buyback', 'equity_financing',
                  'buyback_trade', 'shareholder_return_coverage'}
     superseded = {row.supersedes_id for row in visible if row.kind not in protected}
     by_id = {row.evidence_id: row for row in visible}
@@ -163,7 +165,10 @@ def select_evidence_as_of(records: Sequence[EvidenceRecord], *, code: str,
             seen = set()
             while parent_id in by_id and parent_id not in seen:
                 parent = by_id[parent_id]
-                if row.kind != 'capital_event':
+                if row.kind == 'company_profile':
+                    if (parent.code, parent.kind, parent.period) != (row.code, row.kind, row.period):
+                        raise ValueError('profile supersession must retain company, kind and period')
+                elif row.kind != 'capital_event':
                     if (parent.code, parent.kind, parent.period) != (row.code, row.kind, row.period):
                         raise ValueError('shareholder supersession must retain company, kind and period')
                     if row.kind != 'shareholder_return_coverage' and parent.values.get('plan_id') != row.values.get('plan_id'):

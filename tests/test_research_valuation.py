@@ -476,3 +476,141 @@ def test_pe_uses_exact_deducted_ttm_not_reported_eps_or_annual_shares(store, tmp
         assert report['source_facts']['numerator'] == '22'
         assert report['declared_assumptions']['metric_per_share'] == '2.2'
         assert report['computed_prices']['base'] == '26.136'
+
+
+@pytest.mark.parametrize('profile_period', ['2026-10-02', '2026-09-01'])
+def test_conflicting_authoritative_profiles_reject_append_despite_selected_nonfinancial(store, tmp_path, profile_period):
+    from sqlalchemy.orm import Session
+    from discovery.evidence_store import append_evidence
+    with Session(store) as session:
+        bank = reviewed(tmp_path, 'company_profile', profile_period, {}, industry='银行')
+        append_evidence(session, bank)
+        # The contradictory active source is deliberately absent from the
+        # caller's selected assumption IDs; omission must not remove authority.
+        with pytest.raises(ValueError, match='conflicting.*profile'):
+            append(session, sources(tmp_path))
+
+
+def test_conflicting_authoritative_profile_added_after_assumption_makes_new_creation_watch(store, tmp_path):
+    from sqlalchemy.orm import Session
+    from discovery.evidence_store import append_evidence
+    from jobs.research import create_research_job, _job_evidence_context
+    from research.evaluate import normalize_structured
+    with Session(store) as session:
+        rows = sources(tmp_path)
+        version = append(session, rows)
+        old = create_research_job(session, name='Synthetic', code=rows[0].code, assumption_id=version)
+        session.commit()
+        original = old.evidence_context_json
+        append_evidence(session, reviewed(tmp_path, 'company_profile', '2026-10-02', {}, industry='银行'))
+        session.flush()
+        new = create_research_job(session, name='Synthetic', code=rows[0].code, assumption_id=version)
+        snapshot, _, context, _ = _job_evidence_context(new)
+        assert context['valuation_complete'] is False
+        assert 'conflicting' in context['valuation_reason']
+        result = normalize_structured(model_output(rows[0]), payload(tmp_path, snapshot, context))
+        assert result['price_bands']['mode'] == 'watch'
+        assert result['data_grade'] == 'C'
+        # Existing immutable capture and its verified valuation remain intact.
+        assert old.evidence_context_json == original
+        assert _job_evidence_context(old)[2]['valuation_complete'] is True
+
+
+def test_consistent_authoritative_profile_branches_allow_selected_source(store, tmp_path):
+    from sqlalchemy.orm import Session
+    from discovery.evidence_store import append_evidence
+    from jobs.research import create_research_job, _job_evidence_context
+    with Session(store) as session:
+        append_evidence(session, reviewed(tmp_path, 'company_profile', '2026-09-01', {}, industry='食品制造业'))
+        rows = sources(tmp_path)
+        version = append(session, rows)
+        job = create_research_job(session, name='Synthetic', code=rows[0].code, assumption_id=version)
+        assert _job_evidence_context(job)[2]['valuation_complete'] is True
+
+
+def test_verified_profile_supersession_resolves_conflict(store, tmp_path):
+    from sqlalchemy.orm import Session
+    from discovery.evidence_store import append_evidence
+    from discovery.fundamental_types import evidence_identity
+    from jobs.research import create_research_job, _job_evidence_context
+    with Session(store) as session:
+        rows = list(sources(tmp_path))
+        bank = reviewed(tmp_path, 'company_profile', '2026-10-02', {}, industry='银行')
+        append_evidence(session, bank)
+        corrected = replace(rows[2], supersedes_id=bank.evidence_id)
+        corrected = replace(corrected, evidence_id=evidence_identity(corrected))
+        rows[2] = corrected
+        version = append(session, rows)
+        job = create_research_job(session, name='Synthetic', code=rows[0].code, assumption_id=version)
+        context = _job_evidence_context(job)[2]
+        assert bank.evidence_id not in context['evidence_ids']
+        assert context['valuation_complete'] is True
+        assert context['valuation']['validation']['report']['computed_prices']['base'] == '23.76'
+
+
+@pytest.mark.parametrize('correction_kind', ['untrusted', 'future'])
+def test_untrusted_or_future_profile_successor_cannot_hide_conflicting_authority(store, tmp_path, correction_kind):
+    from sqlalchemy.orm import Session
+    from discovery.evidence_store import append_evidence, load_evidence_as_of
+    from discovery.fundamental_types import evidence_identity
+    from jobs.research import create_research_job, _job_evidence_context
+    from research.valuation import append_assumptions
+    with Session(store) as session:
+        rows = sources(tmp_path)
+        version = append(session, rows)
+        bank = reviewed(tmp_path, 'company_profile', '2026-10-02', {}, industry='银行')
+        append_evidence(session, bank)
+        successor = replace(rows[2], supersedes_id=bank.evidence_id,
+            status='untrusted' if correction_kind == 'untrusted' else 'verified',
+            observed_at=rows[2].observed_at if correction_kind == 'untrusted' else CUTOFF + timedelta(seconds=1))
+        successor = replace(successor, evidence_id=evidence_identity(successor))
+        append_evidence(session, successor)
+        session.flush()
+        selected = {row.evidence_id for row in load_evidence_as_of(session, rows[0].code, CUTOFF)}
+        assert bank.evidence_id in selected
+        assert (successor.evidence_id in selected) == (correction_kind == 'untrusted')
+        with pytest.raises(ValueError, match='conflicting.*profile'):
+            append_assumptions(session, user_id=1, code=rows[0].code, payload=scenario(rows))
+        job = create_research_job(session, name='Synthetic', code=rows[0].code, assumption_id=version)
+        context = _job_evidence_context(job)[2]
+        assert context['valuation_complete'] is False
+        assert 'conflicting' in context['valuation_reason']
+
+
+def test_non_authoritative_extra_profile_does_not_override_retained_verified_profile(store, tmp_path):
+    from sqlalchemy.orm import Session
+    from discovery.evidence_store import append_evidence
+    from discovery.fundamental_types import evidence_identity
+    from jobs.research import create_research_job, _job_evidence_context
+    with Session(store) as session:
+        untrusted = replace(reviewed(tmp_path, 'company_profile', '2026-09-01', {}, industry='银行'), status='untrusted')
+        untrusted = replace(untrusted, evidence_id=evidence_identity(untrusted))
+        append_evidence(session, untrusted)
+        rows = sources(tmp_path)
+        version = append(session, rows)
+        job = create_research_job(session, name='Synthetic', code=rows[0].code, assumption_id=version)
+        assert _job_evidence_context(job)[2]['valuation_complete'] is True
+
+
+def test_profile_successor_without_retained_proof_cannot_resolve_industry_authority(store, tmp_path):
+    from sqlalchemy.orm import Session
+    from discovery.evidence_store import append_evidence
+    from discovery.fundamental_types import evidence_identity
+    from jobs.research import create_research_job, _job_evidence_context
+    from research.valuation import append_assumptions
+    with Session(store) as session:
+        rows = sources(tmp_path)
+        version = append(session, rows)
+        bank = reviewed(tmp_path, 'company_profile', '2026-10-02', {}, industry='银行')
+        append_evidence(session, bank)
+        correction = replace(rows[2], supersedes_id=bank.evidence_id,
+            values={key: value for key, value in rows[2].values.items() if key != '_source_document_path'})
+        correction = replace(correction, evidence_id=evidence_identity(correction))
+        append_evidence(session, correction)
+        session.flush()
+        with pytest.raises(ValueError, match='profile.*proof'):
+            append_assumptions(session, user_id=1, code=rows[0].code, payload=scenario(rows))
+        job = create_research_job(session, name='Synthetic', code=rows[0].code, assumption_id=version)
+        context = _job_evidence_context(job)[2]
+        assert context['valuation_complete'] is False
+        assert 'profile' in context['valuation_reason'] and 'proof' in context['valuation_reason']

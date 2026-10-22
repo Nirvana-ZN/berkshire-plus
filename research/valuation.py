@@ -216,6 +216,17 @@ def _calculate(payload, records, sources, *, code, cutoff):
 
     profile = selected('profile_evidence_id', 'company_profile')
     branch = classify_industry_branch(profile.values.get('_industry'))
+    # Explicit assumption IDs select a source, not an industry interpretation.
+    # All authoritative active sources in the frozen set must agree, including
+    # profiles the caller omitted from its declared scenario evidence IDs.
+    profiles = tuple(row for row in records if row.kind == 'company_profile' and row.status == 'verified')
+    # A status-only correction may have hidden an earlier profile during source
+    # selection. Its missing retained proof cannot silently resolve authority.
+    if any(sources.get(row.evidence_id, {}).get('status') != 'verified' for row in profiles):
+        raise ValueError('company profile retained proof incomplete')
+    branches = {classify_industry_branch(row.values.get('_industry')) for row in profiles}
+    if branches != {branch}:
+        raise ValueError('conflicting authoritative company profiles')
     if (branch, a.method) not in {('bank', 'pb'), ('nonfinancial', 'pe')}:
         raise ValueError('industry method mismatch or unsupported industry')
     shares = selected('shares_evidence_id', 'share_snapshot')
