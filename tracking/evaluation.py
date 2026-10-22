@@ -12,14 +12,14 @@ from discovery.snapshot import load_frozen_inputs
 from tracking.cohorts import cohort_manifest
 from tracking.contracts import VARIANTS, canonical_json, digest
 from tracking.importer import (TRUST_LIMITATION, normalized_event, qualify_events, require,
-    validate_history_bundle, verify_input_projection, retained_document, history_events, calculation_events)
+    verify_history_cohort_bindings, retained_document, history_events, calculation_events)
 from tracking.ledger import simulate_cohort
 from tracking.market import SHANGHAI, utc_time
 
-COMPARISON_POLICY = {'version': 'paper-comparison-v1',
+COMPARISON_POLICY = {'version': 'paper-comparison-v2',
     'benchmark_revisions': 'same_endpoint_series_revision_required',
     'samples': 'descriptive_only_overlapping_samples', 'annualization': 'not_extrapolated',
-    'registration_month_timezone': 'Asia/Shanghai'}
+    'registration_month_timezone': 'Asia/Shanghai', 'cohort_kind': 'separate_groups_and_explicit_rows'}
 
 
 def qualified_benchmarks(metrics):
@@ -51,6 +51,8 @@ def compare_cohorts(observations: Sequence[Mapping[str, object]]) -> Mapping[str
         manifest, result = item['manifest'], item['result']
         if manifest['variant_id'] not in VARIANTS or result['manifest_hash'] != manifest['manifest_hash']:
             raise ValueError('comparison manifest mismatch')
+        if manifest['kind'] not in ('prospective', 'retrospective_observation'):
+            raise ValueError('comparison cohort kind unavailable')
         identity = item.get('cohort_id', manifest['manifest_hash'])
         for horizon, metrics in result['horizons'].items():
             key = (identity, horizon)
@@ -68,16 +70,16 @@ def compare_cohorts(observations: Sequence[Mapping[str, object]]) -> Mapping[str
             memberships += len(manifest['members'])
         key = (manifest['track'], manifest['algorithm_version'],
                utc_time(manifest['registered_at']).astimezone(SHANGHAI).strftime('%Y-%m'),
-               manifest.get('protocol_hash'), horizon)
+               manifest.get('protocol_hash'), horizon, manifest['kind'])
         if key not in groups:
             groups[key] = {'track': key[0], 'algorithm_version': key[1], 'registration_month': key[2],
-                'protocol_hash': key[3], 'horizon_months': int(horizon),
+                'protocol_hash': key[3], 'horizon_months': int(horizon), 'kind': manifest['kind'],
                 'variants': {variant: {'observations': []} for variant in VARIANTS}}
         row = {field: metrics.get(field) for field in ('horizon_status', 'entry_target_date',
             'target_date', 'expected_exit_date', 'actual_exit_date', 'terminal_date', 'observation_date',
             'gross_return', 'net_return', 'horizon_return', 'gross_horizon_return', 'max_drawdown',
             'entry_coverage', 'exit_completion_rate', 'trading_cost', 'turnover', 'cost_sensitivity', 'data_gaps')}
-        row.update(cohort_id=identity, as_of=result['as_of'], manifest_hash=manifest['manifest_hash'],
+        row.update(cohort_id=identity, kind=manifest['kind'], as_of=result['as_of'], manifest_hash=manifest['manifest_hash'],
                    calculation_version=result['calculation_version'])
         if metrics.get('horizon_status') != 'completed':
             row['horizon_return'] = row['gross_horizon_return'] = None
@@ -190,23 +192,17 @@ def verify_tracking_audit(audit, bindings, *, training_end, generated_at):
     as_of = date.fromisoformat(audit['as_of'])
     require(datetime.combine(as_of, time.max, SHANGHAI) <= generated_at, 'mature_observation_required')
     frozen = audit['frozen_input']
-    companies = verify_input_projection(frozen)
     first = entries[0]['manifest']
-    require(bindings.get('input_fingerprint') == frozen['input_fingerprint'] == first['input_hash']
-        and first['run_id'] == frozen['run_id'] and set(first['universe']) == set(companies),
+    require(bindings.get('input_fingerprint') == frozen['input_fingerprint'] == first['input_hash'],
         'validation_binding_mismatch')
     ruler = frozen['run']['ruler_payloads'][first['track']]
     require(digest(ruler['payload']) == ruler['sha256'] == bindings.get('ruler_payload_hash') == first['ruler_hash'],
             'validation_binding_mismatch')
     bundle = audit['history_bundle']
-    require(not validate_history_bundle(bundle), 'data_coverage_required')
-    source = retained_document(bundle['source_manifest'], bundle.get('_root', '.'))
+    verify_history_cohort_bindings(bundle, [entry['manifest'] for entry in entries], frozen)
     source_review = retained_document(bundle['source_review'], bundle.get('_root', '.'))
     require(utc_time(source_review['reviewed_at']) <= generated_at, 'independent_source_review_required')
-    require(retained_document(source['input_projection'], bundle.get('_root', '.')) == frozen,
-            'historical_input_projection_mismatch')
-    require(utc_time(bundle['decision_at']) == utc_time(first['decision_cutoff_at'])
-        and date.fromisoformat(bundle['coverage']['end']) >= as_of, 'data_coverage_required')
+    require(date.fromisoformat(bundle['coverage']['end']) >= as_of, 'data_coverage_required')
     events = qualify_events(audit['events'])
     by_id = {row['event_id']: row for row in events}
     require(len(by_id) == len(events), 'duplicate_history_record')

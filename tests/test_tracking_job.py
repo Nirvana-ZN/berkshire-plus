@@ -3,6 +3,7 @@ from datetime import date
 import json
 import threading
 
+import pytest
 from sqlalchemy import event as sql_event, select, func
 
 from tests.test_tracking_import import seal_sources
@@ -189,6 +190,69 @@ def test_cli_local_retained_refresh_and_default_history_dry_run(tmp_path, monkey
     report = json.loads(capsys.readouterr().out)
     assert report['dry_run'] is True and 'historical_evidence_unavailable' in report['errors']
     assert db.read_bytes() == before
+
+
+@pytest.mark.parametrize('mismatch', ['late_report', 'run', 'input', 'universe', 'later_target_run'])
+def test_history_import_binds_every_original_cohort_before_preview_or_apply(tmp_path, monkeypatch, capsys, mismatch):
+    from scripts import track_selection
+    from tests.test_tracking_import import history_fixture, rebind_bundle, write_json
+    from tracking.cohorts import cohort_manifest, register_cohort
+    from tracking.contracts import default_tracking_config, digest
+    from tracking.evaluation import export_frozen_input
+    from tracking.importer import validate_history_bundle
+    engine, factory, ids = tracking_store(tmp_path, monkeypatch)
+    with factory() as session:
+        original = cohort_manifest(session, ids[0])
+        frozen = export_frozen_input(session, original['run_id'])
+        bindings = {str(identity): cohort_manifest(session, identity)['manifest_hash'] for identity in ids}
+        if mismatch == 'later_target_run':
+            from app.discovery_models import DiscoveryStage
+            from tests.test_tracking_cohorts import persisted_run
+            run = persisted_run(session, week='2025-W39')
+            stage = session.scalar(select(DiscoveryStage).where(DiscoveryStage.run_id == run.id,
+                DiscoveryStage.track == 'garp', DiscoveryStage.stage == 'competition'))
+            stage.status = 'confirmed'
+            extra = register_cohort(session, run_id=run.id, track='garp', variant_id='full_selected',
+                config=default_tracking_config(), registered_at=datetime.fromisoformat(original['registered_at']))
+            bindings[str(extra)] = cohort_manifest(session, extra)['manifest_hash']
+            session.commit()
+    if mismatch == 'run':
+        frozen['run_id'] += 1
+    elif mismatch in ('input', 'universe'):
+        if mismatch == 'input':
+            frozen['companies'][0]['payload']['fields']['amount'] = '999'
+        else:
+            frozen['companies'].pop()
+        for company in frozen['companies']:
+            company['input_fingerprint'] = digest(company['payload'])
+        frozen['run']['companies'] = [{'code': company['payload']['code'],
+            'input_fingerprint': company['input_fingerprint']} for company in frozen['companies']]
+        frozen['input_fingerprint'] = digest(frozen['run'])
+    bundle, grouped, _ = history_fixture(tmp_path, start=date(2025, 9, 17), end=date(2025, 9, 24),
+        codes=tuple(company['payload']['code'] for company in frozen['companies']), frozen_input=frozen)
+    bundle['decision_at'] = original['decision_cutoff_at']
+    if mismatch == 'late_report':
+        for report in grouped['report_versions']:
+            report['available_at'] = '2025-09-18T00:00:00+00:00'
+        rebind_bundle(tmp_path, bundle, grouped)
+        bundle['decision_at'] = '2025-09-18T01:00:00+00:00'
+    bundle['cohort_bindings'] = bindings
+    # Each retained pack is self-consistent, but unrelated to an original bound input/cutoff.
+    assert validate_history_bundle(bundle) == ()
+    reference = write_json(tmp_path, 'mismatched-history.json', bundle)
+    engine.dispose()
+    def provider_must_not_be_constructed(*args, **kwargs):
+        raise AssertionError('unbound history reached the provider')
+    monkeypatch.setattr(track_selection, 'RetainedEventProvider', provider_must_not_be_constructed)
+    db = tmp_path / 'tracking.db'
+    before = db.read_bytes()
+    for mode in ('--dry-run', '--apply'):
+        assert track_selection.main(['--db', str(db), '--import-history', reference['path'], mode]) == 2
+        report = json.loads(capsys.readouterr().out)
+        assert report['applied'] is False
+        assert report['reason'] in ('historical_input_projection_mismatch', 'historical_cohort_binding_mismatch',
+                                    'historical_decision_cutoff_mismatch')
+        assert db.read_bytes() == before
 
 
 def test_future_arrival_keeps_existing_calculation_idempotent(tmp_path, monkeypatch):

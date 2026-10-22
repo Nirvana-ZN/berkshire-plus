@@ -384,6 +384,35 @@ def validate_history_bundle(bundle: Mapping[str, object]) -> tuple[str, ...]:
                 else 'historical_evidence_invalid',)
 
 
+def verify_history_cohort_bindings(bundle, manifests, frozen_input):
+    """Bind source qualification to every original cohort, for import and T13.
+
+    The caller supplies the retained original input preimage: the CLI exports it
+    from the existing run; T13 independently verifies its immutable audit binding.
+    A self-consistent source bundle at a later cutoff is insufficient.
+    """
+    companies = verify_input_projection(frozen_input)
+    require(manifests, 'original_cohort_bindings_required')
+    decision = utc_time(bundle['decision_at'])
+    for manifest in manifests:
+        require(type(manifest['run_id']) is int and type(frozen_input['run_id']) is int
+            and manifest['run_id'] == frozen_input['run_id']
+            and manifest['input_hash'] == manifest['source_run_hash'] == frozen_input['input_fingerprint']
+            and manifest['universe'] == sorted(companies), 'historical_cohort_binding_mismatch')
+        require(manifest.get('decision_cutoff_at') is not None, 'historical_decision_cutoff_unavailable')
+        require(decision == utc_time(manifest['decision_cutoff_at']), 'historical_decision_cutoff_mismatch')
+        require(all(company['as_of'].get('decision_cutoff_at') is not None
+            and utc_time(company['as_of']['decision_cutoff_at']) == decision for company in companies.values()),
+            'historical_decision_cutoff_mismatch')
+    # Includes report availability/revisions and universe activity at this exact
+    # original decision cutoff, together with all retained source/archive proof.
+    require(not validate_history_bundle(bundle), 'data_coverage_required')
+    root = bundle.get('_root', '.')
+    source = retained_document(bundle['source_manifest'], root)
+    projection = retained_document(source['input_projection'], root)
+    require(canonical_json(projection) == canonical_json(frozen_input), 'historical_input_projection_mismatch')
+
+
 def history_events(bundle):
     errors = validate_history_bundle(bundle)
     require(not errors, ';'.join(errors))

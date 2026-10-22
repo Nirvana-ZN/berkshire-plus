@@ -11,7 +11,7 @@ def test_pending_maturity_and_missing_benchmarks_stay_unavailable():
     from tracking.ledger import simulate_cohort
     cohort = manifest()
     cohort.update(track='garp', algorithm_version='v8', registered_at='2026-01-29T00:00:00+00:00',
-                  variant_id='full_selected', registration_hash='synthetic-group')
+                  variant_id='full_selected', registration_hash='synthetic-group', kind='prospective')
     from tracking.contracts import digest
     cohort['manifest_hash'] = digest({k: v for k, v in cohort.items() if k != 'manifest_hash'})
     result = simulate_cohort(cohort, market(), date(2026, 2, 4))
@@ -28,11 +28,51 @@ def test_registration_month_uses_shanghai_business_calendar():
     from tracking.contracts import digest
     cohort = manifest()
     cohort.update(track='garp', algorithm_version='discovery-v8', variant_id='full_selected',
-                  registered_at='2026-01-31T16:30:00+00:00')
+                  registered_at='2026-01-31T16:30:00+00:00', kind='prospective')
     cohort['manifest_hash'] = digest({k: v for k, v in cohort.items() if k != 'manifest_hash'})
     result = simulate_cohort(cohort, market(), date(2026, 2, 4))
     report = compare_cohorts([{'cohort_id': 1, 'manifest': cohort, 'result': result}])
     assert {row['registration_month'] for row in report['groups']} == {'2026-02'}
+
+
+def test_real_registration_kinds_partition_groups_and_public_observations(tmp_path, monkeypatch):
+    from datetime import datetime
+    from sqlalchemy import select
+    from app.discovery_models import DiscoveryStage
+    from tests.test_tracking_cohorts import persisted_run
+    from tests.test_tracking_job import tracking_store
+    from tracking.cohorts import cohort_manifest, register_cohort
+    from tracking.contracts import default_tracking_config
+    from tracking.evaluation import compare_cohorts
+    from tracking.ledger import simulate_cohort
+    engine, factory, ids = tracking_store(tmp_path, monkeypatch)
+    with factory() as session:
+        prospective = cohort_manifest(session, ids[0])
+        run = persisted_run(session, week='2025-W39')
+        stage = session.scalar(select(DiscoveryStage).where(DiscoveryStage.run_id == run.id,
+            DiscoveryStage.track == 'garp', DiscoveryStage.stage == 'competition'))
+        stage.status = 'confirmed'
+        retrospective_id = register_cohort(session, run_id=run.id, track='garp', variant_id='full_selected',
+            config=default_tracking_config(), registered_at=datetime.fromisoformat(prospective['registered_at']))
+        retrospective = cohort_manifest(session, retrospective_id)
+        session.commit()
+    assert prospective['protocol_hash'] == retrospective['protocol_hash']
+    assert prospective['algorithm_version'] == retrospective['algorithm_version']
+    assert prospective['registered_at'] == retrospective['registered_at']
+    events = market(date(2025, 9, 24), codes=tuple(f'60000{i}.SH' for i in range(1, 6)), start=date(2025, 9, 17))
+    report = compare_cohorts([{'cohort_id': identity, 'manifest': cohort,
+        'result': simulate_cohort(cohort, events, date(2025, 9, 24))}
+        for identity, cohort in ((ids[0], prospective), (retrospective_id, retrospective))])
+    assert len(report['groups']) == 6
+    assert {group['kind'] for group in report['groups']} == {'prospective', 'retrospective_observation'}
+    for group in report['groups']:
+        variant = group['variants']['full_selected']
+        assert variant['count'] == 1
+        row = variant['observations'][0]
+        assert row['kind'] == group['kind']
+        assert row['horizon_status'] == ('pending_maturity' if row['kind'] == 'prospective'
+                                         else 'entry_time_unavailable')
+    engine.dispose()
 
 
 @pytest.fixture
@@ -119,7 +159,7 @@ def test_actual_registration_ledger_export_reaches_t13_without_rewriting_protoco
     assert json.loads(capsys.readouterr().out)['status'] == 'completed'
 
 
-@pytest.mark.parametrize('mutation', ['timing', 'input', 'model_in_ablation', 'model_elsewhere', 'missing_source', 'relative', 'omitted_source_event'])
+@pytest.mark.parametrize('mutation', ['timing', 'input', 'model_in_ablation', 'model_elsewhere', 'missing_source', 'relative', 'omitted_source_event', 'history_cutoff'])
 def test_actual_audit_rejects_rebound_timing_input_source_and_model_labels(tmp_path, retained_real_audit, mutation):
     from scripts.evolve_rulers import activation_eligibility
     from tracking.contracts import digest
@@ -132,6 +172,17 @@ def test_actual_audit_rejects_rebound_timing_input_source_and_model_labels(tmp_p
         audit['events'][0].pop('retained_source')
     elif mutation == 'relative':
         audit['observations'][0]['result']['horizons']['3']['benchmarks']['primary']['relative_return'] = '99'
+    elif mutation == 'history_cutoff':
+        from tests.test_tracking_import import rebind_bundle
+        from tracking.importer import validate_history_bundle
+        bundle = audit['history_bundle']
+        grouped = {name: json.loads(open(bundle[name]['path'], encoding='utf-8').read())['records']
+            for name in ('universe_intervals', 'report_versions', 'trading_calendar', 'market_events', 'benchmark_series')}
+        for report in grouped['report_versions']:
+            report['available_at'] = '2025-09-18T00:00:00+00:00'
+        rebind_bundle(tmp_path, bundle, grouped)
+        bundle['decision_at'] = '2025-09-18T01:00:00+00:00'
+        assert validate_history_bundle(bundle) == ()
     elif mutation == 'omitted_source_event':
         from tracking.importer import normalized_event
         from tracking.ledger import simulate_cohort

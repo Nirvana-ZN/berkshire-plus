@@ -16,9 +16,9 @@ from jobs.tracking import refresh_tracking
 from scripts.calibrate_discovery import _read_only_connection
 from tracking.cohorts import cohort_manifest, register_cohort
 from tracking.contracts import VARIANTS, canonical_json, default_tracking_config
-from tracking.evaluation import compare_cohorts, load_observations
+from tracking.evaluation import compare_cohorts, export_frozen_input, load_observations
 from tracking.importer import (RetainedEventProvider, TRUST_LIMITATION, absolute_reference,
-    history_events, strict_json, validate_history_bundle)
+    history_events, strict_json, validate_history_bundle, verify_history_cohort_bindings)
 
 
 def _readonly(path):
@@ -87,9 +87,14 @@ def _run(args):
                 if not isinstance(bindings, dict) or not bindings:
                     return {'status': 'history_gaps', 'dry_run': not args.apply, 'applied': False,
                             'errors': ['original_cohort_bindings_required'], 'backtest_completed': False}, 2
+                manifests = []
                 for identity, manifest_hash in bindings.items():
-                    if cohort_manifest(session, int(identity))['manifest_hash'] != manifest_hash:
+                    manifest = cohort_manifest(session, int(identity))
+                    if manifest['manifest_hash'] != manifest_hash:
                         raise ValueError('historical_cohort_binding_mismatch')
+                    manifests.append(manifest)
+                verify_history_cohort_bindings(bundle, manifests,
+                    export_frozen_input(session, manifests[0]['run_id']))
                 if not args.apply:
                     return {'status': 'history_qualified_for_engine', 'dry_run': True, 'applied': False,
                             'cohort_ids': sorted(map(int, bindings)), 'backtest_completed': False}, 0
