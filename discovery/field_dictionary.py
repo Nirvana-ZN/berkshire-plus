@@ -465,6 +465,9 @@ SELECTION_FIELD_DICTIONARY: Mapping[str, FieldSpec] = MappingProxyType(
             consolidated_basis="consolidated", period_type="period_end",
             derivation_formula=None, financial_sector_substitute=None,
             missing_policy="None for absent/null/ambiguous values; never infer zero. "
+                           "Unmapped: require reviewed restricted monetary funds, not total "
+                           "restricted assets. Missing blocks usable cash and dependent debt/"
+                           "net-cash metrics; independent FCF yield can remain available. "
                            "Manual review required; zero/missing/full-market audit incomplete.",
             source_as_of="NOTICE_DATE (publication); UPDATE_DATE (source revision only)",
             trusted=False,

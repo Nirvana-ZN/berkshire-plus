@@ -89,3 +89,21 @@ CoverageWindow complete=false explicitly retains failed/incomplete scope. Covera
 - Restricted cash lacks Haier two-period values and a verified structured mapping. Related-party-funds numeric scope remains unverified for Gree; Haier p2 negative qualitative statement is not numeric zero across scopes. Unmapped fields remain null and require manually reviewed normalized official-report evidence.
 - Full-market coverage cannot be inferred from two issuers. Missing/incomplete evidence must block corresponding production capabilities.
 - Current restatements and comparative values do not prove original historical availability; archive validation remains T16 work.
+
+## T06 current-market-cap source verification - 2026-10-22
+
+This source is separate from the seven financial-extension mappings above. Two read-only public `RPT_VALUEANALYSIS_DET` requests returned actual `SECUCODE`, `TRADE_DATE`, `TOTAL_MARKET_CAP`, `CLOSE_PRICE` and `TOTAL_SHARES`. Both actual report dates were `2026-10-22 00:00:00`. Parsing retained bytes with `json.loads(parse_float=Decimal)` reproduced each total market cap as the exact product of the same returned day's closing price and total shares:
+
+| Code | Market cap (CNY) | Price (CNY) | Shares | Observation (UTC) | Exact product |
+|---|---|---|---|---|---|
+| 000001.SZ | 219286875637.4 | 11.3 | 19405918198 | 2026-10-22T10:27:29.525960+00:00 | pass |
+| 600519.SH | 1648220090102.49 | 1318.49 | 1250081601 | 2026-10-22T10:27:29.721918+00:00 | pass |
+
+- [000001.SZ exact-date request](https://datacenter-web.eastmoney.com/api/data/v1/get?reportName=RPT_VALUEANALYSIS_DET&columns=SECUCODE%2CTRADE_DATE%2CTOTAL_MARKET_CAP%2CCLOSE_PRICE%2CTOTAL_SHARES&pageNumber=1&pageSize=2&filter=%28SECUCODE%3D%22000001.SZ%22%29%28TRADE_DATE%3D%272026-10-22%27%29); response SHA256 `cddb625ec2b158de89e71069ab737a8547826cdf2827ac68fbdca82673a07caf`.
+- [600519.SH exact-date request](https://datacenter-web.eastmoney.com/api/data/v1/get?reportName=RPT_VALUEANALYSIS_DET&columns=SECUCODE%2CTRADE_DATE%2CTOTAL_MARKET_CAP%2CCLOSE_PRICE%2CTOTAL_SHARES&pageNumber=1&pageSize=2&filter=%28SECUCODE%3D%22600519.SH%22%29%28TRADE_DATE%3D%272026-10-22%27%29); response SHA256 `776865e12b32ee311a8fd0f402d60161b6c9e6821842a993a99b1c1e95879525`.
+
+Actual raw responses are retained in ignored implementation scratch `.superpowers/sdd/2026-10-22-selection-quality-and-validation-plan/source-audit/current-market-cap/{code}-2026-10-22.json`; retained hashes were recomputed. Tests contain synthetic responses only. No production database was accessed.
+
+**Source-semantic status: verified for this provider column/date boundary and these two observed samples. Whole-market production readiness: not established; T19 owns the coverage threshold and activation.** These comparisons verify current market-cap units and same-day source structure, not independent issuer-share accuracy, complete A-share coverage, point-in-time historical availability, or permanent endpoint availability. The bank sample validates source structure only; industrial cash metrics remain not applicable to banks. No financial-extension mapping trust changes.
+
+The opt-in parser requires one matching code, a strictly recognized returned day equal to the requested market day, a finite positive total market cap, and no market day later than observation in Asia/Shanghai. Missing/mismatched dates produce no value; fetch time never becomes market day. It retains code, actual returned market date, UTC observation, source, URL and exact response hash. T07 must freeze all these fields; T09 activates consumption. No annual-share fallback, new runtime dependency or v7 integration was added.

@@ -9,7 +9,9 @@ from decimal import ROUND_FLOOR, Decimal
 from types import MappingProxyType
 from typing import TypeAlias
 
-from discovery.industry import classify_industry_branch
+from discovery.cash_quality import CASH_METRIC_KEYS, cash_metrics
+from discovery.fundamental_types import MetricResult
+from discovery.industry import INDUSTRY_BRANCHES, classify_industry_branch
 from discovery.metrics import mean, median, normalized_earnings, percentile_rank
 from discovery.rulers import (
     DEEP_VALUE_FIELD_DOMAIN_POLICY,
@@ -46,6 +48,24 @@ from discovery.tracks.quality_discount import (
 )
 
 JsonMetric: TypeAlias = None | str | tuple[str, ...]
+
+
+def cash_metrics_for_branch(*, branch: str, cash: Decimal | None,
+                            restricted_cash: Decimal | None, debt: Decimal | None,
+                            fcf: Decimal | None, mcap: Decimal | None) -> dict[str, MetricResult]:
+    """Opt-in v8 adapter; the existing v7 evaluator does not call this boundary."""
+    if branch not in INDUSTRY_BRANCHES:
+        raise ValueError('invalid industry branch')
+    if branch == 'unknown':
+        return {key: MetricResult(None, 'missing', 'industry_branch_unknown', ())
+                for key in CASH_METRIC_KEYS}
+    if branch != 'nonfinancial':
+        return {key: MetricResult(None, 'not_applicable', 'industrial_cash_metrics', ())
+                for key in CASH_METRIC_KEYS}
+    return cash_metrics(cash=cash, restricted_cash=restricted_cash, debt=debt,
+                        fcf=fcf, mcap=mcap)
+
+
 _FIELDS = (
     "deducted_net_income",
     "ocf",
