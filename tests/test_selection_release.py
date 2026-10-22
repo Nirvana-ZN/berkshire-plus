@@ -549,18 +549,23 @@ def test_financial_classification_requires_retained_source_proof(tmp_path, monke
     ({'interest_expense': None}, 'verified', 'ready'),
     ({'ebit': None, 'interest_expense': None}, 'missing', 'insufficient'),
     ({'ebit': '-20'}, 'verified', 'ready'),
-    ({'interest_debt': '-1'}, 'untrusted', 'ready'),
+    ({'interest_debt': '-1'}, 'untrusted', 'insufficient'),
+    ({'ebit': None, 'interest_debt': '-1'}, 'untrusted', 'insufficient'),
+    ({'interest_debt': '0'}, 'verified', 'ready'),
+    ({'ebit': None, 'interest_debt': '0'}, 'verified', 'ready'),
+    ({'total_equity_including_minority': '-21'}, 'untrusted', 'ready'),
 ])
 def test_roic_readiness_shares_actual_source_alternatives_not_economic_thresholds(
     tmp_path, monkeypatch, overrides, expected_metric, expected_coverage,
 ):
-    from discovery.fundamentals import capital_return, fundamentals_from_payload
+    from discovery.fundamentals import capital_return, capital_return_sources, fundamentals_from_payload
     from discovery.snapshot import build_production_snapshot
     from scripts.release_selection_v8 import release_report
     engine, fill_id = retained_release_fill(tmp_path, monkeypatch, financial_overrides=overrides)
     with Session(engine) as session:
         company = build_production_snapshot(session, fill_id=fill_id).companies[0]
-        metric = capital_return(fundamentals_from_payload(company.fields, code=company.code))
+        fundamental = fundamentals_from_payload(company.fields, code=company.code)
+        metric = capital_return(fundamental)
         assert metric.status == expected_metric
         report = release_report(session, fill_id=fill_id)
         assert report['coverage']['tracks']['garp']['roic_gross_5y']['status'] == expected_coverage
@@ -569,6 +574,11 @@ def test_roic_readiness_shares_actual_source_alternatives_not_economic_threshold
             assert report['eligible'], report['blockers']
         if overrides == {'ebit': '-20'}:
             assert metric.value < 0
+        if overrides.get('interest_debt') == '-1':
+            sources = capital_return_sources(fundamental)
+            assert (sources.status, sources.reason) == ('untrusted', 'interest_debt:2020:negative')
+            assert report['coverage']['tracks']['garp']['roic_gross_5y']['trusted'] == 0
+            assert not report['eligible']
     engine.dispose()
 
 

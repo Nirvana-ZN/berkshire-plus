@@ -123,6 +123,7 @@ def test_nonpositive_ic_is_unavailable_but_verified_signed_inputs_are_preserved(
     assert capital_return(snapshot(alter(annuals(), 2020, total_equity_including_minority='0', interest_debt='0'))).value is None
     assert capital_return(snapshot(alter(annuals(), 2025, ebit=None, interest_expense='-1'))).value == D('.1425')
     assert capital_return(snapshot(alter(annuals(), 2025, total_equity_including_minority='-1'))).status == 'verified'
+    assert capital_return_sources(snapshot(alter(annuals(), 2025, total_equity_including_minority='-1'))).status == 'verified'
 
 
 def test_confirmed_zero_tax_survives_pipeline_without_statutory_substitution():
@@ -230,7 +231,7 @@ def test_source_readiness_keeps_producer_alternatives_windows_and_trust(case):
 
 
 @pytest.mark.parametrize('changes', [
-    {'ebit': '-20'}, {'interest_debt': '-1'}, {'total_equity_including_minority': '-20'},
+    {'ebit': '-20'}, {'total_equity_including_minority': '-20'}, {'total_equity_including_minority': '-21'},
 ])
 def test_complete_sources_are_independent_of_return_and_capital_sign(changes):
     frozen = snapshot(alter(annuals(), 2025, **changes))
@@ -240,6 +241,22 @@ def test_complete_sources_are_independent_of_return_and_capital_sign(changes):
         assert result.status == 'verified' and result.value < D('.15')
     else:
         assert result.status == 'untrusted' and result.value is None
+
+
+@pytest.mark.parametrize('ebit', ['20', None])
+def test_negative_gross_debt_is_invalid_source_with_direct_or_reconstructed_ebit(ebit):
+    frozen = snapshot(alter(annuals(), 2025, ebit=ebit, interest_debt='-1'))
+    # Equity 80 plus debt -1 leaves positive IC: debt itself is invalid.
+    metric, sources = capital_return(frozen), capital_return_sources(frozen)
+    assert metric.status == 'untrusted' and metric.reason == 'interest_debt:2025:negative'
+    assert (sources.status, sources.reason, sources.evidence_ids) == (metric.status, metric.reason, metric.evidence_ids)
+
+
+@pytest.mark.parametrize('ebit', ['20', None])
+def test_zero_gross_debt_remains_valid_source_with_direct_or_reconstructed_ebit(ebit):
+    frozen = snapshot(alter(annuals(), 2025, ebit=ebit, interest_debt='0'))
+    assert capital_return(frozen).status == 'verified'
+    assert capital_return_sources(frozen).status == 'verified'
 
 
 def test_classification_identity_rejects_conflicting_trusted_branches():

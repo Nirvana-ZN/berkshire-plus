@@ -246,7 +246,7 @@ def _capital_return(snapshot: FundamentalSnapshot, *, source_only: bool) -> Metr
         requirements.extend(needed)
         debt, _ = _fact(rows, 'interest_debt', period)
         balance = _facts_calculation(rows, needed, lambda equity, debt: equity + debt)
-        if not source_only and debt.value is not None and debt.value < 0:
+        if debt.value is not None and debt.value < 0:
             balance = MetricResult(None, 'untrusted', f'interest_debt:{period}:negative', balance.evidence_ids)
         elif not source_only and balance.value is not None and balance.value <= 0:
             balance = MetricResult(None, 'untrusted', f'invested_capital:{period}:not_positive', balance.evidence_ids)
