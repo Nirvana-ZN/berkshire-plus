@@ -409,3 +409,74 @@ FIELD_DICTIONARY: Mapping[str, FieldSpec] = MappingProxyType(
         ),
     }
 )
+
+
+# Selection evidence fields do not expand the legacy mutable Financial DTO.
+# Keep this registry separate: incomplete source audit blocks automated trust.
+SELECTION_FIELD_DICTIONARY: Mapping[str, FieldSpec] = MappingProxyType(
+    {
+        "accounts_receivable": FieldSpec(
+            'RPT_DMSK_FN_BALANCE', 'ACCOUNTS_RECE', unit="CNY",
+            consolidated_basis="consolidated", period_type="period_end",
+            derivation_formula=None, financial_sector_substitute=None,
+            missing_policy="None for absent/null/ambiguous values; never infer zero. "
+                           "Manual review required; zero/missing/full-market audit incomplete.",
+            source_as_of="NOTICE_DATE (publication); UPDATE_DATE (source revision only)",
+            trusted=False,
+        ),
+        "contract_assets": FieldSpec(
+            'RPT_F10_FINANCE_GBALANCE', 'CONTRACT_ASSET', unit="CNY",
+            consolidated_basis="consolidated", period_type="period_end",
+            derivation_formula=None, financial_sector_substitute=None,
+            missing_policy="None for absent/null/ambiguous values; never infer zero. "
+                           "Manual review required; zero/missing/full-market audit incomplete.",
+            source_as_of="NOTICE_DATE (publication); UPDATE_DATE (source revision only)",
+            trusted=False,
+        ),
+        "inventory": FieldSpec(
+            'RPT_DMSK_FN_BALANCE', 'INVENTORY', unit="CNY",
+            consolidated_basis="consolidated", period_type="period_end",
+            derivation_formula=None, financial_sector_substitute=None,
+            missing_policy="None for absent/null/ambiguous values; never infer zero. "
+                           "Manual review required; zero/missing/full-market audit incomplete.",
+            source_as_of="NOTICE_DATE (publication); UPDATE_DATE (source revision only)",
+            trusted=False,
+        ),
+        "total_equity_including_minority": FieldSpec(
+            'RPT_DMSK_FN_BALANCE', 'TOTAL_EQUITY', unit="CNY",
+            consolidated_basis="consolidated", period_type="period_end",
+            derivation_formula=None, financial_sector_substitute=None,
+            missing_policy="None for absent/null/ambiguous values; never infer zero. "
+                           "Manual review required; zero/missing/full-market audit incomplete.",
+            source_as_of="NOTICE_DATE (publication); UPDATE_DATE (source revision only)",
+            trusted=False,
+        ),
+        "interest_expense": FieldSpec(
+            'RPT_F10_FINANCE_GINCOME', 'FE_INTEREST_EXPENSE', unit="CNY",
+            consolidated_basis="consolidated", period_type="cumulative",
+            derivation_formula=None, financial_sector_substitute=None,
+            missing_policy="None for absent/null/ambiguous values; never infer zero. "
+                           "Manual review required; zero/missing/full-market audit incomplete.",
+            source_as_of="NOTICE_DATE (publication); UPDATE_DATE (source revision only)",
+            trusted=False,
+        ),
+        "restricted_cash": FieldSpec(
+            None, None, unit="CNY",
+            consolidated_basis="consolidated", period_type="period_end",
+            derivation_formula=None, financial_sector_substitute=None,
+            missing_policy="None for absent/null/ambiguous values; never infer zero. "
+                           "Manual review required; zero/missing/full-market audit incomplete.",
+            source_as_of="NOTICE_DATE (publication); UPDATE_DATE (source revision only)",
+            trusted=False,
+        ),
+        "related_party_funds": FieldSpec(
+            None, None, unit="CNY",
+            consolidated_basis="consolidated", period_type="period_end",
+            derivation_formula=None, financial_sector_substitute=None,
+            missing_policy="None for absent/null/ambiguous values; never infer zero. "
+                           "Manual review required; zero/missing/full-market audit incomplete.",
+            source_as_of="NOTICE_DATE (publication); UPDATE_DATE (source revision only)",
+            trusted=False,
+        ),
+    }
+)

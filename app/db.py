@@ -1079,6 +1079,7 @@ def _infer_legacy_financial_completeness(engine: Engine) -> None:
 def init_db(db_path: Path | None = None) -> Engine:
     from app import discovery_models as _discovery_models  # noqa: F401
     from app import models as _models  # noqa: F401
+    from app import selection_models as _selection_models  # noqa: F401
 
     engine = create_db_engine(db_path)
     Base.metadata.create_all(engine)

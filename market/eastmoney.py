@@ -3,13 +3,16 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import date, datetime
+from hashlib import sha256
+import json
 from decimal import Decimal, InvalidOperation
 from threading import Event
 from typing import Protocol
 from urllib.parse import quote
 
 from discovery.constants import china_market_date
-from discovery.field_dictionary import FIELD_DICTIONARY
+from discovery.field_dictionary import FIELD_DICTIONARY, SELECTION_FIELD_DICTIONARY
+from discovery.fundamental_types import EvidenceRecord
 from market.universe import (
     INDUSTRY_MAPPING_VERSION,
     UniverseRow,
@@ -508,6 +511,49 @@ def _report_kind(
     if report and "年" not in report and report not in {"年报", "annual"}:
         return None
     return year, "annual"
+
+
+def parse_selection_report_response(
+    raw_response: bytes,
+    *,
+    code: str,
+    report: str,
+    observed_at: datetime,
+    source_url: str,
+    basis_id: str,
+) -> tuple[EvidenceRecord, ...]:
+    """Adapt retained response bytes without rounding or certifying history.
+
+    The digest identifies the retained provider response, not an official PDF.
+    No coverage assertion follows from an empty or truncated provider response.
+    Existing HTTP helpers parse floats; this boundary intentionally takes bytes.
+    """
+    from market.evidence import SELECTION_EXTENSION_FIELDS, parse_source_evidence
+
+    reports = {SELECTION_FIELD_DICTIONARY[name].report for name in SELECTION_EXTENSION_FIELDS}
+    if report not in reports or report is None:
+        raise ValueError('unsupported selection provider report')
+    payload = json.loads(raw_response, parse_float=Decimal)
+    if not isinstance(payload, dict) or payload.get('success') is False:
+        raise ValueError('provider response failed')
+    result = payload.get('result')
+    if not isinstance(result, dict) or not isinstance(result.get('data'), list):
+        raise ValueError('provider response data unavailable')
+    digest = sha256(raw_response).hexdigest()
+    records: list[EvidenceRecord] = []
+    for index, row in enumerate(result['data']):
+        if not isinstance(row, dict) or row.get('SECUCODE') != code:
+            raise ValueError('provider row code is missing or does not match')
+        period = _report_kind(row, strict=True)
+        if period is None:
+            raise ValueError('provider row period is missing or ambiguous')
+        records.append(parse_source_evidence({
+            'source': 'eastmoney', 'report': report, 'row': row, 'code': code,
+            'kind': 'financial', 'period': period[0], 'observed_at': observed_at,
+            'source_url': source_url, 'document_sha256': digest, 'basis_id': basis_id,
+            'report_location': f'{report}; result.data[{index}]; period {period[0]}',
+        }))
+    return tuple(records)
 
 
 def _as_decimal(value: object) -> Decimal | None:
