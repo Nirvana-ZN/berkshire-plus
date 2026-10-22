@@ -149,27 +149,35 @@ def _facts_calculation(rows, requirements, fn):
                                                          for field, period in requirements), fn))
 
 
-def _classification(snapshot):
+def classification_identity(snapshot) -> tuple[MetricResult, str | None]:
+    """Trusted classification identity, independent of metric applicability."""
     rows = tuple(row for row in snapshot.extensions if row.kind == 'company_classification'
                  and row.code == snapshot.code and available_at(row) <= snapshot.cutoff_at)
     ids = tuple(sorted(row.evidence_id for row in rows))
     if not rows:
-        return MetricResult(None, 'missing', 'industry_classification_missing', ids)
+        return MetricResult(None, 'missing', 'industry_classification_missing', ids), None
     trusted = tuple(row for row in rows if row.status == 'verified')
     if not trusted:
         status = 'untrusted' if any(row.status == 'untrusted' for row in rows) else 'missing'
-        return MetricResult(None, status, f'industry_classification_{status}', ids)
+        return MetricResult(None, status, f'industry_classification_{status}', ids), None
     branches = {row.values.get('_industry_branch') for row in trusted}
     if (len(branches) != 1 or any(row.values.get('_classification_version') != CLASSIFICATION_VERSION for row in trusted)
             or not branches <= {'bank', 'insurance', 'other_financial', 'nonfinancial', 'unknown'}):
-        return MetricResult(None, 'untrusted', 'industry_classification_invalid', ids)
+        return MetricResult(None, 'untrusted', 'industry_classification_invalid', ids), None
     branch = next(iter(branches))
     ids = tuple(sorted(row.evidence_id for row in trusted))
     if branch == 'unknown':
-        return MetricResult(None, 'missing', 'industry_branch_unknown', ids)
+        return MetricResult(None, 'missing', 'industry_branch_unknown', ids), branch
+    return MetricResult(Decimal(1), 'verified', None, ids), branch
+
+
+def _classification(snapshot):
+    identity, branch = classification_identity(snapshot)
+    if identity.status != 'verified':
+        return identity
     if branch != 'nonfinancial':
-        return MetricResult(None, 'not_applicable', 'industrial_capital_return', ids)
-    return MetricResult(Decimal(1), 'verified', None, ids)
+        return replace(identity, value=None, status='not_applicable', reason='industrial_capital_return')
+    return identity
 
 
 def _effective_tax_rate(rows, period):
@@ -214,6 +222,15 @@ def capital_return(snapshot: FundamentalSnapshot) -> MetricResult:
     ROE and provider ROIC are separate legacy metrics. All endpoints and tax
     fallback inputs must share a verified consolidation/currency/accounting basis.
     """
+    return _capital_return(snapshot, source_only=False)
+
+
+def capital_return_sources(snapshot: FundamentalSnapshot) -> MetricResult:
+    """Use the producer's exact source selection without its economic domain gates."""
+    return _capital_return(snapshot, source_only=True)
+
+
+def _capital_return(snapshot: FundamentalSnapshot, *, source_only: bool) -> MetricResult:
     classification = _classification(snapshot)
     if classification.status != 'verified':
         return classification
@@ -229,9 +246,9 @@ def capital_return(snapshot: FundamentalSnapshot) -> MetricResult:
         requirements.extend(needed)
         debt, _ = _fact(rows, 'interest_debt', period)
         balance = _facts_calculation(rows, needed, lambda equity, debt: equity + debt)
-        if debt.value is not None and debt.value < 0:
+        if not source_only and debt.value is not None and debt.value < 0:
             balance = MetricResult(None, 'untrusted', f'interest_debt:{period}:negative', balance.evidence_ids)
-        elif balance.value is not None and balance.value <= 0:
+        elif not source_only and balance.value is not None and balance.value <= 0:
             balance = MetricResult(None, 'untrusted', f'invested_capital:{period}:not_positive', balance.evidence_ids)
         balances[year] = balance
     returns = []
@@ -249,7 +266,7 @@ def capital_return(snapshot: FundamentalSnapshot) -> MetricResult:
         inputs = (earnings, tax, balances[year - 1], balances[year])
         # Delegate arithmetic to the public unit-decimal calculation once.
         ready = _arithmetic(inputs, lambda *_: Decimal(0))
-        if ready.status == 'verified':
+        if ready.status == 'verified' and not source_only:
             ready = replace(roic_gross(ebit=earnings.value, tax_rate=tax.value,
                                       ic_begin=balances[year - 1].value, ic_end=balances[year].value),
                             evidence_ids=ready.evidence_ids)

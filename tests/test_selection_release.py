@@ -10,7 +10,8 @@ from app.db import init_db
 
 
 def retained_release_fill(tmp_path, monkeypatch, *, restricted='0', companies=1, omit_inventory=False,
-                          industries=None, listing_date=None, missing_cash_codes=(), research_sources=False, db_path=None):
+                          industries=None, listing_date=None, missing_cash_codes=(), research_sources=False, db_path=None,
+                          financial_overrides=None, profile_status='verified', profile_industry=None):
     """Real local importer -> fill worker -> sealed schema4 producer, all synthetic."""
     from dataclasses import fields, replace
     from datetime import date, datetime, timedelta, timezone
@@ -30,18 +31,21 @@ def retained_release_fill(tmp_path, monkeypatch, *, restricted='0', companies=1,
     now = datetime(2026, 9, 17, 3, tzinfo=timezone.utc)
     at = now - timedelta(hours=1)
     raw_payloads = []
-    def retained(code, kind, period, values, *, text=None, **extra):
+    def retained(code, kind, period, values, *, text=None, status='verified', **extra):
         content = text or json.dumps(values, sort_keys=True)
         digest = sha256(content.encode()).hexdigest()
         document = tmp_path / f'{digest}.txt'
         document.write_text(content, encoding='utf-8')
         data = dict(code=code, kind=kind, period=period, published_at=at.isoformat(), observed_at=at.isoformat(),
             source_url='https://example.invalid/synthetic-reviewed-source', document_sha256=digest,
-            values=values, basis_id='fixture-consolidated-cny', status='verified',
+            values=values, basis_id='fixture-consolidated-cny', status=status,
             source_document_path=str(document), source_excerpt=content, report_location='synthetic complete source',
             verification={'method': 'human_review', 'reviewer': 'synthetic reviewer', 'reviewed_at': at.isoformat()},
             excerpt_verification={'method': 'literal_utf8', 'document_sha256': digest, 'excerpt_sha256': digest,
                 'report_location': 'synthetic complete source', 'reviewer': 'synthetic reviewer', 'reviewed_at': at.isoformat()}, **extra)
+        if status != 'verified':
+            for key in ('source_document_path', 'source_excerpt', 'excerpt_verification'):
+                data.pop(key)
         raw_payloads.append(data)
         return parse_source_evidence(data)
     codes = [f'600{i:03d}.SH' for i in range(companies)]
@@ -82,12 +86,15 @@ def retained_release_fill(tmp_path, monkeypatch, *, restricted='0', companies=1,
             values.update(accounts_receivable='5', contract_assets='0', inventory='3', related_party_funds='0',
                           total_equity_including_minority='80', interest_expense='4',
                           restricted_cash=None if state.code in missing_cash_codes else restricted)
+            values.update(financial_overrides or {})
             records.append(retained(state.code, 'financial', source.period, values))
             if len(source.period) == 4:
                 financials.append(FinancialRow(code=state.code, period=source.period, period_type='annual',
                     source_as_of='2026-09-16', **{key: Decimal(value) for key, value in values.items()
                         if key in allowed and key in FIELD_DICTIONARY and FIELD_DICTIONARY[key].trusted and value is not None}))
-        records.append(retained(state.code, 'company_profile', '2026-09-16', {}, text=state.industry, industry=state.industry))
+        profile_label = profile_industry if profile_industry is not None else state.industry
+        records.append(retained(state.code, 'company_profile', '2026-09-16', {}, text=profile_label,
+                                industry=profile_label, status=profile_status))
         records.append(retained(state.code, 'disclosure_calendar', '2026', {}, text=calendar_text, disclosure_calendar=descriptor))
         quote = retained(state.code, 'market_snapshot', '2026-09-16', {'current_mcap': '200', 'price': '10'})
         records.append(quote)
@@ -370,7 +377,7 @@ def test_metric_specific_listing_age_and_zero_denominator(tmp_path, monkeypatch)
     engine.dispose()
 
 
-def _queued_release_run(session, receipt):
+def _queued_release_run(session, receipt, *, common_queued=False):
     from datetime import datetime
     from app.discovery_models import DiscoveryRun, DiscoveryCommonStage, DiscoveryCommonResult, DiscoveryStage
     from discovery.constants import china_week_key
@@ -392,6 +399,12 @@ def _queued_release_run(session, receipt):
         created_at=at, updated_at=at, confirmed_at=at)
     session.add(common)
     session.flush()
+    if common_queued:
+        common.status = 'queued'
+        common.total_count = common.pass_count = 0
+        common.confirmed_at = None
+        session.commit()
+        return run.id, common.id, at
     session.add(DiscoveryCommonResult(run_id=run.id, attempt=1, code='600000.SH', verdict='pass',
         reason=None, metrics_json='{}', created_at=at))
     gate = DiscoveryStage(run_id=run.id, track='quality_discount', stage='track_gate', attempt=1, status='queued',
@@ -429,7 +442,11 @@ def test_rollback_blocks_queued_and_inflight_publication(tmp_path, monkeypatch, 
         assert session.scalar(select(func.count()).select_from(DiscoveryResult)) == 0
         assert session.scalar(select(func.count()).select_from(StrategyCohort)) == 0
         assert tuple(session.execute(select(*DiscoveryInputSnapshot.__table__.columns)).all()) == frozen
-        assert session.get(DiscoveryStage, stage_id).status == ('running' if during_callback else 'queued')
+        interrupted = session.get(DiscoveryStage, stage_id)
+        assert interrupted.status == ('failed' if during_callback else 'queued')
+        if during_callback:
+            assert interrupted.failure_kind == 'transient'
+            assert 'publication_authority_lost' in interrupted.error
     engine.dispose()
 
 
@@ -480,3 +497,227 @@ def test_bank_readiness_uses_each_existing_proxy_window():
     assert set(metrics) == {'bank_roe', 'net_assets', 'bank_capital', 'bank_npl'}
     assert all(row.status == 'verified' for row in metrics.values())
     assert _source_metrics(snapshot, candidate('deep_value'), 'bank')['bank_npl'].status == 'missing'
+
+
+@pytest.mark.parametrize('industry', ['银行', '保险', '证券'])
+def test_verified_financial_classification_qualifies_actual_fill(tmp_path, monkeypatch, industry):
+    from discovery.fundamentals import capital_return, fundamentals_from_payload
+    from discovery.snapshot import build_production_snapshot
+    from scripts.release_selection_v8 import release_report
+    engine, fill_id = retained_release_fill(tmp_path, monkeypatch, industries=[industry])
+    with Session(engine) as session:
+        company = build_production_snapshot(session, fill_id=fill_id).companies[0]
+        assert capital_return(fundamentals_from_payload(company.fields, code=company.code)).status == 'not_applicable'
+        report = release_report(session, fill_id=fill_id)
+        assert report['eligible'], report['blockers']
+        assert report['coverage']['sources']['restricted_cash']['status'] == 'not_applicable'
+        if industry == '银行':
+            for track in ('quality_discount', 'deep_value'):
+                assert report['coverage']['tracks'][track]
+                assert all(row['status'] == 'ready' for row in report['coverage']['tracks'][track].values())
+    engine.dispose()
+
+
+@pytest.mark.parametrize('changes', [
+    {'profile_status': 'untrusted'}, {'profile_industry': '制造业'}, {'profile_industry': '-'},
+])
+def test_financial_classification_still_requires_exact_trusted_identity(tmp_path, monkeypatch, changes):
+    from scripts.release_selection_v8 import release_report
+    engine, fill_id = retained_release_fill(tmp_path, monkeypatch, industries=['银行'], **changes)
+    with Session(engine) as session:
+        report = release_report(session, fill_id=fill_id)
+        assert not report['eligible']
+        assert '600000.SH:unverified_classification_denominator' in report['blockers']
+    engine.dispose()
+
+
+def test_financial_classification_requires_retained_source_proof(tmp_path, monkeypatch):
+    from hashlib import sha256
+    from scripts.release_selection_v8 import release_report
+    engine, fill_id = retained_release_fill(tmp_path, monkeypatch, industries=['银行'])
+    document = tmp_path / (sha256('银行'.encode()).hexdigest() + '.txt')
+    document.write_text('changed retained source', encoding='utf-8')
+    with Session(engine) as session:
+        report = release_report(session, fill_id=fill_id)
+        assert not report['eligible']
+        assert '600000.SH:unverified_classification_denominator' in report['blockers']
+    engine.dispose()
+
+
+@pytest.mark.parametrize('overrides,expected_metric,expected_coverage', [
+    ({'ebit': None}, 'verified', 'ready'),
+    ({'interest_expense': None}, 'verified', 'ready'),
+    ({'ebit': None, 'interest_expense': None}, 'missing', 'insufficient'),
+    ({'ebit': '-20'}, 'verified', 'ready'),
+    ({'interest_debt': '-1'}, 'untrusted', 'ready'),
+])
+def test_roic_readiness_shares_actual_source_alternatives_not_economic_thresholds(
+    tmp_path, monkeypatch, overrides, expected_metric, expected_coverage,
+):
+    from discovery.fundamentals import capital_return, fundamentals_from_payload
+    from discovery.snapshot import build_production_snapshot
+    from scripts.release_selection_v8 import release_report
+    engine, fill_id = retained_release_fill(tmp_path, monkeypatch, financial_overrides=overrides)
+    with Session(engine) as session:
+        company = build_production_snapshot(session, fill_id=fill_id).companies[0]
+        metric = capital_return(fundamentals_from_payload(company.fields, code=company.code))
+        assert metric.status == expected_metric
+        report = release_report(session, fill_id=fill_id)
+        assert report['coverage']['tracks']['garp']['roic_gross_5y']['status'] == expected_coverage
+        if overrides == {'ebit': None}:
+            assert str(metric.value) == '0.15'
+            assert report['eligible'], report['blockers']
+        if overrides == {'ebit': '-20'}:
+            assert metric.value < 0
+    engine.dispose()
+
+
+@pytest.mark.parametrize('stage_kind', ['common', 'track'])
+@pytest.mark.parametrize('replacement', ['lease', 'attempt', 'week', 'run'])
+def test_authority_loss_recovery_cannot_overwrite_changed_owner_attempt_or_history(tmp_path, monkeypatch, replacement, stage_kind):
+    from datetime import timedelta
+    from sqlalchemy import select, func
+    from app.discovery_models import (DiscoveryRun, DiscoveryStage, DiscoveryResult, DiscoveryInputSnapshot,
+                                      DiscoveryCommonStage, DiscoveryCommonResult)
+    from app.models import JobLock
+    from app.selection_models import StrategyCohort
+    from jobs import discovery as worker
+    from scripts.release_selection_v8 import publish_release, rollback_release
+    engine, fill_id = retained_release_fill(tmp_path, monkeypatch)
+    path = tmp_path / 'release.db'
+    receipt = publish_release(path, fill_id=fill_id, reason='recovery race', backup_dir=tmp_path / 'backups')
+    with Session(engine) as session:
+        run_id, stage_id, at = _queued_release_run(session, receipt, common_queued=stage_kind == 'common')
+        model = DiscoveryCommonStage if stage_kind == 'common' else DiscoveryStage
+        frozen = tuple(session.execute(select(*DiscoveryInputSnapshot.__table__.columns)).all())
+        now, captured = [at], {}
+        original = worker._recover_authority_loss
+        def race_before_recovery(target, claim, clock):
+            # Real output transaction has already rolled back. Inject a competing
+            # owner/attempt/history transition before the fresh writer lock.
+            with Session(engine) as competing:
+                assert competing.scalar(select(func.count()).select_from(DiscoveryResult)) == 0
+                assert competing.scalar(select(func.count()).select_from(StrategyCohort)) == 0
+                if stage_kind == 'common':
+                    assert competing.scalar(select(func.count()).select_from(DiscoveryCommonResult)) == 0
+                stage = competing.get(model, stage_id)
+                if replacement == 'lease':
+                    competing.get(JobLock, 1).owner_token = 'replacement-owner'
+                elif replacement == 'attempt':
+                    stage.status, stage.failure_kind = 'failed', 'transient'
+                    stage.error, stage.superseded_at = 'replacement attempt owns recovery', at
+                    values = dict(run_id=run_id, attempt=2, status='running', input_fingerprint=stage.input_fingerprint,
+                        algorithm_version=stage.algorithm_version, retry_of_stage_id=stage_id, created_at=at, updated_at=at)
+                    if stage_kind == 'track':
+                        values.update(track=stage.track, stage=stage.stage, common_stage_id=stage.common_stage_id,
+                                      ruler_version_id=stage.ruler_version_id)
+                    competing.add(model(**values))
+                elif replacement == 'week':
+                    now[0] += timedelta(days=7)
+                else:
+                    competing.get(DiscoveryRun, run_id).current = False
+                competing.commit()
+                captured['stage'] = tuple(getattr(stage, col.name) for col in stage.__table__.columns)
+            original(target, claim, clock)
+        monkeypatch.setattr(worker, '_recover_authority_loss', race_before_recovery)
+        def interrupted(context):
+            outcome = worker.builtin_track_executor(context)
+            rollback_release(path, reason='race interruption', backup_dir=tmp_path / 'backups')
+            return outcome
+        original_common = worker.classify_common
+        def interrupted_common(company, dates):
+            outcome = original_common(company, dates)
+            rollback_release(path, reason='common race interruption', backup_dir=tmp_path / 'backups')
+            return outcome
+        if stage_kind == 'common':
+            monkeypatch.setattr(worker, 'classify_common', interrupted_common)
+        if replacement == 'lease':
+            with pytest.raises(worker.DiscoveryLockLostError):
+                worker.drain_run_queue(session, run_id, track_executor=interrupted, now_provider=lambda: now[0])
+        else:
+            assert worker.drain_run_queue(session, run_id, track_executor=interrupted,
+                                          now_provider=lambda: now[0]).executed == 0
+        session.expire_all()
+        stage = session.get(model, stage_id)
+        assert tuple(getattr(stage, col.name) for col in stage.__table__.columns) == captured['stage']
+        assert session.scalar(select(func.count()).select_from(DiscoveryResult)) == 0
+        assert session.scalar(select(func.count()).select_from(StrategyCohort)) == 0
+        if stage_kind == 'common':
+            assert session.scalar(select(func.count()).select_from(DiscoveryCommonResult)) == 0
+        assert tuple(session.execute(select(*DiscoveryInputSnapshot.__table__.columns)).all()) == frozen
+        if replacement == 'lease':
+            assert session.get(JobLock, 1).owner_token == 'replacement-owner'
+        if replacement == 'attempt':
+            newer = session.scalar(select(model).where(model.attempt == 2))
+            assert newer.status == 'running' and newer.error is None
+    engine.dispose()
+
+
+@pytest.mark.parametrize('stage_kind', ['common', 'track'])
+def test_live_republication_retries_interrupted_attempt_without_restart(tmp_path, monkeypatch, stage_kind):
+    from datetime import datetime
+    from fastapi.testclient import TestClient
+    from sqlalchemy import select, func
+    from app.main import create_app
+    from app.discovery_models import (DiscoveryStage, DiscoveryRun, DiscoveryResult, DiscoveryInputSnapshot,
+                                      DiscoveryCommonStage, DiscoveryCommonResult)
+    from app.selection_models import StrategyCohort
+    from market.quotes import FakeQuoteClient
+    from jobs.discovery import drain_run_queue, builtin_track_executor
+    from jobs import discovery as worker
+    from scripts.release_selection_v8 import publish_release, rollback_release
+    engine, fill_id = retained_release_fill(tmp_path, monkeypatch)
+    path = tmp_path / 'release.db'
+    receipt = publish_release(path, fill_id=fill_id, reason='original', backup_dir=tmp_path / 'backups')
+    at = datetime.fromisoformat(receipt['created_at'])
+    app = create_app(db_path=path, quote_client=FakeQuoteClient(), env_path=tmp_path / '.env',
+                     allow_sync=True, discovery_clock=lambda: at)
+    with TestClient(app) as client:
+        with Session(engine) as session:
+            run_id, stage_id, _ = _queued_release_run(session, receipt, common_queued=stage_kind == 'common')
+            frozen = tuple(session.execute(select(*DiscoveryInputSnapshot.__table__.columns)).all())
+            ruler_payloads = session.get(DiscoveryRun, run_id).ruler_payloads_json
+            def interrupted(context):
+                result = builtin_track_executor(context)
+                rollback_release(path, reason='live interruption', backup_dir=tmp_path / 'backups')
+                return result
+            original = worker.classify_common
+            def interrupted_common(company, dates):
+                result = original(company, dates)
+                rollback_release(path, reason='common interruption', backup_dir=tmp_path / 'backups')
+                return result
+            with monkeypatch.context() as patch:
+                if stage_kind == 'common':
+                    patch.setattr(worker, 'classify_common', interrupted_common)
+                assert drain_run_queue(session, run_id, track_executor=interrupted, now_provider=lambda: at).executed == 0
+            assert session.scalar(select(func.count()).select_from(DiscoveryResult)) == 0
+            assert session.scalar(select(func.count()).select_from(StrategyCohort)) == 0
+            model = DiscoveryCommonStage if stage_kind == 'common' else DiscoveryStage
+            old = session.get(model, stage_id)
+            assert old.status == 'failed' and old.failure_kind == 'transient'
+            assert 'publication_authority_lost' in old.error
+            if stage_kind == 'common':
+                assert session.scalar(select(func.count()).select_from(DiscoveryCommonResult)) == 0
+        publish_release(path, fill_id=fill_id, reason='resume original authority', backup_dir=tmp_path / 'backups')
+        suffix = 'stages/safety/retry' if stage_kind == 'common' else 'tracks/quality_discount/stages/track_gate/retry'
+        response = client.post(f'/api/discoveries/{run_id}/{suffix}', json={'sync': True})
+        assert response.status_code == 200, response.text
+        with Session(engine) as session:
+            statement = select(model).where(model.run_id == run_id)
+            if stage_kind == 'track':
+                statement = statement.where(model.track == 'quality_discount', model.stage == 'track_gate')
+            attempts = session.scalars(statement.order_by(model.attempt)).all()
+            assert len(attempts) == 2
+            assert attempts[0].status == 'failed' and attempts[0].failure_kind == 'transient'
+            assert attempts[1].retry_of_stage_id == stage_id and attempts[1].status == 'confirmed'
+            assert session.scalar(select(func.count()).select_from(DiscoveryResult)) > 0
+            if stage_kind == 'track':
+                assert session.scalar(select(func.count()).select_from(DiscoveryResult).where(
+                    DiscoveryResult.run_id == run_id, DiscoveryResult.track == 'quality_discount',
+                    DiscoveryResult.stage == 'track_gate', DiscoveryResult.attempt == 1)) == 0
+            else:
+                assert session.scalar(select(func.count()).select_from(DiscoveryCommonResult).where(
+                    DiscoveryCommonResult.attempt == 1)) == 0
+            assert tuple(session.execute(select(*DiscoveryInputSnapshot.__table__.columns)).all()) == frozen
+            assert session.get(DiscoveryRun, run_id).ruler_payloads_json == ruler_payloads
+    engine.dispose()

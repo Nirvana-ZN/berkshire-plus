@@ -7,7 +7,7 @@ from decimal import Decimal as D, localcontext
 import pytest
 
 from discovery.fundamental_types import evidence_identity
-from discovery.fundamentals import capital_return, freeze_fundamentals, roic_gross
+from discovery.fundamentals import capital_return, capital_return_sources, freeze_fundamentals, roic_gross
 from tests.selection_helpers import evidence
 
 CUTOFF = datetime(2026, 10, 22, tzinfo=timezone.utc)
@@ -190,3 +190,62 @@ def test_untrusted_provider_ebit_can_use_verified_independent_reconstruction():
 def test_invalid_verified_ebit_never_hides_behind_independent_reconstruction():
     result = capital_return(snapshot(alter(annuals(), 2025, ebit='NaN')))
     assert result.status == 'untrusted' and result.reason == 'ebit:2025:invalid'
+
+
+@pytest.mark.parametrize('case', [
+    'reconstruction', 'untrusted_ebit', 'invalid_ebit', 'conflict', 'missing_interest',
+    'tax_fallback', 'missing_tax', 'untrusted_tax', 'no_valid_tax', 'missing_balance',
+    'mixed_basis', 'future_fact',
+])
+def test_source_readiness_keeps_producer_alternatives_windows_and_trust(case):
+    rows = annuals()
+    if case in {'reconstruction', 'untrusted_ebit', 'missing_interest'}:
+        rows = alter(rows, 2025, ebit=None)
+    if case == 'untrusted_ebit':
+        rows += (changed(evidence('2025', ebit='999'), status='untrusted'),)
+    elif case == 'invalid_ebit':
+        rows = alter(rows, 2025, ebit='NaN')
+    elif case == 'conflict':
+        rows += (evidence('2025', ebit='30'),)
+    elif case == 'missing_interest':
+        rows = alter(rows, 2025, interest_expense=None)
+    elif case == 'tax_fallback':
+        rows = alter(rows, 2025, pretax_income='-1')
+    elif case in {'missing_tax', 'untrusted_tax'}:
+        rows = alter(rows, 2025, income_tax=None)
+        if case == 'untrusted_tax':
+            rows += (changed(evidence('2025', income_tax='4'), status='untrusted'),)
+    elif case == 'no_valid_tax':
+        rows = tuple(changed(row, values={**row.values, 'pretax_income': '-1'}) for row in rows)
+    elif case == 'missing_balance':
+        rows = rows[1:]
+    elif case == 'mixed_basis':
+        rows = (*rows[:-1], changed(rows[-1], basis_id='new-consolidation'))
+    elif case == 'future_fact':
+        rows = (*rows[:-1], changed(rows[-1], observed_at=datetime(2026, 10, 23, tzinfo=timezone.utc)))
+    frozen = snapshot(rows)
+    metric, sources = capital_return(frozen), capital_return_sources(frozen)
+    assert (sources.status, sources.reason, sources.evidence_ids) == (metric.status, metric.reason, metric.evidence_ids)
+    assert (sources.status == 'verified') == (case in {'reconstruction', 'untrusted_ebit', 'tax_fallback'})
+
+
+@pytest.mark.parametrize('changes', [
+    {'ebit': '-20'}, {'interest_debt': '-1'}, {'total_equity_including_minority': '-20'},
+])
+def test_complete_sources_are_independent_of_return_and_capital_sign(changes):
+    frozen = snapshot(alter(annuals(), 2025, **changes))
+    assert capital_return_sources(frozen).status == 'verified'
+    result = capital_return(frozen)
+    if 'ebit' in changes:
+        assert result.status == 'verified' and result.value < D('.15')
+    else:
+        assert result.status == 'untrusted' and result.value is None
+
+
+def test_classification_identity_rejects_conflicting_trusted_branches():
+    from discovery.fundamentals import classification_identity
+    frozen = freeze_fundamentals((*annuals(), profile(), profile('银行')), (), (),
+                                code='000001.SZ', cutoff_at=CUTOFF, current_mcap=None)
+    identity, branch = classification_identity(frozen)
+    assert identity.status == 'untrusted' and identity.reason == 'industry_classification_invalid'
+    assert branch is None

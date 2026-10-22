@@ -141,8 +141,8 @@ def _source_metrics(snapshot, ruler, branch):
         result['deducted_ttm_and_current_cap'] = together(profit, cap)
     if ruler.track == 'garp':
         result['deducted_growth_window'] = inputs(('deducted_net_income', 'revenue'), 5)
-        result['roic_gross_5y'] = together(inputs(('ebit', 'pretax_income', 'income_tax', 'interest_expense'), 5),
-            inputs(('interest_debt', 'total_equity_including_minority'), 6))
+        from discovery.fundamentals import capital_return_sources
+        result['roic_gross_5y'] = capital_return_sources(snapshot)
     if ruler.track in {'quality_discount', 'deep_value'}:
         result['normalized_earnings'] = inputs(('deducted_net_income',), 5)
     if ruler.track == 'deep_value':
@@ -228,7 +228,7 @@ def release_report(session: Session, *, fill_id: int):
     from app.models import DiscoveryDataFill, DiscoveryDataCheckpoint
     from discovery.common import classify_common
     from discovery.constants import china_market_date
-    from discovery.fundamentals import fundamentals_from_payload, _fact, _classification, period_order
+    from discovery.fundamentals import fundamentals_from_payload, _fact, classification_identity, period_order
     from discovery.industry import classify_industry_branch
     from discovery.field_dictionary import SELECTION_FIELD_DICTIONARY
     from discovery.rulers import canonical_payload, payload_digest
@@ -285,10 +285,10 @@ def release_report(session: Session, *, fill_id: int):
             universe_qualified = any(row.kind == 'release_universe' and proof[row.evidence_id]
                 and row.values.get('_release_universe') == canonical_json(inventory) for row in records.values())
         branch = classify_industry_branch(company.industry)
-        classification = _classification(fundamental)
+        classification, trusted_branch = classification_identity(fundamental)
         labels = {row.values.get('_industry') for row in fundamental.extensions
                   if row.kind == 'company_classification' and row.status == 'verified'}
-        if (classification.status != 'verified' or labels != {company.industry}
+        if (classification.status != 'verified' or trusted_branch != branch or labels != {company.industry}
                 or not classification.evidence_ids or not all(proof.get(key, False) for key in classification.evidence_ids)):
             report['blockers'].append(f'{company.code}:unverified_classification_denominator')
         buckets = ('all', 'branch:' + branch, 'industry:' + (company.industry or 'unknown'))

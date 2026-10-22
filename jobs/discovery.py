@@ -18,7 +18,7 @@ import json
 from math import isfinite
 import sys
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
@@ -676,10 +676,67 @@ def _verify_run_lock(session: Session, run_id: int) -> None:
         raise DiscoveryLockLostError("discovery run lock ownership was lost")
 
 
+def _attempt_identity(stage) -> tuple:
+    fields = ('id', 'run_id', 'attempt', 'input_fingerprint', 'algorithm_version',
+              'retry_of_stage_id', 'updated_at')
+    if isinstance(stage, DiscoveryStage):
+        fields += ('track', 'stage', 'ruler_version_id', 'common_stage_id',
+                   'predecessor_stage_id', 'predecessor_stage', 'reopen_of_stage_id')
+    return tuple(getattr(stage, field) for field in fields)
+
+
+@dataclass(frozen=True)
+class _ClaimedAttempt:
+    model: type
+    stage_id: int
+    run_id: int
+    identity: tuple
+
+    @classmethod
+    def capture(cls, stage):
+        return cls(type(stage), stage.id, stage.run_id, _attempt_identity(stage))
+
+    def matches(self, stage) -> bool:
+        return (stage is not None and stage.status == 'running'
+                and stage.superseded_at is None and _attempt_identity(stage) == self.identity)
+
+
+def _recover_authority_loss(session, claim: _ClaimedAttempt, now_provider) -> None:
+    """Persist only the interruption of an exact owned claim, never its outputs."""
+    # The rejected output transaction must end before this operational write.
+    session.rollback()
+    if (session.info.get('discovery_lock_run_id') != claim.run_id
+            or not session.info.get('discovery_lock_owner_token')):
+        return
+    session.execute(text('BEGIN IMMEDIATE'))
+    try:
+        session.expire_all()
+        _verify_run_lock(session, claim.run_id)
+        stage = session.get(claim.model, claim.stage_id)
+        if (not claim.matches(stage)
+                or not _run_is_mutable(session.get(DiscoveryRun, claim.run_id), now_provider)):
+            session.rollback()
+            return
+        stage.status = 'failed'
+        stage.error = 'publication_authority_lost: retry after a valid republication'
+        stage.failure_kind = 'transient'
+        stage.updated_at = _now(now_provider)
+        # BEGIN IMMEDIATE keeps lease/attempt checks and this operational update
+        # in one writer transaction. Normal result publication stays gated below.
+        session.commit()
+    except DiscoveryLockLostError:
+        session.rollback()
+    except BaseException:
+        session.rollback()
+        raise
+
+
 def _commit_if_current(
     session: Session,
     run_id: int,
     now_provider: NowProvider,
+    *,
+    interrupted_claim: _ClaimedAttempt | None = None,
 ) -> bool:
     if not _run_is_mutable(
         session.get(DiscoveryRun, run_id),
@@ -693,6 +750,8 @@ def _commit_if_current(
     session.flush()
     if not execution_authorized(session, session.get(DiscoveryRun, run_id)):
         session.rollback()
+        if interrupted_claim is not None:
+            _recover_authority_loss(session, interrupted_claim, now_provider)
         return False
     session.commit()
     return True
@@ -703,6 +762,7 @@ def _persist_failure(
     stage_id: int,
     error: BaseException,
     now_provider: NowProvider,
+    claim: _ClaimedAttempt,
 ) -> StageExecutionOutcome:
     session.rollback()
     stage = session.get(DiscoveryCommonStage, stage_id)
@@ -713,7 +773,7 @@ def _persist_failure(
         now_provider,
     ):
         return StageExecutionOutcome(stage_id, "historical", False)
-    if stage.status != "running" or stage.superseded_at is not None:
+    if not claim.matches(stage):
         return StageExecutionOutcome(stage_id, stage.status, False)
     stage.status = "failed"
     stage.error = _safe_error(error)
@@ -723,6 +783,7 @@ def _persist_failure(
         session,
         stage.run_id,
         now_provider,
+        interrupted_claim=claim,
     ):
         return StageExecutionOutcome(stage_id, "historical", False)
     return StageExecutionOutcome(stage_id, "failed", True)
@@ -747,7 +808,7 @@ def execute_common_stage(
     ):
         return StageExecutionOutcome(stage_id, "historical", False)
     claimed_at = _now(now_provider)
-    claim = session.execute(
+    claimed = session.execute(
         update(DiscoveryCommonStage)
         .where(
             DiscoveryCommonStage.id == stage_id,
@@ -761,13 +822,14 @@ def execute_common_stage(
             updated_at=claimed_at,
         )
     )
+    claim = _ClaimedAttempt.capture(observed) if int(claimed.rowcount or 0) == 1 else None
     if not _commit_if_current(
         session,
         observed.run_id,
         now_provider,
     ):
         return StageExecutionOutcome(stage_id, "historical", False)
-    if int(claim.rowcount or 0) != 1:
+    if int(claimed.rowcount or 0) != 1:
         session.expire_all()
         stage = session.get(DiscoveryCommonStage, stage_id)
         return StageExecutionOutcome(
@@ -780,8 +842,8 @@ def execute_common_stage(
         stage = session.get(DiscoveryCommonStage, stage_id)
         if stage is None:
             raise PermanentDiscoveryError("claimed common stage not found")
-        if stage.superseded_at is not None:
-            raise PermanentDiscoveryError("common stage is superseded")
+        if not claim.matches(stage):
+            raise PermanentDiscoveryError("common stage claim changed")
         run = session.get(DiscoveryRun, stage.run_id)
         if run is None:
             raise PermanentDiscoveryError("discovery run not found")
@@ -838,7 +900,7 @@ def execute_common_stage(
         run = session.get(DiscoveryRun, stage.run_id)
         if not _run_is_mutable(run, now_provider):
             return StageExecutionOutcome(stage_id, "historical", True)
-        if stage.status != "running" or stage.superseded_at is not None:
+        if not claim.matches(stage):
             raise PermanentDiscoveryError(
                 "common stage changed during execution"
             )
@@ -871,7 +933,7 @@ def execute_common_stage(
                 f"共同排雷有结论的公司 {counts['pass'] + counts['drop']}/"
                 f"{len(verdicts)}，低于 {COMMON_READINESS_MIN}"
             )
-            if not _commit_if_current(session, stage.run_id, now_provider):
+            if not _commit_if_current(session, stage.run_id, now_provider, interrupted_claim=claim):
                 return StageExecutionOutcome(stage_id, "historical", True)
             return StageExecutionOutcome(
                 stage_id, "data_not_ready", True, processed=len(verdicts)
@@ -893,6 +955,7 @@ def execute_common_stage(
             session,
             stage.run_id,
             now_provider,
+            interrupted_claim=claim,
         ):
             return StageExecutionOutcome(stage_id, "historical", True)
         return StageExecutionOutcome(
@@ -907,6 +970,7 @@ def execute_common_stage(
             stage_id,
             error,
             now_provider,
+            claim,
         )
 
 
@@ -952,6 +1016,7 @@ def _persist_track_failure(
     stage_id: int,
     error: BaseException,
     now_provider: NowProvider,
+    claim: _ClaimedAttempt,
 ) -> None:
     """Best-effort failure persistence after discarding callback writes."""
 
@@ -962,9 +1027,7 @@ def _persist_track_failure(
     try:
         stage = session.get(DiscoveryStage, stage_id)
         if (
-            stage is not None
-            and stage.superseded_at is None
-            and stage.status in {"queued", "running"}
+            claim.matches(stage)
             and _run_is_mutable(
                 session.get(DiscoveryRun, stage.run_id),
                 now_provider,
@@ -978,6 +1041,7 @@ def _persist_track_failure(
                 session,
                 stage.run_id,
                 now_provider,
+                interrupted_claim=claim,
             ):
                 return
     except BaseException:
@@ -1474,6 +1538,7 @@ def _execute_track_stage(
             updated_at=_now(now_provider),
         )
     )
+    claim = _ClaimedAttempt.capture(stage) if int(claimed.rowcount or 0) == 1 else None
     if not _commit_if_current(
         session,
         stage.run_id,
@@ -1486,22 +1551,9 @@ def _execute_track_stage(
     stage = session.get(DiscoveryStage, stage_id)
     if stage is None:
         raise QueueStalledError(f"track stage {stage_id} disappeared")
-    identity = (
-        stage.id,
-        stage.run_id,
-        stage.track,
-        stage.stage,
-        stage.attempt,
-        stage.input_fingerprint,
-        stage.ruler_version_id,
-        stage.algorithm_version,
-        stage.common_stage_id,
-        stage.predecessor_stage_id,
-        stage.predecessor_stage,
-        stage.retry_of_stage_id,
-        stage.reopen_of_stage_id,
-    )
     try:
+        if not claim.matches(stage):
+            raise TrackExecutorContractError("track stage claim changed")
         ruler_payload = frozen_ruler.get("payload")
         if not isinstance(ruler_payload, Mapping):
             raise PermanentDiscoveryError(
@@ -1547,22 +1599,7 @@ def _execute_track_stage(
         ):
             session.rollback()
             return False
-        current_identity = (
-            stage.id,
-            stage.run_id,
-            stage.track,
-            stage.stage,
-            stage.attempt,
-            stage.input_fingerprint,
-            stage.ruler_version_id,
-            stage.algorithm_version,
-            stage.common_stage_id,
-            stage.predecessor_stage_id,
-            stage.predecessor_stage,
-            stage.retry_of_stage_id,
-            stage.reopen_of_stage_id,
-        )
-        if current_identity != identity or stage.status != "running":
+        if not claim.matches(stage):
             raise TrackExecutorContractError(
                 "track stage identity or status changed during execution"
             )
@@ -1651,6 +1688,7 @@ def _execute_track_stage(
             session,
             stage.run_id,
             now_provider,
+            interrupted_claim=claim,
         ):
             return False
         return True
@@ -1660,6 +1698,7 @@ def _execute_track_stage(
             stage_id,
             error,
             now_provider,
+            claim,
         )
         raise
 
