@@ -104,6 +104,7 @@ class _Market:
         self.ex_links = {key: row['economic_event_id'] for key, row in originals.items()
                          if row['type'] == 'dividend_ex'}
         ex_events = {row['economic_event_id']: row for row in selected if row['type'] == 'dividend_ex'}
+        event_order = {row['event_id']: index for index, row in enumerate(selected)}
         paid = set()
         for row in selected:
             if row['type'] == 'dividend_paid':
@@ -112,6 +113,10 @@ class _Market:
                 if (ex is None or ex['code'] != row['code'] or ex_id in paid
                         or local_day(row) < day_value(ex['pay_date'])):
                     raise ValueError('dividend payment has missing, duplicate or invalid ex-event link')
+                # Use the exact selected timestamp/sequence order consumed below,
+                # including when payment references a superseded ex-version ID.
+                if event_order[row['event_id']] < event_order[ex['event_id']]:
+                    raise ValueError('dividend payment precedes selected ex entitlement')
                 paid.add(ex_id)
             if row['type'] in ACTION_TYPES and row['code'] in codes:
                 self.actions[local_day(row)].append(row)

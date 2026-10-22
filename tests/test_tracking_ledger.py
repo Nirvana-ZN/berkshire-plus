@@ -113,6 +113,54 @@ def test_same_day_actions_follow_explicit_sequence_before_open():
         simulate(records, date(2026, 2, 2))
 
 
+@pytest.mark.parametrize('same_time', [False, True])
+@pytest.mark.parametrize('corrected_ex', [False, True])
+def test_dividend_payment_rejects_order_before_selected_ex(same_time, corrected_ex):
+    records = market()
+    ex = event('dividend_ex', '2026-02-02', cash_per_share='1', pay_date='2026-02-02',
+               action_sequence='2')
+    payment = event('dividend_paid', '2026-02-02', ex_event_id=ex['event_id'],
+                    effective_at='2026-02-02T01:00:00+00:00' if same_time else '2026-02-02T00:00:00+00:00',
+                    action_sequence='1')
+    if corrected_ex:
+        # The referenced version originally preceded payment, but the selected
+        # correction moves entitlement after it. Validate the selected version.
+        original = dict(ex, effective_at=ex['effective_at'] if same_time else '2026-02-01T23:00:00+00:00',
+                        action_sequence='0')
+        records.append(original)
+        ex = dict(ex, event_id='corrected-ex', supersedes_id=original['event_id'],
+                  observed_at='2026-02-03T08:00:00+00:00')
+    records.extend([ex, payment])
+    with pytest.raises(ValueError, match='payment precedes selected ex'):
+        simulate(records)
+
+
+@pytest.mark.parametrize('same_time', [False, True])
+@pytest.mark.parametrize('corrected_ex', [False, True])
+def test_ordered_same_day_payment_transfers_selected_ex_entitlement(same_time, corrected_ex):
+    records = market()
+    ex = event('dividend_ex', '2026-02-02', cash_per_share='1', pay_date='2026-02-02',
+               action_sequence='1')
+    payment = event('dividend_paid', '2026-02-02', ex_event_id=ex['event_id'],
+                    effective_at='2026-02-02T01:00:00+00:00' if same_time else '2026-02-02T01:15:00+00:00',
+                    action_sequence='2')
+    if corrected_ex:
+        original = dict(ex, cash_per_share='2', action_sequence='3',
+                        effective_at=ex['effective_at'] if same_time else '2026-02-02T01:30:00+00:00')
+        records.append(original)
+        ex = dict(ex, event_id='corrected-ex', supersedes_id=original['event_id'],
+                  observed_at='2026-02-03T08:00:00+00:00')
+    records.extend([payment, ex])
+    for day in ('2026-02-02', '2026-02-03', '2026-02-04'):
+        change_bar(records, day, open='9', close='9')
+    result = horizon(simulate(records))
+    assert result['equity'] == '1'
+    assert result['cash'] == '0.1'
+    assert result['receivable'] == '0'
+    assert [row['event_id'] for row in result['ledger'] if row['entry_kind'].startswith('dividend_')] == [
+        ex['event_id'], payment['event_id']]
+
+
 def test_entry_waits_five_sessions_and_keeps_unfilled_cash():
     end = date(2026, 2, 9)
     records = market(end)
