@@ -50,6 +50,23 @@ def utc_time(value: object) -> datetime:
         raise ValueError('market time must be an exact aware UTC timestamp') from None
 
 
+def availability_time(row: Mapping[str, object]) -> datetime:
+    """Accounting cutoff only; T16 must qualify retained archival proof first.
+
+    Actual acquisition remains observed_at. An explicit archived observation
+    never silently changes that clock or certifies source authenticity.
+    """
+    observed = utc_time(row['observed_at'])
+    if 'availability_basis' not in row and 'archived_available_at' not in row:
+        return observed
+    if row.get('availability_basis') != 'retained_archive_v1' or 'archived_available_at' not in row:
+        raise ValueError('archived availability requires its versioned basis and timestamp')
+    available = utc_time(row['archived_available_at'])
+    if available > observed:
+        raise ValueError('archived availability cannot follow actual observation')
+    return available
+
+
 def local_day(row: Mapping[str, object]) -> date:
     return supported_day(utc_time(row['effective_at']).astimezone(SHANGHAI).date())
 
@@ -103,6 +120,9 @@ def _validate(row: Mapping[str, object]) -> dict[str, object]:
     supported_day(effective.astimezone(SHANGHAI).date())
     item['effective_at'] = effective.isoformat()
     item['observed_at'] = utc_time(item.get('observed_at')).isoformat()
+    available = availability_time(item)
+    if 'archived_available_at' in item:
+        item['archived_available_at'] = available.isoformat()
     if item.get('supersedes_id') is not None and type(item['supersedes_id']) is not str:
         raise ValueError('invalid supersedes identity')
     if 'withdrawn' in item and type(item['withdrawn']) is not bool:
@@ -192,7 +212,9 @@ def select_events(events: Sequence[Mapping[str, object]], as_of: date) -> list[d
                     or any(item[key] != parent[key] for key in ('economic_event_id', 'code', 'type'))
                     or utc_time(item['observed_at']) < utc_time(parent['observed_at'])):
                 raise ValueError('invalid market supersedes chain')
-        if utc_time(item['observed_at']) < cutoff and (
+            if availability_time(item) < availability_time(parent):
+                raise ValueError('invalid market version availability chronology')
+        if availability_time(item) < cutoff and (
                 item['type'] == 'calendar_day' or utc_time(item['effective_at']) < cutoff):
             groups[item['economic_event_id']].append(item)
     selected = []

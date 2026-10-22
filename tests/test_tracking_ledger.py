@@ -474,6 +474,24 @@ def test_replay_is_idempotent_conflicts_rejected_and_versions_selected_at_cutoff
         simulate(records + [dict(corrected, supersedes_id=None)])
 
 
+def test_explicit_archived_availability_preserves_actual_observation_time():
+    from tracking.market import select_events
+    record = event('bar', '2026-02-02', open='10', close='10', volume='100',
+        suspended=False, open_limit_up=False, open_limit_down=False,
+        price_basis='unadjusted', adjustment_factor='1', observed_at='2026-10-01T08:00:00+00:00')
+    assert select_events([record], date(2026, 2, 4)) == []
+    archived = dict(record, availability_basis='retained_archive_v1',
+                    archived_available_at='2026-02-02T08:00:00+00:00')
+    selected = select_events([archived], date(2026, 2, 4))
+    assert selected[0]['observed_at'] == record['observed_at']
+    assert selected[0]['archived_available_at'] == archived['archived_available_at']
+    for invalid in (dict(record, archived_available_at=archived['archived_available_at']),
+                    dict(record, availability_basis='retained_archive_v1'),
+                    dict(archived, archived_available_at='2026-11-01T08:00:00+00:00')):
+        with pytest.raises(ValueError, match='availab'):
+            select_events([invalid], date(2026, 2, 4))
+
+
 @pytest.mark.parametrize('changes', [{'price_basis': 'adjusted'}, {'adjustment_factor': '2'},
     {'open': 10.0}, {'close': 'NaN'}, {'volume': '-1'}, {'suspended': 'false'},
     {'effective_at': '2026-02-02'}, {'source_id': ''}])

@@ -219,23 +219,23 @@ def _validation_time(value: object) -> datetime:
     return parsed
 
 
-def _reject_model_evidence(value: object) -> None:
+def _reject_model_evidence(value: object, *, rule_verdict_paths=frozenset(), _path=()) -> None:
     if isinstance(value, Mapping):
         if (set(value) & {"fail_count", "gray_count", "then_verdict", "live_verdict", "research_label"}
-            or value.get("verdict") in ("fail", "gray", "pass")
+            or (value.get("verdict") in ("fail", "gray", "pass") and _path not in rule_verdict_paths)
             or any(value.get(key) in {"model_labels", "llm", "research_hypothesis"}
                    for key in ("origin", "source", "proposal_kind")
                    if isinstance(value.get(key), str))):
             raise _ValidationRefusal("independent_validation_required")
-        for child in value.values():
-            _reject_model_evidence(child)
+        for key, child in value.items():
+            _reject_model_evidence(child, rule_verdict_paths=rule_verdict_paths, _path=(*_path, key))
     elif isinstance(value, list):
-        for child in value:
-            _reject_model_evidence(child)
+        for index, child in enumerate(value):
+            _reject_model_evidence(child, rule_verdict_paths=rule_verdict_paths, _path=(*_path, index))
 
 
 def _retained_document(
-    reference: object, root: Path, *, hash_reason: str = "retained_artifact_hash_mismatch"
+    reference: object, root: Path, *, hash_reason: str = "retained_artifact_hash_mismatch", scan_models=True
 ) -> Mapping[str, Any]:
     _require_validation(isinstance(reference, Mapping), "retained_artifact_required")
     path, digest = reference.get("path"), reference.get("sha256")
@@ -257,7 +257,8 @@ def _retained_document(
     document = json.loads(data.decode("utf-8"), object_pairs_hook=unique_fields,
                           parse_constant=invalid_constant)
     _require_validation(isinstance(document, Mapping), "invalid_validation_report")
-    _reject_model_evidence(document)
+    if scan_models:
+        _reject_model_evidence(document)
     return document
 
 
@@ -343,7 +344,9 @@ def activation_eligibility(
             "sha256": evidence["report_sha256"]}, root,
             hash_reason="validation_report_hash_mismatch")
         source = "deterministic_reproduction" if proposal_kind == "data_error_fix" else "independent_outcomes"
-        _require_validation(type(report.get("schema_version")) is int and report["schema_version"] == 1
+        schema2 = (type(report.get('schema_version')) is int and report['schema_version'] == 2
+            and report.get('adapter') == 'paper-tracking-audit-v1' and proposal_kind == 'validated_experiment')
+        _require_validation(type(report.get("schema_version")) is int and (report["schema_version"] == 1 or schema2)
             and report.get("proposal_kind") == proposal_kind and report.get("source") == source,
             "invalid_validation_report")
         _require_validation(_validation_text(report.get("release_reason")), "release_reason_required")
@@ -351,10 +354,26 @@ def activation_eligibility(
         generated = _validation_time(report["generated_at"])
         _require_validation(generated <= datetime.now(timezone.utc), "invalid_validation_report")
         artifacts = report["artifacts"]
-        documents = {name: _retained_document(reference, root) for name, reference in artifacts.items()}
-        for key, name in zip(_VALIDATION_BINDINGS, ("proposal", "ruler", "input")):
-            _require_validation(evidence.get(key) == report["bindings"].get(key)
-                == artifacts[name]["sha256"], "validation_binding_mismatch")
+        documents = {name: _retained_document(reference, root,
+            scan_models=not (schema2 and name == 'tracking_audit')) for name, reference in artifacts.items()}
+        if schema2:
+            from tracking.evaluation import verify_tracking_audit
+            from tracking.importer import QualificationError
+            keys = ('proposal_sha256', 'input_fingerprint', 'ruler_payload_hash', 'protocol_hash', 'registration_hash')
+            _require_validation(set(report['bindings']) == set(keys)
+                and all(evidence.get(key) == report['bindings'][key] for key in keys)
+                and report['bindings']['proposal_sha256'] == artifacts['proposal']['sha256'],
+                'validation_binding_mismatch')
+            try:
+                allowed = verify_tracking_audit(documents['tracking_audit'], report['bindings'],
+                    training_end=_validation_time(report['training_end']), generated_at=generated)
+            except QualificationError as exc:
+                raise _ValidationRefusal(str(exc)) from None
+            _reject_model_evidence(documents['tracking_audit'], rule_verdict_paths=allowed)
+        else:
+            for key, name in zip(_VALIDATION_BINDINGS, ("proposal", "ruler", "input")):
+                _require_validation(evidence.get(key) == report["bindings"].get(key)
+                    == artifacts[name]["sha256"], "validation_binding_mismatch")
         _require_validation(evidence.get("review_path") and evidence.get("review_sha256"), "independent_review_required")
         review = _retained_document({"path": evidence["review_path"],
             "sha256": evidence["review_sha256"]}, root)
@@ -378,7 +397,7 @@ def activation_eligibility(
                 _require_validation(_validation_text(case.get("id"))
                     and _validation_text(case.get("expected"))
                     and case["expected"] == case.get("actual"), "deterministic_acceptance_required")
-        else:
+        elif not schema2:
             _check_experiment_report(report, documents, root, generated)
         return True, None
     except _ValidationRefusal as exc:
