@@ -24,7 +24,8 @@ def test_tavily_search_maps_results(monkeypatch) -> None:
 
     hits = tavily_search("重庆啤酒 2026 中报", api_key="tvly-test")
     assert hits == [
-        {"title": "中报", "url": "https://example.com/a", "content": "销量下降 3%"}
+        {"title": "中报", "url": "https://example.com/a", "content": "销量下降 3%",
+         "evidence_role": "lead_only", "status": "untrusted"}
     ]
     sent = mock_client.post.call_args
     assert sent.args[0] == "https://api.tavily.com/search"
