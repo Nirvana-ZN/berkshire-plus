@@ -15,7 +15,9 @@ RESEARCH_DIR = ROOT / "research"
 
 
 def _engine(db_path: Path):
-    return create_engine(f"sqlite:///{db_path.resolve().as_posix()}")
+    from app.db import create_db_engine
+    return create_db_engine(db_path)
+
 
 
 def _scalar(db_path: Path, sql: str, params: dict | None = None):
@@ -307,10 +309,9 @@ def test_bool_research_id_is_rejected(tmp_path: Path) -> None:
         _assert_error_envelope(response.json())
         assert response.json()["code"] == "INVALID_WATCHLIST"
     assert _watchlist_count(db_path) == 0
+    from tests.dependency_guards import assert_no_ledger_writes
     for path in RESEARCH_DIR.rglob("*.py"):
-        source = path.read_text(encoding="utf-8")
-        assert "import ledger" not in source
-        assert "from ledger" not in source
+        assert_no_ledger_writes(path.read_text(encoding="utf-8"))
 
 
 def test_views_prefill_and_watchlist_without_direct_book_write() -> None:

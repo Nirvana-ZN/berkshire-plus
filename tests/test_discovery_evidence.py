@@ -6,7 +6,8 @@ from types import MappingProxyType
 
 import pytest
 
-from discovery.builds import BUILD_VERSION
+# Archived v7 evidence rendering and economics remain replayable.
+BUILD_VERSION = 'discovery-v7'
 from discovery.evidence import (
     ALLOWED_RISK_CATEGORIES,
     EVIDENCE_RULE_VERSION,
@@ -110,6 +111,7 @@ def test_evidence_is_deterministic_and_carries_rule_inputs() -> None:
     assert first.items[-1].kind == "risk"
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_canonical_verifier_rejects_semantic_evidence_forgery() -> None:
     from tests.test_discovery_tracks_quality import (
         _classify,
@@ -246,6 +248,7 @@ def test_fewer_than_three_reliable_facts_is_insufficient_not_padded() -> None:
     assert all(item.input_fields != {"text": "generic"} for item in facts)
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_bank_card_uses_branch_specific_reliable_facts() -> None:
     from tests.test_discovery_tracks_quality import (
         _classify,
@@ -287,6 +290,7 @@ def test_bank_card_uses_branch_specific_reliable_facts() -> None:
     )
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_builtin_competition_emits_evidence_for_every_entrant() -> None:
     from discovery.snapshot import FrozenRunInputs, canonical_json
     from jobs.discovery import (

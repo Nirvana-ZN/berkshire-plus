@@ -15,6 +15,7 @@ from sqlalchemy.exc import IntegrityError
 from app.db import create_session_factory, init_db
 from app.models import RulerVersion, Setting
 from discovery.builds import BUILD_VERSION
+HISTORICAL_BUILD_VERSION = 'discovery-v7'
 from discovery.rulers import (
     DISCOVERY_PAYLOAD_SCOPE,
     TrackRuler,
@@ -38,7 +39,10 @@ from discovery.tracks import (
 from screen.ruler import GATE_ACK_KEY, current_hash
 
 
-def _payload(track: str = "quality_discount") -> dict[str, object]:
+def _payload(track: str = "quality_discount", *, build_version=BUILD_VERSION) -> dict[str, object]:
+    if build_version == "discovery-v8":
+        from tests.test_selection_v8 import candidate
+        return json.loads(canonical_payload(candidate(track)))
     if track == "quality_discount":
         from tests.test_discovery_tracks_quality import quality_payload
 
@@ -67,10 +71,11 @@ def _payload(track: str = "quality_discount") -> dict[str, object]:
             ["code", "asc", "nulls_last"],
         ],
         "industry_version": "citic-v1",
-        "algorithm_version": BUILD_VERSION,
+        "algorithm_version": build_version,
     }
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_legacy_ruler_scope_migrates_idempotently_and_keeps_default(
     tmp_path: Path,
 ) -> None:
@@ -167,6 +172,7 @@ def test_legacy_ruler_scope_migrates_idempotently_and_keeps_default(
         ).scalar_one() == partial_sql
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_migration_preserves_referenced_duplicate_ruler_ids(
     tmp_path: Path,
 ) -> None:
@@ -186,7 +192,7 @@ def test_migration_preserves_referenced_duplicate_ruler_ids(
     engine = create_db_engine(db_path)
     Base.metadata.create_all(engine)
     factory = create_session_factory(engine)
-    payload = _payload()
+    payload = _payload(build_version=HISTORICAL_BUILD_VERSION)
     payload_json = canonical_payload(payload)
     digest = payload_digest(payload)
     frozen_json = canonical_json(
@@ -234,7 +240,7 @@ def test_migration_preserves_referenced_duplicate_ruler_ids(
             quality_discount_ruler_version_id=41,
             deep_value_ruler_version_id=None,
             garp_ruler_version_id=None,
-            algorithm_version=BUILD_VERSION,
+            algorithm_version=HISTORICAL_BUILD_VERSION,
             trading_dates_json='{"SH":["2026-09-17"]}',
             ruler_payloads_json=frozen_json,
             input_fingerprint="run-fingerprint",
@@ -260,7 +266,7 @@ def test_migration_preserves_referenced_duplicate_ruler_ids(
                     '{"deep_value":null,"garp":null,'
                     '"quality_discount":41}'
                 ),
-                algorithm_version=BUILD_VERSION,
+                algorithm_version=HISTORICAL_BUILD_VERSION,
                 input_fingerprint="row-fingerprint",
                 snapshot_at=now,
             )
@@ -277,7 +283,7 @@ def test_migration_preserves_referenced_duplicate_ruler_ids(
             error=None,
             confirmed_at=now,
             input_fingerprint="run-fingerprint",
-            algorithm_version=BUILD_VERSION,
+            algorithm_version=HISTORICAL_BUILD_VERSION,
             retry_of_stage_id=None,
             failure_kind=None,
             superseded_at=None,
@@ -300,7 +306,7 @@ def test_migration_preserves_referenced_duplicate_ruler_ids(
             confirmed_at=now,
             input_fingerprint="run-fingerprint",
             ruler_version_id=41,
-            algorithm_version=BUILD_VERSION,
+            algorithm_version=HISTORICAL_BUILD_VERSION,
             common_stage_id=common.id,
             predecessor_stage_id=None,
             predecessor_stage=None,
@@ -327,7 +333,7 @@ def test_migration_preserves_referenced_duplicate_ruler_ids(
             confirmed_at=now,
             input_fingerprint="run-fingerprint",
             ruler_version_id=41,
-            algorithm_version=BUILD_VERSION,
+            algorithm_version=HISTORICAL_BUILD_VERSION,
             common_stage_id=None,
             predecessor_stage_id=gate.id,
             predecessor_stage="track_gate",
@@ -407,7 +413,7 @@ def test_migration_preserves_referenced_duplicate_ruler_ids(
                 RulerVersion.digest == digest,
             )
         ) == 2
-        assert resolve_discovery_rulers(session)["quality_discount"] == 42
+        assert resolve_discovery_rulers(session, algorithm_version=HISTORICAL_BUILD_VERSION)["quality_discount"] == 42
         frozen = json.loads(
             freeze_discovery_ruler_payloads(
                 session,
@@ -416,7 +422,7 @@ def test_migration_preserves_referenced_duplicate_ruler_ids(
                     "deep_value": None,
                     "garp": None,
                 },
-                BUILD_VERSION,
+                HISTORICAL_BUILD_VERSION,
             )
         )
         assert frozen["quality_discount"]["id"] == 41
@@ -458,6 +464,7 @@ def test_fresh_init_does_not_activate_discovery_rulers(tmp_path: Path) -> None:
         assert readiness(session, "quality_discount")["status"] == "ruler_not_ready"
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_quality_semantics_guard_activation_resolution_and_freeze(
     tmp_path: Path,
 ) -> None:
@@ -465,7 +472,7 @@ def test_quality_semantics_guard_activation_resolution_and_freeze(
 
     engine = init_db(tmp_path / "semantic-quality.db")
     factory = create_session_factory(engine)
-    invalid = quality_payload()
+    invalid = quality_payload(build_version=HISTORICAL_BUILD_VERSION)
     invalid["thresholds"].pop("roe_mean_min")
     payload_json = canonical_payload(invalid)
     digest = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
@@ -503,10 +510,11 @@ def test_quality_semantics_guard_activation_resolution_and_freeze(
                     "deep_value": None,
                     "garp": None,
                 },
-                BUILD_VERSION,
+                HISTORICAL_BUILD_VERSION,
             )
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_legacy_funnel_row_with_spoofed_payload_is_never_discovery(
     tmp_path: Path,
 ) -> None:
@@ -522,7 +530,7 @@ def test_legacy_funnel_row_with_spoofed_payload_is_never_discovery(
                 {
                     "scope": "weekly-discovery",
                     "track": "quality_discount",
-                    "algorithm_version": BUILD_VERSION,
+                    "algorithm_version": HISTORICAL_BUILD_VERSION,
                 }
             ),
             activated_at=datetime.now(timezone.utc),
@@ -538,7 +546,7 @@ def test_legacy_funnel_row_with_spoofed_payload_is_never_discovery(
                     "deep_value": None,
                     "garp": None,
                 },
-                BUILD_VERSION,
+                HISTORICAL_BUILD_VERSION,
             )
 
 
@@ -562,19 +570,20 @@ def test_legacy_funnel_row_with_spoofed_payload_is_never_discovery(
         "missing:algorithm_version",
     ],
 )
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_strict_row_parser_blocks_invalid_resolver_and_freeze(
     tmp_path: Path,
     case: str,
 ) -> None:
     engine = init_db(tmp_path / f"{case.replace(':', '-')}.db")
     factory = create_session_factory(engine)
-    payload = _payload()
+    payload = _payload(build_version=HISTORICAL_BUILD_VERSION)
     scope = QUALITY_DISCOUNT_SCOPE
     if case == "minimal":
         payload = {
             "scope": DISCOVERY_PAYLOAD_SCOPE,
             "track": "quality_discount",
-            "algorithm_version": BUILD_VERSION,
+            "algorithm_version": HISTORICAL_BUILD_VERSION,
         }
     elif case == "wrong_scope":
         scope = "funnel"
@@ -585,7 +594,7 @@ def test_strict_row_parser_blocks_invalid_resolver_and_freeze(
     elif case.startswith("missing:"):
         payload.pop(case.split(":", 1)[1])
 
-    valid_text = canonical_payload(_payload())
+    valid_text = canonical_payload(_payload(build_version=HISTORICAL_BUILD_VERSION))
     payload_json = canonical_json(payload)
     digest = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
     if case == "wrong_digest":
@@ -613,7 +622,7 @@ def test_strict_row_parser_blocks_invalid_resolver_and_freeze(
             validate_ruler_version(
                 row,
                 expected_track="quality_discount",
-                expected_algorithm_version=BUILD_VERSION,
+                expected_algorithm_version=HISTORICAL_BUILD_VERSION,
             )
         assert resolve_discovery_rulers(session) == {
             "quality_discount": None,
@@ -628,10 +637,11 @@ def test_strict_row_parser_blocks_invalid_resolver_and_freeze(
                     "deep_value": None,
                     "garp": None,
                 },
-                BUILD_VERSION,
+                HISTORICAL_BUILD_VERSION,
             )
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_scoped_activation_is_independent_and_funnel_is_unchanged(
     tmp_path: Path,
 ) -> None:
@@ -644,11 +654,11 @@ def test_scoped_activation_is_independent_and_funnel_is_unchanged(
         ack = session.get(Setting, GATE_ACK_KEY)
         assert ack is not None and ack.value == str(funnel.id)
 
-        quality = activate(session, _payload(), "calibrated quality")
-        same = activate(session, _payload(), "duplicate request")
+        quality = activate(session, _payload(build_version=HISTORICAL_BUILD_VERSION), "calibrated quality")
+        same = activate(session, _payload(build_version=HISTORICAL_BUILD_VERSION), "duplicate request")
         deep = activate(
             session,
-            _payload("deep_value"),
+            _payload("deep_value", build_version=HISTORICAL_BUILD_VERSION),
             "calibrated deep value",
         )
         session.commit()
@@ -673,6 +683,7 @@ def test_scoped_activation_is_independent_and_funnel_is_unchanged(
         assert current_funnel.digest == current_hash()
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_discovery_activation_is_atomic_across_sessions(tmp_path: Path) -> None:
     db_path = tmp_path / "activation-race.db"
     engine = init_db(db_path)
@@ -682,7 +693,7 @@ def test_discovery_activation_is_atomic_across_sessions(tmp_path: Path) -> None:
     def activate_once(reason: str) -> int:
         with factory() as session:
             barrier.wait()
-            row = activate(session, _payload(), reason)
+            row = activate(session, _payload(build_version=HISTORICAL_BUILD_VERSION), reason)
             session.commit()
             return row.id
 
@@ -699,11 +710,12 @@ def test_discovery_activation_is_atomic_across_sessions(tmp_path: Path) -> None:
         assert [row.id for row in rows] == [ids[0]]
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_ruler_ledger_rows_are_immutable(tmp_path: Path) -> None:
     engine = init_db(tmp_path / "immutable.db")
     factory = create_session_factory(engine)
     with factory() as session:
-        row = activate(session, _payload(), "immutable")
+        row = activate(session, _payload(build_version=HISTORICAL_BUILD_VERSION), "immutable")
         session.commit()
         row_id = row.id
 
@@ -744,6 +756,7 @@ def test_ruler_ledger_rows_are_immutable(tmp_path: Path) -> None:
         session.rollback()
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_ruler_ledger_rejects_all_deletes_and_keeps_run_semantics(
     tmp_path: Path,
 ) -> None:
@@ -755,8 +768,8 @@ def test_ruler_ledger_rejects_all_deletes_and_keeps_run_semantics(
     factory = create_session_factory(engine)
     now = datetime(2026, 9, 17, 3, 0, tzinfo=timezone.utc)
     with factory() as session:
-        quality = activate(session, _payload(), "referenced")
-        deep = activate(session, _payload("deep_value"), "unreferenced")
+        quality = activate(session, _payload(build_version=HISTORICAL_BUILD_VERSION), "referenced")
+        deep = activate(session, _payload("deep_value", build_version=HISTORICAL_BUILD_VERSION), "unreferenced")
         funnel = session.scalars(
             select(RulerVersion).where(RulerVersion.scope == "funnel")
         ).one()
@@ -776,7 +789,7 @@ def test_ruler_ledger_rejects_all_deletes_and_keeps_run_semantics(
                 quality_discount_ruler_version_id=quality.id,
                 deep_value_ruler_version_id=None,
                 garp_ruler_version_id=None,
-                algorithm_version=BUILD_VERSION,
+                algorithm_version=HISTORICAL_BUILD_VERSION,
                 trading_dates_json=None,
                 ruler_payloads_json=None,
                 input_fingerprint=None,
@@ -842,10 +855,11 @@ def test_ruler_ledger_rejects_all_deletes_and_keeps_run_semantics(
         session.rollback()
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_activation_rejects_corrupt_unique_conflict(tmp_path: Path) -> None:
     engine = init_db(tmp_path / "corrupt-conflict.db")
     factory = create_session_factory(engine)
-    digest = payload_digest(_payload())
+    digest = payload_digest(_payload(build_version=HISTORICAL_BUILD_VERSION))
     with factory() as session:
         session.add(
             RulerVersion(
@@ -860,18 +874,19 @@ def test_activation_rejects_corrupt_unique_conflict(tmp_path: Path) -> None:
         session.commit()
     with factory() as session:
         with pytest.raises(ValueError, match="integrity"):
-            activate(session, _payload(), "must not return forged")
+            activate(session, _payload(build_version=HISTORICAL_BUILD_VERSION), "must not return forged")
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_track_ruler_is_deeply_immutable_and_canonical() -> None:
-    ruler = TrackRuler.from_payload(_payload())
+    ruler = TrackRuler.from_payload(_payload(build_version=HISTORICAL_BUILD_VERSION))
     assert ruler.scope == QUALITY_DISCOUNT_SCOPE
     assert ruler.track == "quality_discount"
     assert ruler.thresholds["roe_mean_min"] == "12"
     assert ruler.order[-1] == ("code", "asc", "nulls_last")
     text = canonical_payload(ruler)
-    assert text == canonical_payload(deepcopy(_payload()))
-    assert payload_digest(ruler) == payload_digest(deepcopy(_payload()))
+    assert text == canonical_payload(deepcopy(_payload(build_version=HISTORICAL_BUILD_VERSION)))
+    assert payload_digest(ruler) == payload_digest(deepcopy(_payload(build_version=HISTORICAL_BUILD_VERSION)))
     assert payload_digest(ruler) == hashlib.sha256(
         text.encode("utf-8")
     ).hexdigest()
@@ -957,21 +972,23 @@ def test_track_ruler_is_deeply_immutable_and_canonical() -> None:
         ),
     ],
 )
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_malformed_payload_matrix(category: str, mutate) -> None:
-    value = _payload()
+    value = _payload(build_version=HISTORICAL_BUILD_VERSION)
     mutate(value)
     with pytest.raises((TypeError, ValueError), match="."):
         TrackRuler.from_payload(value)
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_payload_rejects_nonfinite_json_aliases_and_cycles() -> None:
     with pytest.raises(ValueError, match="non-finite"):
         TrackRuler.from_json(
-            canonical_payload(_payload()).replace('"12"', "NaN", 1)
+            canonical_payload(_payload(build_version=HISTORICAL_BUILD_VERSION)).replace('"12"', "NaN", 1)
         )
 
     alias: list[str] = ["roe"]
-    value = _payload()
+    value = _payload(build_version=HISTORICAL_BUILD_VERSION)
     value["sector_branches"] = {
         "financial": {"fields": alias},
         "non_financial": {"fields": alias},
@@ -981,7 +998,7 @@ def test_payload_rejects_nonfinite_json_aliases_and_cycles() -> None:
 
     cycle: dict[str, object] = {}
     cycle["self"] = cycle
-    value = _payload()
+    value = _payload(build_version=HISTORICAL_BUILD_VERSION)
     value["sector_branches"] = {"financial": cycle}
     with pytest.raises(TypeError, match="cycle"):
         TrackRuler.from_payload(value)

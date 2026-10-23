@@ -5,12 +5,16 @@ from decimal import Decimal
 
 import pytest
 
+from discovery.builds import BUILD_VERSION
 from discovery.diff import (
     CorruptDiscoveryHistory,
     PersistedCompanyResult,
     classify_weekly_changes,
     load_weekly_changes,
 )
+
+
+HISTORICAL_BUILD_VERSION = "discovery-v7"
 
 
 def result(
@@ -191,7 +195,8 @@ def test_dropped_is_reported_only_for_the_first_absent_week() -> None:
 
 
 def _finalized_history(
-    tmp_path, *, current_status: str = "confirmed", extra_company: bool = False
+    tmp_path, *, current_status: str = "confirmed", extra_company: bool = False,
+    build_version: str = BUILD_VERSION,
 ):
     from datetime import timedelta
 
@@ -218,7 +223,7 @@ def _finalized_history(
         rulers = {
             track: activate(
                 session,
-                discovery_ruler_payload(track),
+                discovery_ruler_payload(track, build_version=build_version),
                 f"activate {track}",
             ).id
             for track in ("quality_discount", "deep_value", "garp")
@@ -232,13 +237,14 @@ def _finalized_history(
                 session,
                 week_key=week_key,
                 ruler_ids=rulers,
+                build_version=build_version,
             )
             freeze_inputs(
                 session,
                 run,
                 [company("600000.SH")]
                 + ([company("600036.SH")] if extra_company else []),
-                versions(ruler_ids=rulers),
+                versions(ruler_ids=rulers, build_version=build_version),
                 {"SH": ["2026-09-16", "2026-09-17"]},
                 snapshot_at=SNAPSHOT_AT + timedelta(days=index),
             )
@@ -436,6 +442,7 @@ def _finalized_history(
     )
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_waiting_adjudication_is_not_comparable_or_dropped(
     tmp_path, monkeypatch
 ) -> None:
@@ -444,6 +451,7 @@ def test_waiting_adjudication_is_not_comparable_or_dropped(
     engine, factory, run_ids, *_ = _finalized_history(
         tmp_path,
         current_status="waiting_confirmation",
+        build_version=HISTORICAL_BUILD_VERSION,
     )
     loaded: list[int] = []
     original = diff.load_frozen_inputs
@@ -465,13 +473,14 @@ def test_waiting_adjudication_is_not_comparable_or_dropped(
     engine.dispose()
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_weekly_changes_parse_only_selected_companies(
     tmp_path, monkeypatch
 ) -> None:
     import discovery.diff as diff
 
     engine, factory, run_ids, *_ = _finalized_history(
-        tmp_path, extra_company=True
+        tmp_path, extra_company=True, build_version=HISTORICAL_BUILD_VERSION,
     )
     requested: list[set[str]] = []
     original_load = diff.load_frozen_inputs
@@ -508,6 +517,7 @@ def test_weekly_changes_parse_only_selected_companies(
     engine.dispose()
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_adjudication_reason_comes_from_competition_not_notes(tmp_path) -> None:
     from app.discovery_models import DiscoveryResult
 
@@ -518,7 +528,7 @@ def test_adjudication_reason_comes_from_competition_not_notes(tmp_path) -> None:
         _stage_ids,
         competition_result_ids,
         _adjudication_result_ids,
-    ) = _finalized_history(tmp_path)
+    ) = _finalized_history(tmp_path, build_version=HISTORICAL_BUILD_VERSION)
     with factory() as session:
         unchanged = load_weekly_changes(
             session,
@@ -557,12 +567,15 @@ def test_adjudication_reason_comes_from_competition_not_notes(tmp_path) -> None:
         ("competition", "algorithm_version", "wrong-build"),
     ],
 )
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_adjudication_validates_complete_ancestor_chain(
     tmp_path, ancestor: str, field: str, value: object
 ) -> None:
     from app.discovery_models import DiscoveryCommonStage, DiscoveryStage
 
-    engine, factory, run_ids, stage_ids, *_ = _finalized_history(tmp_path)
+    engine, factory, run_ids, stage_ids, *_ = _finalized_history(
+        tmp_path, build_version=HISTORICAL_BUILD_VERSION,
+    )
     with factory() as session:
         adjudication = session.get(DiscoveryStage, stage_ids[-1])
         assert adjudication is not None
@@ -594,6 +607,7 @@ def test_adjudication_validates_complete_ancestor_chain(
 
 
 @pytest.mark.parametrize("corruption", ["algorithm", "historical_json"])
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_corrupt_lineage_fails_closed(
     tmp_path, corruption: str
 ) -> None:
@@ -613,7 +627,7 @@ def test_corrupt_lineage_fails_closed(
         stage_ids,
         _competition_result_ids,
         adjudication_result_ids,
-    ) = _finalized_history(tmp_path)
+    ) = _finalized_history(tmp_path, build_version=HISTORICAL_BUILD_VERSION)
     with factory() as session:
         if corruption == "algorithm":
             stage = session.get(DiscoveryStage, stage_ids[-1])
@@ -651,6 +665,7 @@ def test_corrupt_lineage_fails_closed(
     engine.dispose()
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_routes_expose_compact_and_typed_persisted_changes(tmp_path) -> None:
     from datetime import timedelta
 
@@ -682,7 +697,7 @@ def test_routes_expose_compact_and_typed_persisted_changes(tmp_path) -> None:
         rulers = {
             track: activate(
                 session,
-                discovery_ruler_payload(track),
+                discovery_ruler_payload(track, build_version=HISTORICAL_BUILD_VERSION),
                 f"activate {track}",
             ).id
             for track in ("quality_discount", "deep_value", "garp")
@@ -695,12 +710,13 @@ def test_routes_expose_compact_and_typed_persisted_changes(tmp_path) -> None:
                 session,
                 week_key=week_key,
                 ruler_ids=rulers,
+                build_version=HISTORICAL_BUILD_VERSION,
             )
             freeze_inputs(
                 session,
                 run,
                 [company("600000.SH", amount=Decimal(amount))],
-                versions(ruler_ids=rulers),
+                versions(ruler_ids=rulers, build_version=HISTORICAL_BUILD_VERSION),
                 {"SH": ["2026-09-16", "2026-09-17"]},
                 snapshot_at=SNAPSHOT_AT + timedelta(days=index),
             )

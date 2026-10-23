@@ -10,7 +10,7 @@ from types import MappingProxyType
 
 import pytest
 
-from discovery.builds import BUILD_VERSION
+HISTORICAL_BUILD_VERSION = 'discovery-v7'
 from discovery.snapshot import FrozenRunInputs
 from tests.test_discovery_tracks_quality import (
     _annual,
@@ -106,7 +106,7 @@ FORMULAS = {
 }
 
 
-def garp_payload(**threshold_overrides: str) -> dict[str, object]:
+def garp_payload(*, build_version=HISTORICAL_BUILD_VERSION, **threshold_overrides: str) -> dict[str, object]:
     thresholds = {
         "revenue_cagr_min": "0.08",
         "deducted_profit_cagr_min": "0.1",
@@ -220,7 +220,7 @@ def garp_payload(**threshold_overrides: str) -> dict[str, object]:
             ["code", "asc", "nulls_last"],
         ],
         "industry_version": "test-industry-v1",
-        "algorithm_version": BUILD_VERSION,
+        "algorithm_version": build_version,
     }
 
 
@@ -280,6 +280,7 @@ def _classify(company=None, payload=None):
     )
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_garp_ruler_is_semantically_complete_and_strict() -> None:
     from discovery.rulers import garp_ruler
 
@@ -316,6 +317,7 @@ def test_garp_ruler_is_semantically_complete_and_strict() -> None:
             garp_ruler(payload)
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_exact_annual_observations_and_cagr_periods_are_audited() -> None:
     verdict = _classify()
     assert verdict.verdict == "pass"
@@ -344,6 +346,7 @@ def test_exact_annual_observations_and_cagr_periods_are_audited() -> None:
     "minimum",
     ["sustained_revenue_growth", "sustained_profit_growth"],
 )
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_sustained_growth_minimum_requires_at_least_two_periods(
     minimum: str,
 ) -> None:
@@ -358,6 +361,7 @@ def test_sustained_growth_minimum_requires_at_least_two_periods(
         garp_ruler(payload)
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_one_year_low_base_spike_does_not_satisfy_sustained_growth() -> None:
     revenue = {
         2021: "100",
@@ -395,6 +399,7 @@ def test_one_year_low_base_spike_does_not_satisfy_sustained_growth() -> None:
     assert verdict.metrics["deducted_profit_consistent_growth_periods"] == "1"
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_latest_growth_slowdown_is_compared_with_multi_year_trend() -> None:
     annual = tuple(
         _garp_annual(
@@ -440,6 +445,7 @@ def test_latest_growth_slowdown_is_compared_with_multi_year_trend() -> None:
     )
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_roic_is_primary_and_roe_fallback_is_explicitly_labeled() -> None:
     from discovery.evidence import build_evidence_card
 
@@ -510,6 +516,7 @@ def test_roic_is_primary_and_roe_fallback_is_explicitly_labeled() -> None:
         ),
     ],
 )
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_growth_quality_and_unit_economics_gates(
     latest: dict[str, str],
     reason: str,
@@ -522,6 +529,7 @@ def test_growth_quality_and_unit_economics_gates(
     assert (verdict.verdict, verdict.primary_reason) == ("drop", reason)
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_acquisition_cash_uses_multi_year_flow_intensity_not_endpoint_delta() -> None:
     annual = tuple(
         _garp_annual(year, acquisition_cash_paid="20")
@@ -536,6 +544,7 @@ def test_acquisition_cash_uses_multi_year_flow_intensity_not_endpoint_delta() ->
     assert Decimal("0.15") < intensity < Decimal("0.16")
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_cash_conversion_minimum_is_inclusive_at_base_band() -> None:
     # net income is 20, 24, 28, 32, 36; OCF is exactly 80% of it.
     def verdict(latest_ocf: str):
@@ -556,6 +565,7 @@ def test_cash_conversion_minimum_is_inclusive_at_base_band() -> None:
     )
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_ttm_earnings_far_above_latest_deducted_profit_is_flagged() -> None:
     # Market value 10 x 100 = 1000; latest deducted profit is 36.
     def flags(latest_pe: str):
@@ -566,6 +576,7 @@ def test_ttm_earnings_far_above_latest_deducted_profit_is_flagged() -> None:
     assert "ttm_earnings_above_deducted" in flags("15")
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_net_negative_acquisition_cash_counts_as_zero_not_invalid() -> None:
     annual = tuple(
         _garp_annual(year, acquisition_cash_paid="-50" if year == 2023 else "0")
@@ -576,6 +587,7 @@ def test_net_negative_acquisition_cash_counts_as_zero_not_invalid() -> None:
     assert Decimal(str(verdict.metrics["acquisition_cash_to_revenue"])) == 0
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_excluded_cyclical_industry_is_unsupported_and_labels_are_strict() -> None:
     from discovery.rulers import garp_ruler
 
@@ -612,6 +624,7 @@ def test_excluded_cyclical_industry_is_unsupported_and_labels_are_strict() -> No
         ("asset_disposal_gain", "quality_adjustments_insufficient"),
     ],
 )
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_every_gating_unavailable_input_is_insufficient(
     field: str,
     reason: str,
@@ -627,6 +640,7 @@ def test_every_gating_unavailable_input_is_insufficient(
     )
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_trend_windows_require_exact_configured_endpoints() -> None:
     annual = tuple(
         _garp_annual(year, goodwill=None if year == 2021 else "5")
@@ -641,6 +655,7 @@ def test_trend_windows_require_exact_configured_endpoints() -> None:
     assert verdict.metrics["goodwill_increase_to_revenue"] is None
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_growth_is_capped_for_peg_but_valuation_still_has_independent_gates() -> None:
     fast = tuple(
         _garp_annual(
@@ -687,6 +702,7 @@ def test_growth_is_capped_for_peg_but_valuation_still_has_independent_gates() ->
     assert percentile.primary_reason == "valuation_pe_percentile_above_max"
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_exact_staleness_domain_and_ruler_order_are_enforced() -> None:
     stale = tuple(_garp_annual(year) for year in range(2019, 2024))
     assert _classify(_company(annual=stale)).primary_reason == (
@@ -721,6 +737,7 @@ def test_exact_staleness_domain_and_ruler_order_are_enforced() -> None:
     assert verdict.metrics["cash_conversion"] is not None
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_garp_decimal_arithmetic_is_bounded_and_context_isolated() -> None:
     saved = getcontext().copy()
     saved_default = DefaultContext.copy()
@@ -748,6 +765,7 @@ def test_garp_decimal_arithmetic_is_bounded_and_context_isolated() -> None:
         DefaultContext.flags = saved_default.flags.copy()
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_same_company_has_cross_track_divergent_verdicts() -> None:
     from tests.test_discovery_tracks_deep_value import (
         _classify as deep_value_classify,
@@ -765,6 +783,7 @@ def test_same_company_has_cross_track_divergent_verdicts() -> None:
     assert _classify(company).verdict == "pass"
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_builtin_dispatches_garp_and_generic_evidence_in_order() -> None:
     from jobs.discovery import (
         TrackExecutionCandidate,
@@ -788,7 +807,7 @@ def test_builtin_dispatches_garp_and_generic_evidence_in_order() -> None:
             {"quality_discount": None, "deep_value": None, "garp": 3}
         ),
         ruler_payloads=MappingProxyType({}),
-        algorithm_version=BUILD_VERSION,
+        algorithm_version=HISTORICAL_BUILD_VERSION,
         trading_dates=MappingProxyType({"SH": ("2026-09-17",)}),
         snapshot_at=company.snapshot_at,
         companies=(company,),
@@ -809,7 +828,7 @@ def test_builtin_dispatches_garp_and_generic_evidence_in_order() -> None:
         attempt=1,
         input_fingerprint="run",
         ruler_version_id=3,
-        algorithm_version=BUILD_VERSION,
+        algorithm_version=HISTORICAL_BUILD_VERSION,
         common_stage_id=1,
         predecessor_stage_id=None,
         predecessor_stage=None,
@@ -852,6 +871,7 @@ def test_builtin_dispatches_garp_and_generic_evidence_in_order() -> None:
     assert all(row.rule_id.startswith("garp.") for row in ranked.evidence)
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_garp_competition_order_is_growth_consistency_then_peg() -> None:
     from discovery.competition import CompetitionCandidate, rank_competition
     from discovery.rulers import garp_ruler
@@ -891,6 +911,7 @@ def test_garp_competition_order_is_growth_consistency_then_peg() -> None:
     )
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_growth_driver_trend_emits_generic_deterministic_risk() -> None:
     from discovery.evidence import build_evidence_card
 
@@ -954,13 +975,14 @@ def _garp_calibration_snapshot(company):
             ruler_version_ids=MappingProxyType(
                 {"quality_discount": None, "deep_value": None, "garp": None}
             ),
-            algorithm_version=BUILD_VERSION,
+            algorithm_version=HISTORICAL_BUILD_VERSION,
         ),
         trading_dates=MappingProxyType({"SH": ("2026-09-15",)}),
         snapshot_at=company.snapshot_at,
     )
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_calibrator_garp_approves_declared_roe_fallback_separately(
     tmp_path: Path,
     monkeypatch,
@@ -1018,6 +1040,7 @@ def test_calibrator_garp_approves_declared_roe_fallback_separately(
 
 
 @pytest.mark.parametrize("roic", ["0", "-1"])
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_calibrator_garp_counts_finite_signed_roic_as_provenance(
     tmp_path: Path,
     monkeypatch,
@@ -1055,6 +1078,7 @@ def test_calibrator_garp_counts_finite_signed_roic_as_provenance(
     assert "return_metric_label" not in artifact["field_coverage"]
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_calibrator_reports_exact_supported_and_unsupported_branches() -> None:
     from scripts.calibrate_discovery import _ruler_branch
 

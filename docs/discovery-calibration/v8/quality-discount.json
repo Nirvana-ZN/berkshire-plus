@@ -1,0 +1,2486 @@
+{
+  "algorithm_version": "discovery-v8",
+  "blockers": [
+    "reviewed_official_calendar_unavailable",
+    "restricted_cash_source_unready",
+    "selection_field_trusted_coverage_unproven",
+    "capital_action_coverage_unproven",
+    "whole_market_current_cap_readiness_unproven"
+  ],
+  "coverage_change": "not_measured_without_applicable_production_sample",
+  "hypotheses": {
+    "base": {
+      "counts": null,
+      "ranking_audit": {},
+      "results": [],
+      "ruler": {
+        "algorithm_version": "discovery-v8",
+        "fields": [
+          "listing_years",
+          "roe_mean",
+          "roe_downside_volatility",
+          "roe_recent_ratio",
+          "positive_net_income_observations",
+          "latest_net_income",
+          "latest_net_assets",
+          "cash_conversion",
+          "dilution_rate",
+          "debt_to_equity",
+          "cash_to_assets",
+          "interest_debt_to_assets",
+          "interest_coverage",
+          "margin_change",
+          "pe_percentile",
+          "pe_median_ratio",
+          "pb_percentile",
+          "pb_median_ratio",
+          "normalized_earnings",
+          "normalized_pe",
+          "earnings_yield",
+          "deducted_profit_cagr",
+          "peg",
+          "bank_capital_adequacy",
+          "bank_core_tier1_capital_adequacy",
+          "bank_npl",
+          "code",
+          "economic_dilution",
+          "gross_issuance_rate",
+          "cancellation_rate",
+          "bridge_error",
+          "pe_deducted_ttm",
+          "deducted_peg"
+        ],
+        "formulas": {
+          "bank_capital_adequacy": "latest(annual.capital_adequacy)",
+          "bank_core_tier1_capital_adequacy": "latest(annual.core_tier1_capital_adequacy)",
+          "bank_npl": "latest(annual.npl)",
+          "bridge_error": "capital_change_audit.max_absolute_share_error",
+          "cancellation_rate": "capital_change_audit.cancellation_rate",
+          "cash_conversion": "sum(annual.ocf)/sum(annual.net_income)|annual.net_income>0",
+          "cash_to_assets": "latest(annual.cash)/latest(annual.total_assets)",
+          "debt_to_equity": "latest(annual.interest_debt)/latest(annual.net_assets)",
+          "deducted_peg": "(current_mcap/deducted_profit_ttm)/(min(deducted_profit_cagr,0.25)*100)",
+          "deducted_profit_cagr": "cagr(annual.deducted_net_income,growth)",
+          "dilution_rate": "alias(economic_dilution)",
+          "earnings_yield": "100*deducted_profit_ttm/current_mcap",
+          "economic_dilution": "end_shares/(start_shares*structural_factors)-1",
+          "gross_issuance_rate": "capital_change_audit.gross_issuance_rate",
+          "interest_coverage": "latest(annual.interest_coverage)",
+          "interest_debt_to_assets": "latest(annual.interest_debt)/latest(annual.total_assets)",
+          "latest_net_assets": "latest(annual.net_assets)",
+          "latest_net_income": "latest(annual.net_income)",
+          "margin_change": "latest(annual.gross_margin)-earliest(annual.gross_margin)",
+          "normalized_earnings": "median(exact_five_annual.deducted_net_income)",
+          "normalized_pe": "current_mcap/normalized_earnings",
+          "pb_median_ratio": "current.pb/median(monthly.pb)",
+          "pb_percentile": "percentile_rank(current.pb,monthly.pb)",
+          "pe_deducted_ttm": "current_mcap/deducted_profit_ttm",
+          "pe_median_ratio": "current.pe/median(monthly.pe)",
+          "pe_percentile": "percentile_rank(current.pe,monthly.pe)",
+          "peg": "alias(deducted_peg)",
+          "positive_net_income_observations": "count(annual.net_income>0)",
+          "roe_downside_volatility": "downside_volatility(annual.roe)",
+          "roe_mean": "mean(annual.roe)",
+          "roe_recent_ratio": "mean(recent.roe)/mean(annual.roe)"
+        },
+        "industry_version": "candidate-unreviewed",
+        "metric_contract": {
+          "classification": "frozen_company_classification",
+          "collection_effect": "shadow_only",
+          "collection_policy": {
+            "receivables_ratio_increase_min": "0.05",
+            "restricted_cash_ratio_min": "0.20",
+            "version": "collection-v1"
+          },
+          "current_mcap": "verified_same_company_market_day_quote",
+          "metrics": {
+            "bridge_error": {
+              "alias": null,
+              "formula": "capital_change_audit.max_absolute_share_error",
+              "gate": null,
+              "label": "股本衔接差额（股）",
+              "missing_policy": "shadow",
+              "sources": [
+                "shares"
+              ],
+              "tracks": [
+                "quality_discount",
+                "deep_value",
+                "garp"
+              ],
+              "window": "configured_dilution_endpoints_and_covered_actions"
+            },
+            "cancellation_rate": {
+              "alias": null,
+              "formula": "capital_change_audit.cancellation_rate",
+              "gate": null,
+              "label": "注销率",
+              "missing_policy": "shadow",
+              "sources": [
+                "shares"
+              ],
+              "tracks": [
+                "quality_discount",
+                "deep_value",
+                "garp"
+              ],
+              "window": "configured_dilution_endpoints_and_covered_actions"
+            },
+            "deducted_peg": {
+              "alias": "peg",
+              "formula": "(current_mcap/deducted_profit_ttm)/(min(deducted_profit_cagr,0.25)*100)",
+              "gate": "peg",
+              "label": "扣非 PEG",
+              "missing_policy": "insufficient",
+              "sources": [
+                "deducted_net_income"
+              ],
+              "tracks": [
+                "quality_discount",
+                "garp"
+              ],
+              "window": "latest_comparable_ttm_and_configured_growth"
+            },
+            "earnings_yield": {
+              "alias": null,
+              "formula": "100*deducted_profit_ttm/current_mcap",
+              "gate": "absolute_valuation",
+              "label": "扣非盈利收益率（百分数）",
+              "missing_policy": "insufficient",
+              "sources": [
+                "deducted_net_income"
+              ],
+              "tracks": [
+                "quality_discount"
+              ],
+              "window": "latest_comparable_ttm_and_same_day_cap"
+            },
+            "economic_dilution": {
+              "alias": "dilution_rate",
+              "formula": "end_shares/(start_shares*structural_factors)-1",
+              "gate": "dilution",
+              "label": "经济稀释率",
+              "missing_policy": "insufficient",
+              "sources": [
+                "shares"
+              ],
+              "tracks": [
+                "quality_discount",
+                "deep_value",
+                "garp"
+              ],
+              "window": "configured_dilution_endpoints_and_covered_actions"
+            },
+            "gross_issuance_rate": {
+              "alias": null,
+              "formula": "capital_change_audit.gross_issuance_rate",
+              "gate": null,
+              "label": "毛发行率",
+              "missing_policy": "shadow",
+              "sources": [
+                "shares"
+              ],
+              "tracks": [
+                "quality_discount",
+                "deep_value",
+                "garp"
+              ],
+              "window": "configured_dilution_endpoints_and_covered_actions"
+            },
+            "normalized_earnings": {
+              "alias": null,
+              "formula": "median(exact_five_annual.deducted_net_income)",
+              "gate": "normalized_earnings",
+              "label": "五年正常化扣非盈利",
+              "missing_policy": "insufficient",
+              "sources": [
+                "deducted_net_income"
+              ],
+              "tracks": [
+                "quality_discount",
+                "deep_value"
+              ],
+              "window": "five_consecutive_annuals"
+            },
+            "normalized_pe": {
+              "alias": null,
+              "formula": "current_mcap/normalized_earnings",
+              "gate": "normalized_valuation",
+              "label": "正常化 PE",
+              "missing_policy": "insufficient",
+              "sources": [
+                "deducted_net_income"
+              ],
+              "tracks": [
+                "quality_discount",
+                "deep_value"
+              ],
+              "window": "five_consecutive_annuals_and_same_day_cap"
+            },
+            "pe_deducted_ttm": {
+              "alias": null,
+              "formula": "current_mcap/deducted_profit_ttm",
+              "gate": "valuation",
+              "label": "当前扣非 PE",
+              "missing_policy": "insufficient",
+              "sources": [
+                "deducted_net_income"
+              ],
+              "tracks": [
+                "quality_discount",
+                "garp"
+              ],
+              "window": "latest_comparable_ttm_and_same_day_cap"
+            }
+          },
+          "normalized_sensitivity_years": [
+            7,
+            10
+          ],
+          "ordinary_pe_history_label": "普通 PE 历史位置",
+          "shadow_metrics": {
+            "cash_conversion": {
+              "formula": "collection_metrics.cash_conversion",
+              "gate": null,
+              "missing_policy": "shadow",
+              "sources": [
+                "ocf",
+                "net_income"
+              ],
+              "window": "latest_and_prior_comparable_ttm"
+            },
+            "cash_conversion_change": {
+              "formula": "collection_metrics.cash_conversion_change",
+              "gate": null,
+              "missing_policy": "shadow",
+              "sources": [
+                "ocf",
+                "net_income"
+              ],
+              "window": "latest_and_prior_comparable_ttm"
+            },
+            "inventory_ratio": {
+              "formula": "collection_metrics.inventory_ratio",
+              "gate": null,
+              "missing_policy": "shadow",
+              "sources": [
+                "inventory",
+                "revenue"
+              ],
+              "window": "latest_and_prior_comparable_ttm"
+            },
+            "inventory_ratio_change": {
+              "formula": "collection_metrics.inventory_ratio_change",
+              "gate": null,
+              "missing_policy": "shadow",
+              "sources": [
+                "inventory",
+                "revenue"
+              ],
+              "window": "latest_and_prior_comparable_ttm"
+            },
+            "prior_cash_conversion": {
+              "formula": "collection_metrics.prior_cash_conversion",
+              "gate": null,
+              "missing_policy": "shadow",
+              "sources": [
+                "ocf",
+                "net_income"
+              ],
+              "window": "latest_and_prior_comparable_ttm"
+            },
+            "prior_inventory_ratio": {
+              "formula": "collection_metrics.prior_inventory_ratio",
+              "gate": null,
+              "missing_policy": "shadow",
+              "sources": [
+                "inventory",
+                "revenue"
+              ],
+              "window": "latest_and_prior_comparable_ttm"
+            },
+            "prior_receivables_ratio": {
+              "formula": "collection_metrics.prior_receivables_ratio",
+              "gate": null,
+              "missing_policy": "shadow",
+              "sources": [
+                "accounts_receivable",
+                "contract_assets",
+                "revenue"
+              ],
+              "window": "latest_and_prior_comparable_ttm"
+            },
+            "receivables_ratio": {
+              "formula": "collection_metrics.receivables_ratio",
+              "gate": null,
+              "missing_policy": "shadow",
+              "sources": [
+                "accounts_receivable",
+                "contract_assets",
+                "revenue"
+              ],
+              "window": "latest_and_prior_comparable_ttm"
+            },
+            "receivables_ratio_change": {
+              "formula": "collection_metrics.receivables_ratio_change",
+              "gate": null,
+              "missing_policy": "shadow",
+              "sources": [
+                "accounts_receivable",
+                "contract_assets",
+                "revenue"
+              ],
+              "window": "latest_and_prior_comparable_ttm"
+            },
+            "restricted_cash_ratio": {
+              "formula": "collection_metrics.restricted_cash_ratio",
+              "gate": null,
+              "missing_policy": "shadow",
+              "sources": [
+                "restricted_cash",
+                "cash"
+              ],
+              "window": "latest_and_prior_comparable_ttm"
+            }
+          },
+          "source_fields": {
+            "accounts_receivable": {
+              "consolidated_basis": "consolidated",
+              "derivation_formula": null,
+              "field": "ACCOUNTS_RECE",
+              "financial_sector_substitute": null,
+              "missing_policy": "None for absent/null/ambiguous values; never infer zero. Manual review required; zero/missing/full-market audit incomplete.",
+              "period_type": "period_end",
+              "registry": "selection_evidence",
+              "report": "RPT_DMSK_FN_BALANCE",
+              "source_as_of": "NOTICE_DATE (publication); UPDATE_DATE (source revision only)",
+              "trusted": false,
+              "unit": "CNY"
+            },
+            "cash": {
+              "consolidated_basis": "consolidated",
+              "derivation_formula": null,
+              "field": "MONETARYFUNDS",
+              "financial_sector_substitute": "MONETARYFUNDS",
+              "missing_policy": "None when absent; bank monetary funds remain visible but are not used for ROIC without verified interest debt.",
+              "period_type": "period_end",
+              "registry": "legacy_financial",
+              "report": "RPT_DMSK_FN_BALANCE",
+              "source_as_of": "NOTICE_DATE/UPDATE_DATE",
+              "trusted": true,
+              "unit": "CNY"
+            },
+            "contract_assets": {
+              "consolidated_basis": "consolidated",
+              "derivation_formula": null,
+              "field": "CONTRACT_ASSET",
+              "financial_sector_substitute": null,
+              "missing_policy": "None for absent/null/ambiguous values; never infer zero. Manual review required; zero/missing/full-market audit incomplete.",
+              "period_type": "period_end",
+              "registry": "selection_evidence",
+              "report": "RPT_F10_FINANCE_GBALANCE",
+              "source_as_of": "NOTICE_DATE (publication); UPDATE_DATE (source revision only)",
+              "trusted": false,
+              "unit": "CNY"
+            },
+            "deducted_net_income": {
+              "consolidated_basis": "consolidated",
+              "derivation_formula": null,
+              "field": "DEDUCT_PARENT_NETPROFIT",
+              "financial_sector_substitute": "KCFJCXSYJLR",
+              "missing_policy": "None; never substitute reported net income.",
+              "period_type": "cumulative",
+              "registry": "legacy_financial",
+              "report": "RPT_DMSK_FN_INCOME",
+              "source_as_of": "NOTICE_DATE/UPDATE_DATE",
+              "trusted": true,
+              "unit": "CNY"
+            },
+            "interest_expense": {
+              "consolidated_basis": "consolidated",
+              "derivation_formula": null,
+              "field": "FE_INTEREST_EXPENSE",
+              "financial_sector_substitute": null,
+              "missing_policy": "None for absent/null/ambiguous values; never infer zero. Independent finance interest expense only; INTEREST_EXPENSE (financial-subsidiary cost) and net FINANCE_EXPENSE are not aliases. Manual review required; zero/missing/full-market audit incomplete.",
+              "period_type": "cumulative",
+              "registry": "selection_evidence",
+              "report": "RPT_F10_FINANCE_GINCOME",
+              "source_as_of": "NOTICE_DATE (publication); UPDATE_DATE (source revision only)",
+              "trusted": false,
+              "unit": "CNY"
+            },
+            "inventory": {
+              "consolidated_basis": "consolidated",
+              "derivation_formula": null,
+              "field": "INVENTORY",
+              "financial_sector_substitute": null,
+              "missing_policy": "None for absent/null/ambiguous values; never infer zero. Manual review required; zero/missing/full-market audit incomplete.",
+              "period_type": "period_end",
+              "registry": "selection_evidence",
+              "report": "RPT_DMSK_FN_BALANCE",
+              "source_as_of": "NOTICE_DATE (publication); UPDATE_DATE (source revision only)",
+              "trusted": false,
+              "unit": "CNY"
+            },
+            "net_income": {
+              "consolidated_basis": "consolidated",
+              "derivation_formula": null,
+              "field": "PARENT_NETPROFIT",
+              "financial_sector_substitute": "PARENTNETPROFIT",
+              "missing_policy": "None when parent-attributable profit is absent.",
+              "period_type": "cumulative",
+              "registry": "legacy_financial",
+              "report": "RPT_DMSK_FN_INCOME",
+              "source_as_of": "NOTICE_DATE/UPDATE_DATE",
+              "trusted": true,
+              "unit": "CNY"
+            },
+            "ocf": {
+              "consolidated_basis": "consolidated",
+              "derivation_formula": null,
+              "field": "NETCASH_OPERATE",
+              "financial_sector_substitute": "NETCASH_OPERATE_PK",
+              "missing_policy": "None when operating net cash flow is absent.",
+              "period_type": "cumulative",
+              "registry": "legacy_financial",
+              "report": "RPT_DMSK_FN_CASHFLOW",
+              "source_as_of": "NOTICE_DATE/UPDATE_DATE",
+              "trusted": true,
+              "unit": "CNY"
+            },
+            "related_party_funds": {
+              "consolidated_basis": "consolidated",
+              "derivation_formula": null,
+              "field": null,
+              "financial_sector_substitute": null,
+              "missing_policy": "None for absent/null/ambiguous values; never infer zero. Manual review required; zero/missing/full-market audit incomplete.",
+              "period_type": "period_end",
+              "registry": "selection_evidence",
+              "report": null,
+              "source_as_of": "NOTICE_DATE (publication); UPDATE_DATE (source revision only)",
+              "trusted": false,
+              "unit": "CNY"
+            },
+            "restricted_cash": {
+              "consolidated_basis": "consolidated",
+              "derivation_formula": null,
+              "field": null,
+              "financial_sector_substitute": null,
+              "missing_policy": "None for absent/null/ambiguous values; never infer zero. Unmapped: require reviewed restricted monetary funds, not total restricted assets. Missing blocks usable cash and dependent debt/net-cash metrics; independent FCF yield can remain available. Manual review required; zero/missing/full-market audit incomplete.",
+              "period_type": "period_end",
+              "registry": "selection_evidence",
+              "report": null,
+              "source_as_of": "NOTICE_DATE (publication); UPDATE_DATE (source revision only)",
+              "trusted": false,
+              "unit": "CNY"
+            },
+            "revenue": {
+              "consolidated_basis": "consolidated",
+              "derivation_formula": null,
+              "field": "TOTAL_OPERATE_INCOME",
+              "financial_sector_substitute": "TOTALOPERATEREVE",
+              "missing_policy": "None when the reported consolidated line is absent.",
+              "period_type": "cumulative",
+              "registry": "legacy_financial",
+              "report": "RPT_DMSK_FN_INCOME",
+              "source_as_of": "NOTICE_DATE/UPDATE_DATE",
+              "trusted": true,
+              "unit": "CNY"
+            },
+            "shares": {
+              "consolidated_basis": "consolidated",
+              "derivation_formula": null,
+              "field": "TOTAL_SHARE",
+              "financial_sector_substitute": null,
+              "missing_policy": "None unless the exact field is finite and positive; no total-share alias is accepted.",
+              "period_type": "period_end",
+              "registry": "legacy_financial",
+              "report": "RPT_F10_FINANCE_MAINFINADATA",
+              "source_as_of": "NOTICE_DATE/UPDATE_DATE",
+              "trusted": true,
+              "unit": "shares"
+            },
+            "total_equity_including_minority": {
+              "consolidated_basis": "consolidated",
+              "derivation_formula": null,
+              "field": "TOTAL_EQUITY",
+              "financial_sector_substitute": null,
+              "missing_policy": "None for absent/null/ambiguous values; never infer zero. Gross IC requires this minority-inclusive equity plus verified interest debt; never substitute parent-attributable equity. Manual review required; zero/missing/full-market audit incomplete.",
+              "period_type": "period_end",
+              "registry": "selection_evidence",
+              "report": "RPT_DMSK_FN_BALANCE",
+              "source_as_of": "NOTICE_DATE (publication); UPDATE_DATE (source revision only)",
+              "trusted": false,
+              "unit": "CNY"
+            }
+          },
+          "source_mode": "schema4_frozen_evidence",
+          "version": "selection-metrics-v1"
+        },
+        "min_observations": {
+          "bank_capital": 1,
+          "bank_npl": 1,
+          "bank_roe": 5,
+          "cash_conversion": 5,
+          "dilution": 2,
+          "growth": 5,
+          "interest_coverage": 1,
+          "leverage": 1,
+          "margin": 2,
+          "net_assets": 1,
+          "normalized_earnings": 5,
+          "positive_net_income": 5,
+          "roe": 5,
+          "roe_recent": 3,
+          "valuation_pb": 60,
+          "valuation_pe": 60
+        },
+        "missing_policy": {
+          "bank_capital_adequacy": "insufficient",
+          "bank_core_tier1_capital_adequacy": "insufficient",
+          "bank_npl": "insufficient",
+          "bridge_error": "shadow",
+          "cancellation_rate": "shadow",
+          "cash_conversion": "insufficient",
+          "cash_to_assets": "insufficient",
+          "code": "insufficient",
+          "debt_to_equity": "insufficient",
+          "deducted_peg": "insufficient",
+          "deducted_profit_cagr": "insufficient",
+          "dilution_rate": "insufficient",
+          "earnings_yield": "insufficient",
+          "economic_dilution": "insufficient",
+          "gross_issuance_rate": "shadow",
+          "interest_coverage": "insufficient",
+          "interest_debt_to_assets": "insufficient",
+          "latest_net_assets": "insufficient",
+          "latest_net_income": "insufficient",
+          "listing_years": "insufficient",
+          "margin_change": "insufficient",
+          "normalized_earnings": "insufficient",
+          "normalized_pe": "insufficient",
+          "pb_median_ratio": "insufficient",
+          "pb_percentile": "insufficient",
+          "pe_deducted_ttm": "insufficient",
+          "pe_median_ratio": "insufficient",
+          "pe_percentile": "insufficient",
+          "peg": "insufficient",
+          "positive_net_income_observations": "insufficient",
+          "roe_downside_volatility": "insufficient",
+          "roe_mean": "insufficient",
+          "roe_recent_ratio": "insufficient"
+        },
+        "operating_policy": {},
+        "order": [
+          [
+            "pe_percentile",
+            "asc",
+            "nulls_last"
+          ],
+          [
+            "roe_downside_volatility",
+            "asc",
+            "nulls_last"
+          ],
+          [
+            "cash_conversion",
+            "desc",
+            "nulls_last"
+          ],
+          [
+            "code",
+            "asc",
+            "nulls_last"
+          ]
+        ],
+        "ranking_contract": {
+          "annual_risk_policy": {
+            "deducted_drop_max": "-0.15",
+            "fcf_min_observations": 3,
+            "fcf_window_years": 5,
+            "goodwill_to_equity_min": "0.25",
+            "negative_fcf_years": 2,
+            "pb_min": "8",
+            "recent_cash_conversion_max": "0.4",
+            "roe_decline_min": "4",
+            "roe_mean_min": "50",
+            "roe_window_years": 4,
+            "version": "annual-risk-v1"
+          },
+          "branch_orders": {
+            "bank": [
+              [
+                "pb_percentile",
+                "asc"
+              ],
+              [
+                "roe_mean",
+                "desc"
+              ],
+              [
+                "bank_core_tier1_capital_adequacy",
+                "desc"
+              ]
+            ],
+            "cyclical": [
+              [
+                "pb_percentile",
+                "asc"
+              ],
+              [
+                "normalized_pe",
+                "asc"
+              ],
+              [
+                "cash_conversion",
+                "desc"
+              ]
+            ],
+            "nonfinancial": [
+              [
+                "pe_percentile",
+                "asc"
+              ],
+              [
+                "roe_downside_volatility",
+                "asc"
+              ],
+              [
+                "cash_conversion",
+                "desc"
+              ]
+            ],
+            "unknown": []
+          },
+          "industry_cap": 2,
+          "risk_policy": {
+            "operating_states": {
+              "deteriorating": "deteriorating",
+              "improving": "clear",
+              "stable": "clear",
+              "unknown": "unknown"
+            },
+            "verified_risk_types": {
+              "acquisition_cash_to_revenue_worsening": "watch",
+              "annual_deducted_drop": "watch",
+              "cash_debt_double_high": "watch",
+              "consecutive_negative_fcf": "watch",
+              "deducted_profit_growth_slowdown_worsening": "watch",
+              "dilution_rate_worsening": "watch",
+              "earnings_decline_worsening": "watch",
+              "goodwill_bloat": "watch",
+              "goodwill_increase_to_revenue_worsening": "watch",
+              "gross_margin_change_deterioration": "watch",
+              "interest_debt_increase_to_revenue_worsening": "watch",
+              "margin_deterioration": "watch",
+              "negative_5y_fcf": "watch",
+              "net_margin_change_deterioration": "watch",
+              "npl_change_worsening": "watch",
+              "recent_ocf_collapse": "watch",
+              "revenue_decline_worsening": "watch",
+              "revenue_growth_slowdown_worsening": "watch",
+              "roe_step_down_3y": "watch",
+              "thin_equity_high_pb": "watch"
+            }
+          },
+          "total_cap": 15,
+          "version": "selection-ranking-v1"
+        },
+        "scope": "weekly-discovery",
+        "sector_branches": {
+          "bank": {
+            "gate_order": [
+              "listing_age",
+              "positive_equity",
+              "bank_roe",
+              "bank_capital",
+              "bank_npl",
+              "bank_valuation"
+            ],
+            "latest_net_income_policy": "ignore",
+            "margin_deterioration_policy": "evidence",
+            "valuation_policy": "pb"
+          },
+          "branch_policies": {
+            "bank": "bank",
+            "insurance": "unsupported",
+            "nonfinancial": "industry_map",
+            "other_financial": "unsupported",
+            "unknown": "insufficient"
+          },
+          "common": {
+            "field_domain_policy": "quality-domain-v1",
+            "latest_annual_staleness_years": 1,
+            "lookback_windows": {
+              "bank_capital": 5,
+              "bank_npl": 5,
+              "cash_conversion": 5,
+              "dilution": 5,
+              "growth": 5,
+              "interest_coverage": 1,
+              "leverage": 1,
+              "margin": 5,
+              "normalized_earnings": 5,
+              "positive_equity": 1,
+              "profitability": 5,
+              "roe": 10,
+              "roe_recent": 3
+            },
+            "valuation_ratio_method": "PE_TTM/PB_MRQ"
+          },
+          "cyclical": {
+            "gate_order": [
+              "listing_age",
+              "roe_mean",
+              "roe_stability",
+              "profitability",
+              "positive_equity",
+              "cash_conversion",
+              "dilution",
+              "leverage",
+              "interest_coverage",
+              "cash_debt",
+              "margin",
+              "normalized_earnings_positive",
+              "cyclical_valuation"
+            ],
+            "latest_net_income_policy": "require_positive",
+            "margin_deterioration_policy": "evidence",
+            "valuation_policy": "pb"
+          },
+          "industry_map": {
+            "bank": [
+              "银行"
+            ],
+            "cyclical": [
+              "光伏设备",
+              "养殖业",
+              "冶钢原料",
+              "化学原料",
+              "小金属",
+              "工业金属",
+              "普钢",
+              "煤炭开采",
+              "特钢Ⅱ",
+              "能源金属",
+              "航运港口",
+              "装修建材",
+              "贵金属"
+            ],
+            "nonfinancial": [
+              "制造业"
+            ]
+          },
+          "nonfinancial": {
+            "gate_order": [
+              "listing_age",
+              "roe_mean",
+              "roe_stability",
+              "roe_trend",
+              "profitability",
+              "positive_equity",
+              "cash_conversion",
+              "dilution",
+              "leverage",
+              "interest_coverage",
+              "cash_debt",
+              "margin",
+              "valuation",
+              "absolute_valuation"
+            ],
+            "latest_net_income_policy": "require_positive",
+            "margin_deterioration_policy": "evidence",
+            "valuation_policy": "both"
+          }
+        },
+        "thresholds": {
+          "bank_capital_adequacy_min": "12",
+          "bank_core_tier1_min": "9",
+          "bank_npl_max": "2",
+          "bank_roe_min": "10",
+          "cash_conversion_min": "1",
+          "cash_to_assets_min": "0.2",
+          "debt_to_equity_max": "1",
+          "dilution_rate_max": "0.05",
+          "earnings_yield_spread_min": "3",
+          "interest_coverage_min": "3",
+          "interest_debt_to_assets_min": "0.2",
+          "listing_years_min": "5",
+          "margin_deterioration_max": "2",
+          "net_assets_positive_min": "0",
+          "net_income_positive_min": "0",
+          "normalized_earnings_min": "0",
+          "normalized_pe_max": "15",
+          "pb_median_ratio_max": "0.8",
+          "pb_percentile_max": "30",
+          "pe_median_ratio_max": "0.8",
+          "pe_percentile_max": "30",
+          "peg_growth_cap": "0.25",
+          "peg_release_max": "1.5",
+          "readiness_min": "0.8",
+          "roe_downside_volatility_max": "0.25",
+          "roe_mean_min": "12",
+          "roe_recent_ratio_min": "0.8",
+          "treasury_yield": "1.69"
+        },
+        "track": "quality_discount"
+      },
+      "ruler_digest": "e85ea922b0611fbcebc5e70b7a6a994458ce2d7343e41ddba2a3d6b55c0b058c"
+    },
+    "conservative": {
+      "counts": null,
+      "ranking_audit": {},
+      "results": [],
+      "ruler": {
+        "algorithm_version": "discovery-v8",
+        "fields": [
+          "listing_years",
+          "roe_mean",
+          "roe_downside_volatility",
+          "roe_recent_ratio",
+          "positive_net_income_observations",
+          "latest_net_income",
+          "latest_net_assets",
+          "cash_conversion",
+          "dilution_rate",
+          "debt_to_equity",
+          "cash_to_assets",
+          "interest_debt_to_assets",
+          "interest_coverage",
+          "margin_change",
+          "pe_percentile",
+          "pe_median_ratio",
+          "pb_percentile",
+          "pb_median_ratio",
+          "normalized_earnings",
+          "normalized_pe",
+          "earnings_yield",
+          "deducted_profit_cagr",
+          "peg",
+          "bank_capital_adequacy",
+          "bank_core_tier1_capital_adequacy",
+          "bank_npl",
+          "code",
+          "economic_dilution",
+          "gross_issuance_rate",
+          "cancellation_rate",
+          "bridge_error",
+          "pe_deducted_ttm",
+          "deducted_peg"
+        ],
+        "formulas": {
+          "bank_capital_adequacy": "latest(annual.capital_adequacy)",
+          "bank_core_tier1_capital_adequacy": "latest(annual.core_tier1_capital_adequacy)",
+          "bank_npl": "latest(annual.npl)",
+          "bridge_error": "capital_change_audit.max_absolute_share_error",
+          "cancellation_rate": "capital_change_audit.cancellation_rate",
+          "cash_conversion": "sum(annual.ocf)/sum(annual.net_income)|annual.net_income>0",
+          "cash_to_assets": "latest(annual.cash)/latest(annual.total_assets)",
+          "debt_to_equity": "latest(annual.interest_debt)/latest(annual.net_assets)",
+          "deducted_peg": "(current_mcap/deducted_profit_ttm)/(min(deducted_profit_cagr,0.25)*100)",
+          "deducted_profit_cagr": "cagr(annual.deducted_net_income,growth)",
+          "dilution_rate": "alias(economic_dilution)",
+          "earnings_yield": "100*deducted_profit_ttm/current_mcap",
+          "economic_dilution": "end_shares/(start_shares*structural_factors)-1",
+          "gross_issuance_rate": "capital_change_audit.gross_issuance_rate",
+          "interest_coverage": "latest(annual.interest_coverage)",
+          "interest_debt_to_assets": "latest(annual.interest_debt)/latest(annual.total_assets)",
+          "latest_net_assets": "latest(annual.net_assets)",
+          "latest_net_income": "latest(annual.net_income)",
+          "margin_change": "latest(annual.gross_margin)-earliest(annual.gross_margin)",
+          "normalized_earnings": "median(exact_five_annual.deducted_net_income)",
+          "normalized_pe": "current_mcap/normalized_earnings",
+          "pb_median_ratio": "current.pb/median(monthly.pb)",
+          "pb_percentile": "percentile_rank(current.pb,monthly.pb)",
+          "pe_deducted_ttm": "current_mcap/deducted_profit_ttm",
+          "pe_median_ratio": "current.pe/median(monthly.pe)",
+          "pe_percentile": "percentile_rank(current.pe,monthly.pe)",
+          "peg": "alias(deducted_peg)",
+          "positive_net_income_observations": "count(annual.net_income>0)",
+          "roe_downside_volatility": "downside_volatility(annual.roe)",
+          "roe_mean": "mean(annual.roe)",
+          "roe_recent_ratio": "mean(recent.roe)/mean(annual.roe)"
+        },
+        "industry_version": "candidate-unreviewed",
+        "metric_contract": {
+          "classification": "frozen_company_classification",
+          "collection_effect": "shadow_only",
+          "collection_policy": {
+            "receivables_ratio_increase_min": "0.05",
+            "restricted_cash_ratio_min": "0.20",
+            "version": "collection-v1"
+          },
+          "current_mcap": "verified_same_company_market_day_quote",
+          "metrics": {
+            "bridge_error": {
+              "alias": null,
+              "formula": "capital_change_audit.max_absolute_share_error",
+              "gate": null,
+              "label": "股本衔接差额（股）",
+              "missing_policy": "shadow",
+              "sources": [
+                "shares"
+              ],
+              "tracks": [
+                "quality_discount",
+                "deep_value",
+                "garp"
+              ],
+              "window": "configured_dilution_endpoints_and_covered_actions"
+            },
+            "cancellation_rate": {
+              "alias": null,
+              "formula": "capital_change_audit.cancellation_rate",
+              "gate": null,
+              "label": "注销率",
+              "missing_policy": "shadow",
+              "sources": [
+                "shares"
+              ],
+              "tracks": [
+                "quality_discount",
+                "deep_value",
+                "garp"
+              ],
+              "window": "configured_dilution_endpoints_and_covered_actions"
+            },
+            "deducted_peg": {
+              "alias": "peg",
+              "formula": "(current_mcap/deducted_profit_ttm)/(min(deducted_profit_cagr,0.25)*100)",
+              "gate": "peg",
+              "label": "扣非 PEG",
+              "missing_policy": "insufficient",
+              "sources": [
+                "deducted_net_income"
+              ],
+              "tracks": [
+                "quality_discount",
+                "garp"
+              ],
+              "window": "latest_comparable_ttm_and_configured_growth"
+            },
+            "earnings_yield": {
+              "alias": null,
+              "formula": "100*deducted_profit_ttm/current_mcap",
+              "gate": "absolute_valuation",
+              "label": "扣非盈利收益率（百分数）",
+              "missing_policy": "insufficient",
+              "sources": [
+                "deducted_net_income"
+              ],
+              "tracks": [
+                "quality_discount"
+              ],
+              "window": "latest_comparable_ttm_and_same_day_cap"
+            },
+            "economic_dilution": {
+              "alias": "dilution_rate",
+              "formula": "end_shares/(start_shares*structural_factors)-1",
+              "gate": "dilution",
+              "label": "经济稀释率",
+              "missing_policy": "insufficient",
+              "sources": [
+                "shares"
+              ],
+              "tracks": [
+                "quality_discount",
+                "deep_value",
+                "garp"
+              ],
+              "window": "configured_dilution_endpoints_and_covered_actions"
+            },
+            "gross_issuance_rate": {
+              "alias": null,
+              "formula": "capital_change_audit.gross_issuance_rate",
+              "gate": null,
+              "label": "毛发行率",
+              "missing_policy": "shadow",
+              "sources": [
+                "shares"
+              ],
+              "tracks": [
+                "quality_discount",
+                "deep_value",
+                "garp"
+              ],
+              "window": "configured_dilution_endpoints_and_covered_actions"
+            },
+            "normalized_earnings": {
+              "alias": null,
+              "formula": "median(exact_five_annual.deducted_net_income)",
+              "gate": "normalized_earnings",
+              "label": "五年正常化扣非盈利",
+              "missing_policy": "insufficient",
+              "sources": [
+                "deducted_net_income"
+              ],
+              "tracks": [
+                "quality_discount",
+                "deep_value"
+              ],
+              "window": "five_consecutive_annuals"
+            },
+            "normalized_pe": {
+              "alias": null,
+              "formula": "current_mcap/normalized_earnings",
+              "gate": "normalized_valuation",
+              "label": "正常化 PE",
+              "missing_policy": "insufficient",
+              "sources": [
+                "deducted_net_income"
+              ],
+              "tracks": [
+                "quality_discount",
+                "deep_value"
+              ],
+              "window": "five_consecutive_annuals_and_same_day_cap"
+            },
+            "pe_deducted_ttm": {
+              "alias": null,
+              "formula": "current_mcap/deducted_profit_ttm",
+              "gate": "valuation",
+              "label": "当前扣非 PE",
+              "missing_policy": "insufficient",
+              "sources": [
+                "deducted_net_income"
+              ],
+              "tracks": [
+                "quality_discount",
+                "garp"
+              ],
+              "window": "latest_comparable_ttm_and_same_day_cap"
+            }
+          },
+          "normalized_sensitivity_years": [
+            7,
+            10
+          ],
+          "ordinary_pe_history_label": "普通 PE 历史位置",
+          "shadow_metrics": {
+            "cash_conversion": {
+              "formula": "collection_metrics.cash_conversion",
+              "gate": null,
+              "missing_policy": "shadow",
+              "sources": [
+                "ocf",
+                "net_income"
+              ],
+              "window": "latest_and_prior_comparable_ttm"
+            },
+            "cash_conversion_change": {
+              "formula": "collection_metrics.cash_conversion_change",
+              "gate": null,
+              "missing_policy": "shadow",
+              "sources": [
+                "ocf",
+                "net_income"
+              ],
+              "window": "latest_and_prior_comparable_ttm"
+            },
+            "inventory_ratio": {
+              "formula": "collection_metrics.inventory_ratio",
+              "gate": null,
+              "missing_policy": "shadow",
+              "sources": [
+                "inventory",
+                "revenue"
+              ],
+              "window": "latest_and_prior_comparable_ttm"
+            },
+            "inventory_ratio_change": {
+              "formula": "collection_metrics.inventory_ratio_change",
+              "gate": null,
+              "missing_policy": "shadow",
+              "sources": [
+                "inventory",
+                "revenue"
+              ],
+              "window": "latest_and_prior_comparable_ttm"
+            },
+            "prior_cash_conversion": {
+              "formula": "collection_metrics.prior_cash_conversion",
+              "gate": null,
+              "missing_policy": "shadow",
+              "sources": [
+                "ocf",
+                "net_income"
+              ],
+              "window": "latest_and_prior_comparable_ttm"
+            },
+            "prior_inventory_ratio": {
+              "formula": "collection_metrics.prior_inventory_ratio",
+              "gate": null,
+              "missing_policy": "shadow",
+              "sources": [
+                "inventory",
+                "revenue"
+              ],
+              "window": "latest_and_prior_comparable_ttm"
+            },
+            "prior_receivables_ratio": {
+              "formula": "collection_metrics.prior_receivables_ratio",
+              "gate": null,
+              "missing_policy": "shadow",
+              "sources": [
+                "accounts_receivable",
+                "contract_assets",
+                "revenue"
+              ],
+              "window": "latest_and_prior_comparable_ttm"
+            },
+            "receivables_ratio": {
+              "formula": "collection_metrics.receivables_ratio",
+              "gate": null,
+              "missing_policy": "shadow",
+              "sources": [
+                "accounts_receivable",
+                "contract_assets",
+                "revenue"
+              ],
+              "window": "latest_and_prior_comparable_ttm"
+            },
+            "receivables_ratio_change": {
+              "formula": "collection_metrics.receivables_ratio_change",
+              "gate": null,
+              "missing_policy": "shadow",
+              "sources": [
+                "accounts_receivable",
+                "contract_assets",
+                "revenue"
+              ],
+              "window": "latest_and_prior_comparable_ttm"
+            },
+            "restricted_cash_ratio": {
+              "formula": "collection_metrics.restricted_cash_ratio",
+              "gate": null,
+              "missing_policy": "shadow",
+              "sources": [
+                "restricted_cash",
+                "cash"
+              ],
+              "window": "latest_and_prior_comparable_ttm"
+            }
+          },
+          "source_fields": {
+            "accounts_receivable": {
+              "consolidated_basis": "consolidated",
+              "derivation_formula": null,
+              "field": "ACCOUNTS_RECE",
+              "financial_sector_substitute": null,
+              "missing_policy": "None for absent/null/ambiguous values; never infer zero. Manual review required; zero/missing/full-market audit incomplete.",
+              "period_type": "period_end",
+              "registry": "selection_evidence",
+              "report": "RPT_DMSK_FN_BALANCE",
+              "source_as_of": "NOTICE_DATE (publication); UPDATE_DATE (source revision only)",
+              "trusted": false,
+              "unit": "CNY"
+            },
+            "cash": {
+              "consolidated_basis": "consolidated",
+              "derivation_formula": null,
+              "field": "MONETARYFUNDS",
+              "financial_sector_substitute": "MONETARYFUNDS",
+              "missing_policy": "None when absent; bank monetary funds remain visible but are not used for ROIC without verified interest debt.",
+              "period_type": "period_end",
+              "registry": "legacy_financial",
+              "report": "RPT_DMSK_FN_BALANCE",
+              "source_as_of": "NOTICE_DATE/UPDATE_DATE",
+              "trusted": true,
+              "unit": "CNY"
+            },
+            "contract_assets": {
+              "consolidated_basis": "consolidated",
+              "derivation_formula": null,
+              "field": "CONTRACT_ASSET",
+              "financial_sector_substitute": null,
+              "missing_policy": "None for absent/null/ambiguous values; never infer zero. Manual review required; zero/missing/full-market audit incomplete.",
+              "period_type": "period_end",
+              "registry": "selection_evidence",
+              "report": "RPT_F10_FINANCE_GBALANCE",
+              "source_as_of": "NOTICE_DATE (publication); UPDATE_DATE (source revision only)",
+              "trusted": false,
+              "unit": "CNY"
+            },
+            "deducted_net_income": {
+              "consolidated_basis": "consolidated",
+              "derivation_formula": null,
+              "field": "DEDUCT_PARENT_NETPROFIT",
+              "financial_sector_substitute": "KCFJCXSYJLR",
+              "missing_policy": "None; never substitute reported net income.",
+              "period_type": "cumulative",
+              "registry": "legacy_financial",
+              "report": "RPT_DMSK_FN_INCOME",
+              "source_as_of": "NOTICE_DATE/UPDATE_DATE",
+              "trusted": true,
+              "unit": "CNY"
+            },
+            "interest_expense": {
+              "consolidated_basis": "consolidated",
+              "derivation_formula": null,
+              "field": "FE_INTEREST_EXPENSE",
+              "financial_sector_substitute": null,
+              "missing_policy": "None for absent/null/ambiguous values; never infer zero. Independent finance interest expense only; INTEREST_EXPENSE (financial-subsidiary cost) and net FINANCE_EXPENSE are not aliases. Manual review required; zero/missing/full-market audit incomplete.",
+              "period_type": "cumulative",
+              "registry": "selection_evidence",
+              "report": "RPT_F10_FINANCE_GINCOME",
+              "source_as_of": "NOTICE_DATE (publication); UPDATE_DATE (source revision only)",
+              "trusted": false,
+              "unit": "CNY"
+            },
+            "inventory": {
+              "consolidated_basis": "consolidated",
+              "derivation_formula": null,
+              "field": "INVENTORY",
+              "financial_sector_substitute": null,
+              "missing_policy": "None for absent/null/ambiguous values; never infer zero. Manual review required; zero/missing/full-market audit incomplete.",
+              "period_type": "period_end",
+              "registry": "selection_evidence",
+              "report": "RPT_DMSK_FN_BALANCE",
+              "source_as_of": "NOTICE_DATE (publication); UPDATE_DATE (source revision only)",
+              "trusted": false,
+              "unit": "CNY"
+            },
+            "net_income": {
+              "consolidated_basis": "consolidated",
+              "derivation_formula": null,
+              "field": "PARENT_NETPROFIT",
+              "financial_sector_substitute": "PARENTNETPROFIT",
+              "missing_policy": "None when parent-attributable profit is absent.",
+              "period_type": "cumulative",
+              "registry": "legacy_financial",
+              "report": "RPT_DMSK_FN_INCOME",
+              "source_as_of": "NOTICE_DATE/UPDATE_DATE",
+              "trusted": true,
+              "unit": "CNY"
+            },
+            "ocf": {
+              "consolidated_basis": "consolidated",
+              "derivation_formula": null,
+              "field": "NETCASH_OPERATE",
+              "financial_sector_substitute": "NETCASH_OPERATE_PK",
+              "missing_policy": "None when operating net cash flow is absent.",
+              "period_type": "cumulative",
+              "registry": "legacy_financial",
+              "report": "RPT_DMSK_FN_CASHFLOW",
+              "source_as_of": "NOTICE_DATE/UPDATE_DATE",
+              "trusted": true,
+              "unit": "CNY"
+            },
+            "related_party_funds": {
+              "consolidated_basis": "consolidated",
+              "derivation_formula": null,
+              "field": null,
+              "financial_sector_substitute": null,
+              "missing_policy": "None for absent/null/ambiguous values; never infer zero. Manual review required; zero/missing/full-market audit incomplete.",
+              "period_type": "period_end",
+              "registry": "selection_evidence",
+              "report": null,
+              "source_as_of": "NOTICE_DATE (publication); UPDATE_DATE (source revision only)",
+              "trusted": false,
+              "unit": "CNY"
+            },
+            "restricted_cash": {
+              "consolidated_basis": "consolidated",
+              "derivation_formula": null,
+              "field": null,
+              "financial_sector_substitute": null,
+              "missing_policy": "None for absent/null/ambiguous values; never infer zero. Unmapped: require reviewed restricted monetary funds, not total restricted assets. Missing blocks usable cash and dependent debt/net-cash metrics; independent FCF yield can remain available. Manual review required; zero/missing/full-market audit incomplete.",
+              "period_type": "period_end",
+              "registry": "selection_evidence",
+              "report": null,
+              "source_as_of": "NOTICE_DATE (publication); UPDATE_DATE (source revision only)",
+              "trusted": false,
+              "unit": "CNY"
+            },
+            "revenue": {
+              "consolidated_basis": "consolidated",
+              "derivation_formula": null,
+              "field": "TOTAL_OPERATE_INCOME",
+              "financial_sector_substitute": "TOTALOPERATEREVE",
+              "missing_policy": "None when the reported consolidated line is absent.",
+              "period_type": "cumulative",
+              "registry": "legacy_financial",
+              "report": "RPT_DMSK_FN_INCOME",
+              "source_as_of": "NOTICE_DATE/UPDATE_DATE",
+              "trusted": true,
+              "unit": "CNY"
+            },
+            "shares": {
+              "consolidated_basis": "consolidated",
+              "derivation_formula": null,
+              "field": "TOTAL_SHARE",
+              "financial_sector_substitute": null,
+              "missing_policy": "None unless the exact field is finite and positive; no total-share alias is accepted.",
+              "period_type": "period_end",
+              "registry": "legacy_financial",
+              "report": "RPT_F10_FINANCE_MAINFINADATA",
+              "source_as_of": "NOTICE_DATE/UPDATE_DATE",
+              "trusted": true,
+              "unit": "shares"
+            },
+            "total_equity_including_minority": {
+              "consolidated_basis": "consolidated",
+              "derivation_formula": null,
+              "field": "TOTAL_EQUITY",
+              "financial_sector_substitute": null,
+              "missing_policy": "None for absent/null/ambiguous values; never infer zero. Gross IC requires this minority-inclusive equity plus verified interest debt; never substitute parent-attributable equity. Manual review required; zero/missing/full-market audit incomplete.",
+              "period_type": "period_end",
+              "registry": "selection_evidence",
+              "report": "RPT_DMSK_FN_BALANCE",
+              "source_as_of": "NOTICE_DATE (publication); UPDATE_DATE (source revision only)",
+              "trusted": false,
+              "unit": "CNY"
+            }
+          },
+          "source_mode": "schema4_frozen_evidence",
+          "version": "selection-metrics-v1"
+        },
+        "min_observations": {
+          "bank_capital": 1,
+          "bank_npl": 1,
+          "bank_roe": 5,
+          "cash_conversion": 5,
+          "dilution": 2,
+          "growth": 5,
+          "interest_coverage": 1,
+          "leverage": 1,
+          "margin": 2,
+          "net_assets": 1,
+          "normalized_earnings": 5,
+          "positive_net_income": 5,
+          "roe": 5,
+          "roe_recent": 3,
+          "valuation_pb": 60,
+          "valuation_pe": 60
+        },
+        "missing_policy": {
+          "bank_capital_adequacy": "insufficient",
+          "bank_core_tier1_capital_adequacy": "insufficient",
+          "bank_npl": "insufficient",
+          "bridge_error": "shadow",
+          "cancellation_rate": "shadow",
+          "cash_conversion": "insufficient",
+          "cash_to_assets": "insufficient",
+          "code": "insufficient",
+          "debt_to_equity": "insufficient",
+          "deducted_peg": "insufficient",
+          "deducted_profit_cagr": "insufficient",
+          "dilution_rate": "insufficient",
+          "earnings_yield": "insufficient",
+          "economic_dilution": "insufficient",
+          "gross_issuance_rate": "shadow",
+          "interest_coverage": "insufficient",
+          "interest_debt_to_assets": "insufficient",
+          "latest_net_assets": "insufficient",
+          "latest_net_income": "insufficient",
+          "listing_years": "insufficient",
+          "margin_change": "insufficient",
+          "normalized_earnings": "insufficient",
+          "normalized_pe": "insufficient",
+          "pb_median_ratio": "insufficient",
+          "pb_percentile": "insufficient",
+          "pe_deducted_ttm": "insufficient",
+          "pe_median_ratio": "insufficient",
+          "pe_percentile": "insufficient",
+          "peg": "insufficient",
+          "positive_net_income_observations": "insufficient",
+          "roe_downside_volatility": "insufficient",
+          "roe_mean": "insufficient",
+          "roe_recent_ratio": "insufficient"
+        },
+        "operating_policy": {},
+        "order": [
+          [
+            "pe_percentile",
+            "asc",
+            "nulls_last"
+          ],
+          [
+            "roe_downside_volatility",
+            "asc",
+            "nulls_last"
+          ],
+          [
+            "cash_conversion",
+            "desc",
+            "nulls_last"
+          ],
+          [
+            "code",
+            "asc",
+            "nulls_last"
+          ]
+        ],
+        "ranking_contract": {
+          "annual_risk_policy": {
+            "deducted_drop_max": "-0.15",
+            "fcf_min_observations": 3,
+            "fcf_window_years": 5,
+            "goodwill_to_equity_min": "0.25",
+            "negative_fcf_years": 2,
+            "pb_min": "8",
+            "recent_cash_conversion_max": "0.4",
+            "roe_decline_min": "4",
+            "roe_mean_min": "50",
+            "roe_window_years": 4,
+            "version": "annual-risk-v1"
+          },
+          "branch_orders": {
+            "bank": [
+              [
+                "pb_percentile",
+                "asc"
+              ],
+              [
+                "roe_mean",
+                "desc"
+              ],
+              [
+                "bank_core_tier1_capital_adequacy",
+                "desc"
+              ]
+            ],
+            "cyclical": [
+              [
+                "pb_percentile",
+                "asc"
+              ],
+              [
+                "normalized_pe",
+                "asc"
+              ],
+              [
+                "cash_conversion",
+                "desc"
+              ]
+            ],
+            "nonfinancial": [
+              [
+                "pe_percentile",
+                "asc"
+              ],
+              [
+                "roe_downside_volatility",
+                "asc"
+              ],
+              [
+                "cash_conversion",
+                "desc"
+              ]
+            ],
+            "unknown": []
+          },
+          "industry_cap": 2,
+          "risk_policy": {
+            "operating_states": {
+              "deteriorating": "deteriorating",
+              "improving": "clear",
+              "stable": "clear",
+              "unknown": "unknown"
+            },
+            "verified_risk_types": {
+              "acquisition_cash_to_revenue_worsening": "watch",
+              "annual_deducted_drop": "watch",
+              "cash_debt_double_high": "watch",
+              "consecutive_negative_fcf": "watch",
+              "deducted_profit_growth_slowdown_worsening": "watch",
+              "dilution_rate_worsening": "watch",
+              "earnings_decline_worsening": "watch",
+              "goodwill_bloat": "watch",
+              "goodwill_increase_to_revenue_worsening": "watch",
+              "gross_margin_change_deterioration": "watch",
+              "interest_debt_increase_to_revenue_worsening": "watch",
+              "margin_deterioration": "watch",
+              "negative_5y_fcf": "watch",
+              "net_margin_change_deterioration": "watch",
+              "npl_change_worsening": "watch",
+              "recent_ocf_collapse": "watch",
+              "revenue_decline_worsening": "watch",
+              "revenue_growth_slowdown_worsening": "watch",
+              "roe_step_down_3y": "watch",
+              "thin_equity_high_pb": "watch"
+            }
+          },
+          "total_cap": 15,
+          "version": "selection-ranking-v1"
+        },
+        "scope": "weekly-discovery",
+        "sector_branches": {
+          "bank": {
+            "gate_order": [
+              "listing_age",
+              "positive_equity",
+              "bank_roe",
+              "bank_capital",
+              "bank_npl",
+              "bank_valuation"
+            ],
+            "latest_net_income_policy": "ignore",
+            "margin_deterioration_policy": "evidence",
+            "valuation_policy": "pb"
+          },
+          "branch_policies": {
+            "bank": "bank",
+            "insurance": "unsupported",
+            "nonfinancial": "industry_map",
+            "other_financial": "unsupported",
+            "unknown": "insufficient"
+          },
+          "common": {
+            "field_domain_policy": "quality-domain-v1",
+            "latest_annual_staleness_years": 1,
+            "lookback_windows": {
+              "bank_capital": 5,
+              "bank_npl": 5,
+              "cash_conversion": 5,
+              "dilution": 5,
+              "growth": 5,
+              "interest_coverage": 1,
+              "leverage": 1,
+              "margin": 5,
+              "normalized_earnings": 5,
+              "positive_equity": 1,
+              "profitability": 5,
+              "roe": 10,
+              "roe_recent": 3
+            },
+            "valuation_ratio_method": "PE_TTM/PB_MRQ"
+          },
+          "cyclical": {
+            "gate_order": [
+              "listing_age",
+              "roe_mean",
+              "roe_stability",
+              "profitability",
+              "positive_equity",
+              "cash_conversion",
+              "dilution",
+              "leverage",
+              "interest_coverage",
+              "cash_debt",
+              "margin",
+              "normalized_earnings_positive",
+              "cyclical_valuation"
+            ],
+            "latest_net_income_policy": "require_positive",
+            "margin_deterioration_policy": "evidence",
+            "valuation_policy": "pb"
+          },
+          "industry_map": {
+            "bank": [
+              "银行"
+            ],
+            "cyclical": [
+              "光伏设备",
+              "养殖业",
+              "冶钢原料",
+              "化学原料",
+              "小金属",
+              "工业金属",
+              "普钢",
+              "煤炭开采",
+              "特钢Ⅱ",
+              "能源金属",
+              "航运港口",
+              "装修建材",
+              "贵金属"
+            ],
+            "nonfinancial": [
+              "制造业"
+            ]
+          },
+          "nonfinancial": {
+            "gate_order": [
+              "listing_age",
+              "roe_mean",
+              "roe_stability",
+              "roe_trend",
+              "profitability",
+              "positive_equity",
+              "cash_conversion",
+              "dilution",
+              "leverage",
+              "interest_coverage",
+              "cash_debt",
+              "margin",
+              "valuation",
+              "absolute_valuation"
+            ],
+            "latest_net_income_policy": "require_positive",
+            "margin_deterioration_policy": "evidence",
+            "valuation_policy": "both"
+          }
+        },
+        "thresholds": {
+          "bank_capital_adequacy_min": "14",
+          "bank_core_tier1_min": "10",
+          "bank_npl_max": "1.5",
+          "bank_roe_min": "12",
+          "cash_conversion_min": "1.1",
+          "cash_to_assets_min": "0.15",
+          "debt_to_equity_max": "0.7",
+          "dilution_rate_max": "0",
+          "earnings_yield_spread_min": "4",
+          "interest_coverage_min": "5",
+          "interest_debt_to_assets_min": "0.15",
+          "listing_years_min": "5",
+          "margin_deterioration_max": "1",
+          "net_assets_positive_min": "0",
+          "net_income_positive_min": "0",
+          "normalized_earnings_min": "0",
+          "normalized_pe_max": "12",
+          "pb_median_ratio_max": "0.7",
+          "pb_percentile_max": "20",
+          "pe_median_ratio_max": "0.7",
+          "pe_percentile_max": "20",
+          "peg_growth_cap": "0.25",
+          "peg_release_max": "1",
+          "readiness_min": "0.9",
+          "roe_downside_volatility_max": "0.2",
+          "roe_mean_min": "15",
+          "roe_recent_ratio_min": "0.9",
+          "treasury_yield": "1.69"
+        },
+        "track": "quality_discount"
+      },
+      "ruler_digest": "80e497ac53790cf84ca5db93b8fab6bde28249a606b52014f3b7d302dd17ec59"
+    },
+    "relaxed": {
+      "counts": null,
+      "ranking_audit": {},
+      "results": [],
+      "ruler": {
+        "algorithm_version": "discovery-v8",
+        "fields": [
+          "listing_years",
+          "roe_mean",
+          "roe_downside_volatility",
+          "roe_recent_ratio",
+          "positive_net_income_observations",
+          "latest_net_income",
+          "latest_net_assets",
+          "cash_conversion",
+          "dilution_rate",
+          "debt_to_equity",
+          "cash_to_assets",
+          "interest_debt_to_assets",
+          "interest_coverage",
+          "margin_change",
+          "pe_percentile",
+          "pe_median_ratio",
+          "pb_percentile",
+          "pb_median_ratio",
+          "normalized_earnings",
+          "normalized_pe",
+          "earnings_yield",
+          "deducted_profit_cagr",
+          "peg",
+          "bank_capital_adequacy",
+          "bank_core_tier1_capital_adequacy",
+          "bank_npl",
+          "code",
+          "economic_dilution",
+          "gross_issuance_rate",
+          "cancellation_rate",
+          "bridge_error",
+          "pe_deducted_ttm",
+          "deducted_peg"
+        ],
+        "formulas": {
+          "bank_capital_adequacy": "latest(annual.capital_adequacy)",
+          "bank_core_tier1_capital_adequacy": "latest(annual.core_tier1_capital_adequacy)",
+          "bank_npl": "latest(annual.npl)",
+          "bridge_error": "capital_change_audit.max_absolute_share_error",
+          "cancellation_rate": "capital_change_audit.cancellation_rate",
+          "cash_conversion": "sum(annual.ocf)/sum(annual.net_income)|annual.net_income>0",
+          "cash_to_assets": "latest(annual.cash)/latest(annual.total_assets)",
+          "debt_to_equity": "latest(annual.interest_debt)/latest(annual.net_assets)",
+          "deducted_peg": "(current_mcap/deducted_profit_ttm)/(min(deducted_profit_cagr,0.25)*100)",
+          "deducted_profit_cagr": "cagr(annual.deducted_net_income,growth)",
+          "dilution_rate": "alias(economic_dilution)",
+          "earnings_yield": "100*deducted_profit_ttm/current_mcap",
+          "economic_dilution": "end_shares/(start_shares*structural_factors)-1",
+          "gross_issuance_rate": "capital_change_audit.gross_issuance_rate",
+          "interest_coverage": "latest(annual.interest_coverage)",
+          "interest_debt_to_assets": "latest(annual.interest_debt)/latest(annual.total_assets)",
+          "latest_net_assets": "latest(annual.net_assets)",
+          "latest_net_income": "latest(annual.net_income)",
+          "margin_change": "latest(annual.gross_margin)-earliest(annual.gross_margin)",
+          "normalized_earnings": "median(exact_five_annual.deducted_net_income)",
+          "normalized_pe": "current_mcap/normalized_earnings",
+          "pb_median_ratio": "current.pb/median(monthly.pb)",
+          "pb_percentile": "percentile_rank(current.pb,monthly.pb)",
+          "pe_deducted_ttm": "current_mcap/deducted_profit_ttm",
+          "pe_median_ratio": "current.pe/median(monthly.pe)",
+          "pe_percentile": "percentile_rank(current.pe,monthly.pe)",
+          "peg": "alias(deducted_peg)",
+          "positive_net_income_observations": "count(annual.net_income>0)",
+          "roe_downside_volatility": "downside_volatility(annual.roe)",
+          "roe_mean": "mean(annual.roe)",
+          "roe_recent_ratio": "mean(recent.roe)/mean(annual.roe)"
+        },
+        "industry_version": "candidate-unreviewed",
+        "metric_contract": {
+          "classification": "frozen_company_classification",
+          "collection_effect": "shadow_only",
+          "collection_policy": {
+            "receivables_ratio_increase_min": "0.05",
+            "restricted_cash_ratio_min": "0.20",
+            "version": "collection-v1"
+          },
+          "current_mcap": "verified_same_company_market_day_quote",
+          "metrics": {
+            "bridge_error": {
+              "alias": null,
+              "formula": "capital_change_audit.max_absolute_share_error",
+              "gate": null,
+              "label": "股本衔接差额（股）",
+              "missing_policy": "shadow",
+              "sources": [
+                "shares"
+              ],
+              "tracks": [
+                "quality_discount",
+                "deep_value",
+                "garp"
+              ],
+              "window": "configured_dilution_endpoints_and_covered_actions"
+            },
+            "cancellation_rate": {
+              "alias": null,
+              "formula": "capital_change_audit.cancellation_rate",
+              "gate": null,
+              "label": "注销率",
+              "missing_policy": "shadow",
+              "sources": [
+                "shares"
+              ],
+              "tracks": [
+                "quality_discount",
+                "deep_value",
+                "garp"
+              ],
+              "window": "configured_dilution_endpoints_and_covered_actions"
+            },
+            "deducted_peg": {
+              "alias": "peg",
+              "formula": "(current_mcap/deducted_profit_ttm)/(min(deducted_profit_cagr,0.25)*100)",
+              "gate": "peg",
+              "label": "扣非 PEG",
+              "missing_policy": "insufficient",
+              "sources": [
+                "deducted_net_income"
+              ],
+              "tracks": [
+                "quality_discount",
+                "garp"
+              ],
+              "window": "latest_comparable_ttm_and_configured_growth"
+            },
+            "earnings_yield": {
+              "alias": null,
+              "formula": "100*deducted_profit_ttm/current_mcap",
+              "gate": "absolute_valuation",
+              "label": "扣非盈利收益率（百分数）",
+              "missing_policy": "insufficient",
+              "sources": [
+                "deducted_net_income"
+              ],
+              "tracks": [
+                "quality_discount"
+              ],
+              "window": "latest_comparable_ttm_and_same_day_cap"
+            },
+            "economic_dilution": {
+              "alias": "dilution_rate",
+              "formula": "end_shares/(start_shares*structural_factors)-1",
+              "gate": "dilution",
+              "label": "经济稀释率",
+              "missing_policy": "insufficient",
+              "sources": [
+                "shares"
+              ],
+              "tracks": [
+                "quality_discount",
+                "deep_value",
+                "garp"
+              ],
+              "window": "configured_dilution_endpoints_and_covered_actions"
+            },
+            "gross_issuance_rate": {
+              "alias": null,
+              "formula": "capital_change_audit.gross_issuance_rate",
+              "gate": null,
+              "label": "毛发行率",
+              "missing_policy": "shadow",
+              "sources": [
+                "shares"
+              ],
+              "tracks": [
+                "quality_discount",
+                "deep_value",
+                "garp"
+              ],
+              "window": "configured_dilution_endpoints_and_covered_actions"
+            },
+            "normalized_earnings": {
+              "alias": null,
+              "formula": "median(exact_five_annual.deducted_net_income)",
+              "gate": "normalized_earnings",
+              "label": "五年正常化扣非盈利",
+              "missing_policy": "insufficient",
+              "sources": [
+                "deducted_net_income"
+              ],
+              "tracks": [
+                "quality_discount",
+                "deep_value"
+              ],
+              "window": "five_consecutive_annuals"
+            },
+            "normalized_pe": {
+              "alias": null,
+              "formula": "current_mcap/normalized_earnings",
+              "gate": "normalized_valuation",
+              "label": "正常化 PE",
+              "missing_policy": "insufficient",
+              "sources": [
+                "deducted_net_income"
+              ],
+              "tracks": [
+                "quality_discount",
+                "deep_value"
+              ],
+              "window": "five_consecutive_annuals_and_same_day_cap"
+            },
+            "pe_deducted_ttm": {
+              "alias": null,
+              "formula": "current_mcap/deducted_profit_ttm",
+              "gate": "valuation",
+              "label": "当前扣非 PE",
+              "missing_policy": "insufficient",
+              "sources": [
+                "deducted_net_income"
+              ],
+              "tracks": [
+                "quality_discount",
+                "garp"
+              ],
+              "window": "latest_comparable_ttm_and_same_day_cap"
+            }
+          },
+          "normalized_sensitivity_years": [
+            7,
+            10
+          ],
+          "ordinary_pe_history_label": "普通 PE 历史位置",
+          "shadow_metrics": {
+            "cash_conversion": {
+              "formula": "collection_metrics.cash_conversion",
+              "gate": null,
+              "missing_policy": "shadow",
+              "sources": [
+                "ocf",
+                "net_income"
+              ],
+              "window": "latest_and_prior_comparable_ttm"
+            },
+            "cash_conversion_change": {
+              "formula": "collection_metrics.cash_conversion_change",
+              "gate": null,
+              "missing_policy": "shadow",
+              "sources": [
+                "ocf",
+                "net_income"
+              ],
+              "window": "latest_and_prior_comparable_ttm"
+            },
+            "inventory_ratio": {
+              "formula": "collection_metrics.inventory_ratio",
+              "gate": null,
+              "missing_policy": "shadow",
+              "sources": [
+                "inventory",
+                "revenue"
+              ],
+              "window": "latest_and_prior_comparable_ttm"
+            },
+            "inventory_ratio_change": {
+              "formula": "collection_metrics.inventory_ratio_change",
+              "gate": null,
+              "missing_policy": "shadow",
+              "sources": [
+                "inventory",
+                "revenue"
+              ],
+              "window": "latest_and_prior_comparable_ttm"
+            },
+            "prior_cash_conversion": {
+              "formula": "collection_metrics.prior_cash_conversion",
+              "gate": null,
+              "missing_policy": "shadow",
+              "sources": [
+                "ocf",
+                "net_income"
+              ],
+              "window": "latest_and_prior_comparable_ttm"
+            },
+            "prior_inventory_ratio": {
+              "formula": "collection_metrics.prior_inventory_ratio",
+              "gate": null,
+              "missing_policy": "shadow",
+              "sources": [
+                "inventory",
+                "revenue"
+              ],
+              "window": "latest_and_prior_comparable_ttm"
+            },
+            "prior_receivables_ratio": {
+              "formula": "collection_metrics.prior_receivables_ratio",
+              "gate": null,
+              "missing_policy": "shadow",
+              "sources": [
+                "accounts_receivable",
+                "contract_assets",
+                "revenue"
+              ],
+              "window": "latest_and_prior_comparable_ttm"
+            },
+            "receivables_ratio": {
+              "formula": "collection_metrics.receivables_ratio",
+              "gate": null,
+              "missing_policy": "shadow",
+              "sources": [
+                "accounts_receivable",
+                "contract_assets",
+                "revenue"
+              ],
+              "window": "latest_and_prior_comparable_ttm"
+            },
+            "receivables_ratio_change": {
+              "formula": "collection_metrics.receivables_ratio_change",
+              "gate": null,
+              "missing_policy": "shadow",
+              "sources": [
+                "accounts_receivable",
+                "contract_assets",
+                "revenue"
+              ],
+              "window": "latest_and_prior_comparable_ttm"
+            },
+            "restricted_cash_ratio": {
+              "formula": "collection_metrics.restricted_cash_ratio",
+              "gate": null,
+              "missing_policy": "shadow",
+              "sources": [
+                "restricted_cash",
+                "cash"
+              ],
+              "window": "latest_and_prior_comparable_ttm"
+            }
+          },
+          "source_fields": {
+            "accounts_receivable": {
+              "consolidated_basis": "consolidated",
+              "derivation_formula": null,
+              "field": "ACCOUNTS_RECE",
+              "financial_sector_substitute": null,
+              "missing_policy": "None for absent/null/ambiguous values; never infer zero. Manual review required; zero/missing/full-market audit incomplete.",
+              "period_type": "period_end",
+              "registry": "selection_evidence",
+              "report": "RPT_DMSK_FN_BALANCE",
+              "source_as_of": "NOTICE_DATE (publication); UPDATE_DATE (source revision only)",
+              "trusted": false,
+              "unit": "CNY"
+            },
+            "cash": {
+              "consolidated_basis": "consolidated",
+              "derivation_formula": null,
+              "field": "MONETARYFUNDS",
+              "financial_sector_substitute": "MONETARYFUNDS",
+              "missing_policy": "None when absent; bank monetary funds remain visible but are not used for ROIC without verified interest debt.",
+              "period_type": "period_end",
+              "registry": "legacy_financial",
+              "report": "RPT_DMSK_FN_BALANCE",
+              "source_as_of": "NOTICE_DATE/UPDATE_DATE",
+              "trusted": true,
+              "unit": "CNY"
+            },
+            "contract_assets": {
+              "consolidated_basis": "consolidated",
+              "derivation_formula": null,
+              "field": "CONTRACT_ASSET",
+              "financial_sector_substitute": null,
+              "missing_policy": "None for absent/null/ambiguous values; never infer zero. Manual review required; zero/missing/full-market audit incomplete.",
+              "period_type": "period_end",
+              "registry": "selection_evidence",
+              "report": "RPT_F10_FINANCE_GBALANCE",
+              "source_as_of": "NOTICE_DATE (publication); UPDATE_DATE (source revision only)",
+              "trusted": false,
+              "unit": "CNY"
+            },
+            "deducted_net_income": {
+              "consolidated_basis": "consolidated",
+              "derivation_formula": null,
+              "field": "DEDUCT_PARENT_NETPROFIT",
+              "financial_sector_substitute": "KCFJCXSYJLR",
+              "missing_policy": "None; never substitute reported net income.",
+              "period_type": "cumulative",
+              "registry": "legacy_financial",
+              "report": "RPT_DMSK_FN_INCOME",
+              "source_as_of": "NOTICE_DATE/UPDATE_DATE",
+              "trusted": true,
+              "unit": "CNY"
+            },
+            "interest_expense": {
+              "consolidated_basis": "consolidated",
+              "derivation_formula": null,
+              "field": "FE_INTEREST_EXPENSE",
+              "financial_sector_substitute": null,
+              "missing_policy": "None for absent/null/ambiguous values; never infer zero. Independent finance interest expense only; INTEREST_EXPENSE (financial-subsidiary cost) and net FINANCE_EXPENSE are not aliases. Manual review required; zero/missing/full-market audit incomplete.",
+              "period_type": "cumulative",
+              "registry": "selection_evidence",
+              "report": "RPT_F10_FINANCE_GINCOME",
+              "source_as_of": "NOTICE_DATE (publication); UPDATE_DATE (source revision only)",
+              "trusted": false,
+              "unit": "CNY"
+            },
+            "inventory": {
+              "consolidated_basis": "consolidated",
+              "derivation_formula": null,
+              "field": "INVENTORY",
+              "financial_sector_substitute": null,
+              "missing_policy": "None for absent/null/ambiguous values; never infer zero. Manual review required; zero/missing/full-market audit incomplete.",
+              "period_type": "period_end",
+              "registry": "selection_evidence",
+              "report": "RPT_DMSK_FN_BALANCE",
+              "source_as_of": "NOTICE_DATE (publication); UPDATE_DATE (source revision only)",
+              "trusted": false,
+              "unit": "CNY"
+            },
+            "net_income": {
+              "consolidated_basis": "consolidated",
+              "derivation_formula": null,
+              "field": "PARENT_NETPROFIT",
+              "financial_sector_substitute": "PARENTNETPROFIT",
+              "missing_policy": "None when parent-attributable profit is absent.",
+              "period_type": "cumulative",
+              "registry": "legacy_financial",
+              "report": "RPT_DMSK_FN_INCOME",
+              "source_as_of": "NOTICE_DATE/UPDATE_DATE",
+              "trusted": true,
+              "unit": "CNY"
+            },
+            "ocf": {
+              "consolidated_basis": "consolidated",
+              "derivation_formula": null,
+              "field": "NETCASH_OPERATE",
+              "financial_sector_substitute": "NETCASH_OPERATE_PK",
+              "missing_policy": "None when operating net cash flow is absent.",
+              "period_type": "cumulative",
+              "registry": "legacy_financial",
+              "report": "RPT_DMSK_FN_CASHFLOW",
+              "source_as_of": "NOTICE_DATE/UPDATE_DATE",
+              "trusted": true,
+              "unit": "CNY"
+            },
+            "related_party_funds": {
+              "consolidated_basis": "consolidated",
+              "derivation_formula": null,
+              "field": null,
+              "financial_sector_substitute": null,
+              "missing_policy": "None for absent/null/ambiguous values; never infer zero. Manual review required; zero/missing/full-market audit incomplete.",
+              "period_type": "period_end",
+              "registry": "selection_evidence",
+              "report": null,
+              "source_as_of": "NOTICE_DATE (publication); UPDATE_DATE (source revision only)",
+              "trusted": false,
+              "unit": "CNY"
+            },
+            "restricted_cash": {
+              "consolidated_basis": "consolidated",
+              "derivation_formula": null,
+              "field": null,
+              "financial_sector_substitute": null,
+              "missing_policy": "None for absent/null/ambiguous values; never infer zero. Unmapped: require reviewed restricted monetary funds, not total restricted assets. Missing blocks usable cash and dependent debt/net-cash metrics; independent FCF yield can remain available. Manual review required; zero/missing/full-market audit incomplete.",
+              "period_type": "period_end",
+              "registry": "selection_evidence",
+              "report": null,
+              "source_as_of": "NOTICE_DATE (publication); UPDATE_DATE (source revision only)",
+              "trusted": false,
+              "unit": "CNY"
+            },
+            "revenue": {
+              "consolidated_basis": "consolidated",
+              "derivation_formula": null,
+              "field": "TOTAL_OPERATE_INCOME",
+              "financial_sector_substitute": "TOTALOPERATEREVE",
+              "missing_policy": "None when the reported consolidated line is absent.",
+              "period_type": "cumulative",
+              "registry": "legacy_financial",
+              "report": "RPT_DMSK_FN_INCOME",
+              "source_as_of": "NOTICE_DATE/UPDATE_DATE",
+              "trusted": true,
+              "unit": "CNY"
+            },
+            "shares": {
+              "consolidated_basis": "consolidated",
+              "derivation_formula": null,
+              "field": "TOTAL_SHARE",
+              "financial_sector_substitute": null,
+              "missing_policy": "None unless the exact field is finite and positive; no total-share alias is accepted.",
+              "period_type": "period_end",
+              "registry": "legacy_financial",
+              "report": "RPT_F10_FINANCE_MAINFINADATA",
+              "source_as_of": "NOTICE_DATE/UPDATE_DATE",
+              "trusted": true,
+              "unit": "shares"
+            },
+            "total_equity_including_minority": {
+              "consolidated_basis": "consolidated",
+              "derivation_formula": null,
+              "field": "TOTAL_EQUITY",
+              "financial_sector_substitute": null,
+              "missing_policy": "None for absent/null/ambiguous values; never infer zero. Gross IC requires this minority-inclusive equity plus verified interest debt; never substitute parent-attributable equity. Manual review required; zero/missing/full-market audit incomplete.",
+              "period_type": "period_end",
+              "registry": "selection_evidence",
+              "report": "RPT_DMSK_FN_BALANCE",
+              "source_as_of": "NOTICE_DATE (publication); UPDATE_DATE (source revision only)",
+              "trusted": false,
+              "unit": "CNY"
+            }
+          },
+          "source_mode": "schema4_frozen_evidence",
+          "version": "selection-metrics-v1"
+        },
+        "min_observations": {
+          "bank_capital": 1,
+          "bank_npl": 1,
+          "bank_roe": 5,
+          "cash_conversion": 5,
+          "dilution": 2,
+          "growth": 5,
+          "interest_coverage": 1,
+          "leverage": 1,
+          "margin": 2,
+          "net_assets": 1,
+          "normalized_earnings": 5,
+          "positive_net_income": 5,
+          "roe": 5,
+          "roe_recent": 3,
+          "valuation_pb": 60,
+          "valuation_pe": 60
+        },
+        "missing_policy": {
+          "bank_capital_adequacy": "insufficient",
+          "bank_core_tier1_capital_adequacy": "insufficient",
+          "bank_npl": "insufficient",
+          "bridge_error": "shadow",
+          "cancellation_rate": "shadow",
+          "cash_conversion": "insufficient",
+          "cash_to_assets": "insufficient",
+          "code": "insufficient",
+          "debt_to_equity": "insufficient",
+          "deducted_peg": "insufficient",
+          "deducted_profit_cagr": "insufficient",
+          "dilution_rate": "insufficient",
+          "earnings_yield": "insufficient",
+          "economic_dilution": "insufficient",
+          "gross_issuance_rate": "shadow",
+          "interest_coverage": "insufficient",
+          "interest_debt_to_assets": "insufficient",
+          "latest_net_assets": "insufficient",
+          "latest_net_income": "insufficient",
+          "listing_years": "insufficient",
+          "margin_change": "insufficient",
+          "normalized_earnings": "insufficient",
+          "normalized_pe": "insufficient",
+          "pb_median_ratio": "insufficient",
+          "pb_percentile": "insufficient",
+          "pe_deducted_ttm": "insufficient",
+          "pe_median_ratio": "insufficient",
+          "pe_percentile": "insufficient",
+          "peg": "insufficient",
+          "positive_net_income_observations": "insufficient",
+          "roe_downside_volatility": "insufficient",
+          "roe_mean": "insufficient",
+          "roe_recent_ratio": "insufficient"
+        },
+        "operating_policy": {},
+        "order": [
+          [
+            "pe_percentile",
+            "asc",
+            "nulls_last"
+          ],
+          [
+            "roe_downside_volatility",
+            "asc",
+            "nulls_last"
+          ],
+          [
+            "cash_conversion",
+            "desc",
+            "nulls_last"
+          ],
+          [
+            "code",
+            "asc",
+            "nulls_last"
+          ]
+        ],
+        "ranking_contract": {
+          "annual_risk_policy": {
+            "deducted_drop_max": "-0.15",
+            "fcf_min_observations": 3,
+            "fcf_window_years": 5,
+            "goodwill_to_equity_min": "0.25",
+            "negative_fcf_years": 2,
+            "pb_min": "8",
+            "recent_cash_conversion_max": "0.4",
+            "roe_decline_min": "4",
+            "roe_mean_min": "50",
+            "roe_window_years": 4,
+            "version": "annual-risk-v1"
+          },
+          "branch_orders": {
+            "bank": [
+              [
+                "pb_percentile",
+                "asc"
+              ],
+              [
+                "roe_mean",
+                "desc"
+              ],
+              [
+                "bank_core_tier1_capital_adequacy",
+                "desc"
+              ]
+            ],
+            "cyclical": [
+              [
+                "pb_percentile",
+                "asc"
+              ],
+              [
+                "normalized_pe",
+                "asc"
+              ],
+              [
+                "cash_conversion",
+                "desc"
+              ]
+            ],
+            "nonfinancial": [
+              [
+                "pe_percentile",
+                "asc"
+              ],
+              [
+                "roe_downside_volatility",
+                "asc"
+              ],
+              [
+                "cash_conversion",
+                "desc"
+              ]
+            ],
+            "unknown": []
+          },
+          "industry_cap": 2,
+          "risk_policy": {
+            "operating_states": {
+              "deteriorating": "deteriorating",
+              "improving": "clear",
+              "stable": "clear",
+              "unknown": "unknown"
+            },
+            "verified_risk_types": {
+              "acquisition_cash_to_revenue_worsening": "watch",
+              "annual_deducted_drop": "watch",
+              "cash_debt_double_high": "watch",
+              "consecutive_negative_fcf": "watch",
+              "deducted_profit_growth_slowdown_worsening": "watch",
+              "dilution_rate_worsening": "watch",
+              "earnings_decline_worsening": "watch",
+              "goodwill_bloat": "watch",
+              "goodwill_increase_to_revenue_worsening": "watch",
+              "gross_margin_change_deterioration": "watch",
+              "interest_debt_increase_to_revenue_worsening": "watch",
+              "margin_deterioration": "watch",
+              "negative_5y_fcf": "watch",
+              "net_margin_change_deterioration": "watch",
+              "npl_change_worsening": "watch",
+              "recent_ocf_collapse": "watch",
+              "revenue_decline_worsening": "watch",
+              "revenue_growth_slowdown_worsening": "watch",
+              "roe_step_down_3y": "watch",
+              "thin_equity_high_pb": "watch"
+            }
+          },
+          "total_cap": 15,
+          "version": "selection-ranking-v1"
+        },
+        "scope": "weekly-discovery",
+        "sector_branches": {
+          "bank": {
+            "gate_order": [
+              "listing_age",
+              "positive_equity",
+              "bank_roe",
+              "bank_capital",
+              "bank_npl",
+              "bank_valuation"
+            ],
+            "latest_net_income_policy": "ignore",
+            "margin_deterioration_policy": "evidence",
+            "valuation_policy": "pb"
+          },
+          "branch_policies": {
+            "bank": "bank",
+            "insurance": "unsupported",
+            "nonfinancial": "industry_map",
+            "other_financial": "unsupported",
+            "unknown": "insufficient"
+          },
+          "common": {
+            "field_domain_policy": "quality-domain-v1",
+            "latest_annual_staleness_years": 1,
+            "lookback_windows": {
+              "bank_capital": 5,
+              "bank_npl": 5,
+              "cash_conversion": 5,
+              "dilution": 5,
+              "growth": 5,
+              "interest_coverage": 1,
+              "leverage": 1,
+              "margin": 5,
+              "normalized_earnings": 5,
+              "positive_equity": 1,
+              "profitability": 5,
+              "roe": 10,
+              "roe_recent": 3
+            },
+            "valuation_ratio_method": "PE_TTM/PB_MRQ"
+          },
+          "cyclical": {
+            "gate_order": [
+              "listing_age",
+              "roe_mean",
+              "roe_stability",
+              "profitability",
+              "positive_equity",
+              "cash_conversion",
+              "dilution",
+              "leverage",
+              "interest_coverage",
+              "cash_debt",
+              "margin",
+              "normalized_earnings_positive",
+              "cyclical_valuation"
+            ],
+            "latest_net_income_policy": "require_positive",
+            "margin_deterioration_policy": "evidence",
+            "valuation_policy": "pb"
+          },
+          "industry_map": {
+            "bank": [
+              "银行"
+            ],
+            "cyclical": [
+              "光伏设备",
+              "养殖业",
+              "冶钢原料",
+              "化学原料",
+              "小金属",
+              "工业金属",
+              "普钢",
+              "煤炭开采",
+              "特钢Ⅱ",
+              "能源金属",
+              "航运港口",
+              "装修建材",
+              "贵金属"
+            ],
+            "nonfinancial": [
+              "制造业"
+            ]
+          },
+          "nonfinancial": {
+            "gate_order": [
+              "listing_age",
+              "roe_mean",
+              "roe_stability",
+              "roe_trend",
+              "profitability",
+              "positive_equity",
+              "cash_conversion",
+              "dilution",
+              "leverage",
+              "interest_coverage",
+              "cash_debt",
+              "margin",
+              "valuation",
+              "absolute_valuation"
+            ],
+            "latest_net_income_policy": "require_positive",
+            "margin_deterioration_policy": "evidence",
+            "valuation_policy": "both"
+          }
+        },
+        "thresholds": {
+          "bank_capital_adequacy_min": "11",
+          "bank_core_tier1_min": "8",
+          "bank_npl_max": "2.5",
+          "bank_roe_min": "8",
+          "cash_conversion_min": "0.8",
+          "cash_to_assets_min": "0.25",
+          "debt_to_equity_max": "1.5",
+          "dilution_rate_max": "0.1",
+          "earnings_yield_spread_min": "2",
+          "interest_coverage_min": "2",
+          "interest_debt_to_assets_min": "0.25",
+          "listing_years_min": "5",
+          "margin_deterioration_max": "3",
+          "net_assets_positive_min": "0",
+          "net_income_positive_min": "0",
+          "normalized_earnings_min": "0",
+          "normalized_pe_max": "18",
+          "pb_median_ratio_max": "0.9",
+          "pb_percentile_max": "40",
+          "pe_median_ratio_max": "0.9",
+          "pe_percentile_max": "40",
+          "peg_growth_cap": "0.25",
+          "peg_release_max": "2",
+          "readiness_min": "0.7",
+          "roe_downside_volatility_max": "0.35",
+          "roe_mean_min": "10",
+          "roe_recent_ratio_min": "0.7",
+          "treasury_yield": "1.69"
+        },
+        "track": "quality_discount"
+      },
+      "ruler_digest": "125932e1944d6e8b1a0950104a925bc33d4c974a1a0db8e02bba763c912705ea"
+    }
+  },
+  "input_fingerprint": null,
+  "operating_policy": {},
+  "outcome_maturity": "not_started",
+  "production_activation": "inactive_T19_required",
+  "sample_count": null,
+  "selection_fundamentals": true,
+  "selection_source_dir": null,
+  "semantic_changes": [
+    "deducted_ttm_valuation",
+    "economic_dilution",
+    "usable_cash_debt",
+    "fractional_gross_roic_candidate_threshold",
+    "branch_normalized_ranking"
+  ],
+  "software_validation": "candidate_contract_validated",
+  "source_mode": "contract_only_no_observations",
+  "source_readiness": "incomplete",
+  "status": "candidate_blocked",
+  "track": "quality_discount"
+}

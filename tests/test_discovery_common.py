@@ -76,12 +76,15 @@ def _freeze_run(
     *,
     week_key="2026-W38",
     ruler_ids=None,
+    published=False,
 ):
-    from discovery.snapshot import freeze_inputs
+    from discovery.snapshot import freeze_inputs, freeze_discovery_ruler_payloads
 
     run = add_unfrozen_run(
         session, week_key=week_key, ruler_ids=ruler_ids
     )
+    if published:
+        run.ruler_payloads_json = freeze_discovery_ruler_payloads(session, ruler_ids, run.algorithm_version)
     freeze_inputs(
         session,
         run,
@@ -472,6 +475,7 @@ def test_classifier_rejects_self_consistent_future_bundle(tmp_path) -> None:
     assert verdict.reason is not None
 
 
+@pytest.mark.usefixtures("isolated_discovery_authority")
 def test_execute_common_stage_persists_canonical_complete_results(tmp_path) -> None:
     from app.discovery_models import (
         DiscoveryCommonResult,
@@ -540,6 +544,7 @@ def test_execute_common_stage_persists_canonical_complete_results(tmp_path) -> N
     engine.dispose()
 
 
+@pytest.mark.usefixtures("isolated_discovery_authority")
 def test_execute_claim_prevents_a_second_session_running_same_attempt(
     tmp_path, monkeypatch
 ) -> None:
@@ -571,6 +576,7 @@ def test_execute_claim_prevents_a_second_session_running_same_attempt(
     engine.dispose()
 
 
+@pytest.mark.usefixtures("isolated_discovery_authority")
 def test_execute_reads_only_frozen_inputs_after_source_mutation(tmp_path) -> None:
     from app.discovery_models import DiscoveryCommonResult
     from app.models import (
@@ -636,6 +642,7 @@ def test_execute_reads_only_frozen_inputs_after_source_mutation(tmp_path) -> Non
         (lambda: InterruptedError("interrupted"), "transient"),
     ],
 )
+@pytest.mark.usefixtures("isolated_discovery_authority")
 def test_execute_failure_is_persisted_without_partial_results(
     tmp_path, monkeypatch, error_factory, failure_kind
 ) -> None:
@@ -671,6 +678,7 @@ def test_execute_failure_is_persisted_without_partial_results(
     engine.dispose()
 
 
+@pytest.mark.usefixtures("isolated_discovery_authority")
 def test_execute_rejects_snapshot_or_stage_identity_mismatch(tmp_path) -> None:
     from app.discovery_models import DiscoveryCommonStage
     from jobs.discovery import execute_common_stage
@@ -692,6 +700,7 @@ def test_execute_rejects_snapshot_or_stage_identity_mismatch(tmp_path) -> None:
     engine.dispose()
 
 
+@pytest.mark.usefixtures("isolated_discovery_authority")
 def test_drain_serializes_cross_table_order_and_releases_lock(
     tmp_path, monkeypatch
 ) -> None:
@@ -790,6 +799,7 @@ def _passing_track_outcome(context, *, codes=None):
     )
 
 
+@pytest.mark.usefixtures("isolated_discovery_authority")
 def test_drain_commits_successful_track_callback_atomically(tmp_path) -> None:
     from app.discovery_models import DiscoveryResult, DiscoveryStage
     from jobs.discovery import drain_run_queue
@@ -825,6 +835,7 @@ def test_drain_commits_successful_track_callback_atomically(tmp_path) -> None:
     engine.dispose()
 
 
+@pytest.mark.usefixtures("isolated_discovery_authority")
 def test_track_stage_loads_only_candidate_companies(tmp_path) -> None:
     from sqlalchemy import update
 
@@ -862,6 +873,7 @@ def test_track_stage_loads_only_candidate_companies(tmp_path) -> None:
     engine.dispose()
 
 
+@pytest.mark.usefixtures("isolated_discovery_authority")
 def test_track_executor_is_pure_and_drain_persists_its_outcome(
     tmp_path,
 ) -> None:
@@ -944,6 +956,7 @@ def test_track_executor_is_pure_and_drain_persists_its_outcome(
         ("ruler_not_ready", (), "ruler_not_ready"),
     ],
 )
+@pytest.mark.usefixtures("isolated_discovery_authority")
 def test_waiting_track_outcome_requires_exact_candidate_code_set(
     tmp_path,
     status: str,
@@ -1060,6 +1073,7 @@ def test_waiting_track_outcome_requires_exact_candidate_code_set(
     engine.dispose()
 
 
+@pytest.mark.usefixtures("isolated_discovery_authority")
 def test_waiting_track_outcome_accepts_empty_exact_candidate_set(
     tmp_path,
 ) -> None:
@@ -1113,7 +1127,7 @@ def test_waiting_track_outcome_accepts_empty_exact_candidate_set(
     engine.dispose()
 
 
-def test_drain_persists_validated_competition_evidence(tmp_path) -> None:
+def test_drain_persists_validated_competition_evidence(tmp_path, monkeypatch) -> None:
     from sqlalchemy import select
 
     from app.discovery_models import DiscoveryEvidence, DiscoveryStage
@@ -1135,15 +1149,17 @@ def test_drain_persists_validated_competition_evidence(tmp_path) -> None:
     )
     from tests.discovery_helpers import discovery_ruler_payload
 
-    engine = init_db(tmp_path / "competition-evidence.db")
+    from tests.test_selection_release import retained_release_fill
+    from scripts.release_selection_v8 import publish_release
+    from discovery.rulers import require_ready
+    path = tmp_path / "competition-evidence.db"
+    from tests.test_selection_release import seed_published_release
+    seed_published_release(path)
+    engine = init_db(path)
     factory = create_session_factory(engine)
     with factory() as session:
         rulers = {
-            track: activate(
-                session,
-                discovery_ruler_payload(track),
-                f"test {track}",
-            ).id
+            track: require_ready(session, track)[0].id
             for track in ("quality_discount", "deep_value", "garp")
         }
         seeded = company("600000.SH")
@@ -1166,6 +1182,7 @@ def test_drain_persists_validated_competition_evidence(tmp_path) -> None:
                         "security": "2026-09-17",
                         "financial": "2026-09-17",
                         "valuation": "2026-09-17",
+                        "decision_cutoff_at": SNAPSHOT_AT.isoformat(),
                     },
                 )
             ],
@@ -1252,6 +1269,7 @@ def test_drain_persists_validated_competition_evidence(tmp_path) -> None:
     engine.dispose()
 
 
+@pytest.mark.usefixtures("isolated_discovery_authority")
 def test_drain_marks_throwing_pure_executor_failed_without_writes(
     tmp_path,
 ) -> None:
@@ -1292,6 +1310,7 @@ def test_drain_marks_throwing_pure_executor_failed_without_writes(
     engine.dispose()
 
 
+@pytest.mark.usefixtures("isolated_discovery_authority")
 def test_drain_integrity_error_rolls_back_and_releases_lock(tmp_path) -> None:
     from app.discovery_models import DiscoveryResult, DiscoveryStage
     from app.models import JobLock
@@ -1327,6 +1346,7 @@ def test_drain_integrity_error_rolls_back_and_releases_lock(tmp_path) -> None:
     engine.dispose()
 
 
+@pytest.mark.usefixtures("isolated_discovery_authority")
 def test_drain_rejects_obsolete_session_executor_signature(tmp_path) -> None:
     from app.discovery_models import DiscoveryResult, DiscoveryStage
     from app.models import JobLock
@@ -1359,6 +1379,7 @@ def test_drain_rejects_obsolete_session_executor_signature(tmp_path) -> None:
     engine.dispose()
 
 
+@pytest.mark.usefixtures("isolated_discovery_authority")
 def test_drain_does_nothing_when_global_lock_is_held(tmp_path) -> None:
     from app.discovery_models import DiscoveryCommonStage
     from jobs.discovery import drain_run_queue
@@ -1385,6 +1406,7 @@ def test_drain_does_nothing_when_global_lock_is_held(tmp_path) -> None:
     engine.dispose()
 
 
+@pytest.mark.usefixtures("isolated_discovery_authority")
 def test_drain_fails_safely_if_track_executor_does_not_advance(tmp_path) -> None:
     from app.models import JobLock
     from jobs.discovery import drain_run_queue
@@ -1412,6 +1434,7 @@ def test_drain_fails_safely_if_track_executor_does_not_advance(tmp_path) -> None
     engine.dispose()
 
 
+@pytest.mark.usefixtures("isolated_discovery_authority")
 def test_startup_recovery_fails_only_running_then_drain_resumes_queued(
     tmp_path,
 ) -> None:
@@ -1517,6 +1540,7 @@ def test_startup_recovery_fails_only_running_then_drain_resumes_queued(
         ("verdict", "{}", "600000.SH", "maybe", 1),
     ],
 )
+@pytest.mark.usefixtures("isolated_discovery_authority")
 def test_track_executor_malformed_output_rolls_back_and_fails_permanent(
     tmp_path,
     fault: str,
@@ -1578,6 +1602,7 @@ def test_track_executor_malformed_output_rolls_back_and_fails_permanent(
     engine.dispose()
 
 
+@pytest.mark.usefixtures("isolated_discovery_authority")
 def test_malformed_pure_outcome_preserves_history_and_continues(
     tmp_path,
 ) -> None:
@@ -1721,6 +1746,7 @@ def test_malformed_pure_outcome_preserves_history_and_continues(
     engine.dispose()
 
 
+@pytest.mark.usefixtures("isolated_discovery_authority")
 def test_old_discovery_worker_cannot_commit_or_release_new_lease(
     tmp_path,
 ) -> None:
@@ -1793,6 +1819,7 @@ def test_old_discovery_worker_cannot_commit_or_release_new_lease(
     engine.dispose()
 
 
+@pytest.mark.usefixtures("isolated_discovery_authority")
 def test_adopted_lease_is_released_when_adoption_and_first_release_fail(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1870,6 +1897,7 @@ def test_adopted_lease_is_released_when_adoption_and_first_release_fail(
     engine.dispose()
 
 
+@pytest.mark.usefixtures("isolated_discovery_authority")
 def test_exclusive_sqlite_adoption_failure_releases_exact_lease(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1959,6 +1987,7 @@ def test_exclusive_sqlite_adoption_failure_releases_exact_lease(
     engine.dispose()
 
 
+@pytest.mark.usefixtures("isolated_discovery_authority")
 def test_pure_executor_has_no_database_handle_and_tracks_continue(
     tmp_path,
 ) -> None:
@@ -2111,6 +2140,7 @@ def test_startup_recovery_preserves_prior_week_running_stages(
     engine.dispose()
 
 
+@pytest.mark.usefixtures("isolated_discovery_authority")
 def test_common_rollover_after_classification_commits_only_running_claim(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2180,7 +2210,7 @@ def test_common_rollover_after_classification_commits_only_running_claim(
 
 
 def test_track_rollover_after_executor_commits_only_running_claim(
-    tmp_path,
+    tmp_path, monkeypatch,
 ) -> None:
     from fastapi.testclient import TestClient
 
@@ -2190,7 +2220,12 @@ def test_track_rollover_after_executor_commits_only_running_claim(
     from jobs.discovery import drain_run_queue
     from market.quotes import FakeQuoteClient
 
+    from tests.test_selection_release import retained_release_fill
+    from scripts.release_selection_v8 import publish_release
+    from discovery.rulers import require_ready
     db_path = tmp_path / "track-rollover.db"
+    from tests.test_selection_release import seed_published_release
+    seed_published_release(db_path)
     engine = init_db(db_path)
     factory = create_session_factory(engine)
     now = [SNAPSHOT_AT]
@@ -2198,18 +2233,15 @@ def test_track_rollover_after_executor_commits_only_running_claim(
         from discovery.rulers import activate
         from tests.discovery_helpers import discovery_ruler_payload
 
-        ruler = activate(
-            session,
-            discovery_ruler_payload("quality_discount"),
-            "rollover fixture",
-        )
+        ruler = require_ready(session, "quality_discount")[0]
         run = _freeze_run(
             session,
             [company("600000.SH")],
+            published=True,
             ruler_ids={
                 "quality_discount": ruler.id,
-                "deep_value": 1,
-                "garp": 1,
+                "deep_value": require_ready(session, "deep_value")[0].id,
+                "garp": require_ready(session, "garp")[0].id,
             },
         )
         stage = _add_track_stage(
@@ -2262,6 +2294,7 @@ def test_track_rollover_after_executor_commits_only_running_claim(
         assert history.json()["current"]["status"] == "running"
 
 
+@pytest.mark.usefixtures("isolated_discovery_authority")
 def test_common_failure_after_rollover_does_not_persist_failure(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2304,6 +2337,7 @@ def test_common_failure_after_rollover_does_not_persist_failure(
     engine.dispose()
 
 
+@pytest.mark.usefixtures("isolated_discovery_authority")
 def test_track_failure_after_rollover_does_not_persist_failure(
     tmp_path,
 ) -> None:
@@ -2347,6 +2381,7 @@ def test_track_failure_after_rollover_does_not_persist_failure(
 
 
 @pytest.mark.parametrize("kind", ["common", "track"])
+@pytest.mark.usefixtures("isolated_discovery_authority")
 def test_prior_week_queued_stage_is_not_claimed(
     tmp_path, kind: str
 ) -> None:

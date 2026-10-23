@@ -24,7 +24,7 @@ from app.models import (
     ResearchJob,
 )
 from discovery.builds import BUILD_VERSION
-from discovery.rulers import activate, latest, load
+from discovery.rulers import activate
 from ledger.positions import LOCAL_USER_ID
 from scripts.calibrate_discovery import (
     DEEP_VALUE_BANDS,
@@ -38,40 +38,18 @@ from scripts.evolve_rulers import evolve, main
 
 
 def _seed_evolution_db(db_path: Path) -> None:
-    engine = create_engine(f"sqlite:///{db_path}")
-    Base.metadata.create_all(engine)
+    from tests.test_selection_release import seed_published_release
+    from app.db import create_db_engine
+    from discovery.rulers import require_ready
+    seed_published_release(db_path)
+    engine = create_db_engine(db_path)
     now = datetime(2026, 10, 20, 8, 0, tzinfo=timezone.utc)
     industries = ["医药生物", "银行Ⅱ", "煤炭开采"]
 
     with Session(engine) as session:
-        q_row = activate(
-            session,
-            _quality_payload(
-                HYPOTHESIS_BANDS["base"],
-                industry_version="sw-2021",
-                industries=industries,
-                valuation_ratio_method="PE_TTM/PB_MRQ",
-            ),
-            "base quality",
-        )
-        d_row = activate(
-            session,
-            _deep_value_payload(
-                DEEP_VALUE_BANDS["base"],
-                industry_version="sw-2021",
-                valuation_ratio_method="PE_TTM/PB_MRQ",
-            ),
-            "base deep value",
-        )
-        g_row = activate(
-            session,
-            _garp_payload(
-                GARP_BANDS["base"],
-                industry_version="sw-2021",
-                valuation_ratio_method="PE_TTM/PB_MRQ",
-            ),
-            "base garp",
-        )
+        q_row = require_ready(session, 'quality_discount')[0]
+        d_row = require_ready(session, 'deep_value')[0]
+        g_row = require_ready(session, 'garp')[0]
         run = DiscoveryRun(
             user_id=LOCAL_USER_ID,
             week_key="2026-W43",
@@ -89,6 +67,18 @@ def _seed_evolution_db(db_path: Path) -> None:
             updated_at=now,
         )
         session.add(run)
+        session.flush()
+        from app.discovery_models import DiscoveryCommonStage, DiscoveryStage
+        common = DiscoveryCommonStage(run_id=run.id, attempt=1, status='confirmed',
+            input_fingerprint=run.input_fingerprint, algorithm_version=BUILD_VERSION,
+            created_at=now, updated_at=now, confirmed_at=now)
+        session.add(common)
+        session.flush()
+        for track, ruler in (('quality_discount', q_row), ('deep_value', d_row), ('garp', g_row)):
+            session.add(DiscoveryStage(run_id=run.id, track=track, stage='track_gate', attempt=1,
+                status='confirmed', common_stage_id=common.id, ruler_version_id=ruler.id,
+                input_fingerprint=run.input_fingerprint, algorithm_version=BUILD_VERSION,
+                created_at=now, updated_at=now, confirmed_at=now))
         session.flush()
 
         for code, name in (
@@ -323,7 +313,7 @@ def _seed_evolution_db(db_path: Path) -> None:
     engine.dispose()
 
 
-def test_evolve_rulers_proposes_pareto_tightening_and_activates_on_apply(
+def test_evolve_rulers_proposes_research_hypothesis_and_refuses_apply(
     tmp_path: Path,
 ) -> None:
     db = tmp_path / "evolve.db"
@@ -337,23 +327,23 @@ def test_evolve_rulers_proposes_pareto_tightening_and_activates_on_apply(
     assert report["applied"] is False
     assert report["min_support"] == 2
     q_report = report["tracks"]["quality_discount"]
-    # Under default min_support=2, a single FP stays in shadow_staging rather than mutating live ruler
+    # Model disagreements remain hypotheses, regardless of the legacy support setting.
     assert q_report["changed"] is False
     assert q_report["has_shadow_staging"] is True
-    assert q_report["threshold_changes"]["peg_release_max"]["status"] == "shadow_staging"
+    assert q_report["threshold_changes"]["peg_release_max"]["status"] == "research_hypothesis"
     assert q_report["counts"] == {
         "baseline_track_pass": 2,
         "evolved_track_pass": 2,
         "shadow_track_pass": 1,
         "evolved_competition_pass": 2,
         "borda_competition_pass": 2,
-        "false_positives_total": 1,
-        "false_positives_eliminated": 1,
-        "false_positives_caught_by_interim": 1,
-        "protected_hit_by_interim": 0,
+        "research_disagreement_total": 1,
+        "research_disagreement_excluded_by_hypothesis": 1,
+        "research_disagreement_caught_by_interim": 1,
+        "research_agreement_hit_by_interim": 0,
         "unresearched_flagged_by_interim": 0,
-        "protected_retained": 1,
-        "protected_total": 1,
+        "research_agreement_retained": 1,
+        "research_agreement_total": 1,
         "near_miss_total": 1,
     }
     assert q_report["interim_deterioration_alerts"] == [
@@ -376,7 +366,7 @@ def test_evolve_rulers_proposes_pareto_tightening_and_activates_on_apply(
         and item["rejected_reason"] == "spurious_non_causal_correlation"
         for item in q_report["rejected_overfit_candidates"]
     )
-    assert q_report["false_negatives"] == [
+    assert q_report["research_gate_disagreement"] == [
         {
             "code": "000538.SZ",
             "name": "云南白药",
@@ -410,19 +400,13 @@ def test_evolve_rulers_proposes_pareto_tightening_and_activates_on_apply(
             "--apply",
         ]
     )
-    assert exit_code == 0
+    assert exit_code == 2
     saved = json.loads(output_file.read_text(encoding="utf-8"))
-    assert saved["applied"] is True
-    new_id = saved["activated_ruler_version_ids"]["quality_discount"]
-    assert isinstance(new_id, int) and new_id > q_report["baseline_ruler_version_id"]
-
-    engine = create_engine(f"sqlite:///{db}")
-    try:
-        with Session(engine) as session:
-            active = latest(session, "quality_discount")
-            assert active is not None and active.id == new_id
-            ruler = load(active)
-            assert ruler.thresholds["peg_release_max"] == "1"
-            assert ruler.thresholds["cash_conversion_min"] == "1"
-    finally:
-        engine.dispose()
+    assert saved["applied"] is False
+    assert saved["proposal_kind"] == "research_hypothesis"
+    assert saved["blocked_reasons"] == ["independent_validation_required"]
+    assert saved["validation_report"]["eligible"] is False
+    assert saved["validation_report"]["evidence_gaps"]
+    assert saved["activated_ruler_version_ids"] == {}
+    assert saved["tracks"]["quality_discount"]["threshold_changes"]
+    assert hashlib.sha256(db.read_bytes()).hexdigest() == before_bytes

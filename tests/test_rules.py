@@ -18,7 +18,9 @@ TRADE_COUNT = 5
 
 
 def _engine(db_path: Path):
-    return create_engine(f"sqlite:///{db_path.resolve().as_posix()}")
+    from app.db import create_db_engine
+    return create_db_engine(db_path)
+
 
 
 def _scalar(db_path: Path, sql: str, params: dict | None = None):

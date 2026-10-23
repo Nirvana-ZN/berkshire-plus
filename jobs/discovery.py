@@ -18,7 +18,7 @@ import json
 from math import isfinite
 import sys
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
@@ -34,6 +34,7 @@ from app.discovery_models import (
 from app.models import JobLock
 from discovery.aggregate import aggregate_run_status
 from discovery.builds import AVAILABLE_BUILDS, _is_build_available
+from discovery.rulers import execution_authorized
 from discovery.common import CommonVerdict, classify_common
 from discovery.competition import CompetitionCandidate, rank_borda_competition, rank_competition
 from discovery.constants import (
@@ -58,6 +59,8 @@ from discovery.snapshot import (
     load_frozen_inputs,
 )
 from discovery.rulers import deep_value_ruler, garp_ruler, quality_discount_ruler
+from discovery.selection_contract import is_candidate, rank_inputs, load_fundamentals, eligible_legacy_company
+from discovery.ranking import rank_candidates, ranking_audit
 from discovery.tracks.deep_value import classify as classify_deep_value
 from discovery.tracks.garp import classify as classify_garp
 from discovery.tracks.quality_discount import (
@@ -172,6 +175,7 @@ def confirm_waiting_layers(
             DiscoveryStage.superseded_at.is_(None),
         )
     ):
+        _register_competition_publication(session, stage, now)
         stage.status = "confirmed"
         stage.confirmed_at = now
         stage.updated_at = now
@@ -196,6 +200,14 @@ def confirm_waiting_layers(
             )
             queued = True
     return queued
+
+
+def _register_competition_publication(session: Session, stage: DiscoveryStage, now: datetime) -> None:
+    """Freeze the three variants before the first confirmed result is visible."""
+    from discovery.builds import CANDIDATE_BUILD_VERSION
+    if stage.stage == "competition" and stage.algorithm_version == CANDIDATE_BUILD_VERSION:
+        from tracking.cohorts import publish_track_cohorts
+        publish_track_cohorts(session, stage_id=stage.id, published_at=now)
 
 
 class TransientDiscoveryError(RuntimeError):
@@ -337,15 +349,35 @@ def _competition_metrics(
     company: FrozenCompanyInput,
     raw_metrics: Mapping[str, object],
     extra_flags: Sequence[str] = (),
+    *, ruler=None,
 ) -> dict[str, object]:
     out = dict(raw_metrics)
+    candidate = ruler is not None and is_candidate(ruler)
+    if candidate:
+        company, _ = eligible_legacy_company(company, load_fundamentals(company, ruler))
+    policy = ruler.ranking_contract['annual_risk_policy'] if candidate else {}
+    def threshold(name, legacy):
+        return Decimal(policy[name]) if candidate else Decimal(legacy)
+    incomplete_risks = False
+    operating = company.fields.get('operating_result')
+    if isinstance(operating, Mapping):
+        out['operating_result'] = operating
+        out['operating_policy'] = company.fields.get('operating_policy')
+        out['fundamental_fingerprint'] = company.fields.get('fundamental_fingerprint')
+        out['freeze_new_positions'] = operating.get('state') in {'deteriorating', 'unknown'}
     flags = [str(f) for f in (raw_metrics.get("risk_flags") or ()) if f]
     for ef in extra_flags:
         if not ef:
             continue
         if str(ef).startswith("interim_yoy:"):
+            text = str(ef).split(":", 1)[1]
+            if candidate:
+                value = _dec_or_none(text)
+                if value is not None:
+                    out['_interim_yoy'] = str(value)
+                continue
             try:
-                out["_interim_yoy"] = float(str(ef).split(":", 1)[1])
+                out["_interim_yoy"] = float(text)
             except ValueError:
                 pass
             continue
@@ -353,7 +385,7 @@ def _competition_metrics(
             flags.append(str(ef))
     pb = _dec_or_none(company.fields.get("pb"))
     roe_mean = _dec_or_none(raw_metrics.get("roe_mean"))
-    if pb is not None and pb > Decimal("8") and roe_mean is not None and roe_mean > Decimal("50"):
+    if pb is not None and pb > threshold("pb_min", "8") and roe_mean is not None and roe_mean > threshold("roe_mean_min", "50"):
         flags.append("thin_equity_high_pb")
 
     hist = company.fields.get("financial_history") or ()
@@ -364,6 +396,13 @@ def _competition_metrics(
         p = str(row.get("period") or "")
         vals = row.get("values")
         if p.isdigit() and len(p) == 4 and isinstance(vals, Mapping):
+            if candidate:
+                sources = row.get('field_sources', {})
+                provenance = row.get('provenance', {})
+                vals = {key: value if isinstance(sources.get(key), Mapping)
+                        and sources[key].get('trusted') is True
+                        and tuple(provenance.get(key, ())) == ('discovery',) else None
+                        for key, value in vals.items()}
             ann_vals.append((int(p), vals))
     ann_vals.sort(key=lambda x: x[0])
 
@@ -371,10 +410,10 @@ def _competition_metrics(
         latest_vals = ann_vals[-1][1]
         gw = _dec_or_none(latest_vals.get("goodwill"))
         na = _dec_or_none(latest_vals.get("net_assets"))
-        if gw is not None and gw > 0 and na is not None and na > 0 and (gw / na) > Decimal("0.25"):
+        if gw is not None and gw > 0 and na is not None and na > 0 and (gw / na) > threshold("goodwill_to_equity_min", "0.25"):
             flags.append("goodwill_bloat")
 
-        is_fin = (
+        is_fin = raw_metrics.get('ranking_branch') == 'bank' if candidate else (
             raw_metrics.get("branch") == "financial"
             or raw_metrics.get("quality_branch") == "bank"
             or "银行" in (company.industry or "")
@@ -384,7 +423,7 @@ def _competition_metrics(
         if not is_fin:
             l_ni = _dec_or_none(latest_vals.get("net_income"))
             l_ocf = _dec_or_none(latest_vals.get("ocf"))
-            if l_ni is not None and l_ni > 0 and l_ocf is not None and (l_ocf / l_ni) < Decimal("0.40"):
+            if l_ni is not None and l_ni > 0 and l_ocf is not None and (l_ocf / l_ni) < threshold("recent_cash_conversion_max", "0.40"):
                 flags.append("recent_ocf_collapse")
             if len(ann_vals) >= 2:
                 v0, v1 = ann_vals[-1][1], ann_vals[-2][1]
@@ -412,7 +451,7 @@ def _competition_metrics(
             dni_cur = _dec_or_none(ann_vals[-1][1].get("deducted_net_income"))
             dni_prev = _dec_or_none(ann_vals[-2][1].get("deducted_net_income"))
             if dni_cur is not None and dni_prev is not None and dni_prev > 0:
-                if (dni_cur - dni_prev) / dni_prev <= Decimal("-0.15"):
+                if (dni_cur - dni_prev) / dni_prev <= threshold("deducted_drop_max", "-0.15"):
                     flags.append("annual_deducted_drop")
 
         roes = [
@@ -420,10 +459,22 @@ def _competition_metrics(
             for _, v in ann_vals[-4:]
             if _dec_or_none(v.get("roe")) is not None
         ]
-        if len(roes) == 4 and roes[0] > roes[1] > roes[2] > roes[3] and (roes[0] - roes[3]) >= Decimal("4"):  # type: ignore[operator]
+        if len(roes) == 4 and roes[0] > roes[1] > roes[2] > roes[3] and (roes[0] - roes[3]) >= threshold("roe_decline_min", "4"):  # type: ignore[operator]
             flags.append("roe_step_down_3y")
 
-    out["risk_flags"] = tuple(dict.fromkeys(flags))
+    out['risk_flags'] = tuple(dict.fromkeys(flags))
+    if candidate:
+        # An unavailable annual risk input cannot certify an empty risk set.
+        required = ('goodwill', 'net_assets', 'deducted_net_income', 'roe')
+        if out.get('ranking_branch') != 'bank':
+            required += ('net_income', 'ocf', 'capex')
+        incomplete_risks = (len(ann_vals) < 5 or any(vals.get(field) is None
+                            for _, vals in ann_vals[-5:] for field in required))
+        formal = [flag for flag in out['risk_flags'] if not flag.startswith(('collection_', 'restricted_cash_'))]
+        if incomplete_risks:
+            formal.append('annual_risk_evidence_missing')
+        out['verified_risk_types'] = tuple(sorted(set(formal)))
+        out['operating_state'] = operating.get('state') if isinstance(operating, Mapping) else 'unknown'
     return out
 
 
@@ -462,24 +513,23 @@ def builtin_track_executor(
                 "competition candidates do not match frozen companies"
             )
         metrics = {
-            candidate.code: _plain_metrics(candidate.metrics_json)
+            candidate.code: _competition_metrics(
+                companies[candidate.code], _plain_metrics(candidate.metrics_json),
+                candidate.extra_risk_flags, ruler=ruler)
             for candidate in context.candidates
         }
-        ranked = rank_borda_competition(
-            tuple(
-                CompetitionCandidate(
-                    code=candidate.code,
-                    industry=companies[candidate.code].industry,
-                    metrics=_competition_metrics(
-                        companies[candidate.code],
-                        metrics[candidate.code],
-                        candidate.extra_risk_flags,
-                    ),
-                )
-                for candidate in context.candidates
-            ),
-            ruler.order,
-        )
+        entrants = tuple(CompetitionCandidate(
+            code=candidate.code, industry=companies[candidate.code].industry,
+            metrics=rank_inputs(metrics[candidate.code], ruler) if is_candidate(ruler) else metrics[candidate.code])
+            for candidate in context.candidates)
+        if is_candidate(ruler):
+            ranked = rank_candidates(entrants, ruler.ranking_contract)
+            audits = ranking_audit(entrants, ruler.ranking_contract)
+            for code, audit in audits.items():
+                metrics[code]['ranking_audit'] = audit
+                metrics[code]['rank_score'] = audit['rank_score']
+        else:
+            ranked = rank_borda_competition(entrants, ruler.order)
         cards = {
             row.code: build_evidence_card(
                 row.code,
@@ -492,7 +542,6 @@ def builtin_track_executor(
             )
             for row in ranked
         }
-        candidates = {candidate.code: candidate for candidate in context.candidates}
         return TrackExecutionOutcome(
             status="waiting_confirmation",
             results=tuple(
@@ -510,7 +559,7 @@ def builtin_track_executor(
                         and cards[row.code].verdict == "insufficient"
                         else row.reason
                     ),
-                    metrics_json=candidates[row.code].metrics_json,
+                    metrics_json=canonical_json(metrics[row.code]),
                     rank=row.rank,
                 )
                 for row in ranked
@@ -627,10 +676,67 @@ def _verify_run_lock(session: Session, run_id: int) -> None:
         raise DiscoveryLockLostError("discovery run lock ownership was lost")
 
 
+def _attempt_identity(stage) -> tuple:
+    fields = ('id', 'run_id', 'attempt', 'input_fingerprint', 'algorithm_version',
+              'retry_of_stage_id', 'updated_at')
+    if isinstance(stage, DiscoveryStage):
+        fields += ('track', 'stage', 'ruler_version_id', 'common_stage_id',
+                   'predecessor_stage_id', 'predecessor_stage', 'reopen_of_stage_id')
+    return tuple(getattr(stage, field) for field in fields)
+
+
+@dataclass(frozen=True)
+class _ClaimedAttempt:
+    model: type
+    stage_id: int
+    run_id: int
+    identity: tuple
+
+    @classmethod
+    def capture(cls, stage):
+        return cls(type(stage), stage.id, stage.run_id, _attempt_identity(stage))
+
+    def matches(self, stage) -> bool:
+        return (stage is not None and stage.status == 'running'
+                and stage.superseded_at is None and _attempt_identity(stage) == self.identity)
+
+
+def _recover_authority_loss(session, claim: _ClaimedAttempt, now_provider) -> None:
+    """Persist only the interruption of an exact owned claim, never its outputs."""
+    # The rejected output transaction must end before this operational write.
+    session.rollback()
+    if (session.info.get('discovery_lock_run_id') != claim.run_id
+            or not session.info.get('discovery_lock_owner_token')):
+        return
+    session.execute(text('BEGIN IMMEDIATE'))
+    try:
+        session.expire_all()
+        _verify_run_lock(session, claim.run_id)
+        stage = session.get(claim.model, claim.stage_id)
+        if (not claim.matches(stage)
+                or not _run_is_mutable(session.get(DiscoveryRun, claim.run_id), now_provider)):
+            session.rollback()
+            return
+        stage.status = 'failed'
+        stage.error = 'publication_authority_lost: retry after a valid republication'
+        stage.failure_kind = 'transient'
+        stage.updated_at = _now(now_provider)
+        # BEGIN IMMEDIATE keeps lease/attempt checks and this operational update
+        # in one writer transaction. Normal result publication stays gated below.
+        session.commit()
+    except DiscoveryLockLostError:
+        session.rollback()
+    except BaseException:
+        session.rollback()
+        raise
+
+
 def _commit_if_current(
     session: Session,
     run_id: int,
     now_provider: NowProvider,
+    *,
+    interrupted_claim: _ClaimedAttempt | None = None,
 ) -> bool:
     if not _run_is_mutable(
         session.get(DiscoveryRun, run_id),
@@ -639,6 +745,14 @@ def _commit_if_current(
         session.rollback()
         return False
     _verify_run_lock(session, run_id)
+    # Flush owns SQLite's writer transaction before authority is re-read. A
+    # rollback during a long callback must win before any results/cohorts commit.
+    session.flush()
+    if not execution_authorized(session, session.get(DiscoveryRun, run_id)):
+        session.rollback()
+        if interrupted_claim is not None:
+            _recover_authority_loss(session, interrupted_claim, now_provider)
+        return False
     session.commit()
     return True
 
@@ -648,6 +762,7 @@ def _persist_failure(
     stage_id: int,
     error: BaseException,
     now_provider: NowProvider,
+    claim: _ClaimedAttempt,
 ) -> StageExecutionOutcome:
     session.rollback()
     stage = session.get(DiscoveryCommonStage, stage_id)
@@ -658,7 +773,7 @@ def _persist_failure(
         now_provider,
     ):
         return StageExecutionOutcome(stage_id, "historical", False)
-    if stage.status != "running" or stage.superseded_at is not None:
+    if not claim.matches(stage):
         return StageExecutionOutcome(stage_id, stage.status, False)
     stage.status = "failed"
     stage.error = _safe_error(error)
@@ -668,6 +783,7 @@ def _persist_failure(
         session,
         stage.run_id,
         now_provider,
+        interrupted_claim=claim,
     ):
         return StageExecutionOutcome(stage_id, "historical", False)
     return StageExecutionOutcome(stage_id, "failed", True)
@@ -692,7 +808,7 @@ def execute_common_stage(
     ):
         return StageExecutionOutcome(stage_id, "historical", False)
     claimed_at = _now(now_provider)
-    claim = session.execute(
+    claimed = session.execute(
         update(DiscoveryCommonStage)
         .where(
             DiscoveryCommonStage.id == stage_id,
@@ -706,13 +822,14 @@ def execute_common_stage(
             updated_at=claimed_at,
         )
     )
+    claim = _ClaimedAttempt.capture(observed) if int(claimed.rowcount or 0) == 1 else None
     if not _commit_if_current(
         session,
         observed.run_id,
         now_provider,
     ):
         return StageExecutionOutcome(stage_id, "historical", False)
-    if int(claim.rowcount or 0) != 1:
+    if int(claimed.rowcount or 0) != 1:
         session.expire_all()
         stage = session.get(DiscoveryCommonStage, stage_id)
         return StageExecutionOutcome(
@@ -725,8 +842,8 @@ def execute_common_stage(
         stage = session.get(DiscoveryCommonStage, stage_id)
         if stage is None:
             raise PermanentDiscoveryError("claimed common stage not found")
-        if stage.superseded_at is not None:
-            raise PermanentDiscoveryError("common stage is superseded")
+        if not claim.matches(stage):
+            raise PermanentDiscoveryError("common stage claim changed")
         run = session.get(DiscoveryRun, stage.run_id)
         if run is None:
             raise PermanentDiscoveryError("discovery run not found")
@@ -783,7 +900,7 @@ def execute_common_stage(
         run = session.get(DiscoveryRun, stage.run_id)
         if not _run_is_mutable(run, now_provider):
             return StageExecutionOutcome(stage_id, "historical", True)
-        if stage.status != "running" or stage.superseded_at is not None:
+        if not claim.matches(stage):
             raise PermanentDiscoveryError(
                 "common stage changed during execution"
             )
@@ -816,7 +933,7 @@ def execute_common_stage(
                 f"共同排雷有结论的公司 {counts['pass'] + counts['drop']}/"
                 f"{len(verdicts)}，低于 {COMMON_READINESS_MIN}"
             )
-            if not _commit_if_current(session, stage.run_id, now_provider):
+            if not _commit_if_current(session, stage.run_id, now_provider, interrupted_claim=claim):
                 return StageExecutionOutcome(stage_id, "historical", True)
             return StageExecutionOutcome(
                 stage_id, "data_not_ready", True, processed=len(verdicts)
@@ -838,6 +955,7 @@ def execute_common_stage(
             session,
             stage.run_id,
             now_provider,
+            interrupted_claim=claim,
         ):
             return StageExecutionOutcome(stage_id, "historical", True)
         return StageExecutionOutcome(
@@ -852,6 +970,7 @@ def execute_common_stage(
             stage_id,
             error,
             now_provider,
+            claim,
         )
 
 
@@ -897,6 +1016,7 @@ def _persist_track_failure(
     stage_id: int,
     error: BaseException,
     now_provider: NowProvider,
+    claim: _ClaimedAttempt,
 ) -> None:
     """Best-effort failure persistence after discarding callback writes."""
 
@@ -907,9 +1027,7 @@ def _persist_track_failure(
     try:
         stage = session.get(DiscoveryStage, stage_id)
         if (
-            stage is not None
-            and stage.superseded_at is None
-            and stage.status in {"queued", "running"}
+            claim.matches(stage)
             and _run_is_mutable(
                 session.get(DiscoveryRun, stage.run_id),
                 now_provider,
@@ -923,6 +1041,7 @@ def _persist_track_failure(
                 session,
                 stage.run_id,
                 now_provider,
+                interrupted_claim=claim,
             ):
                 return
     except BaseException:
@@ -1034,33 +1153,16 @@ def _track_candidates(
 
     interim_flags_by_code: dict[str, tuple[str, ...]] = {}
     if stage.stage == "competition" and passed_rows:
-        from app.models import Financial
-        from research.thesis import financial_drift
-
-        p_codes = [r.code for r, _, _ in passed_rows]
-        fins_by_code: dict[str, list[dict[str, object]]] = {}
-        for f_row in session.scalars(
-            select(Financial).where(Financial.code.in_(p_codes))
-        ).all():
-            fins_by_code.setdefault(f_row.code, []).append(
-                {
-                    "period": f_row.period,
-                    "period_type": f_row.period_type,
-                    "net_income": f_row.net_income,
-                    "deducted_net_income": f_row.deducted_net_income,
-                    "ocf": f_row.ocf,
-                }
-            )
-        for c_code, f_list in fins_by_code.items():
-            drift = financial_drift({}, f_list, since_baseline=False)
-            if drift is not None:
-                yoy_val = drift.get("deducted_net_income_yoy")
-                if yoy_val is None:
-                    yoy_val = drift.get("net_income_yoy")
-                flags_list = [f"interim_{reason}" for reason in (drift.get("reasons") or ())]
-                if yoy_val is not None:
-                    flags_list.append(f"interim_yoy:{yoy_val}")
-                interim_flags_by_code[c_code] = tuple(flags_list)
+        frozen = load_frozen_inputs(session, stage.run_id)
+        for company in frozen.companies:
+            result = company.fields.get('operating_result')
+            if isinstance(result, Mapping):
+                if result.get('state') == 'deteriorating':
+                    period = str(result.get('period') or '')
+                    flag = 'annual_operating_deterioration' if len(period) == 4 else 'interim_deterioration'
+                    interim_flags_by_code[company.code] = (flag,)
+                elif result.get('state') == 'unknown':
+                    interim_flags_by_code[company.code] = ('operating_unknown',)
 
     candidates = []
     for row, override, effective in passed_rows:
@@ -1436,6 +1538,7 @@ def _execute_track_stage(
             updated_at=_now(now_provider),
         )
     )
+    claim = _ClaimedAttempt.capture(stage) if int(claimed.rowcount or 0) == 1 else None
     if not _commit_if_current(
         session,
         stage.run_id,
@@ -1448,22 +1551,9 @@ def _execute_track_stage(
     stage = session.get(DiscoveryStage, stage_id)
     if stage is None:
         raise QueueStalledError(f"track stage {stage_id} disappeared")
-    identity = (
-        stage.id,
-        stage.run_id,
-        stage.track,
-        stage.stage,
-        stage.attempt,
-        stage.input_fingerprint,
-        stage.ruler_version_id,
-        stage.algorithm_version,
-        stage.common_stage_id,
-        stage.predecessor_stage_id,
-        stage.predecessor_stage,
-        stage.retry_of_stage_id,
-        stage.reopen_of_stage_id,
-    )
     try:
+        if not claim.matches(stage):
+            raise TrackExecutorContractError("track stage claim changed")
         ruler_payload = frozen_ruler.get("payload")
         if not isinstance(ruler_payload, Mapping):
             raise PermanentDiscoveryError(
@@ -1509,22 +1599,7 @@ def _execute_track_stage(
         ):
             session.rollback()
             return False
-        current_identity = (
-            stage.id,
-            stage.run_id,
-            stage.track,
-            stage.stage,
-            stage.attempt,
-            stage.input_fingerprint,
-            stage.ruler_version_id,
-            stage.algorithm_version,
-            stage.common_stage_id,
-            stage.predecessor_stage_id,
-            stage.predecessor_stage,
-            stage.retry_of_stage_id,
-            stage.reopen_of_stage_id,
-        )
-        if current_identity != identity or stage.status != "running":
+        if not claim.matches(stage):
             raise TrackExecutorContractError(
                 "track stage identity or status changed during execution"
             )
@@ -1584,6 +1659,8 @@ def _execute_track_stage(
         # Discovery is rule-only: a finished layer is final and the next one
         # queues in the same commit. Competition is the last layer.
         finished = outcome.status == "waiting_confirmation"
+        if finished:
+            _register_competition_publication(session, stage, completed_at)
         stage.status = "confirmed" if finished else outcome.status
         if finished:
             stage.confirmed_at = completed_at
@@ -1611,6 +1688,7 @@ def _execute_track_stage(
             session,
             stage.run_id,
             now_provider,
+            interrupted_claim=claim,
         ):
             return False
         return True
@@ -1620,6 +1698,7 @@ def _execute_track_stage(
             stage_id,
             error,
             now_provider,
+            claim,
         )
         raise
 
@@ -1786,7 +1865,8 @@ def drain_run_queue(
         while True:
             session.expire_all()
             run = session.get(DiscoveryRun, run_id)
-            if not _run_is_mutable(run, now_provider):
+            if not _run_is_mutable(run, now_provider) or not execution_authorized(session, run):
+                session.rollback()
                 return DrainOutcome(run_id, True, executed)
             confirm_waiting_layers(session, run, _now(now_provider))
             if not _commit_if_current(session, run_id, now_provider):

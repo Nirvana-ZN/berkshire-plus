@@ -19,7 +19,7 @@ from types import MappingProxyType
 
 import pytest
 
-from discovery.builds import BUILD_VERSION
+HISTORICAL_BUILD_VERSION = 'discovery-v7'
 from discovery.field_dictionary import FIELD_DICTIONARY
 from discovery.snapshot import FrozenCompanyInput, canonical_json
 from market.types import FinancialRow
@@ -93,7 +93,7 @@ FORMULAS = {
 }
 
 
-def quality_payload(**threshold_overrides: str) -> dict[str, object]:
+def quality_payload(*, build_version=HISTORICAL_BUILD_VERSION, **threshold_overrides: str) -> dict[str, object]:
     thresholds = {
         "listing_years_min": "5",
         "roe_mean_min": "12",
@@ -247,7 +247,7 @@ def quality_payload(**threshold_overrides: str) -> dict[str, object]:
             ["code", "asc", "nulls_last"],
         ],
         "industry_version": "test-industry-v1",
-        "algorithm_version": BUILD_VERSION,
+        "algorithm_version": build_version,
     }
 
 
@@ -420,7 +420,7 @@ def frozen_company(
         ruler_version_ids=MappingProxyType(
             {"quality_discount": 1, "deep_value": None, "garp": None}
         ),
-        algorithm_version=BUILD_VERSION,
+        algorithm_version=HISTORICAL_BUILD_VERSION,
         input_fingerprint="fingerprint",
         snapshot_at=SNAPSHOT_AT,
     )
@@ -436,6 +436,7 @@ def _classify(company=None, payload=None):
     )
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_quality_ruler_has_strict_semantic_schema() -> None:
     from discovery.rulers import quality_discount_ruler
 
@@ -497,6 +498,7 @@ def test_quality_ruler_has_strict_semantic_schema() -> None:
             quality_discount_ruler(value)
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_less_than_required_valuation_months_is_insufficient() -> None:
     verdict = _classify(frozen_company(valuations=_valuations(59)))
     assert (verdict.verdict, verdict.primary_reason) == (
@@ -506,6 +508,7 @@ def test_less_than_required_valuation_months_is_insufficient() -> None:
     assert verdict.metrics["valuation_pe_observations"] == "59"
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_gate_order_selects_one_primary_reason_and_keeps_all_evidence() -> None:
     annual = tuple(
         _annual(year, roe="8", ocf="50", net_income="100")
@@ -522,6 +525,7 @@ def test_gate_order_selects_one_primary_reason_and_keeps_all_evidence() -> None:
     assert verdict.metrics["cash_conversion"] == "0.5"
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_persistent_losses_drop_before_cash_conversion() -> None:
     annual = tuple(
         _annual(
@@ -546,6 +550,7 @@ def test_persistent_losses_drop_before_cash_conversion() -> None:
     )
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_cash_conversion_uses_only_strictly_positive_income_periods() -> None:
     annual = tuple(
         _annual(
@@ -570,6 +575,7 @@ def test_cash_conversion_uses_only_strictly_positive_income_periods() -> None:
     assert verdict.metrics["cash_conversion"] == "1.2"
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_latest_loss_policy_is_explicit_and_ordered_before_cash() -> None:
     annual = tuple(
         _annual(
@@ -596,6 +602,7 @@ def test_latest_loss_policy_is_explicit_and_ordered_before_cash() -> None:
 
 
 @pytest.mark.parametrize("equity", ["0", "-100"])
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_nonpositive_equity_drops_without_division(equity: str) -> None:
     annual = tuple(
         _annual(year, net_assets=equity if year == 2025 else "100")
@@ -610,6 +617,7 @@ def test_nonpositive_equity_drops_without_division(equity: str) -> None:
     assert verdict.metrics["debt_to_equity"] is None
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_missing_equity_uses_exact_policy() -> None:
     annual = tuple(
         _annual(year, net_assets=None)  # type: ignore[arg-type]
@@ -622,6 +630,7 @@ def test_missing_equity_uses_exact_policy() -> None:
     )
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_bank_nonpositive_equity_drops_before_bank_quality_logic() -> None:
     annual = tuple(
         _annual(year, net_assets="-1")
@@ -638,6 +647,7 @@ def test_bank_nonpositive_equity_drops_before_bank_quality_logic() -> None:
 
 
 @pytest.mark.parametrize("shares", ["0", "-1"])
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_nonpositive_shares_are_invalid_not_arithmetic(shares: str) -> None:
     annual = tuple(
         _annual(year, shares=shares if year == 2023 else "100")
@@ -663,6 +673,7 @@ def test_nonpositive_shares_are_invalid_not_arithmetic(shares: str) -> None:
         ("noncurrent_liab_1year", "noncurrent_liab_1year_negative"),
     ],
 )
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_negative_accounting_balances_are_invalid(
     field: str,
     reason: str,
@@ -689,6 +700,7 @@ def test_negative_accounting_balances_are_invalid(
         ),
     ],
 )
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_negative_bank_npl_values_are_invalid(
     field: str,
     reason: str,
@@ -706,6 +718,7 @@ def test_negative_bank_npl_values_are_invalid(
 
 
 @pytest.mark.parametrize("price", ["0", "-10"])
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_nonpositive_price_is_invalid(price: str) -> None:
     valuations = list(_valuations())
     valuations[-1] = dict(valuations[-1], price=price)
@@ -720,6 +733,7 @@ def test_nonpositive_price_is_invalid(price: str) -> None:
 
 
 @pytest.mark.parametrize(("ratio", "value"), [("pe", "-10"), ("pb", "0")])
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_nonpositive_valuation_ratios_are_unusable_not_false_passes(
     ratio: str,
     value: str,
@@ -732,6 +746,7 @@ def test_nonpositive_valuation_ratios_are_unusable_not_false_passes(
     assert verdict.metrics[f"valuation_{ratio}_observations"] == "59"
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_signed_economic_fields_remain_valid_domains() -> None:
     annual = tuple(
         _annual(
@@ -752,6 +767,7 @@ def test_signed_economic_fields_remain_valid_domains() -> None:
     assert verdict.primary_reason != "financial_history_invalid"
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_negative_capital_adequacy_is_valid_ratio_and_drops() -> None:
     annual = tuple(
         _annual(
@@ -769,6 +785,7 @@ def test_negative_capital_adequacy_is_valid_ratio_and_drops() -> None:
     assert verdict.metrics["bank_capital_adequacy"] == "-1"
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_roe_level_and_stability_are_separate_ordered_gates() -> None:
     annual = tuple(
         _annual(year, roe=value)
@@ -782,6 +799,7 @@ def test_roe_level_and_stability_are_separate_ordered_gates() -> None:
     assert verdict.metrics["roe_downside_volatility"] is not None
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_roe_stability_ignores_rises_and_pre_listing_years() -> None:
     rising = tuple(
         _annual(year, roe=str(10 + 2 * (year - 2021))) for year in range(2021, 2026)
@@ -802,6 +820,7 @@ def test_roe_stability_ignores_rises_and_pre_listing_years() -> None:
     assert listed.metrics["roe_window_start_year"] == "2017"
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_zero_interest_debt_skips_interest_coverage() -> None:
     def verdict_for(debt: str):
         annual = tuple(
@@ -814,6 +833,7 @@ def test_zero_interest_debt_skips_interest_coverage() -> None:
     assert verdict_for("0").verdict == "pass"
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_roe_trend_drops_recent_decline_only_in_nonfinancial_branch() -> None:
     years = range(2016, 2026)
     roes = ("18",) * 7 + ("13",) * 3
@@ -835,6 +855,7 @@ def test_roe_trend_drops_recent_decline_only_in_nonfinancial_branch() -> None:
     assert Decimal(steady.metrics["roe_recent_ratio"]) == 1
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_cash_debt_double_high_drops_nonfinancial_branches() -> None:
     def verdict_for(cash: str | None, debt: str, assets: str | None, industry="制造业"):
         annual = tuple(
@@ -857,6 +878,7 @@ def test_cash_debt_double_high_drops_nonfinancial_branches() -> None:
     )
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_absolute_valuation_needs_bond_spread_or_cheap_growth() -> None:
     def verdict_for(latest_pe: str, deducted: tuple[str, ...] = ("100",) * 5):
         valuations = tuple(
@@ -889,6 +911,7 @@ def test_absolute_valuation_needs_bond_spread_or_cheap_growth() -> None:
     assert _classify(frozen_company(industry="煤炭")).metrics["earnings_yield"] is None
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_margin_risk_is_evidence_only_unless_branch_policy_drops() -> None:
     annual = tuple(
         _annual(year, gross_margin=str(30 - index))
@@ -908,6 +931,7 @@ def test_margin_risk_is_evidence_only_unless_branch_policy_drops() -> None:
 
 
 @pytest.mark.parametrize("policy", ["both", "either", "pe", "pb"])
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_configured_valuation_policy_checks_percentile_and_median(
     policy: str,
 ) -> None:
@@ -928,6 +952,7 @@ def test_configured_valuation_policy_checks_percentile_and_median(
     assert verdict.primary_reason == expected
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_percentile_above_threshold_drops_for_pe_and_pb() -> None:
     verdict = _classify(
         frozen_company(valuations=_valuations(latest_pe="99", latest_pb="9"))
@@ -940,6 +965,7 @@ def test_percentile_above_threshold_drops_for_pe_and_pb() -> None:
     )
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_median_missing_policy_is_independent_from_percentile_policy() -> None:
     earlier = dict(
         _valuations()[0],
@@ -962,6 +988,7 @@ def test_median_missing_policy_is_independent_from_percentile_policy() -> None:
     )
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_cyclical_uses_normalized_earnings_and_price_times_shares() -> None:
     annual = tuple(
         _annual(
@@ -983,6 +1010,7 @@ def test_cyclical_uses_normalized_earnings_and_price_times_shares() -> None:
 
 
 @pytest.mark.parametrize("earnings", ["0", "-100"])
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_cyclical_nonpositive_normalized_earnings_drops(
     earnings: str,
 ) -> None:
@@ -1001,6 +1029,7 @@ def test_cyclical_nonpositive_normalized_earnings_drops(
     )
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_bank_bypasses_industrial_gates_and_uses_declared_policy() -> None:
     annual = tuple(
         _annual(
@@ -1028,6 +1057,7 @@ def test_bank_bypasses_industrial_gates_and_uses_declared_policy() -> None:
         ({"interest_coverage": "2"}, "interest_coverage_below_min"),
     ],
 )
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_dilution_leverage_and_interest_follow_ruler_policies(
     latest: dict[str, str],
     reason: str,
@@ -1040,6 +1070,7 @@ def test_dilution_leverage_and_interest_follow_ruler_policies(
     assert (verdict.verdict, verdict.primary_reason) == ("drop", reason)
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_unknown_industry_and_malformed_snapshot_are_insufficient() -> None:
     unknown = _classify(frozen_company(industry="未知新行业"))
     assert (unknown.verdict, unknown.primary_reason) == (
@@ -1096,14 +1127,14 @@ def test_shared_industry_branch_classifier_is_used_everywhere(
 
 
 def test_quality_branch_data_contract_is_build_versioned_and_immutable() -> None:
-    from discovery.builds import BUILD_VERSION
+    from discovery.builds import BUILD_VERSION as HISTORICAL_BUILD_VERSION
     from discovery.quality_contract import (
         QUALITY_DATA_CONTRACTS,
         quality_branch_data_contract,
         quality_ruler_branch_policies,
     )
 
-    contract = quality_branch_data_contract(BUILD_VERSION)
+    contract = quality_branch_data_contract(HISTORICAL_BUILD_VERSION)
     assert set(contract) == {
         "bank",
         "insurance",
@@ -1118,7 +1149,7 @@ def test_quality_branch_data_contract_is_build_versioned_and_immutable() -> None
         "industry_branch_insurance_unsupported"
     )
     assert contract["unknown"].insufficient_reason == "industry_branch_unknown"
-    assert dict(quality_ruler_branch_policies(BUILD_VERSION)) == {
+    assert dict(quality_ruler_branch_policies(HISTORICAL_BUILD_VERSION)) == {
         "bank": "bank",
         "insurance": "unsupported",
         "other_financial": "unsupported",
@@ -1163,6 +1194,7 @@ def test_quality_branch_data_contract_is_build_versioned_and_immutable() -> None
         ("-", "unknown", "industry_branch_unknown"),
     ],
 )
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_unsupported_financial_branches_never_run_industrial_gates(
     industry: str,
     branch: str,
@@ -1178,6 +1210,7 @@ def test_unsupported_financial_branches_never_run_industrial_gates(
     assert verdict.evidence_rule_ids == (f"quality.{reason}",)
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_bank_uses_dedicated_shared_branch() -> None:
     verdict = _classify(frozen_company(industry="商业银行"))
     assert verdict.verdict == "pass"
@@ -1185,6 +1218,7 @@ def test_bank_uses_dedicated_shared_branch() -> None:
     assert verdict.metrics["quality_branch"] == "bank"
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_ambiguous_nonbank_label_never_uses_bank_or_industrial_gates() -> None:
     verdict = _classify(frozen_company(industry="非银行"))
     assert (verdict.verdict, verdict.primary_reason) == (
@@ -1195,6 +1229,7 @@ def test_ambiguous_nonbank_label_never_uses_bank_or_industrial_gates() -> None:
     assert verdict.metrics["quality_branch"] is None
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_histories_are_bounded_and_duplicate_periods_are_deduped() -> None:
     values = _valuations()
     duplicate = values[:-1] + (values[0], values[-1])
@@ -1212,6 +1247,7 @@ def test_histories_are_bounded_and_duplicate_periods_are_deduped() -> None:
     )
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_roe_uses_exact_ten_year_calendar_window() -> None:
     annual = tuple(
         _annual(
@@ -1234,6 +1270,7 @@ def test_roe_uses_exact_ten_year_calendar_window() -> None:
     assert verdict.metrics["roe_available_count"] == "10"
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_old_profits_cannot_rescue_recent_profitability_window() -> None:
     annual = tuple(
         _annual(
@@ -1259,6 +1296,7 @@ def test_old_profits_cannot_rescue_recent_profitability_window() -> None:
     assert verdict.metrics["cash_conversion"] is None
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_calendar_year_gaps_reduce_window_observations() -> None:
     annual = tuple(
         _annual(year)
@@ -1278,6 +1316,7 @@ def test_calendar_year_gaps_reduce_window_observations() -> None:
     assert verdict.metrics["roe_observations"] == "4"
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_stale_latest_fiscal_year_is_insufficient() -> None:
     annual = tuple(
         _annual(year)
@@ -1294,6 +1333,7 @@ def test_stale_latest_fiscal_year_is_insufficient() -> None:
     assert verdict.evidence_rule_ids == ("quality.financial_history_stale",)
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_annual_periods_are_canonical_and_unique_by_fiscal_year() -> None:
     leap = list(
         _annual(year) for year in range(2021, 2026)
@@ -1316,6 +1356,7 @@ def test_annual_periods_are_canonical_and_unique_by_fiscal_year() -> None:
     )
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_future_annual_period_is_never_included() -> None:
     future = tuple(
         _annual(year) for year in range(2022, 2027)
@@ -1327,6 +1368,7 @@ def test_future_annual_period_is_never_included() -> None:
     )
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_dilution_reports_configured_window_endpoints() -> None:
     annual = tuple(
         _annual(
@@ -1350,6 +1392,7 @@ def test_dilution_reports_configured_window_endpoints() -> None:
     assert verdict.metrics["dilution_endpoint_end_year"] == "2025"
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_normalized_earnings_uses_configured_recent_window() -> None:
     annual = tuple(
         _annual(
@@ -1369,6 +1412,7 @@ def test_normalized_earnings_uses_configured_recent_window() -> None:
     )
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_margin_and_bank_metrics_report_exact_branch_windows() -> None:
     industrial = tuple(
         _annual(year, gross_margin="100" if year == 2020 else "30")
@@ -1412,6 +1456,7 @@ def test_margin_and_bank_metrics_report_exact_branch_windows() -> None:
     )
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_future_data_mixed_methods_and_untrusted_values_are_insufficient() -> None:
     future = list(_valuations())
     future[-1] = dict(future[-1], trade_date="2027-01-01")
@@ -1461,6 +1506,7 @@ def test_future_data_mixed_methods_and_untrusted_values_are_insufficient() -> No
     ).primary_reason == "roe_insufficient"
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_verdict_input_and_ruler_are_immutable_and_json_has_no_float() -> None:
     from discovery.rulers import quality_discount_ruler
     from discovery.tracks.quality_discount import classify
@@ -1507,6 +1553,7 @@ def test_verdict_input_and_ruler_are_immutable_and_json_has_no_float() -> None:
         verdict.metrics["roe_mean"] = "0"  # type: ignore[index]
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_quality_decimal_arithmetic_ignores_hostile_contexts() -> None:
     huge = "1" + "0" * 100
     annual = tuple(
@@ -1552,6 +1599,7 @@ def test_quality_decimal_arithmetic_ignores_hostile_contexts() -> None:
         DefaultContext.flags = saved_default.flags.copy()
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_interest_coverage_sign_is_context_and_flag_invariant() -> None:
     annual = tuple(
         _annual(
@@ -1591,6 +1639,7 @@ def test_interest_coverage_sign_is_context_and_flag_invariant() -> None:
         DefaultContext.flags = saved_default.flags.copy()
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_extreme_decimal_exponent_is_bounded_before_formatting() -> None:
     annual = list(frozen_company().fields["financial_history"])
     annual[0] = _annual(2021, roe="1E+5000")
@@ -1601,6 +1650,7 @@ def test_extreme_decimal_exponent_is_bounded_before_formatting() -> None:
     )
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_quality_and_other_track_concepts_remain_independent() -> None:
     company = frozen_company()
     quality = _classify(company)
@@ -1612,6 +1662,7 @@ def test_quality_and_other_track_concepts_remain_independent() -> None:
     assert other_track_fixture_gate(company) == "drop"
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_listing_age_screen_does_not_veto_the_track() -> None:
     from jobs.discovery import _verdict_is_scored
 
@@ -1630,6 +1681,7 @@ def test_listing_age_screen_does_not_veto_the_track() -> None:
     )
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_builtin_dispatcher_enforces_overall_coverage_without_artifacts() -> None:
     from discovery.rulers import quality_discount_ruler
     from jobs.discovery import (
@@ -1658,7 +1710,7 @@ def test_builtin_dispatcher_enforces_overall_coverage_without_artifacts() -> Non
             {"quality_discount": 1, "deep_value": None, "garp": None}
         ),
         ruler_payloads=MappingProxyType({}),
-        algorithm_version=BUILD_VERSION,
+        algorithm_version=HISTORICAL_BUILD_VERSION,
         trading_dates=MappingProxyType({"SH": ("2026-09-17",)}),
         snapshot_at=SNAPSHOT_AT,
         companies=(ready, unknown),
@@ -1677,7 +1729,7 @@ def test_builtin_dispatcher_enforces_overall_coverage_without_artifacts() -> Non
         attempt=1,
         input_fingerprint="run",
         ruler_version_id=1,
-        algorithm_version=BUILD_VERSION,
+        algorithm_version=HISTORICAL_BUILD_VERSION,
         common_stage_id=1,
         predecessor_stage_id=None,
         predecessor_stage=None,
@@ -1692,6 +1744,7 @@ def test_builtin_dispatcher_enforces_overall_coverage_without_artifacts() -> Non
     assert ruler.thresholds["readiness_min"] == "1"
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_calibrator_missing_schema_is_blocked_deterministic_and_read_only(
     tmp_path: Path,
 ) -> None:
@@ -1767,6 +1820,7 @@ def _calibration_preflight_db(
         )
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_calibrator_preflight_blocks_resources_before_snapshot_build(
     tmp_path: Path,
     monkeypatch,
@@ -1800,6 +1854,7 @@ def test_calibrator_preflight_blocks_resources_before_snapshot_build(
     assert hashlib.sha256(db.read_bytes()).hexdigest() == before
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_calibrator_blocks_incomplete_and_corrupt_current_fills(
     tmp_path: Path,
 ) -> None:
@@ -1822,6 +1877,7 @@ def test_calibrator_blocks_incomplete_and_corrupt_current_fills(
     )["blocked_reasons"] == ["database_corrupt"]
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_finished_fill_keeps_failed_companies_out_of_the_incomplete_check() -> None:
     from scripts.calibrate_discovery import _preflight_incomplete
 
@@ -1838,6 +1894,7 @@ def test_finished_fill_keeps_failed_companies_out_of_the_incomplete_check() -> N
     assert _preflight_incomplete(still_open) is True
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_calibration_scores_done_companies_and_drops_failed_payloads() -> None:
     from scripts.calibrate_discovery import _scoreable_companies
 
@@ -1860,6 +1917,7 @@ def test_calibration_scores_done_companies_and_drops_failed_payloads() -> None:
     )
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_one_unreadable_company_does_not_reject_the_rest() -> None:
     from dataclasses import dataclass
 
@@ -1895,6 +1953,7 @@ def test_one_unreadable_company_does_not_reject_the_rest() -> None:
     )
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_calibrator_blocks_noncurrent_algorithm_build(
     tmp_path: Path,
     monkeypatch,
@@ -1946,6 +2005,7 @@ def test_calibrator_blocks_noncurrent_algorithm_build(
     assert artifact["approval_ready"] is False
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_calibrator_ready_full_market_proposal_is_deterministic_and_read_only(
     tmp_path: Path,
     monkeypatch,
@@ -2004,7 +2064,7 @@ def test_calibrator_ready_full_market_proposal_is_deterministic_and_read_only(
             ruler_version_ids=MappingProxyType(
                 {"quality_discount": None, "deep_value": None, "garp": None}
             ),
-            algorithm_version=BUILD_VERSION,
+            algorithm_version=HISTORICAL_BUILD_VERSION,
         ),
         trading_dates=MappingProxyType({"SH": ("2026-09-15",)}),
         snapshot_at=SNAPSHOT_AT,
@@ -2096,6 +2156,7 @@ def test_calibrator_uses_exact_linear_quartiles() -> None:
     }
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_calibrator_rejects_unknown_valuation_and_security_sources() -> None:
     from scripts.calibrate_discovery import (
         _source_coverage,
@@ -2131,6 +2192,7 @@ def test_calibrator_rejects_unknown_valuation_and_security_sources() -> None:
     }
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_calibrator_declares_every_required_supported_branch() -> None:
     from scripts.calibrate_discovery import _required_supported_branches
 
@@ -2146,6 +2208,7 @@ def test_calibrator_declares_every_required_supported_branch() -> None:
     assert _required_supported_branches("garp") == {"nonfinancial"}
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_calibrator_quality_cyclical_map_uses_exact_level_two_labels() -> None:
     from scripts.calibrate_discovery import (
         QUALITY_CYCLICAL_INDUSTRIES,
@@ -2172,6 +2235,7 @@ def test_calibrator_quality_cyclical_map_uses_exact_level_two_labels() -> None:
     )
 
 
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_calibrator_domain_validity_is_an_approval_gate_with_diagnostics() -> None:
     from scripts.calibrate_discovery import (
         _domain_readiness,
@@ -2195,6 +2259,7 @@ def test_calibrator_domain_validity_is_an_approval_gate_with_diagnostics() -> No
 
 
 @pytest.mark.parametrize("alias_kind", ["same", "hardlink", "symlink"])
+@pytest.mark.usefixtures("legacy_v7_algorithm")
 def test_calibrator_cli_rejects_database_output_alias_without_writing(
     tmp_path: Path,
     alias_kind: str,
@@ -2231,79 +2296,23 @@ def test_calibrator_cli_rejects_database_output_alias_without_writing(
     assert hashlib.sha256(db.read_bytes()).hexdigest() == before_hash
 
 
-def test_api_uses_builtin_quality_gate_and_keeps_other_tracks_independent(
-    tmp_path: Path,
-) -> None:
+def test_api_uses_published_v8_gates_and_keeps_tracks_independent(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
-
     from app.main import create_app
-    from discovery.rulers import activate, latest
-    from discovery.snapshot import ProductionSnapshot, SnapshotVersions
     from market.quotes import FakeQuoteClient
-
-    db = tmp_path / "api.db"
-    base = frozen_company()
-    security = dict(base.security_status)
-    security["last_trade_date"] = "2026-09-15"
-    company = replace(
-        base,
-        security_status=MappingProxyType(security),
-    )
-
-    def snapshot(session, **_kwargs):
-        ruler = latest(session, "quality_discount")
-        assert ruler is not None
-        return ProductionSnapshot(
-            fill_id=1,
-            companies=(company,),  # type: ignore[arg-type]
-            versions=SnapshotVersions(
-                data_version="data-v1",
-                financial_version="financial-v1",
-                valuation_version="valuation-v1",
-                ruler_version_ids=MappingProxyType(
-                    {
-                        "quality_discount": ruler.id,
-                        "deep_value": None,
-                        "garp": None,
-                    }
-                ),
-                algorithm_version=BUILD_VERSION,
-            ),
-            trading_dates=MappingProxyType({"SH": ("2026-09-15",)}),
-            snapshot_at=SNAPSHOT_AT,
-        )
-
-    app = create_app(
-        db_path=db,
-        quote_client=FakeQuoteClient(),
-        env_path=tmp_path / ".env",
-        allow_sync=True,
-        discovery_clock=lambda: SNAPSHOT_AT,
-        discovery_snapshot_provider=snapshot,
-    )
+    from tests.test_selection_release import retained_release_fill
+    from scripts.release_selection_v8 import publish_release
+    from tests.test_selection_release import seed_published_release
+    seed_published_release(tmp_path / 'release.db')
+    app = create_app(db_path=tmp_path / 'release.db', quote_client=FakeQuoteClient(), env_path=tmp_path / '.env',
+                     allow_sync=True, discovery_clock=lambda: SNAPSHOT_AT)
     with TestClient(app) as client:
-        with app.state.session_factory() as session:
-            activate(session, quality_payload(), "test calibration approval")
-            session.commit()
-        run = client.post(
-            "/api/discoveries", json={"sync": True}
-        ).json()
-        run_id = run["id"]
-        assert run["ruler_readiness"] == {
-            "quality_discount": "ready",
-            "deep_value": "ruler_not_ready",
-            "garp": "ruler_not_ready",
-        }
-        quality = client.get(
-            f"/api/discoveries/{run_id}/tracks/quality_discount"
-            "/stages/track_gate"
-        ).json()
-        assert quality["current"]["status"] == "confirmed"
-        assert [row["code"] for row in quality["pass"]] == ["600000.SH"]
-        assert quality["pass"][0]["metrics"]["roe_mean"] == "15"
-        for track in ("deep_value", "garp"):
-            stage = client.get(
-                f"/api/discoveries/{run_id}/tracks/{track}"
-                "/stages/track_gate"
-            ).json()
-            assert stage["current"]["status"] == "ruler_not_ready"
+        response = client.post('/api/discoveries', json={'sync': True})
+        assert response.status_code == 200, response.text
+        run = response.json()
+        assert set(run['ruler_readiness'].values()) == {'ready'}
+        for track in ('quality_discount', 'deep_value', 'garp'):
+            stage = client.get(f"/api/discoveries/{run['id']}/tracks/{track}/stages/track_gate").json()
+            assert stage['current']['status'] == 'confirmed', stage
+            assert [row['code'] for row in stage['pass']] == ['600000.SH']
+            assert stage['pass'][0]['metrics']['metric_results']['economic_dilution']['status'] == 'verified'

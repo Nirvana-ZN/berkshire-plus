@@ -23,7 +23,9 @@ JOBS_DIR = ROOT / "jobs"
 
 
 def _engine(db_path: Path):
-    return create_engine(f"sqlite:///{db_path.resolve().as_posix()}")
+    from app.db import create_db_engine
+    return create_db_engine(db_path)
+
 
 
 def _scalar(db_path: Path, sql: str, params: dict | None = None):
@@ -653,11 +655,25 @@ def test_funnel_share_expansion_non_ma_drops() -> None:
 
 
 def test_screen_and_jobs_have_no_http_or_llm() -> None:
+    from tests.dependency_guards import assert_no_direct_http_or_llm
     for folder in (SCREEN_DIR, JOBS_DIR):
         for path in folder.rglob("*.py"):
-            source = path.read_text(encoding="utf-8")
-            assert "httpx" not in source
-            assert "openai" not in source.lower()
+            assert_no_direct_http_or_llm(path.read_text(encoding="utf-8"))
+
+
+def test_http_dependency_guard_only_exempts_exact_model_config_literal() -> None:
+    import pytest
+    from tests.dependency_guards import assert_no_direct_http_or_llm
+    assert_no_direct_http_or_llm('import os; model = os.environ.get("OPENAI_MODEL")')
+    for source in (
+        'import httpx', 'from openai import OpenAI', 'import requests as transport',
+        'from urllib.request import urlopen', '__import__("openai")',
+        'import importlib; importlib.import_module("httpx")',
+        'from importlib import import_module as load; load(name="requests")',
+        'client = "OPENAI_MODEL_CLIENT"',
+    ):
+        with pytest.raises(AssertionError):
+            assert_no_direct_http_or_llm(source)
 
 
 def test_screen_view_has_three_chinese_tables_not_json() -> None:

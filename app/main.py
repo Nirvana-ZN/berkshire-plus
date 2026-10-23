@@ -15,8 +15,9 @@ from fastapi.responses import FileResponse, JSONResponse
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from app.db import PROJECT_ROOT, create_session_factory, init_db
+from app.db import PROJECT_ROOT, create_session_factory, database_read_only, init_db
 from app.discovery_models import DiscoveryRun
+from app.tracking_routes import create_tracking_router
 from app.discovery_routes import (
     cancel_discovery_research_worker,
     create_discovery_router,
@@ -75,7 +76,7 @@ from jobs.lock import (
     release,
     try_acquire,
 )
-from jobs.research import execute_research, load_financials
+from jobs.research import create_research_job, execute_research, load_financials
 from jobs.review import execute_review
 from ledger.positions import LOCAL_USER_ID, load_positions
 from ledger.quotes import (
@@ -266,6 +267,9 @@ def _positions_payload(
     session, rows, cash: Decimal
 ) -> dict[str, object]:
     book = project_book(session, rows, cash)
+    from ledger.exposure import exact_book_weights, freeze_selected_exposure
+    exposure_context = freeze_selected_exposure(session, user_id=LOCAL_USER_ID,
+        cutoff_at=datetime.now(timezone.utc), weights=exact_book_weights(book))
     held_names = [row.name for row in book.positions]
     theses = load_by_names(session, LOCAL_USER_ID, held_names)
     pos_jsons = [
@@ -308,6 +312,8 @@ def _positions_payload(
                 sent_payload = parsed_sent
         except json.JSONDecodeError:
             sent_payload = None
+    optimization = portfolio_optimization(pos_jsons, unheld_candidates, sentiment=sent_payload,
+                                          exposure_context=exposure_context)
     return {
         "positions": pos_jsons,
         "cash": {
@@ -319,9 +325,8 @@ def _positions_payload(
             "deviation": _json_optional(book.cash.deviation),
         },
         "rebalance": rebalance_alerts(book.positions, book.cash),
-        "optimization": portfolio_optimization(
-            pos_jsons, unheld_candidates, sentiment=sent_payload
-        ),
+        "optimization": optimization,
+        'common_exposure': optimization['common_exposure'],
     }
 
 
@@ -627,6 +632,7 @@ def _artifact_payload(session, job: ResearchJob) -> dict[str, object]:
         "structured": structured,
         "markdown": markdown,
         "report_path": report_path,
+        "legacy_evidence_contract": bool(artifact is not None and not isinstance(structured.get("evidence_contract"), dict)),
     }
     if structured:
         body["verdict"] = structured.get("verdict")
@@ -638,7 +644,7 @@ def _artifact_payload(session, job: ResearchJob) -> dict[str, object]:
         body["as_of"] = structured.get("as_of")
         body["portfolio_fit"] = structured.get("portfolio_fit")
         val = dict(structured.get("valuation") or {}) if isinstance(structured.get("valuation"), dict) else {}
-        if ("pe_ttm" not in val or "pe_deducted_ttm" not in val) and job.code:
+        if body['legacy_evidence_contract'] and ("pe_ttm" not in val or "pe_deducted_ttm" not in val) and job.code:
             as_of_dict = structured.get("as_of") if isinstance(structured.get("as_of"), dict) else {}
             raw_price = as_of_dict.get("price") if as_of_dict else None
             if raw_price is None:
@@ -662,7 +668,7 @@ def _artifact_payload(session, job: ResearchJob) -> dict[str, object]:
                         val["pe_deducted_ttm"] = _json_optional(dec_price / ded_eps)
                         val["pe_deducted_ttm_basis"] = ded_basis
                 _enrich_balance_sheet_traps(val, fins)
-        elif job.code and ("goodwill_pct" not in val and "net_cash_yi" not in val):
+        elif body['legacy_evidence_contract'] and job.code and ("goodwill_pct" not in val and "net_cash_yi" not in val):
             _enrich_balance_sheet_traps(val, load_financials(session, job.code))
         body["valuation"] = val
     thesis = session.scalars(
@@ -901,6 +907,8 @@ def _review_payload(row: PortfolioReview) -> dict[str, object]:
         "markdown": row.markdown or "",
         "report_path": row.report_path,
         "has_stale": bool(row.has_stale or structured.get("has_stale")),
+        'common_exposure': structured.get('common_exposure'),
+        'opportunity_cost': structured.get('opportunity_cost'),
     }
 
 
@@ -933,6 +941,8 @@ def create_app(
     discovery_snapshot_provider=None,
     discovery_clock=None,
     fund_client=None,
+    tracking_provider=None,
+    tracking_clock=None,
 ) -> FastAPI:
     resolved_dist = dist_path if dist_path is not None else DEFAULT_DIST_PATH
     resolved_fund_client = fund_client if fund_client is not None else FundClient()
@@ -952,7 +962,10 @@ def create_app(
         engine = init_db(db_path)
         session_factory = create_session_factory(engine)
         app.state.engine = engine
+        app.state.schema_read_only = database_read_only(engine)
         app.state.session_factory = session_factory
+        app.state.tracking_provider = tracking_provider
+        app.state.tracking_clock = tracking_clock or (lambda: datetime.now(timezone.utc))
         app.state.quote_client = resolved_quote_client
         app.state.market_client = resolved_market_client
         app.state.fund_client = resolved_fund_client
@@ -984,6 +997,14 @@ def create_app(
         resolved_yaml = _resolve_yaml_dir(yaml_dir)
         app.state.yaml_dir = str(resolved_yaml) if resolved_yaml is not None else None
         app.state.migrate_error = None
+        if app.state.schema_read_only:
+            # No portfolio import/refresh, lock cleanup, worker resumption or
+            # background fetch may run against an unknown schema.
+            try:
+                yield
+            finally:
+                engine.dispose()
+            return
         with session_factory() as session:
             try:
                 migrate_yaml_portfolio(session, resolved_yaml)
@@ -1072,7 +1093,14 @@ def create_app(
         engine.dispose()
 
     app = FastAPI(title="本机工作台", lifespan=lifespan)
+    @app.middleware('http')
+    async def schema_write_guard(request: Request, call_next):
+        if getattr(request.app.state, 'schema_read_only', False) and request.method not in {'GET', 'HEAD', 'OPTIONS'}:
+            return JSONResponse(status_code=503, content={'error': 'database is read-only',
+                'code': 'schema_read_only', 'detail': 'Unknown database schema; compatible historical reads only.'})
+        return await call_next(request)
     app.include_router(create_discovery_router())
+    app.include_router(create_tracking_router())
 
     @app.get("/api/health")
     def health(request: Request) -> dict[str, object]:
@@ -2140,18 +2168,15 @@ def create_app(
                     code="INVALID_RESEARCH",
                     detail=str(exc),
                 )
-            now = datetime.now(timezone.utc)
-            job = ResearchJob(
-                user_id=LOCAL_USER_ID,
-                screen_run_id=screen_run_id,
-                name=name,
-                code=code,
-                status="queued",
-                error=None,
-                created_at=now,
-                updated_at=now,
-            )
-            session.add(job)
+            assumption_id = payload.get('assumption_id')
+            if assumption_id is not None and (type(assumption_id) is not int or assumption_id <= 0):
+                return _error_json(400, error='请求无效', code='INVALID_RESEARCH',
+                    detail='assumption_id 必须是所选公司已审阅假设的正整数版本 ID')
+            try:
+                job = create_research_job(session, screen_run_id=screen_run_id, name=name, code=code,
+                    assumption_id=assumption_id)
+            except ValueError as exc:
+                return _error_json(400, error='请求无效', code='INVALID_RESEARCH', detail=str(exc))
             session.flush()
             if not try_acquire(session, job.id, JOB_TYPE_RESEARCH):
                 session.rollback()

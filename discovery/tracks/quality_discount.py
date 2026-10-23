@@ -34,6 +34,8 @@ from discovery.rulers import (
     quality_discount_ruler,
 )
 from discovery.snapshot import FrozenCompanyInput
+from discovery.selection_contract import (is_candidate, input_schema_matches, load_fundamentals,
+                                          annual_values, apply_metrics, SelectionInputError, eligible_legacy_company)
 from market.types import FinancialRow
 
 JsonMetric: TypeAlias = None | str | tuple[str, ...]
@@ -904,6 +906,7 @@ def _metric_values(
     windows: Mapping[str, _FinancialWindow],
     valuations: Sequence[_ValuationPoint],
     listing_date: date,
+    annual=None,
 ) -> tuple[
     dict[str, Decimal | None],
     dict[str, int],
@@ -993,7 +996,7 @@ def _metric_values(
         )
         shares = tuple(row.values["shares"] for row in share_rows)
         counts["dilution"] = len(shares)
-        if len(shares) >= ruler.min_observations["dilution"]:
+        if not is_candidate(ruler) and len(shares) >= ruler.min_observations["dilution"]:
             ratio = _divide(shares[-1], shares[0])
             values["dilution_rate"] = _subtract(ratio, Decimal(1))
             audit["dilution_endpoint_start_year"] = str(
@@ -1081,7 +1084,7 @@ def _metric_values(
                 - growth_history[0].fiscal_year,
             )
         growth = values["deducted_profit_cagr"]
-        if current_pe is not None and current_pe > 0:
+        if not is_candidate(ruler) and current_pe is not None and current_pe > 0:
             values["earnings_yield"] = _divide(Decimal(100), current_pe)
             if growth is not None and growth > 0:
                 capped = min(
@@ -1100,10 +1103,10 @@ def _metric_values(
             row.values["deducted_net_income"]
             for row in normalized_history
         )
-        values["normalized_earnings"] = normalized_earnings(
-            earnings,
-            ruler.min_observations["normalized_earnings"],
-        )
+        values['normalized_earnings'] = (annual['normalized_earnings'].value if annual is not None else
+            normalized_earnings(earnings, ruler.min_observations['normalized_earnings']))
+        if annual is not None:
+            counts['normalized_earnings'] = 5 if annual['normalized_earnings'].status == 'verified' else 0
         latest_shares = next(
             (
                 row.values["shares"]
@@ -1120,7 +1123,8 @@ def _metric_values(
         )
         earnings_floor = Decimal(ruler.thresholds["normalized_earnings_min"])
         if (
-            price is not None
+            not is_candidate(ruler)
+            and price is not None
             and latest_shares is not None
             and values["normalized_earnings"] is not None
             and values["normalized_earnings"] > earnings_floor
@@ -1497,6 +1501,8 @@ def classify(company: FrozenCompanyInput, ruler: TrackRuler) -> TrackVerdict:
         raise TypeError("company must be a FrozenCompanyInput")
     code = company.code if type(company.code) is str else ""
     metrics = _empty_metrics(code)
+    if is_candidate(ruler):
+        metrics['ranking_branch'] = 'unknown'
     try:
         if (
             type(company.code) is not str
@@ -1517,9 +1523,7 @@ def classify(company: FrozenCompanyInput, ruler: TrackRuler) -> TrackVerdict:
         ):
             raise _SnapshotInvalid("snapshot schema")
         if (
-            set(company.fields) != _FIELD_KEYS
-            or set(company.sources) != _SOURCE_KEYS
-            or set(company.as_of) != _AS_OF_KEYS
+            not input_schema_matches(company, ruler, _FIELD_KEYS, _SOURCE_KEYS, _AS_OF_KEYS)
             or set(company.security_status) != _SECURITY_KEYS
             or company.fields["listing_date"]
             != company.security_status["listing_date"]
@@ -1531,6 +1535,8 @@ def classify(company: FrozenCompanyInput, ruler: TrackRuler) -> TrackVerdict:
         )
         metrics["branch"] = shared_branch
         metrics["quality_branch"] = quality_branch
+        if is_candidate(ruler):
+            metrics["ranking_branch"] = quality_branch or "unknown"
         if branch_reason is not None:
             return _verdict(
                 company.code,
@@ -1583,6 +1589,10 @@ def classify(company: FrozenCompanyInput, ruler: TrackRuler) -> TrackVerdict:
             raise _SnapshotInvalid("snapshot look-ahead")
         if valuation_as_of > company.snapshot_at.date():
             raise _SnapshotInvalid("valuation look-ahead")
+        snapshot = load_fundamentals(company, ruler) if is_candidate(ruler) else None
+        if snapshot is not None:
+            company, eligibility = eligible_legacy_company(company, snapshot)
+            metrics['legacy_field_eligibility'] = eligibility
         financial = _financial_history(company, financial_as_of)
         windows, window_metrics, stale = _financial_windows(
             financial,
@@ -1636,6 +1646,8 @@ def classify(company: FrozenCompanyInput, ruler: TrackRuler) -> TrackVerdict:
                 != latest.price
             ):
                 raise _SnapshotInvalid("current valuation mismatch")
+        window = windows.get('normalized_earnings')
+        annual = annual_values(snapshot, window.end_year if window is not None else None) if snapshot is not None and quality_branch == 'cyclical' else None
         decimal_metrics, counts, calculation_audit = _metric_values(
             company,
             ruler,
@@ -1643,12 +1655,17 @@ def classify(company: FrozenCompanyInput, ruler: TrackRuler) -> TrackVerdict:
             windows,
             valuations,
             listing_date,
+            annual,
         )
         metrics.update(calculation_audit)
-    except _SnapshotInvalid as error:
+        if snapshot is not None:
+            apply_metrics(company, ruler, quality_branch, windows, decimal_metrics, counts, metrics, snapshot=snapshot, annual=annual)
+    except (_SnapshotInvalid, SelectionInputError) as error:
         reason = str(error)
         evidence: tuple[str, ...] = ()
-        if isinstance(error, _DomainInvalid):
+        if isinstance(error, SelectionInputError):
+            reason = 'selection_evidence_invalid'
+        elif isinstance(error, _DomainInvalid):
             evidence = (f"quality.{reason}",)
         elif isinstance(error, _AnnualPeriodDuplicate):
             evidence = (f"quality.{reason}",)

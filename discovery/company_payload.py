@@ -7,7 +7,7 @@ import hmac
 import json
 import re
 from dataclasses import fields
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 from math import isfinite
 from typing import Any
@@ -15,7 +15,7 @@ from typing import Any
 from discovery.field_dictionary import FIELD_DICTIONARY, FieldSpec
 from market.types import DiscoveryCompanyData, FinancialRow, SecurityState
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 PAYLOAD_SCHEMA_BLOCK_REASON = "payload_schema_restart_required"
 PAYLOAD_SCHEMA_RESTART_GUIDANCE = (
     f"{PAYLOAD_SCHEMA_BLOCK_REASON}: company payload schema is unavailable "
@@ -35,6 +35,11 @@ _ROOT_KEYS = {
     "source_as_of",
     "financial_rows",
     "valuation_points",
+}
+_FUNDAMENTAL_KEYS = {
+    'annual_evidence', 'interim_history', 'capital_events', 'fundamental_extensions',
+    'coverage', 'evidence_ids', 'current_mcap', 'fundamental_fingerprint',
+    'decision_cutoff_at', 'operating_policy', 'operating_result',
 }
 
 
@@ -118,6 +123,8 @@ def serialize_company_payload(
     captured_at: datetime,
 ) -> str:
     """Serialize exactly one successful typed fetch without request internals."""
+    from discovery.fundamentals import (freeze_fundamentals, market_cap_evidence,
+                                        operating_state, plain, snapshot_payload)
 
     if bundle.code != bundle.security_state.code or any(
         row.code != bundle.code
@@ -153,6 +160,19 @@ def serialize_company_payload(
             }
         )
     state = bundle.security_state
+    records = list(bundle.evidence_records)
+    if any(row.code != bundle.code for row in records):
+        raise ValueError('discovery evidence company mismatch')
+    cap = None
+    if bundle.current_market_cap is not None:
+        market_day = max((row.trade_date for row in bundle.valuation_points), default=None)
+        quote = market_cap_evidence(bundle.current_market_cap, code=bundle.code,
+                                    market_date=date.fromisoformat(market_day) if market_day else None, cutoff_at=captured_at)
+        records.append(quote)
+        if quote.status == 'verified':
+            cap = Decimal(quote.values['current_mcap'])
+    fundamental = freeze_fundamentals(records, (), bundle.coverage, code=bundle.code,
+                                      cutoff_at=captured_at, current_mcap=cap)
     payload = {
         "schema_version": SCHEMA_VERSION,
         "captured_at": captured_at,
@@ -169,6 +189,9 @@ def serialize_company_payload(
             {field.name: getattr(point, field.name) for field in fields(point)}
             for point in bundle.valuation_points
         ],
+        **snapshot_payload(fundamental),
+        'operating_policy': plain(bundle.operating_policy),
+        'operating_result': plain(operating_state(fundamental, bundle.operating_policy)),
     }
     return _canonical(payload)
 
@@ -206,6 +229,7 @@ def parse_company_payload(
     expected_code: str | None = None,
 ) -> dict[str, Any]:
     """Parse and fully validate persisted canonical payload JSON."""
+    from discovery.fundamentals import fundamentals_from_payload, operating_state, plain
 
     def reject_constant(value: str) -> None:
         raise ValueError(f"non-finite JSON constant: {value}")
@@ -214,8 +238,9 @@ def parse_company_payload(
         value = json.loads(text, parse_constant=reject_constant)
     except (TypeError, json.JSONDecodeError, ValueError) as error:
         raise ValueError("invalid discovery company payload JSON") from error
-    payload = _object(value, _ROOT_KEYS, "discovery company payload")
-    if payload["schema_version"] != SCHEMA_VERSION:
+    schema = value.get('schema_version') if isinstance(value, dict) else None
+    payload = _object(value, _ROOT_KEYS | (_FUNDAMENTAL_KEYS if schema == 4 else set()), "discovery company payload")
+    if type(schema) is not int or schema not in {3, SCHEMA_VERSION}:
         raise ValueError("unsupported discovery company payload schema")
     code = _text(payload["code"], "payload code")
     if expected_code is not None and code != expected_code:
@@ -310,6 +335,12 @@ def parse_company_payload(
         for key in ("pe", "pb", "price"):
             _decimal(point[key], f"valuation {key}")
 
+    if schema == 4:
+        fundamental = fundamentals_from_payload(payload, code=code)
+        if fundamental.cutoff_at != parsed_at:
+            raise ValueError('fundamental cutoff differs from capture')
+        if plain(operating_state(fundamental, payload['operating_policy'])) != payload['operating_result']:
+            raise ValueError('operating result integrity mismatch')
     if _canonical(payload) != text:
         raise ValueError("discovery company payload is not canonical")
     return payload

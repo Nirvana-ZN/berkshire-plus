@@ -9,6 +9,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
 
 from app.main import create_app
+from app.db import create_db_engine
 from app.models import RulerVersion
 from ledger.positions import LOCAL_USER_ID
 from market.eastmoney import FakeMarketClient
@@ -37,7 +38,7 @@ def _client(tmp_path: Path):
 
 
 def _add_stale(db_path: Path) -> None:
-    engine = create_engine(f"sqlite:///{db_path.resolve().as_posix()}")
+    engine = create_db_engine(db_path)
     with engine.begin() as conn:
         conn.execute(
             text(
@@ -81,7 +82,7 @@ def test_fresh_db_matches_and_funnel_starts(tmp_path: Path) -> None:
 def test_latest_defaults_to_funnel_scope(tmp_path: Path) -> None:
     db_path = tmp_path / "app.db"
     with _client(tmp_path):
-        engine = create_engine(f"sqlite:///{db_path.resolve().as_posix()}")
+        engine = create_db_engine(db_path)
         with Session(engine) as session:
             session.add(
                 RulerVersion(
@@ -103,7 +104,7 @@ def test_latest_defaults_to_funnel_scope(tmp_path: Path) -> None:
 def test_screen_mutations_reject_non_funnel_scope(tmp_path: Path) -> None:
     db_path = tmp_path / "app.db"
     with _client(tmp_path):
-        engine = create_engine(f"sqlite:///{db_path.resolve().as_posix()}")
+        engine = create_db_engine(db_path)
         with Session(engine) as session:
             for action in (
                 lambda: activate(

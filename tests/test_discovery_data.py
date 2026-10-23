@@ -10,7 +10,7 @@ from urllib.parse import parse_qs, urlsplit
 import httpx2
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, delete, inspect, select, text
+from sqlalchemy import create_engine, delete, func, inspect, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -167,11 +167,7 @@ def test_init_db_adds_discovery_tables_and_migrates_old_financial_schema(
         "fetched_at",
     }
     valuation_fks = schema.get_foreign_keys("valuation_history")
-    assert any(
-        fk["referred_table"] == "valuation_series"
-        and fk["constrained_columns"] == ["code", "ratio_method"]
-        for fk in valuation_fks
-    )
+    assert valuation_fks == []  # Retain the old cache layout without a rebuild.
     financial_types = {
         column["name"]: str(column["type"])
         for column in schema.get_columns("financials")
@@ -189,7 +185,7 @@ def test_init_db_adds_discovery_tables_and_migrates_old_financial_schema(
         "income_tax",
         "goodwill",
     ):
-        assert financial_types[field] == "TEXT"
+        assert financial_types[field] == ("NUMERIC(20, 8)" if field in {"net_income", "ocf", "capex"} else "TEXT")
     checkpoint_unique = {
         tuple(item["column_names"])
         for item in schema.get_unique_constraints("discovery_data_checkpoints")
@@ -214,8 +210,14 @@ def test_init_db_adds_discovery_tables_and_migrates_old_financial_schema(
 
     with Session(engine) as session:
         series = session.get(ValuationSeries, "600519.SH")
-        assert series is not None
-        assert series.ratio_method == "PE_TTM/PB_MRQ"
+        assert series is None  # No inferred lineage is attached to legacy rows.
+        assert session.execute(text(
+            "SELECT code, month, trade_date, pe, pb, price, source, ratio_method "
+            "FROM valuation_history"
+        )).all() == [(
+            "600519.SH", "2026-08", "2026-08-31", 19.2, 7.1, 1460,
+            "eastmoney:RPT_VALUEANALYSIS_DET", "PE_TTM/PB_MRQ",
+        )]
     engine.dispose()
 
 
@@ -307,6 +309,7 @@ def test_legacy_then_discovery_updates_only_owned_financial_fields(tmp_path) -> 
         roe=Decimal("15"),
         net_income=Decimal("100"),
         revenue=Decimal("999"),
+        deducted_net_income=Decimal("80"),
     )
     discovery = FinancialRow(
         code=legacy.code,
@@ -315,6 +318,7 @@ def test_legacy_then_discovery_updates_only_owned_financial_fields(tmp_path) -> 
         roe=None,
         net_income=Decimal("101"),
         revenue=Decimal("1000.01"),
+        deducted_net_income=Decimal("81"),
         other_income=Decimal("5"),
     )
     with Session(engine) as session:
@@ -324,7 +328,10 @@ def test_legacy_then_discovery_updates_only_owned_financial_fields(tmp_path) -> 
             Financial, (legacy.code, legacy.period, legacy.period_type)
         )
         assert stored is not None
-        assert stored.revenue is None
+        # Legacy research owns these reported amounts until reviewed discovery
+        # provenance takes ownership (jobs.funnel, commit 3c6a063).
+        assert stored.revenue == Decimal("999")
+        assert stored.deducted_net_income == Decimal("80")
 
         persist_discovery_financials(session, [discovery])
         session.commit()
@@ -332,6 +339,14 @@ def test_legacy_then_discovery_updates_only_owned_financial_fields(tmp_path) -> 
         assert stored.roe == Decimal("15")
         assert stored.net_income == Decimal("101")
         assert stored.revenue == Decimal("1000.01")
+        assert stored.deducted_net_income == Decimal("81")
+        for field in ('revenue', 'deducted_net_income'):
+            assert session.get(FinancialFieldProvenance,
+                               (legacy.code, legacy.period, legacy.period_type, field, 'discovery')) is not None
+        persist_financials(session, [replace(legacy, revenue=Decimal('1'), deducted_net_income=Decimal('2'))])
+        session.flush()
+        assert stored.revenue == Decimal('1000.01')
+        assert stored.deducted_net_income == Decimal('81')
         assert stored.other_income == Decimal("5")
 
         persist_discovery_financials(
@@ -524,7 +539,7 @@ def test_strict_value_and_provenance_rollback_together(tmp_path) -> None:
 
 
 
-def test_existing_financial_rows_infer_only_safe_legacy_completeness(tmp_path) -> None:
+def test_existing_financial_rows_do_not_infer_legacy_completeness(tmp_path) -> None:
     db_path = tmp_path / "legacy-completeness.db"
     old_engine = create_engine(f"sqlite:///{db_path.resolve().as_posix()}")
     with old_engine.begin() as conn:
@@ -581,7 +596,8 @@ def test_existing_financial_rows_infer_only_safe_legacy_completeness(tmp_path) -
                     FinancialFetchCompleteness.mode == "legacy"
                 )
             )
-        ) == {"000001.SZ"}
+        ) == set()
+        assert session.scalar(select(func.count()).select_from(Financial)) == 2
     engine.dispose()
 
 
@@ -629,7 +645,7 @@ def test_decimal_text_accepts_legacy_numeric_reads() -> None:
     assert converter.process_result_value(12345.5, None) == Decimal("12345.5")
 
 
-def test_init_db_converts_interim_discovery_money_columns_to_text(tmp_path) -> None:
+def test_init_db_preserves_legacy_numeric_money_without_rebuilding(tmp_path) -> None:
     db_path = tmp_path / "numeric-money.db"
     old_engine = create_engine(f"sqlite:///{db_path.resolve().as_posix()}")
     with old_engine.begin() as conn:
@@ -689,10 +705,10 @@ def test_init_db_converts_interim_discovery_money_columns_to_text(tmp_path) -> N
             row[1]: row[2]
             for row in conn.exec_driver_sql("PRAGMA table_info(financials)")
         }
-    assert columns["revenue"] == "TEXT"
-    assert columns["net_income"] == "TEXT"
-    assert columns["ocf"] == "TEXT"
-    assert columns["capex"] == "TEXT"
+    assert columns["revenue"] == "NUMERIC(20, 8)"
+    assert columns["net_income"] == "NUMERIC(20, 8)"
+    assert columns["ocf"] == "NUMERIC(20, 8)"
+    assert columns["capex"] == "NUMERIC(20, 8)"
     with Session(engine) as session:
         stored = session.get(Financial, ("600519.SH", "2025", "annual"))
         assert stored is not None
@@ -706,13 +722,13 @@ def test_init_db_converts_interim_discovery_money_columns_to_text(tmp_path) -> N
         assert {
             row[1]: row[2]
             for row in conn.exec_driver_sql("PRAGMA table_info(financials)")
-        }["net_income"] == "TEXT"
+        }["net_income"] == "NUMERIC(20, 8)"
         assert conn.execute(
             text(
                 "SELECT net_income FROM financials "
                 "WHERE code = '600519.SH'"
             )
-        ).scalar_one() == "82320067101.68"
+        ).scalar_one() == 82320067101.68
     migrated_again.dispose()
 
 
@@ -3653,8 +3669,16 @@ def test_discovery_company_payload_round_trips_exact_strict_bundle() -> None:
     from discovery.company_payload import company_payload_digest
 
     assert company_payload_digest(encoded) == (
-        "360375e659a0b75374bf2daec37a170fe8bd9f37ae9c4f217ce01c3ca9e019d7"
+        "c7ad423400378e5bd10710198e6c4cd20e2b0037e86b5fe30208c6ffeef831f6"
     )
+    # The unchanged schema3 bytes remain readable, with their original identity.
+    old_keys = {'schema_version', 'captured_at', 'code', 'security_state',
+                'source_as_of', 'financial_rows', 'valuation_points'}
+    old_payload = {key: value for key, value in parsed.items() if key in old_keys}
+    old_payload['schema_version'] = 3
+    old_text = json.dumps(old_payload, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+    assert company_payload_digest(old_text) == '360375e659a0b75374bf2daec37a170fe8bd9f37ae9c4f217ce01c3ca9e019d7'
+    assert parse_company_payload(old_text) == old_payload
     row = parsed["financial_rows"][0]
     assert row["values"]["revenue"] == "337532000000.123456789012345678"
     assert row["values"]["net_income"] is None

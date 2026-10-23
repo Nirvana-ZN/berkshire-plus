@@ -40,7 +40,9 @@ MIRROR = ["能看懂生意。", "管理层可靠。", "十年后更好。", "价
 
 
 def _engine(db_path: Path):
-    return create_engine(f"sqlite:///{db_path.resolve().as_posix()}")
+    from app.db import create_db_engine
+    return create_db_engine(db_path)
+
 
 
 def _scalar(db_path: Path, sql: str, params: dict | None = None):
@@ -527,10 +529,9 @@ def test_stale_price_does_not_judge_band_or_deviation() -> None:
 
 
 def test_research_does_not_import_ledger() -> None:
+    from tests.dependency_guards import assert_no_ledger_writes
     for path in RESEARCH_DIR.rglob("*.py"):
-        source = path.read_text(encoding="utf-8")
-        assert "import ledger" not in source
-        assert "from ledger" not in source
+        assert_no_ledger_writes(path.read_text(encoding='utf-8'))
 
 
 def test_eligible_research_upserts_and_marks_page(tmp_path: Path) -> None:
@@ -810,6 +811,7 @@ def test_dynamic_sizing_evaluates_role_band_and_drift() -> None:
     from research.thesis import dynamic_sizing
 
     core = _structured(mode="steady", conservative="48", as_of_price=42)
+    core.update(data_grade='B', operating_result={'state': 'stable'})
     core["price_bands"]["aggressive"] = "36"
     core["price_bands"]["steady"] = "42"
     core["memo"] = {"role": "core"}
@@ -821,6 +823,7 @@ def test_dynamic_sizing_evaluates_role_band_and_drift() -> None:
     assert hold_res["label"] == "核心仓·持有观察区（不追高补仓）"
 
     sat = _structured(mode="steady", conservative="8.9", as_of_price=8.4)
+    sat.update(data_grade='B', operating_result={'state': 'stable'})
     sat["price_bands"]["aggressive"] = "7.0"
     sat["price_bands"]["steady"] = "7.9"
     sat["memo"] = {"role": "satellite"}

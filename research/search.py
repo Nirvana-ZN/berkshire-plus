@@ -64,7 +64,8 @@ def _hits_from_body(body: object) -> list[dict[str, str]]:
             continue
         if len(content) > CONTENT_LIMIT:
             content = content[:CONTENT_LIMIT]
-        hits.append({"title": title, "url": url, "content": content})
+        hits.append({"title": title, "url": url, "content": content,
+                     "evidence_role": "lead_only", "status": "untrusted"})
         if len(hits) >= MAX_RESULTS:
             break
     return hits

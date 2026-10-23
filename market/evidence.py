@@ -1,0 +1,398 @@
+"""Conservative source boundary for normalized and Eastmoney evidence.
+
+A human-review receipt records an explicit assertion; it does not certify an
+archive. Standalone imports cannot grant archival trust. Reserved values keys
+begin with '_' and carry provenance text, never numeric calculation inputs.
+"""
+
+from collections.abc import Mapping, Sequence
+from dataclasses import replace
+from datetime import date, datetime, time, timedelta, timezone
+from decimal import Decimal, InvalidOperation
+from hashlib import sha256
+import json
+from pathlib import Path
+import re
+from urllib.parse import urlparse
+
+from discovery.constants import CHINA_MARKET_TIMEZONE
+from discovery.field_dictionary import SELECTION_FIELD_DICTIONARY
+from discovery.fundamental_types import (CoverageWindow, EvidenceRecord, evidence_identity,
+                                         validate_manual_verification)
+
+CAPITAL_TEXT_FIELDS = frozenset({
+    'economic_event_id', 'action', 'stage', 'effective_at',
+    'start', 'end', 'complete', 'scope', 'evidence_ids',
+})
+
+# Typed source descriptors, never caller-supplied reserved provenance keys.
+SHAREHOLDER_KINDS = frozenset({'dividend', 'buyback', 'equity_financing', 'buyback_trade'})
+SHAREHOLDER_TEXT_FIELDS = frozenset({
+    'stage', 'plan_id', 'window_start', 'window_end', 'accumulation_scope',
+    'effective_at', 'effective_date', 'trade_id', 'purpose',
+})
+SHAREHOLDER_COVERAGE_SCOPES = {
+    'all_dividend_paid': 'shareholder_dividend_paid',
+    'all_buyback_executed': 'shareholder_buyback_executed',
+    'all_buyback_cancelled': 'shareholder_buyback_cancelled',
+    'all_equity_financing_executed': 'shareholder_equity_financing_executed',
+}
+
+SELECTION_EXTENSION_FIELDS = (
+    'accounts_receivable', 'contract_assets', 'inventory',
+    'total_equity_including_minority', 'interest_expense',
+    'restricted_cash', 'related_party_funds',
+)
+
+
+def _text(value: object, name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f'{name} must be nonempty text')
+    return value
+
+
+def _time(value: object, name: str, *, provider: bool = False) -> datetime:
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        except ValueError as exc:
+            raise ValueError(f'invalid {name}') from exc
+    if not isinstance(value, datetime):
+        raise ValueError(f'{name} must be a timezone-aware datetime')
+    if value.utcoffset() is None:
+        if not provider:
+            raise ValueError(f'{name} must be a timezone-aware datetime')
+        value = value.replace(tzinfo=CHINA_MARKET_TIMEZONE)
+    return value.astimezone(timezone.utc)
+
+
+def _decimal(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, (str, Decimal, int)) or isinstance(value, bool):
+        raise ValueError('financial values require exact decimal text, Decimal or integer')
+    try:
+        amount = Decimal(value)
+    except InvalidOperation as exc:
+        raise ValueError('invalid decimal value') from exc
+    if not amount.is_finite():
+        raise ValueError('decimal value must be finite')
+    if amount == 0:
+        return '0'
+    result = format(amount, 'f')
+    return result.rstrip('0').rstrip('.') if '.' in result else result
+
+
+def _review(payload: Mapping[str, object]) -> str:
+    review = payload.get('verification')
+    if not isinstance(review, Mapping) or review.get('method') != 'human_review':
+        raise ValueError('verified manual evidence requires an explicit human-review receipt')
+    _text(review.get('reviewer'), 'reviewer')
+    _time(review.get('reviewed_at'), 'reviewed_at')
+    return json.dumps(dict(review), ensure_ascii=False, sort_keys=True, allow_nan=False, separators=(',', ':'))
+
+
+def _retained_excerpt(payload: Mapping[str, object], *, document_sha256: str,
+                      location: str, observed_at: datetime) -> dict[str, str]:
+    """Explicit retained-document receipt; never derive trust from a search hit.
+
+    human_review supports PDF/binary documents and records a human assertion,
+    not automated PDF extraction. literal_utf8 additionally checks exact text.
+    """
+    fields = ('source_document_path', 'source_excerpt', 'excerpt_verification')
+    if not any(key in payload for key in fields):
+        return {}
+    if payload.get('source', 'normalized') != 'normalized' or payload.get('status') != 'verified':
+        raise ValueError('retained source excerpts require verified manual evidence')
+    path = Path(_text(payload.get('source_document_path'), 'source_document_path'))
+    if not path.is_absolute():
+        raise ValueError('source_document_path must be absolute')
+    excerpt = _text(payload.get('source_excerpt'), 'source_excerpt')
+    receipt = payload.get('excerpt_verification')
+    if not isinstance(receipt, Mapping) or receipt.get('method') not in {'literal_utf8', 'human_review'}:
+        raise ValueError('excerpt_verification requires literal_utf8 or human_review receipt')
+    if (receipt.get('document_sha256') != document_sha256
+            or receipt.get('excerpt_sha256') != sha256(excerpt.encode('utf-8')).hexdigest()
+            or receipt.get('report_location') != location):
+        raise ValueError('excerpt verification document/hash/location binding mismatch')
+    _text(receipt.get('reviewer'), 'excerpt reviewer')
+    reviewed_at = _time(receipt.get('reviewed_at'), 'excerpt reviewed_at')
+    source_reviewed = _time(payload['verification'].get('reviewed_at'), 'source reviewed_at')
+    if max(reviewed_at, source_reviewed) > observed_at:
+        raise ValueError('source and excerpt review cannot follow verified observation')
+    raw = path.read_bytes()
+    if sha256(raw).hexdigest() != document_sha256:
+        raise ValueError('retained source document hash mismatch')
+    if receipt['method'] == 'literal_utf8':
+        try:
+            if excerpt not in raw.decode('utf-8'):
+                raise ValueError('source excerpt must be an exact UTF-8 document substring')
+        except UnicodeError as error:
+            raise ValueError('nontext documents require a human_review excerpt receipt') from error
+    return {'_source_document_path': str(path.resolve()), '_source_excerpt': excerpt,
+            '_excerpt_verification': json.dumps(dict(receipt), ensure_ascii=False,
+                sort_keys=True, allow_nan=False, separators=(',', ':'))}
+
+
+RELEASE_SECURITY_FIELDS = frozenset({'exchange', 'listing_date', 'is_st', 'is_delisting',
+    'trading_status', 'is_suspended', 'last_trade_date', 'industry_version', 'industry_as_of',
+    'security_source', 'market_status_code'})
+RELEASE_CALENDAR_FIELDS = frozenset({'calendar_version', 'calendar_source_url',
+    'calendar_document_sha256', 'calendar_coverage_end', 'period_due_dates'})
+
+
+def _release_descriptor(payload, *, source_url, document_sha256):
+    kind = payload.get('kind')
+    def day(value):
+        if type(value) is not str or date.fromisoformat(value).isoformat() != value:
+            raise ValueError('release descriptor requires canonical dates')
+        return value
+    if kind == 'release_universe':
+        from ledger.quotes import is_a_share_code
+        value = payload.get('release_universe')
+        if not isinstance(value, Mapping) or set(value) != {'version', 'market_date', 'trading_dates', 'securities'} or value['version'] != 'release-universe-v1':
+            raise ValueError('release universe descriptor is invalid')
+        day(value['market_date'])
+        calendars = value['trading_dates']
+        if not isinstance(calendars, dict) or not calendars or not set(calendars) <= {'SH', 'SZ'}:
+            raise ValueError('release universe calendars are invalid')
+        for dates in calendars.values():
+            if (not isinstance(dates, list) or not dates or any(type(item) is not str for item in dates)
+                    or dates != sorted(set(dates)) or any(day(item) > value['market_date'] for item in dates)):
+                raise ValueError('release universe calendars are invalid')
+        securities = value['securities']
+        if not isinstance(securities, list) or not securities:
+            raise ValueError('release universe securities are required')
+        codes = []
+        for row in securities:
+            if not isinstance(row, dict) or set(row) != {'code', 'name', 'industry', 'security_status'}:
+                raise ValueError('release universe security shape is invalid')
+            if type(row['code']) is not str or not is_a_share_code(row['code']) or row['code'] != row['code'].upper():
+                raise ValueError('release universe code is invalid')
+            codes.append(row['code'])
+            _text(row['name'], 'security name')
+            if row['industry'] is not None:
+                _text(row['industry'], 'industry')
+            state = row['security_status']
+            if not isinstance(state, dict) or set(state) != RELEASE_SECURITY_FIELDS:
+                raise ValueError('release universe security fields are invalid')
+            for key, item in state.items():
+                if item is None:
+                    continue  # retained unknown state remains a release blocker
+                if key in {'is_st', 'is_delisting', 'is_suspended'}:
+                    if type(item) is not bool:
+                        raise ValueError('release universe state must be boolean or null')
+                elif key == 'market_status_code':
+                    if type(item) is not int:
+                        raise ValueError('release universe market status is invalid')
+                elif key in {'listing_date', 'last_trade_date', 'industry_as_of'}:
+                    day(item)
+                else:
+                    _text(item, key)
+        if codes != sorted(set(codes)) or payload.get('code') != codes[0]:
+            raise ValueError('release universe requires sorted unique codes and first-code anchor')
+        if payload.get('period') != value['market_date']:
+            raise ValueError('release universe period must equal market date')
+        return {'_release_universe': json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False, allow_nan=False)}
+    if kind == 'disclosure_calendar':
+        from discovery.fundamentals import period_order
+        value = payload.get('disclosure_calendar')
+        if not isinstance(value, Mapping) or set(value) != RELEASE_CALENDAR_FIELDS:
+            raise ValueError('disclosure calendar descriptor is invalid')
+        _text(value['calendar_version'], 'calendar version')
+        if value['calendar_source_url'] != source_url or value['calendar_document_sha256'] != document_sha256:
+            raise ValueError('disclosure calendar must bind its retained source')
+        day(value['calendar_coverage_end'])
+        if not isinstance(value['period_due_dates'], dict) or not value['period_due_dates']:
+            raise ValueError('disclosure calendar due dates are required')
+        for period, due in value['period_due_dates'].items():
+            period_order(period)
+            day(due)
+        return {'_disclosure_calendar': json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False, allow_nan=False)}
+    if 'release_universe' in payload or 'disclosure_calendar' in payload:
+        raise ValueError('release descriptors require their explicit evidence kind')
+    return {}
+
+
+def parse_source_evidence(payload: Mapping[str, object]) -> EvidenceRecord:
+    """Normalize without inferring trust, publication dates or absent zeros.
+
+    `source=eastmoney` accepts a report/row envelope with explicit observation
+    and source provenance. Present audited columns are still untrusted because
+    zero/missing and full-market checks remain incomplete. `status=verified`
+    is permitted only for normalized manual evidence with a human-review receipt.
+    """
+    if not isinstance(payload, Mapping):
+        raise ValueError('evidence payload must be a mapping')
+    if payload.get('archive_verified', False) is not False:
+        raise ValueError('standalone import cannot certify archive_verified; validated archive bundle required')
+    source_url = _text(payload.get('source_url'), 'source_url')
+    if urlparse(source_url).scheme != 'https' or not urlparse(source_url).netloc:
+        raise ValueError('source_url must be an HTTPS document URL')
+    document_sha256 = _text(payload.get('document_sha256'), 'document_sha256')
+    if not re.fullmatch(r'[0-9a-f]{64}', document_sha256):
+        raise ValueError('document_sha256 must be a lowercase SHA256 digest')
+    values: dict[str, str | None] = {}
+    location = _text(payload.get('report_location'), 'report_location')
+    if payload.get('source', 'normalized') == 'eastmoney':
+        report = _text(payload.get('report'), 'report')
+        raw = payload.get('row')
+        if not isinstance(raw, Mapping):
+            raise ValueError('provider row must be a mapping')
+        published = _time(raw.get('NOTICE_DATE'), 'NOTICE_DATE publication', provider=True)
+        updated = _time(raw['UPDATE_DATE'], 'UPDATE_DATE', provider=True) if raw.get('UPDATE_DATE') else None
+        for name in SELECTION_EXTENSION_FIELDS:
+            spec = SELECTION_FIELD_DICTIONARY[name]
+            values[name] = _decimal(raw.get(spec.field)) if spec.report == report and isinstance(spec.field, str) else None
+        status = 'untrusted' if any(value is not None for value in values.values()) else 'missing'
+        date_only = True  # Vendor NOTICE_DATE does not certify intraday precision.
+    elif payload.get('source', 'normalized') == 'normalized':
+        raw = payload.get('values')
+        if not isinstance(raw, Mapping):
+            raise ValueError('values must be a mapping')
+        for key, value in raw.items():
+            _text(key, 'values key')
+            if key.startswith('_'):
+                raise ValueError('reserved provenance keys must be supplied through explicit metadata fields')
+            # Action descriptors are text, never decimal amounts or provenance.
+            # All other normalized values retain the financial numeric boundary.
+            kind = payload.get('kind', '')
+            shareholder_text = (kind in SHAREHOLDER_KINDS and key in SHAREHOLDER_TEXT_FIELDS
+                or kind == 'shareholder_return_coverage' and key in CAPITAL_TEXT_FIELDS | {'stage'}
+                or kind == 'asset_realization' and key in {'stage', 'effective_at', 'effective_date'})
+            if shareholder_text or key in CAPITAL_TEXT_FIELDS and str(kind).startswith(('capital_', 'buyback_')):
+                values[key] = _text(value, key) if value is not None else None
+            else:
+                values[key] = _decimal(value)
+        if payload.get('kind') == 'company_profile':
+            # A narrowly typed categorical boundary: callers still cannot inject
+            # reserved values or self-certify classification through raw values.
+            values['_industry'] = _text(payload.get('industry'), 'industry')
+        values.update(_release_descriptor(payload, source_url=source_url, document_sha256=document_sha256))
+        published = _time(payload.get('published_at'), 'published_at')
+        updated = _time(payload['source_updated_at'], 'source_updated_at') if payload.get('source_updated_at') is not None else None
+        status = payload.get('status', 'untrusted')
+        if status == 'verified':
+            values['_verification'] = _review(payload)
+        date_only = payload.get('date_only', False)
+    else:
+        raise ValueError('unsupported evidence source')
+    values['_report_location'] = location
+    # Archive provenance text may be retained, but never grants archive trust.
+    if payload.get('archive_verification_source') is not None:
+        values['_archive_verification_source'] = _text(payload['archive_verification_source'], 'archive_verification_source')
+    observed_at = _time(payload.get('observed_at'), 'observed_at')
+    values.update(_retained_excerpt(payload, document_sha256=document_sha256,
+                                   location=location, observed_at=observed_at))
+    row = EvidenceRecord(
+        evidence_id='pending', code=payload.get('code'), kind=payload.get('kind'),
+        period=payload.get('period'), published_at=published,
+        observed_at=observed_at,
+        source_updated_at=updated, source_url=source_url, document_sha256=document_sha256,
+        values=values, status=status, basis_id=payload.get('basis_id'),
+        supersedes_id=payload.get('supersedes_id'), date_only=date_only, archive_verified=False,
+    )
+    identity = evidence_identity(row)
+    validate_manual_verification(replace(row, evidence_id=identity))
+    if payload.get('evidence_id') is not None and payload['evidence_id'] != identity:
+        raise ValueError('evidence identity conflicts with canonical content')
+    return replace(row, evidence_id=identity)
+
+
+def parse_event_coverage(receipt: EvidenceRecord, records: Sequence[EvidenceRecord]) -> CoverageWindow:
+    """Read an independently reviewed, explicit (start, end] coverage assertion.
+
+    Import the receipt through parse_source_evidence just like event evidence.
+    Its values contain ISO start/end, complete='true'/'false',
+    scope='all_capital_actions' and a JSON array of exactly the supplied evidence
+    IDs. Include the receipt in the window so its observation/review provenance
+    is subject to the same repository cutoff as the action evidence. A reviewed
+    empty array is an explicit zero-event assertion, never inferred from titles.
+    The entire Shanghai end date must have elapsed before review/observation;
+    a review dated after first observation cannot certify that earlier receipt.
+    Premature assertions remain incomplete with their original identity/interval.
+    """
+    from market.corporate_actions import parse_capital_events
+
+    if receipt.kind != 'capital_event_coverage':
+        raise ValueError('capital coverage requires a separate coverage receipt')
+    if receipt.values.get('scope') != 'all_capital_actions':
+        raise ValueError('capital coverage requires an explicit all_capital_actions scope')
+    start = date.fromisoformat(_text(receipt.values.get('start'), 'start'))
+    end = date.fromisoformat(_text(receipt.values.get('end'), 'end'))
+    complete = receipt.values.get('complete')
+    if complete not in {'true', 'false'}:
+        raise ValueError('coverage complete must be true or false text')
+    ids = json.loads(_text(receipt.values.get('evidence_ids'), 'evidence_ids'))
+    if not isinstance(ids, list) or any(not isinstance(item, str) for item in ids) or len(set(ids)) != len(ids):
+        raise ValueError('coverage evidence_ids must be a unique JSON array of text')
+    supplied = {row.evidence_id: row for row in records}
+    if set(ids) != set(supplied) or any(row.code != receipt.code for row in records):
+        raise ValueError('coverage must reference exactly the supplied same-company evidence')
+    events = parse_capital_events(records)
+    if any(not start < event.effective_at.astimezone(CHINA_MARKET_TIMEZONE).date() <= end for event in events):
+        raise ValueError('capital event lies outside the asserted coverage interval')
+    reviewed = receipt.status == 'verified' and receipt.values.get('_verification') is not None
+    timely = False
+    # The terminal date has no representable next day: it cannot be closed.
+    if reviewed and end != date.max:
+        review = json.loads(_text(receipt.values['_verification'], '_verification'))
+        _review({'verification': review})
+        reviewed_at = _time(review['reviewed_at'], 'reviewed_at')
+        interval_closed_at = (datetime.combine(end, time.min, tzinfo=CHINA_MARKET_TIMEZONE)
+                              + timedelta(days=1)).astimezone(timezone.utc)
+        observed_at = receipt.observed_at.astimezone(timezone.utc)
+        timely = interval_closed_at <= reviewed_at <= observed_at
+    # A source-only/untrusted notice cannot become a complete action register.
+    stages = {'capital_event': {'implemented', 'withdrawn'},
+              'capital_plan': {'proposed', 'approved'}, 'buyback_trade': {'traded'}}
+    verified = all(row.status == 'verified' and row.values.get('stage') in stages.get(row.kind, set())
+                   for row in records)
+    return CoverageWindow(receipt.code, 'capital_event', start, end,
+                          complete == 'true' and reviewed and timely and verified,
+                          tuple(ids) + (receipt.evidence_id,))
+
+
+def parse_shareholder_coverage(receipt: EvidenceRecord, records: Sequence[EvidenceRecord]) -> CoverageWindow:
+    """A reviewed complete ledger for one exact kind/stage and (start,end].
+
+    Source dates, not announcement/report years, locate actual cash and shares.
+    Window-scoped cumulative amounts retain their source interval; this receipt
+    cannot convert a cross-year plan-to-date amount into annual cash.
+    """
+    from market.corporate_actions import shareholder_effective_date, shareholder_stage
+
+    if receipt.kind != 'shareholder_return_coverage':
+        raise ValueError('shareholder coverage requires a separate coverage receipt')
+    scope = receipt.values.get('scope')
+    if scope not in SHAREHOLDER_COVERAGE_SCOPES:
+        raise ValueError('shareholder coverage requires an explicit kind/stage scope')
+    start = date.fromisoformat(_text(receipt.values.get('start'), 'start'))
+    end = date.fromisoformat(_text(receipt.values.get('end'), 'end'))
+    complete = receipt.values.get('complete')
+    if complete not in {'true', 'false'}:
+        raise ValueError('coverage complete must be true or false text')
+    ids = json.loads(_text(receipt.values.get('evidence_ids'), 'evidence_ids'))
+    if not isinstance(ids, list) or any(not isinstance(item, str) for item in ids) or len(set(ids)) != len(ids):
+        raise ValueError('coverage evidence_ids must be a unique JSON array of text')
+    supplied = {row.evidence_id: row for row in records}
+    if set(ids) != set(supplied) or any(row.code != receipt.code for row in records):
+        raise ValueError('coverage must reference exactly the supplied same-company evidence')
+    for row in records:
+        kind, stage = shareholder_stage(row)
+        if f'all_{kind}_{stage}' != scope:
+            raise ValueError('shareholder coverage contains a different kind/stage')
+        if not start < shareholder_effective_date(row) <= end:
+            raise ValueError('shareholder execution lies outside the asserted coverage interval')
+    reviewed = receipt.status == 'verified' and receipt.values.get('_verification') is not None
+    timely = False
+    # Preserve the requested interval and mark it incomplete at the date limit.
+    if reviewed and end != date.max:
+        review = json.loads(_text(receipt.values['_verification'], '_verification'))
+        _review({'verification': review})
+        reviewed_at = _time(review['reviewed_at'], 'reviewed_at')
+        closed = (datetime.combine(end, time.min, tzinfo=CHINA_MARKET_TIMEZONE) + timedelta(days=1)).astimezone(timezone.utc)
+        timely = closed <= reviewed_at <= receipt.observed_at
+    return CoverageWindow(receipt.code, SHAREHOLDER_COVERAGE_SCOPES[scope], start, end,
+        complete == 'true' and reviewed and timely and receipt.values.get('stage') not in {'withdrawn', 'revoked'}
+        and all(row.status == 'verified' for row in records), tuple(ids) + (receipt.evidence_id,))

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
-from sqlalchemy import select, update
+from sqlalchemy import and_, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.models import (
@@ -22,6 +22,8 @@ JOB_TYPE_RESEARCH = "research"
 JOB_TYPE_REVIEW = "review"
 JOB_TYPE_DISCOVERY_DATA = "discovery_data"
 JOB_TYPE_DISCOVERY = "discovery"
+JOB_TYPE_TRACKING = "tracking"
+TRACKING_LEASE_SECONDS = 120
 LOCK_ROW_ID = 1
 ACTIVE_STATUSES = ("queued", "running")
 FILL_RESTART_PAUSE = "进程重启，任务已暂停"
@@ -141,7 +143,17 @@ def clear_stale_lock(
             stage.error = "进程重启，任务中断"
         stage.updated_at = discovery_interrupted_at
     row = session.get(JobLock, LOCK_ROW_ID)
-    if row is not None:
+    if row is not None and row.job_type == JOB_TYPE_TRACKING:
+        # A second process may have renewed/recovered after our read. Clear only
+        # the expired token we actually saw, never that process's live lease.
+        session.execute(update(JobLock).where(JobLock.id == LOCK_ROW_ID,
+            JobLock.job_type == JOB_TYPE_TRACKING, JobLock.owner_token == row.owner_token,
+            or_(JobLock.held_at.is_(None), JobLock.owner_token.is_(None),
+                JobLock.held_at <= discovery_interrupted_at - timedelta(seconds=TRACKING_LEASE_SECONDS)))
+            .values(job_id=None, job_type=None, held_at=None, owner_token=None)
+            .execution_options(synchronize_session=False))
+        session.expire(row)
+    elif row is not None:
         row.job_id = None
         row.job_type = None
         row.held_at = None
@@ -188,6 +200,33 @@ def acquire_discovery(session: Session, run_id: int) -> str | None:
         )
     )
     return token if int(result.rowcount or 0) == 1 else None
+
+
+def acquire_tracking(session: Session, *, now: datetime | None = None) -> str | None:
+    """CAS acquire or recover only an expired tracking lease; caller commits."""
+    at = now or datetime.now(timezone.utc)
+    if at.tzinfo is None or at.utcoffset() is None:
+        raise ValueError('tracking lease requires an aware clock')
+    ensure_lock_row(session)
+    token = uuid4().hex
+    result = session.execute(update(JobLock).where(JobLock.id == LOCK_ROW_ID, or_(
+        JobLock.job_id.is_(None), and_(JobLock.job_type == JOB_TYPE_TRACKING,
+            or_(JobLock.held_at.is_(None),
+                JobLock.held_at <= at - timedelta(seconds=TRACKING_LEASE_SECONDS)))))
+        .values(job_id=0, job_type=JOB_TYPE_TRACKING, held_at=at, owner_token=token))
+    return token if int(result.rowcount or 0) == 1 else None
+
+
+def renew_tracking(session: Session, token: str, *, now: datetime | None = None) -> bool:
+    at = now or datetime.now(timezone.utc)
+    if at.tzinfo is None or at.utcoffset() is None:
+        raise ValueError('tracking lease requires an aware clock')
+    result = session.execute(update(JobLock).where(JobLock.id == LOCK_ROW_ID,
+        JobLock.job_id == 0, JobLock.job_type == JOB_TYPE_TRACKING,
+        JobLock.owner_token == token,
+        JobLock.held_at > at - timedelta(seconds=TRACKING_LEASE_SECONDS))
+        .values(held_at=at))
+    return int(result.rowcount or 0) == 1
 
 
 def release(

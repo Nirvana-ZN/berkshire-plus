@@ -2406,7 +2406,7 @@ def test_recomputation_requires_complete_available_saved_build() -> None:
         validate_recomputation,
     )
 
-    assert BUILD_VERSION == "discovery-v7"
+    assert BUILD_VERSION == "discovery-v8"
     assert AVAILABLE_BUILDS == frozenset({BUILD_VERSION})
     validate_recomputation(
         BUILD_VERSION,
@@ -3369,9 +3369,10 @@ def test_upgraded_discovery_stage_lineage_triggers_are_idempotent(
             )
         ).all()
     assert recovered == [
-        (1, 1, None, None),
-        (2, None, 1, "track_gate"),
-        (3, None, 2, "competition"),
+        # Additive migration must not infer lineage for retained old rows.
+        (1, None, None, None),
+        (2, None, None, None),
+        (3, None, None, None),
         (4, None, None, None),
     ]
     insert = (
@@ -3678,6 +3679,7 @@ def _api_payload(
     *,
     financial_rows=None,
     valuation_points=None,
+    code: str = '600000.SH',
 ) -> str:
     from discovery.company_payload import serialize_company_payload
     from market.types import (
@@ -3691,7 +3693,7 @@ def _api_payload(
     rows = (
         (
             FinancialRow(
-                code="600000.SH",
+                code=code,
                 period="2025",
                 period_type="annual",
                 net_income=Decimal("100"),
@@ -3704,7 +3706,7 @@ def _api_payload(
     points = (
         (
             ValuationPoint(
-                code="600000.SH",
+                code=code,
                 month="2026-09",
                 trade_date="2026-09-17",
                 pe=Decimal("8"),
@@ -3719,9 +3721,9 @@ def _api_payload(
     )
     return serialize_company_payload(
         DiscoveryCompanyData(
-            code="600000.SH",
+            code=code,
             security_state=SecurityState(
-                code="600000.SH",
+                code=code,
                 name="浦发银行",
                 industry="银行",
                 exchange="SH",
@@ -3759,7 +3761,10 @@ def _api_payload(
     )
 
 
-def _seed_api_snapshot(db_path: Path) -> None:
+def _seed_api_snapshot(db_path: Path, *, published=True) -> None:
+    if published:
+        from tests.test_selection_release import seed_published_release
+        seed_published_release(db_path)
     from app.models import (
         DiscoveryDataCheckpoint,
         DiscoveryDataFill,
@@ -3835,8 +3840,8 @@ def _seed_api_snapshot(db_path: Path) -> None:
             net_income=Decimal("100"),
             source_as_of="2026-03-31",
         )
-        session.add(financial)
-        session.add(
+        session.merge(financial)
+        session.merge(
             FinancialFieldProvenance(
                 code=financial.code,
                 period=financial.period,
@@ -3845,16 +3850,16 @@ def _seed_api_snapshot(db_path: Path) -> None:
                 source="discovery",
             )
         )
-        session.add(
+        session.merge(
             FinancialFetchCompleteness(
                 code="600000.SH",
                 mode="discovery",
                 completed_at=SNAPSHOT_AT,
             )
         )
-        session.add(ValuationSeries(code="600000.SH", ratio_method="PE_TTM/PB_MRQ"))
+        session.merge(ValuationSeries(code="600000.SH", ratio_method="PE_TTM/PB_MRQ"))
         session.flush()
-        session.add(
+        session.merge(
             ValuationHistory(
                 code="600000.SH",
                 month="2026-09",
@@ -3977,7 +3982,7 @@ def test_discovery_api_create_read_and_missing_rulers(tmp_path: Path) -> None:
     from market.quotes import FakeQuoteClient
 
     db_path = tmp_path / "discovery-api.db"
-    _seed_api_snapshot(db_path)
+    _seed_api_snapshot(db_path, published=False)
     app = create_app(
         db_path=db_path,
         quote_client=FakeQuoteClient(),
@@ -3989,7 +3994,7 @@ def test_discovery_api_create_read_and_missing_rulers(tmp_path: Path) -> None:
         created = client.post("/api/discoveries", json={"sync": True})
         assert created.status_code == 200
         run = created.json()
-        assert run["status"] == "failed"
+        assert run["status"] == "queued"
         assert run["ruler_version_ids"] == {
             "quality_discount": None,
             "deep_value": None,
@@ -4000,15 +4005,15 @@ def test_discovery_api_create_read_and_missing_rulers(tmp_path: Path) -> None:
         safety = client.get(
             f"/api/discoveries/{run['id']}/stages/safety"
         ).json()
-        assert safety["current"]["status"] == "confirmed"
-        assert [row["code"] for row in safety["pass"]] == ["600000.SH"]
+        assert safety["current"]["status"] == "queued"
+        assert safety["pass"] == []
 
         for track in ("quality_discount", "deep_value", "garp"):
             stage = client.get(
                 f"/api/discoveries/{run['id']}/tracks/{track}"
                 "/stages/track_gate"
-            ).json()
-            assert stage["current"]["status"] == "ruler_not_ready"
+            )
+            assert stage.status_code == 404
 
         from app.models import Financial, ValuationHistory
         from discovery.snapshot import load_frozen_inputs
@@ -4071,7 +4076,7 @@ def test_discovery_api_rejects_bad_body_and_supports_abandon(tmp_path: Path) -> 
             track: (row["stage"], row["status"], row["created"])
             for track, row in body["tracks"].items()
         } == {
-            track: ("track_gate", "ruler_not_ready", True)
+            track: ("track_gate", "data_not_ready", True)
             for track in ("quality_discount", "deep_value", "garp")
         }
         assert client.get("/api/discoveries/current").status_code == 404
@@ -4142,49 +4147,8 @@ def test_three_tracks_advance_independently_with_injected_executor(
         metrics_by_code = {}
         evidence_by_code = {}
         for code in context.candidate_codes:
-            metrics = {
-                field: "1" for field in context.ruler_payload["formulas"]
-            }
-            metrics.update(
-                {
-                    "code": code,
-                    "branch": "bank",
-                    "quality_branch": "bank",
-                }
-            )
-            for count in (
-                "valuation_pe_observations",
-                "valuation_pb_observations",
-                "roe_observations",
-                "cash_conversion_observations",
-                "bank_roe_observations",
-                "bank_capital_available_count",
-                "bank_npl_available_count",
-                "normalized_earnings_observations",
-                "fcf_observations",
-                "net_debt_observations",
-                "interest_coverage_observations",
-                "bank_npl_observations",
-                "dilution_observations",
-                "revenue_observations",
-                "one_time_profit_observations",
-                "impairment_observations",
-                "non_core_income_proxy_observations",
-                "revenue_growth_observations",
-                "deducted_profit_growth_observations",
-                "roic_observations",
-                "roe_fallback_observations",
-            ):
-                metrics[count] = "999"
-            if context.track == "deep_value":
-                policy = context.ruler_payload["sector_branches"][
-                    "branch_policies"
-                ]["bank"]
-                metrics["branch"] = (
-                    "bank"
-                    if policy in {"unsupported", "insufficient"}
-                    else policy
-                )
+            from tests.test_discovery_overrides import _competition_metrics
+            metrics = _competition_metrics(context.track, code)
             metrics_by_code[code] = metrics
             if context.stage == "competition":
                 card = build_evidence_card(
@@ -4230,6 +4194,13 @@ def test_three_tracks_advance_independently_with_injected_executor(
             ),
         )
 
+    def current_snapshot(session, **kwargs):
+        from dataclasses import replace
+        from discovery.snapshot import build_production_snapshot
+        snapshot = build_production_snapshot(session, **kwargs)
+        return replace(snapshot, companies=tuple(replace(item, industry="制造业",
+            as_of={**item.as_of, "decision_cutoff_at": SNAPSHOT_AT.isoformat()}) for item in snapshot.companies))
+
     app = create_app(
         db_path=db_path,
         quote_client=FakeQuoteClient(),
@@ -4237,13 +4208,16 @@ def test_three_tracks_advance_independently_with_injected_executor(
         allow_sync=True,
         discovery_clock=lambda: SNAPSHOT_AT,
         discovery_track_executor=execute,
+        discovery_snapshot_provider=current_snapshot,
     )
     with TestClient(app) as client:
         run = client.post(
             "/api/discoveries", json={"sync": True}
         ).json()
         run_id = run["id"]
-        assert run["status"] == "completed"
+        with SessionLocal() as diagnostic:
+            errors = [(row.track, row.stage, row.status, row.error) for row in diagnostic.scalars(select(DiscoveryStage))]
+        assert run["status"] == "completed", errors
         assert executed[:3] == [
             ("quality_discount", "track_gate"),
             ("deep_value", "track_gate"),
@@ -4462,7 +4436,7 @@ def test_newer_nonready_fill_blocks_older_ready_snapshot(tmp_path: Path) -> None
     from market.quotes import FakeQuoteClient
 
     db_path = tmp_path / "newer-paused-fill.db"
-    _seed_api_snapshot(db_path)
+    _seed_api_snapshot(db_path, published=False)
     engine = init_db(db_path)
     SessionLocal = create_session_factory(engine)
     newer_row_time = SNAPSHOT_AT - timedelta(hours=1)
@@ -4502,6 +4476,7 @@ def test_newer_nonready_fill_blocks_older_ready_snapshot(tmp_path: Path) -> None
         ) == 0
 
 
+
 def test_failed_checkpoint_cannot_leak_stale_global_data(
     tmp_path: Path,
 ) -> None:
@@ -4530,7 +4505,7 @@ def test_failed_checkpoint_cannot_leak_stale_global_data(
             )
         )
         checkpoint = session.get(
-            DiscoveryDataCheckpoint, (1, "600000.SH")
+            DiscoveryDataCheckpoint, (2, "600000.SH")
         )
         assert checkpoint is not None
         checkpoint.status = "failed"
@@ -4577,7 +4552,7 @@ def test_snapshot_ignores_future_and_unproven_global_data(
     from market.quotes import FakeQuoteClient
 
     db_path = tmp_path / "snapshot-contamination.db"
-    _seed_api_snapshot(db_path)
+    _seed_api_snapshot(db_path, published=False)
     engine = init_db(db_path)
     SessionLocal = create_session_factory(engine)
     with SessionLocal() as session:
@@ -4642,6 +4617,7 @@ def test_snapshot_ignores_future_and_unproven_global_data(
     valuations = frozen.fields["valuation_history"]
     assert [row["month"] for row in valuations] == ["2026-09"]
     assert frozen.fields["price"] == "10"
+
 
 
 def test_create_dispatch_failure_retries_existing_queued_run(
@@ -4839,11 +4815,8 @@ def test_stage_reads_preserve_zero_result_attempts_and_partitions(
             from discovery.rulers import activate
             from tests.discovery_helpers import discovery_ruler_payload
 
-            garp_ruler = activate(
-                session,
-                discovery_ruler_payload("garp"),
-                "route partition fixture",
-            )
+            from discovery.rulers import require_ready
+            garp_ruler = require_ready(session, "garp")[0]
             second_gate = DiscoveryStage(
                 run_id=run_id,
                 track="garp",
@@ -5227,7 +5200,7 @@ def test_checkpoint_security_set_mismatch_is_data_not_ready(
     from market.quotes import FakeQuoteClient
 
     db_path = tmp_path / "snapshot-set-mismatch.db"
-    _seed_api_snapshot(db_path)
+    _seed_api_snapshot(db_path, published=False)
     engine = init_db(db_path)
     SessionLocal = create_session_factory(engine)
     with SessionLocal() as session:
@@ -5245,6 +5218,7 @@ def test_checkpoint_security_set_mismatch_is_data_not_ready(
         response = client.post("/api/discoveries", json={"sync": True})
         assert response.status_code == 409
         assert response.json()["code"] == "DATA_NOT_READY"
+
 
 
 def test_drain_observes_forced_abandon_before_queued_work(
@@ -5395,7 +5369,7 @@ def test_post_cutoff_done_checkpoint_is_not_affiliated(
     from market.quotes import FakeQuoteClient
 
     db_path = tmp_path / "checkpoint-after-cutoff.db"
-    _seed_api_snapshot(db_path)
+    _seed_api_snapshot(db_path, published=False)
     engine = init_db(db_path)
     SessionLocal = create_session_factory(engine)
     with SessionLocal() as session:
@@ -5415,6 +5389,7 @@ def test_post_cutoff_done_checkpoint_is_not_affiliated(
         response = client.post("/api/discoveries", json={"sync": True})
         assert response.status_code == 409
         assert response.json()["code"] == "DATA_NOT_READY"
+
 
 
 @pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
@@ -5831,7 +5806,7 @@ def test_latest_fill_payload_omits_prior_financial_periods_and_values(
     from market.types import FinancialRow
 
     db_path = tmp_path / "exact-fill-financial-payload.db"
-    _seed_api_snapshot(db_path)
+    _seed_api_snapshot(db_path, published=False)
     engine = init_db(db_path)
     SessionLocal = create_session_factory(engine)
     with SessionLocal() as session:
@@ -5891,6 +5866,7 @@ def test_latest_fill_payload_omits_prior_financial_periods_and_values(
     assert history[0]["values"]["net_income"] == "222"
 
 
+
 def test_production_snapshot_never_queries_shared_company_caches(
     tmp_path: Path,
 ) -> None:
@@ -5899,7 +5875,7 @@ def test_production_snapshot_never_queries_shared_company_caches(
     from discovery.snapshot import build_production_snapshot
 
     db_path = tmp_path / "no-shared-cache-reads.db"
-    _seed_api_snapshot(db_path)
+    _seed_api_snapshot(db_path, published=False)
     engine = init_db(db_path)
     forbidden = {
         "financials",
@@ -5929,6 +5905,7 @@ def test_production_snapshot_never_queries_shared_company_caches(
     engine.dispose()
 
 
+
 def test_snapshot_versions_hash_exact_checkpoint_payload_content(
     tmp_path: Path,
 ) -> None:
@@ -5939,7 +5916,7 @@ def test_snapshot_versions_hash_exact_checkpoint_payload_content(
 
     paths = [tmp_path / "payload-a.db", tmp_path / "payload-b.db"]
     for path in paths:
-        _seed_api_snapshot(path)
+        _seed_api_snapshot(path, published=False)
     engine = init_db(paths[1])
     SessionLocal = create_session_factory(engine)
     with SessionLocal() as session:
@@ -5987,6 +5964,7 @@ def test_snapshot_versions_hash_exact_checkpoint_payload_content(
     )
 
 
+
 def test_snapshot_keeps_annual_rows_but_versions_cover_interim(
     tmp_path: Path,
 ) -> None:
@@ -5998,7 +5976,7 @@ def test_snapshot_keeps_annual_rows_but_versions_cover_interim(
     snapshots = []
     for interim_income in ("40", "41"):
         path = tmp_path / f"interim-{interim_income}.db"
-        _seed_api_snapshot(path)
+        _seed_api_snapshot(path, published=False)
         engine = init_db(path)
         with create_session_factory(engine)() as session:
             session.execute(
@@ -6043,6 +6021,7 @@ def test_snapshot_keeps_annual_rows_but_versions_cover_interim(
     )
 
 
+
 def test_streamed_snapshot_versions_match_whole_value_hashes(
     tmp_path: Path,
 ) -> None:
@@ -6059,7 +6038,7 @@ def test_streamed_snapshot_versions_match_whole_value_hashes(
     from discovery.snapshot import _sha256, build_production_snapshot
 
     db_path = tmp_path / "streamed-versions.db"
-    _seed_api_snapshot(db_path)
+    _seed_api_snapshot(db_path, published=False)
     engine = init_db(db_path)
     with create_session_factory(engine)() as session:
         session.execute(
@@ -6071,7 +6050,9 @@ def test_streamed_snapshot_versions_match_whole_value_hashes(
         fill = session.scalars(select(DiscoveryDataFill)).one()
         template = session.scalars(select(DiscoveryUniverseSecurity)).one()
         columns = DiscoveryUniverseSecurity.__table__.columns
-        done_text = _api_payload(SNAPSHOT_AT).replace("600000.SH", "600036.SH")
+        # Generate the second issuer's own identity-bearing schema4 content.
+        # Text replacement would leave its embedded fundamental digest invalid.
+        done_text = _api_payload(SNAPSHOT_AT, code="600036.SH")
         for code, status, text_value in (
             ("000001.SZ", "failed", None),
             ("600036.SH", "done", done_text),
@@ -6150,7 +6131,12 @@ def test_streamed_snapshot_versions_match_whole_value_hashes(
     assert snapshot.versions.financial_version == (
         f"financial:fill:{stamp}:"
         + _sha256(
-            {code: value["financial_rows"] for code, value in payloads.items()}
+            {code: {key: value[key] for key in (
+                'financial_rows', 'schema_version', 'annual_evidence', 'interim_history',
+                'capital_events', 'fundamental_extensions', 'coverage', 'evidence_ids',
+                'current_mcap', 'fundamental_fingerprint', 'decision_cutoff_at',
+                'operating_policy', 'operating_result',
+            )} for code, value in payloads.items()}
         )[:20]
     )
     assert snapshot.versions.valuation_version == (
@@ -6159,6 +6145,7 @@ def test_streamed_snapshot_versions_match_whole_value_hashes(
             {code: value["valuation_points"] for code, value in payloads.items()}
         )[:20]
     )
+
 
 
 @pytest.mark.parametrize(
@@ -6182,7 +6169,7 @@ def test_latest_done_checkpoint_rejects_unreproducible_payload(
     from market.quotes import FakeQuoteClient
 
     db_path = tmp_path / f"unreproducible-{tamper}.db"
-    _seed_api_snapshot(db_path)
+    _seed_api_snapshot(db_path, published=False)
     engine = init_db(db_path)
     SessionLocal = create_session_factory(engine)
     with SessionLocal() as session:
@@ -6226,6 +6213,7 @@ def test_latest_done_checkpoint_rejects_unreproducible_payload(
     assert "restart" in detail or "start a new fill" in detail
 
 
+
 @pytest.mark.parametrize(
     "future_part",
     ["calendar", "universe_snapshot", "universe_source", "checkpoint"],
@@ -6244,7 +6232,7 @@ def test_production_snapshot_rejects_future_fill_timestamps(
     from market.quotes import FakeQuoteClient
 
     db_path = tmp_path / f"future-fill-{future_part}.db"
-    _seed_api_snapshot(db_path)
+    _seed_api_snapshot(db_path, published=False)
     engine = init_db(db_path)
     SessionLocal = create_session_factory(engine)
     with SessionLocal() as session:
@@ -6307,6 +6295,7 @@ def test_production_snapshot_rejects_future_fill_timestamps(
     assert response.json()["code"] == "DATA_NOT_READY"
 
 
+
 @pytest.mark.parametrize(
     ("market_date", "expected_status"),
     [("2026-09-17", 200), ("2026-09-18", 409)],
@@ -6329,7 +6318,7 @@ def test_snapshot_date_cutoff_uses_china_market_day(
     from market.quotes import FakeQuoteClient
 
     db_path = tmp_path / f"china-cutoff-{market_date}.db"
-    _seed_api_snapshot(db_path)
+    _seed_api_snapshot(db_path, published=False)
     cutoff = datetime(2026, 9, 16, 17, tzinfo=timezone.utc)
     engine = init_db(db_path)
     SessionLocal = create_session_factory(engine)
@@ -6392,6 +6381,7 @@ def test_snapshot_date_cutoff_uses_china_market_day(
         assert response.json()["code"] == "DATA_NOT_READY"
 
 
+
 @pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
 def test_nonfinite_tagged_discovery_ruler_is_ignored(
     tmp_path: Path, constant: str
@@ -6403,7 +6393,7 @@ def test_nonfinite_tagged_discovery_ruler_is_ignored(
     from market.quotes import FakeQuoteClient
 
     db_path = tmp_path / f"nonfinite-ruler-{constant}.db"
-    _seed_api_snapshot(db_path)
+    _seed_api_snapshot(db_path, published=False)
     engine = init_db(db_path)
     SessionLocal = create_session_factory(engine)
     with SessionLocal() as session:

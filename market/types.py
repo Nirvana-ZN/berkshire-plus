@@ -1,11 +1,57 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import date
+from dataclasses import dataclass, field
+from collections.abc import Mapping
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Callable
+from discovery.fundamental_types import EvidenceRecord, CoverageWindow
 
 DiscoveryPreRequest = Callable[[], None]
+
+
+@dataclass(frozen=True)
+class CurrentMarketCap:
+    """One dated provider observation; absent/invalid observations carry no value."""
+
+    code: str
+    value: Decimal | None
+    market_date: date | None
+    observed_at: datetime
+    source: str
+    source_url: str
+    response_sha256: str
+    status: str
+    reason: str | None
+
+    def __post_init__(self) -> None:
+        if (type(self.code) is not str or len(self.code) != 9
+                or not self.code[:6].isdigit() or self.code[6:] not in {'.SH', '.SZ'}):
+            raise ValueError('current market cap requires a canonical A-share code')
+        if (not isinstance(self.observed_at, datetime)
+                or self.observed_at.utcoffset() is None):
+            raise ValueError('observed_at must be an aware datetime')
+        object.__setattr__(self, 'observed_at', self.observed_at.astimezone(timezone.utc))
+        if self.market_date is not None and type(self.market_date) is not date:
+            raise ValueError('market_date must be an actual date or None')
+        if self.status not in {'verified', 'missing', 'untrusted'}:
+            raise ValueError('invalid current market cap status')
+        if self.status == 'verified':
+            from discovery.constants import china_market_date
+            if (not isinstance(self.value, Decimal) or not self.value.is_finite()
+                    or self.value <= 0 or self.market_date is None
+                    or self.market_date > china_market_date(self.observed_at)):
+                raise ValueError('verified current market cap requires positive value and observed market day')
+            if self.reason is not None:
+                raise ValueError('verified current market cap cannot have a failure reason')
+        elif self.value is not None or not isinstance(self.reason, str) or not self.reason.strip():
+            raise ValueError('unavailable current market cap requires reason and no value')
+        if (not isinstance(self.source, str) or not self.source.strip()
+                or not isinstance(self.source_url, str) or not self.source_url.startswith('https://')):
+            raise ValueError('current market cap requires source provenance')
+        if (not isinstance(self.response_sha256, str) or len(self.response_sha256) != 64
+                or any(char not in '0123456789abcdef' for char in self.response_sha256)):
+            raise ValueError('current market cap requires response SHA256')
 
 
 class MarketError(Exception):
@@ -204,3 +250,7 @@ class DiscoveryCompanyData:
     valuation_points: tuple[ValuationPoint, ...]
     request_count: int
     source_as_of: DiscoverySourceAsOf
+    evidence_records: tuple[EvidenceRecord, ...] = ()
+    coverage: tuple[CoverageWindow, ...] = ()
+    current_market_cap: CurrentMarketCap | None = None
+    operating_policy: Mapping[str, object] = field(default_factory=dict)

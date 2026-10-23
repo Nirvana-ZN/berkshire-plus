@@ -49,7 +49,7 @@ An empty database is usable. A YAML ledger is optional.
    Choose an industry, index, or theme, then click "开始筛选". The model is called only when "评估终选" is checked, or when "个股直接评估" is used.
 
 4. **Weekly discovery** at http://127.0.0.1:8765/discover  
-   Click "更新全市场数据" first. "开始本周发现" stays disabled until that fetch finishes. The fetch pulls a full-market snapshot from East Money and takes a long time. Leave the workbench terminal open.
+   A fetch alone does not authorize discovery-v8 execution. Retain reviewed source evidence, complete the schema4 frozen fill, and follow the readiness/publication workflow below. The fetch pulls market data from East Money and takes a long time. Leave the workbench terminal open.
 
 5. **Index funds** at http://127.0.0.1:8765/index-funds  
    Click "刷新数据". Each index gets one representative fund and an undervaluation screen.
@@ -111,14 +111,18 @@ None of these are committed. Another computer needs its own frontend build, and 
 
 ## Upgrading an existing database
 
-A fresh clone skips this section. It applies only to a full-market snapshot that was already marked `ready` before an upgrade. That snapshot is kept as-is. Fields are not backfilled and values are not rewritten. Do not keep using that fill after the upgrade. Stop the workbench, mark the old fill unavailable, then click "更新全市场数据" again on the weekly discovery page:
+The executable build is `discovery-v8`; v7 is retired and retained for historical reads. Frozen runs, rulers, sources and tracking configurations keep their original bytes. Startup preserves old financial caches without inventing trust. Schema 8 requires a supported connection capability for every application-table write; old programs fail closed. Unknown schemas permit compatible reads only, and mutation endpoints return `schema_read_only`.
 
-```sql
-UPDATE discovery_data_fills
-SET snapshot_status = 'unavailable',
-    status = 'snapshot_unavailable',
-    last_error = 'pre-fix snapshot; start a new fill'
-WHERE id = <旧填充 ID> AND snapshot_status = 'ready';
+v8 introduces ranking normalized within each branch, economic dilution, deducted-profit TTM/PEG, usable cash and traceable gross invested-capital returns. Collection and restricted-cash signals remain auditable shadow signals. Selection grants research eligibility; deterministic evidence grades, scenario prices and exposure after proposed changes constrain recommendations.
+
+**Production is not ready.** The retained [source audit](docs/discovery-calibration/selection-evidence-source-audit.md) and archive establish a limited sample, not full-market or point-in-time completeness. The three v8 calibration artifacts remain contract hypotheses with null observation counts. Software acceptance, source readiness, production activation and mature outcomes are separate statuses. This implementation did not publish against the production database.
+
+Prepare a new independently captured schema4 fill with reviewed retained source documents, a complete security-state inventory and the actual disclosure-calendar policy. See the [release/source workflow](docs/stock-selection-strategies.md#9-selection-v8发布与历史边界). The default command only reads:
+
+```powershell
+uv run python -m scripts.release_selection_v8 --db <absolute-database-path> --fill-id <new-fill-id> --dry-run
 ```
 
-The old snapshot stays read-only. Do not delete or edit it row by row.
+Publication requires 95% trusted common fields and 90% for each applicable new source/metric window, with the same minima for every nonempty industry. Candidate counts are diagnostic only. Explicit `--apply --reason <reason> --backup-dir <absolute-directory>` verifies a consistent SQLite API backup (integrity, foreign keys, every actual table count and SHA256), then atomically appends all three rulers and a release receipt. Default reporting creates no backup directory. `--rollback-read-only --reason <reason> --backup-dir <absolute-directory>` appends a disabling receipt without changing history or enabling old-build recomputation.
+
+Paper tracking retains dividends, suspensions, unfilled orders, costs and benchmark gaps. Pending horizons have null realized returns and are never annualized. Market/publication/calendar windows start at 1992-01-01; earlier listing dates remain valid metadata, while earlier historical-timezone windows are explicitly unsupported. Mature synthetic fixtures do not establish real mature strategy returns.

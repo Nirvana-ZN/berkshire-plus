@@ -17,7 +17,9 @@ FIXTURES = ROOT / "tests" / "fixtures" / "portfolio"
 
 
 def _engine(db_path: Path):
-    return create_engine(f"sqlite:///{db_path.resolve().as_posix()}")
+    from app.db import create_db_engine
+    return create_db_engine(db_path)
+
 
 
 def _scalar(db_path: Path, sql: str, params: dict | None = None):
@@ -742,10 +744,9 @@ def test_model_rebalance_note_is_dropped(tmp_path: Path) -> None:
 
 
 def test_review_module_does_not_import_ledger() -> None:
+    from tests.dependency_guards import assert_no_ledger_writes
     for path in REVIEW_DIR.rglob("*.py"):
-        source = path.read_text(encoding="utf-8")
-        assert "import ledger" not in source
-        assert "from ledger" not in source
+        assert_no_ledger_writes(path.read_text(encoding='utf-8'))
 
 
 def test_positions_and_home_have_review_entry_without_apply() -> None:

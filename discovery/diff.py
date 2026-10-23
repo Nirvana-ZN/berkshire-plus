@@ -211,6 +211,26 @@ def _cause(
     return None
 
 
+def selection_metric_changes(previous: PersistedCompanyResult | None,
+                             current: PersistedCompanyResult | None) -> dict[str, object]:
+    """Explain candidate changes from persisted v8 metrics, without recomputation.
+
+    Kept alongside WeeklyChange so its published historical DTO stays exact.
+    Presence/status/value/IDs are compared independently; missing is never zero.
+    """
+    before = _json_value(previous.metrics_json) if previous and previous.metrics_json else {}
+    after = _json_value(current.metrics_json) if current and current.metrics_json else {}
+    if 'metric_results' not in before and 'metric_results' not in after:
+        return {}
+    left, right = before.get('metric_results', {}), after.get('metric_results', {})
+    return {'metrics': {key: {'previous': left.get(key), 'current': right.get(key)}
+                        for key in sorted(left.keys() | right.keys()) if left.get(key) != right.get(key)},
+            'operating_state': {'previous': before.get('operating_state'), 'current': after.get('operating_state')},
+            'ranking_audit': {'previous': before.get('ranking_audit'), 'current': after.get('ranking_audit')},
+            'shadow_signals': {'previous': before.get('shadow_signals'), 'current': after.get('shadow_signals')},
+            'collection_effect': 'shadow_only'}
+
+
 def classify_weekly_changes(
     rows: Iterable[PersistedCompanyResult],
     *,

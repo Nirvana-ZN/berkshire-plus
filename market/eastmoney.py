@@ -2,14 +2,18 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
-from datetime import date, datetime
+from datetime import date, datetime, timezone
+from hashlib import sha256
+from pathlib import Path
+import json
 from decimal import Decimal, InvalidOperation
 from threading import Event
 from typing import Protocol
 from urllib.parse import quote
 
 from discovery.constants import china_market_date
-from discovery.field_dictionary import FIELD_DICTIONARY
+from discovery.field_dictionary import FIELD_DICTIONARY, SELECTION_FIELD_DICTIONARY
+from discovery.fundamental_types import EvidenceRecord, evidence_identity
 from market.universe import (
     INDUSTRY_MAPPING_VERSION,
     UniverseRow,
@@ -18,6 +22,7 @@ from market.universe import (
 )
 from market.types import (
     Constituent,
+    CurrentMarketCap,
     DiscoveryCompanyData,
     DiscoveryCompanyError,
     DiscoveryPreRequest,
@@ -510,6 +515,167 @@ def _report_kind(
     return year, "annual"
 
 
+def parse_selection_report_response(
+    raw_response: bytes,
+    *,
+    code: str,
+    report: str,
+    observed_at: datetime,
+    source_url: str,
+    basis_id: str,
+) -> tuple[EvidenceRecord, ...]:
+    """Adapt retained response bytes without rounding or certifying history.
+
+    The digest identifies the retained provider response, not an official PDF.
+    No coverage assertion follows from an empty or truncated provider response.
+    Existing HTTP helpers parse floats; this boundary intentionally takes bytes.
+    """
+    from market.evidence import SELECTION_EXTENSION_FIELDS, parse_source_evidence
+
+    reports = {SELECTION_FIELD_DICTIONARY[name].report for name in SELECTION_EXTENSION_FIELDS}
+    if report not in reports or report is None:
+        raise ValueError('unsupported selection provider report')
+    payload = json.loads(raw_response, parse_float=Decimal)
+    if not isinstance(payload, dict) or payload.get('success') is False:
+        raise ValueError('provider response failed')
+    result = payload.get('result')
+    if not isinstance(result, dict) or not isinstance(result.get('data'), list):
+        raise ValueError('provider response data unavailable')
+    digest = sha256(raw_response).hexdigest()
+    records: list[EvidenceRecord] = []
+    for index, row in enumerate(result['data']):
+        if not isinstance(row, dict) or row.get('SECUCODE') != code:
+            raise ValueError('provider row code is missing or does not match')
+        period = _report_kind(row, strict=True)
+        if period is None:
+            raise ValueError('provider row period is missing or ambiguous')
+        records.append(parse_source_evidence({
+            'source': 'eastmoney', 'report': report, 'row': row, 'code': code,
+            'kind': 'financial', 'period': period[0], 'observed_at': observed_at,
+            'source_url': source_url, 'document_sha256': digest, 'basis_id': basis_id,
+            'report_location': f'{report}; result.data[{index}]; period {period[0]}',
+        }))
+    return tuple(records)
+
+
+def parse_fundamental_report_response(
+    raw_response: bytes, *, code: str, report: str, observed_at: datetime,
+    source_url: str,
+) -> tuple[EvidenceRecord, ...]:
+    """Retain actual provider publication and bytes identity, without basis trust.
+
+    The provider does not certify stable consolidation scope across versions.
+    These observations therefore require review before selection calculations.
+    Extension columns remain separate from the legacy field contract.
+    """
+    from market.evidence import _time, _decimal
+    from discovery.fundamentals import classification_evidence
+
+    payload = json.loads(raw_response, parse_float=Decimal)
+    if not isinstance(payload, dict) or payload.get('success') is False:
+        raise ValueError('provider report failed')
+    result = payload.get('result')
+    if not isinstance(result, dict) or not isinstance(result.get('data'), list):
+        raise ValueError('provider report data missing')
+    digest = sha256(raw_response).hexdigest()
+    records = []
+    for index, raw in enumerate(result['data']):
+        if not isinstance(raw, dict) or raw.get('SECUCODE') != code:
+            raise ValueError('provider report code mismatch')
+        period = _report_kind(raw, strict=True)
+        if period is None or not raw.get('NOTICE_DATE'):
+            # UPDATE_DATE/fetch time must never become a publication timestamp.
+            continue
+        published = _time(raw['NOTICE_DATE'], 'NOTICE_DATE', provider=True)
+        updated = _time(raw['UPDATE_DATE'], 'UPDATE_DATE', provider=True) if raw.get('UPDATE_DATE') else None
+        for dictionary, group in ((FIELD_DICTIONARY, 'legacy'), (SELECTION_FIELD_DICTIONARY, 'extensions')):
+            values = {name: _decimal(raw.get(spec.field)) for name, spec in dictionary.items()
+                      if spec.report == report and isinstance(spec.field, str)
+                      and (group == 'extensions' or spec.trusted)}
+            if not values:
+                continue
+            status = 'untrusted' if any(value is not None for value in values.values()) else 'missing'
+            values.update({'_report_location': f'{report}; result.data[{index}]; {group}',
+                           '_basis_status': 'unverified', '_source': 'eastmoney'})
+            if isinstance(raw.get('INDUSTRY_NAME'), str):
+                values['_industry'] = raw['INDUSTRY_NAME']
+            row = EvidenceRecord('pending', code, 'financial', period[0], published,
+                                  observed_at, updated, source_url, digest, values,
+                                  status, 'unverified-consolidation-basis', date_only=True)
+            row = replace(row, evidence_id=evidence_identity(row))
+            records.append(row)
+            if group == 'legacy' and isinstance(raw.get('INDUSTRY_NAME'), str):
+                records.append(classification_evidence(row, industry=raw['INDUSTRY_NAME'], version=INDUSTRY_MAPPING_VERSION))
+    return tuple(records)
+
+
+def parse_current_market_cap_response(
+    raw_response: bytes, *, code: str, market_date: date,
+    observed_at: datetime, source_url: str,
+) -> CurrentMarketCap:
+    """Validate returned identity/day, never substituting shares or fetch day.
+
+    The established RPT_VALUEANALYSIS_DET total-market-cap column is CNY yuan.
+    Verification covers this current provider observation, not historical
+    availability or financial evidence. Retain raw bytes independently for replay.
+    """
+    if type(raw_response) is not bytes or type(market_date) is not date:
+        raise TypeError('raw_response must be bytes and market_date must be date')
+    actual_date = None
+
+    def result(status: str, reason: str | None, value: Decimal | None = None) -> CurrentMarketCap:
+        return CurrentMarketCap(code, value, actual_date, observed_at,
+                                'eastmoney:RPT_VALUEANALYSIS_DET', source_url,
+                                sha256(raw_response).hexdigest(), status, reason)
+
+    try:
+        payload = json.loads(raw_response, parse_float=Decimal)
+    except (ValueError, UnicodeError):
+        return result('untrusted', 'market_cap_response_invalid')
+    if not isinstance(payload, dict) or payload.get('success') is not True:
+        return result('untrusted', 'market_cap_response_failed')
+    body = payload.get('result')
+    rows = body.get('data') if isinstance(body, dict) else None
+    if rows == []:
+        return result('missing', 'current_mcap_missing')
+    if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
+        return result('untrusted', 'market_cap_response_ambiguous')
+    row = rows[0]
+    if row.get('SECUCODE') != code:
+        return result('untrusted', 'market_cap_code_mismatch')
+    raw_date = row.get('TRADE_DATE')
+    if raw_date is None or raw_date == '':
+        return result('missing', 'market_date_missing')
+    if not isinstance(raw_date, str):
+        return result('untrusted', 'market_date_invalid')
+    try:
+        actual_date = date.fromisoformat(raw_date[:10])
+        if raw_date not in {actual_date.isoformat(), f'{actual_date} 00:00:00',
+                            f'{actual_date}T00:00:00'}:
+            raise ValueError('invalid market day marker')
+    except ValueError:
+        actual_date = None
+        return result('untrusted', 'market_date_invalid')
+    if actual_date != market_date:
+        return result('untrusted', 'market_date_mismatch')
+    if not isinstance(observed_at, datetime) or observed_at.utcoffset() is None:
+        raise ValueError('observed_at must be aware')
+    if actual_date > china_market_date(observed_at):
+        return result('untrusted', 'market_date_after_observation')
+    raw_value = row.get('TOTAL_MARKET_CAP')
+    if raw_value is None or raw_value == '':
+        return result('missing', 'current_mcap_missing')
+    if isinstance(raw_value, bool) or not isinstance(raw_value, (str, int, Decimal)):
+        return result('untrusted', 'current_mcap_invalid')
+    try:
+        value = Decimal(raw_value)
+    except (InvalidOperation, ValueError):
+        return result('untrusted', 'current_mcap_invalid')
+    if not value.is_finite() or value <= 0:
+        return result('untrusted', 'current_mcap_invalid')
+    return result('verified', None, value)
+
+
 def _as_decimal(value: object) -> Decimal | None:
     if value is None or value == "" or value == "-":
         return None
@@ -961,7 +1127,11 @@ class EastMoneyClient:
         before_request: DiscoveryPreRequest | None = None,
         security_state: SecurityState | None = None,
         as_of: date | None = None,
+        selection_fundamentals: bool = False,
+        selection_source_dir: Path | None = None,
     ) -> DiscoveryCompanyData:
+        if selection_fundamentals and selection_source_dir is None:
+            raise ValueError("selection_source_dir is required to retain raw evidence bytes")
         normalized = (code or "").strip().upper()
         started = self._request_count
         scoped_attempts = 0
@@ -1083,12 +1253,22 @@ class EastMoneyClient:
         financial_dates = [
             row.source_as_of for row in financials if row.source_as_of
         ]
+        evidence_records = ()
+        market_cap = None
+        if selection_fundamentals:
+            evidence_records = self.fetch_fundamental_evidence(
+                normalized, source_dir=selection_source_dir, before_request=request_gate)
+            market_cap = self.fetch_current_market_cap(
+                normalized, market_date=date.fromisoformat(security.last_trade_date),
+                before_request=request_gate)
         return DiscoveryCompanyData(
             code=normalized,
             security_state=security,
             financial_rows=tuple(financials),
             valuation_points=tuple(valuations),
             request_count=request_count(),
+            evidence_records=evidence_records,
+            current_market_cap=market_cap,
             source_as_of=DiscoverySourceAsOf(
                 security=security.industry_as_of,
                 valuation=max(
@@ -1097,6 +1277,32 @@ class EastMoneyClient:
                 financial=max(financial_dates, default=None),
             ),
         )
+
+    def fetch_fundamental_evidence(
+        self, code: str, *, source_dir: Path,
+        before_request: DiscoveryPreRequest | None = None,
+    ) -> tuple[EvidenceRecord, ...]:
+        """Opt-in schema4 source capture; each exact response is content-addressed."""
+        source_dir = Path(source_dir)
+        source_dir.mkdir(parents=True, exist_ok=True)
+        records = []
+        reports = sorted({spec.report for spec in FIELD_DICTIONARY.values() if spec.report})
+        for report in reports:
+            filt = f'(SECUCODE="{code}")'
+            url = (f'{FINANCIALS_URL}?reportName={report}&columns=ALL&pageNumber=1'
+                   f'&pageSize=50&sortColumns=REPORT_DATE&sortTypes=-1&filter={quote(filt)}')
+            raw = self._get_json_direct_retry(url, before_request=before_request, raw_response=True)
+            observed = datetime.now(timezone.utc)
+            digest = sha256(raw).hexdigest()
+            path = source_dir / f'{digest}.json'
+            if path.exists():
+                if path.read_bytes() != raw:
+                    raise ValueError('retained source digest conflict')
+            else:
+                path.write_bytes(raw)
+            records.extend(parse_fundamental_report_response(raw, code=code, report=report,
+                           observed_at=observed, source_url=url))
+        return tuple(records)
 
     def fetch_listed_years(self, codes: Sequence[str]) -> dict[str, int]:
         years: dict[str, int] = {}
@@ -1866,7 +2072,8 @@ class EastMoneyClient:
         url: str,
         *,
         before_request: DiscoveryPreRequest | None = None,
-    ) -> dict:
+        raw_response: bool = False,
+    ) -> dict | bytes:
         import httpx2
 
         if before_request is not None:
@@ -1902,6 +2109,8 @@ class EastMoneyClient:
             )
             raise error_type(f"direct request HTTP {status_code}") from cause
         try:
+            if raw_response:
+                return response.content
             payload = response.json()
         except (ValueError, httpx2.DecodingError) as exc:
             raise TransientMarketError(
@@ -1920,10 +2129,14 @@ class EastMoneyClient:
         url: str,
         *,
         before_request: DiscoveryPreRequest | None = None,
-    ) -> dict:
+        raw_response: bool = False,
+    ) -> dict | bytes:
         last_error: TransientMarketError | None = None
         for _attempt in range(DIRECT_RETRY_ATTEMPTS):
             try:
+                if raw_response:
+                    return self._get_json_direct(
+                        url, before_request=before_request, raw_response=True)
                 return (
                     self._get_json_direct(url)
                     if before_request is None
@@ -1939,6 +2152,28 @@ class EastMoneyClient:
             f"direct request failed after {DIRECT_RETRY_ATTEMPTS} attempts: "
             f"{type(last_error.__cause__).__name__ if last_error else 'unknown'}"
         ) from last_error
+
+    def fetch_current_market_cap(
+        self, code: str, *, market_date: date,
+        before_request: DiscoveryPreRequest | None = None,
+    ) -> CurrentMarketCap:
+        """Fetch one exact market day; each attempt consumes the existing policy hook.
+
+        No calendar inference, share fallback or new activation occurs here.
+        Observation time is taken after receiving bytes; TRADE_DATE stays separate.
+        """
+        if (not isinstance(code, str) or len(code) != 9 or not code[:6].isdigit()
+                or code[6:] not in {'.SH', '.SZ'} or type(market_date) is not date):
+            raise ValueError('canonical code and market_date are required')
+        filt = f'(SECUCODE="{code}")(TRADE_DATE=\'{market_date.isoformat()}\')'
+        url = (f'{FINANCIALS_URL}?reportName=RPT_VALUEANALYSIS_DET'
+               '&columns=SECUCODE,TRADE_DATE,TOTAL_MARKET_CAP'
+               '&pageNumber=1&pageSize=2'
+               f'&filter={quote(filt)}')
+        raw = self._get_json_direct_retry(url, before_request=before_request, raw_response=True)
+        return parse_current_market_cap_response(
+            raw, code=code, market_date=market_date,
+            observed_at=datetime.now(timezone.utc), source_url=url)
 
     def fetch_valuation(self, code: str) -> dict[str, object]:
         # BPS/不良用最新一期；EPS 只用年报，避免季报把市盈率抬高一倍

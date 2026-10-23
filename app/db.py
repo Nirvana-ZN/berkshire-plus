@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sqlite3
 
 from sqlalchemy import create_engine, event
 from sqlalchemy.engine import Engine
@@ -11,6 +12,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "app.db"
 FIN_FETCH_KEY = "fin_fetch_version"
 FIN_FETCH_VERSION = "4"
+SELECTION_SCHEMA_VERSION = 8
 _DISCOVERY_CNY_COLUMNS = (
     "net_income",
     "ocf",
@@ -52,19 +54,54 @@ def _attach_busy_timeout(engine: Engine) -> None:
         cursor = dbapi_connection.cursor()
         cursor.execute("PRAGMA busy_timeout=5000")
         cursor.execute("PRAGMA foreign_keys=ON")
+        version = cursor.execute('PRAGMA user_version').fetchone()[0]
+        if version not in (0, SELECTION_SCHEMA_VERSION):
+            cursor.execute('PRAGMA query_only=ON')
+            engine.selection_read_only = True
+        else:
+            dbapi_connection.create_function('selection_writer_version', 0, lambda: SELECTION_SCHEMA_VERSION)
         cursor.close()
 
 
 def create_db_engine(db_path: Path | None = None) -> Engine:
-    path = db_path or DEFAULT_DB_PATH
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path = Path(db_path or DEFAULT_DB_PATH).resolve()
+    version = 0
+    if path.exists():
+        with sqlite3.connect(path.as_uri() + '?mode=ro', uri=True) as probe:
+            version = probe.execute('PRAGMA user_version').fetchone()[0]
+    read_only = version not in (0, SELECTION_SCHEMA_VERSION)
+    if not read_only:
+        path.parent.mkdir(parents=True, exist_ok=True)
     engine = create_engine(
-        _sqlite_url(path),
+        (f'sqlite+pysqlite:///{path.as_uri()}?mode=ro&uri=true' if read_only else _sqlite_url(path)),
         connect_args={"check_same_thread": False, "timeout": 5},
         poolclass=NullPool,
     )
+    engine.selection_read_only = read_only
     _attach_busy_timeout(engine)
     return engine
+
+
+def database_read_only(engine: Engine) -> bool:
+    return bool(getattr(engine, 'selection_read_only', False))
+
+
+def _install_writer_guards(engine: Engine) -> None:
+    """An older connector cannot write through its unregistered connection.
+
+    This is compatibility fencing, not protection against a database owner
+    intentionally removing triggers. Include every actual application table.
+    """
+    with engine.begin() as conn:
+        tables = conn.exec_driver_sql("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").scalars().all()
+        for table in tables:
+            quoted = table.replace('"', '""')
+            for operation in ('INSERT', 'UPDATE', 'DELETE'):
+                name = f'selection_writer_{table}_{operation.lower()}'.replace('"', '""')
+                conn.exec_driver_sql(f'CREATE TRIGGER IF NOT EXISTS "{name}" BEFORE {operation} ON "{quoted}" '
+                    f'WHEN selection_writer_version() != {SELECTION_SCHEMA_VERSION} '
+                    "BEGIN SELECT RAISE(ABORT, 'incompatible writer'); END")
+        conn.exec_driver_sql(f'PRAGMA user_version={SELECTION_SCHEMA_VERSION}')
 
 
 def create_session_factory(engine: Engine) -> sessionmaker[Session]:
@@ -322,63 +359,8 @@ def _ensure_discovery_lineage(engine: Engine) -> None:
                     )
                 )
 
-        # ponytail: only deterministic one-candidate legacy chains are safe to
-        # recover; ambiguous rows intentionally remain null and fail closed.
-        conn.execute(
-            text(
-                "UPDATE discovery_stages AS child "
-                "SET common_stage_id = ("
-                "SELECT parent.id FROM discovery_common_stages AS parent "
-                "WHERE parent.run_id = child.run_id "
-                "AND parent.status = 'confirmed' "
-                "AND parent.superseded_at IS NULL "
-                "AND parent.created_at <= child.created_at"
-                ") WHERE child.stage = 'track_gate' "
-                "AND child.common_stage_id IS NULL "
-                "AND child.predecessor_stage_id IS NULL "
-                "AND child.predecessor_stage IS NULL "
-                "AND 1 = (SELECT COUNT(*) "
-                "FROM discovery_common_stages AS parent "
-                "WHERE parent.run_id = child.run_id "
-                "AND parent.status = 'confirmed' "
-                "AND parent.superseded_at IS NULL "
-                "AND parent.created_at <= child.created_at)"
-            )
-        )
-        for child_stage, parent_stage in (
-            ("competition", "track_gate"),
-            ("adjudication", "competition"),
-        ):
-            conn.execute(
-                text(
-                    "UPDATE discovery_stages AS child "
-                    "SET predecessor_stage_id = ("
-                    "SELECT parent.id FROM discovery_stages AS parent "
-                    "WHERE parent.run_id = child.run_id "
-                    "AND parent.track = child.track "
-                    "AND parent.stage = :parent_stage "
-                    "AND parent.status = 'confirmed' "
-                    "AND parent.superseded_at IS NULL "
-                    "AND parent.created_at <= child.created_at"
-                    "), predecessor_stage = :parent_stage "
-                    "WHERE child.stage = :child_stage "
-                    "AND child.predecessor_stage_id IS NULL "
-                    "AND child.predecessor_stage IS NULL "
-                    "AND child.common_stage_id IS NULL "
-                    "AND 1 = (SELECT COUNT(*) "
-                    "FROM discovery_stages AS parent "
-                    "WHERE parent.run_id = child.run_id "
-                    "AND parent.track = child.track "
-                    "AND parent.stage = :parent_stage "
-                    "AND parent.status = 'confirmed' "
-                    "AND parent.superseded_at IS NULL "
-                    "AND parent.created_at <= child.created_at)"
-                ),
-                {
-                    "child_stage": child_stage,
-                    "parent_stage": parent_stage,
-                },
-            )
+        # New columns stay NULL for old rows. Startup must not manufacture
+        # historical lineage or rewrite retained stages from current guesses.
 
         invalid = """
             (NEW.stage = 'track_gate' AND (
@@ -543,6 +525,45 @@ def _ensure_research_columns(engine: Engine) -> None:
             row[1]
             for row in conn.execute(text("PRAGMA table_info(research_jobs)")).all()
         }
+        if "evidence_context_json" not in names:
+            conn.execute(text("ALTER TABLE research_jobs ADD COLUMN evidence_context_json TEXT"))
+        if "model_input_json" not in names:
+            conn.execute(text("ALTER TABLE research_jobs ADD COLUMN model_input_json TEXT"))
+        conn.execute(text(
+            "CREATE TRIGGER IF NOT EXISTS trg_research_model_input_immutable "
+            "BEFORE UPDATE OF model_input_json ON research_jobs "
+            "WHEN OLD.model_input_json IS NOT NULL AND NEW.model_input_json IS NOT OLD.model_input_json "
+            "BEGIN SELECT RAISE(ABORT, 'research model input is immutable'); END"
+        ))
+        conn.execute(text(
+            "CREATE TRIGGER IF NOT EXISTS trg_research_model_input_replace_immutable "
+            "BEFORE INSERT ON research_jobs WHEN EXISTS (SELECT 1 FROM research_jobs "
+            "WHERE id = NEW.id AND model_input_json IS NOT NULL) "
+            "BEGIN SELECT RAISE(ABORT, 'research model input is immutable'); END"
+        ))
+        conn.execute(text(
+            "CREATE TRIGGER IF NOT EXISTS trg_research_model_input_delete_immutable "
+            "BEFORE DELETE ON research_jobs WHEN OLD.model_input_json IS NOT NULL "
+            "BEGIN SELECT RAISE(ABORT, 'research model input is immutable'); END"
+        ))
+        conn.execute(text(
+            "CREATE TRIGGER IF NOT EXISTS trg_research_context_immutable "
+            "BEFORE UPDATE OF evidence_context_json ON research_jobs "
+            "WHEN OLD.evidence_context_json IS NOT NULL "
+            "AND NEW.evidence_context_json IS NOT OLD.evidence_context_json "
+            "BEGIN SELECT RAISE(ABORT, 'research evidence context is immutable'); END"
+        ))
+        conn.execute(text(
+            "CREATE TRIGGER IF NOT EXISTS trg_research_context_replace_immutable "
+            "BEFORE INSERT ON research_jobs WHEN EXISTS (SELECT 1 FROM research_jobs "
+            "WHERE id = NEW.id AND evidence_context_json IS NOT NULL) "
+            "BEGIN SELECT RAISE(ABORT, 'research evidence context is immutable'); END"
+        ))
+        conn.execute(text(
+            "CREATE TRIGGER IF NOT EXISTS trg_research_context_delete_immutable "
+            "BEFORE DELETE ON research_jobs WHEN OLD.evidence_context_json IS NOT NULL "
+            "BEGIN SELECT RAISE(ABORT, 'research evidence context is immutable'); END"
+        ))
         if "discovery_run_id" not in names:
             conn.execute(
                 text(
@@ -1079,9 +1100,18 @@ def _infer_legacy_financial_completeness(engine: Engine) -> None:
 def init_db(db_path: Path | None = None) -> Engine:
     from app import discovery_models as _discovery_models  # noqa: F401
     from app import models as _models  # noqa: F401
+    from app import selection_models as _selection_models  # noqa: F401
 
     engine = create_db_engine(db_path)
+    if database_read_only(engine):
+        return engine
     Base.metadata.create_all(engine)
+    # Repair missing guards on existing registration tables without rewriting
+    # historical rows. Metadata creation installs the same guards for new DBs.
+    from sqlalchemy import text
+    with engine.begin() as conn:
+        for statement in _selection_models.strategy_guard_statements():
+            conn.execute(text(statement))
     _ensure_ruler_scope(engine)
     _ensure_discovery_snapshot_columns(engine)
     _ensure_discovery_lineage(engine)
@@ -1094,14 +1124,14 @@ def init_db(db_path: Path | None = None) -> Engine:
     _ensure_discovery_fill_columns(engine)
     _ensure_discovery_checkpoint_columns(engine)
     _ensure_discovery_universe_seals(engine)
-    _ensure_financial_text_storage(engine)
-    _ensure_valuation_series(engine)
-    _reset_stale_financials(engine)
-    _infer_legacy_financial_completeness(engine)
+    # Old caches are not selection evidence. Never rebuild, delete, or infer
+    # provenance for their rows during additive startup migration. A new
+    # schema4 fill captures independently; old payload bytes stay unchanged.
     SessionLocal = create_session_factory(engine)
     with SessionLocal() as session:
         seed_local_user(session)
         from screen.ruler import seed_if_empty
 
         seed_if_empty(session)
+    _install_writer_guards(engine)
     return engine

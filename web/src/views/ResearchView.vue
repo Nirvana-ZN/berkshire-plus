@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { RouterLink, useRoute, useRouter } from 'vue-router'
 import { renderMarkdownHtml } from './homeViewModel'
+import { formatPercent } from './trackingViewModel'
 
 interface Gate {
   name: string
@@ -100,6 +101,34 @@ const shouldEnter = ref('')
 const funding = ref('')
 const overlap = ref('')
 const dataGrade = ref('')
+const legacyEvidenceContract = ref(false)
+const structured = ref<Record<string, unknown>>({})
+function record(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
+}
+function text(value: unknown): string {
+  if (value == null || value === '') return '不可用'
+  if (Array.isArray(value)) return value.map(text).join('；')
+  if (typeof value === 'object') return Object.entries(record(value)).map(([key, item]) => `${key}：${text(item)}`).join('；')
+  if (typeof value === 'boolean') return value ? '是' : '否'
+  return String(value)
+}
+const contract = computed(() => record(structured.value.evidence_contract))
+const scenarios = computed(() => record(structured.value.valuation_scenarios))
+const prices = computed(() => record(scenarios.value.computed_prices))
+const context = computed(() => record(structured.value.research_context))
+const sourceEvidence = computed(() => Array.isArray(context.value.evidence) ? context.value.evidence.map(record) : [])
+const gateAudits = computed(() => Array.isArray(structured.value.gates) ? structured.value.gates.map(record) : [])
+const sensitivity = computed(() => Array.isArray(scenarios.value.sensitivity) ? scenarios.value.sensitivity.map(record) : [])
+const scenarioLabels: Record<string, string> = {low: '积极买入价', base: '常规买入价', high: '停止加仓价'}
+const factLabels: Record<string, string> = {metric_basis: '指标口径', period: '报告期', numerator: '指标总额（元）',
+  current_shares: '当前总股数（股）', basis_id: '财务口径版本', numerator_evidence_ids: '指标证据',
+  shares_evidence_id: '股数证据', profile_evidence_id: '行业证据', price_evidence_id: '价格证据'}
+const assumptionLabels: Record<string, string> = {metric_per_share: '每股指标（元）', growth: '增长率（小数）',
+  multiples: '情景倍数', haircuts: '情景折扣（小数）', horizon_years: '假设期限（年）', evidence_ids: '证据编号'}
+function sourceUrl(value: unknown): string | undefined {
+  return typeof value === 'string' && /^https?:\/\//i.test(value) ? value : undefined
+}
 const asOfDate = ref('')
 const asOfPrice = ref<string | number | null>(null)
 const valuation = ref<Record<string, string | number>>({})
@@ -171,6 +200,7 @@ function stopPoll() {
 }
 
 function applyResearch(data: Record<string, unknown>) {
+  structured.value = record(data.structured)
   status.value = typeof data.status === 'string' ? data.status : ''
   name.value = typeof data.name === 'string' ? data.name : ''
   verdict.value = typeof data.verdict === 'string' ? data.verdict : ''
@@ -211,6 +241,7 @@ function applyResearch(data: Record<string, unknown>) {
     overlap.value = typeof row.overlap === 'string' ? row.overlap : ''
   }
   dataGrade.value = typeof data.data_grade === 'string' ? data.data_grade : ''
+  legacyEvidenceContract.value = data.legacy_evidence_contract === true
   const asOf = data.as_of
   if (asOf && typeof asOf === 'object') {
     const row = asOf as Record<string, unknown>
@@ -384,10 +415,16 @@ onBeforeUnmount(stopPoll)
             <p class="stat-label">价格带模式</p>
             <p class="stat-value">{{ BAND_ZH[bandMode] || bandMode || '—' }}</p>
             <p class="stat-sub">信息丰富度：{{ dataGrade || '—' }}</p>
+            <p v-if="legacyEvidenceContract" class="stat-sub">旧版研究（legacy_evidence_contract）：原文与原等级保留，未按冻结证据合同核验。</p>
           </div>
         </div>
 
-        <div v-if="Object.keys(bandPrices).length" class="band-grid">
+        <div v-if="!legacyEvidenceContract && Object.keys(prices).length" class="band-grid">
+          <div v-for="(label, key) in scenarioLabels" :key="key" class="band-item">
+            <span class="band-label">{{ label }}</span><strong class="band-val">{{ text(prices[key]) }} 元</strong>
+          </div>
+        </div>
+        <div v-else-if="Object.keys(bandPrices).length" class="band-grid">
           <div
             v-for="(text, key) in bandPrices"
             :key="'b-' + key"
@@ -405,6 +442,47 @@ onBeforeUnmount(stopPoll)
             <strong class="val-num">{{ fmtValue(value) }}</strong>
           </div>
         </div>
+      </section>
+
+      <section v-if="!legacyEvidenceContract && Object.keys(contract).length" class="panel evidence-audit">
+        <h2>冻结证据与缺口</h2>
+        <p>A 表示证据覆盖，不保证结论正确或尽职调查完整。</p>
+        <p>证据截止：{{ text(contract.cutoff_at) }} · 估值版本：{{ text(contract.assumption_id) }}</p>
+        <p>财务证据完整：{{ text(contract.financial_complete) }} · 关键论断完整：{{ text(contract.critical_claims_complete) }} · 估值完整：{{ text(contract.valuation_complete) }}</p>
+        <p>估值缺口：{{ text(contract.valuation_reason) }} · 论断缺口：{{ text(contract.errors) }}</p>
+        <div v-for="(audit, index) in gateAudits" :key="index">
+          <h3>{{ text(audit.name) }}</h3>
+          <p>证据：{{ text(audit.evidence_ids) }} · 反证：{{ text(audit.counterevidence_ids) }}</p>
+          <p>反证检索范围：{{ text(record(audit.counterevidence_search).scope) }}</p>
+          <p>失效条件：{{ text(audit.falsification_condition) }} · 核验时间：{{ text(audit.checked_at) }}</p>
+          <p>缺口：{{ text(record(audit.claim_evidence).errors || audit.errors) }}</p>
+        </div>
+        <details><summary>冻结来源（{{ sourceEvidence.length }}）</summary>
+          <article v-for="source in sourceEvidence" :key="text(source.evidence_id)">
+            <h3>{{ text(source.kind) }} · {{ text(source.period) }}</h3>
+            <p class="source-evidence-id">证据编号：{{ text(source.evidence_id) }}</p>
+            <p>状态：{{ text(record(source.source_proof).status) }} · 缺口：{{ text(record(source.source_proof).reason) }}</p>
+            <p><a v-if="sourceUrl(source.source_url)" :href="sourceUrl(source.source_url)" target="_blank" rel="noopener noreferrer">原始来源</a> · {{ text(record(source.source_proof).report_location) }}</p>
+            <p>{{ text(record(source.source_proof).excerpt) }}</p>
+            <p>文件哈希：{{ text(source.document_sha256) }}</p>
+          </article>
+        </details>
+      </section>
+
+      <section v-if="!legacyEvidenceContract && Object.keys(prices).length" class="panel evidence-audit">
+        <h2>可复算价格情景</h2>
+        <p>{{ text(scenarios.version) }} · {{ text(scenarios.method) }} · 公式：{{ text(scenarios.formula) }}</p>
+        <h3>来源事实</h3>
+        <p v-for="(value, key) in record(scenarios.source_facts)" :key="key">{{ factLabels[key] || key }}：{{ text(value) }}</p>
+        <h3>审阅后的情景假设</h3>
+        <p>增长、倍数和折扣是情景声明。</p>
+        <p v-for="(value, key) in record(scenarios.declared_assumptions)" :key="key">{{ assumptionLabels[key] || key }}：{{ text(value) }}</p>
+        <p>悲观情景：{{ text(record(scenarios.pessimistic).price) }} 元 · {{ text(record(scenarios.pessimistic).description) }}</p>
+        <p>估值利差：{{ formatPercent(typeof record(scenarios.valuation_spread).value === 'string' ? record(scenarios.valuation_spread).value as string : null) }} · 国债日期 {{ text(record(scenarios.valuation_spread).treasury_date) }} · 来源 {{ text(record(scenarios.valuation_spread).treasury_source) }} · 状态 {{ text(record(scenarios.valuation_spread).reason || record(scenarios.valuation_spread).status) }}</p>
+        <details><summary>增长 / 倍数敏感性</summary><div class="scenario-scroll"><table>
+          <thead><tr><th>增长率（小数）</th><th>倍数</th><th>折扣（小数）</th><th>价格（元）</th></tr></thead>
+          <tbody><tr v-for="(row, index) in sensitivity" :key="index"><td>{{ text(row.growth) }}</td><td>{{ text(row.multiple) }}</td><td>{{ text(row.haircut) }}</td><td>{{ text(row.price) }}</td></tr></tbody>
+        </table></div></details>
       </section>
 
       <div class="memo-fit-grid">
@@ -638,6 +716,10 @@ onBeforeUnmount(stopPoll)
 .gate-reason {
   line-height: 1.55;
 }
+
+.evidence-audit p, .evidence-audit article { overflow-wrap: anywhere; }
+.source-evidence-id { min-width: 0; white-space: normal; overflow-wrap: anywhere; }
+.scenario-scroll { max-width: 100%; overflow-x: auto; }
 
 @media (max-width: 820px) {
   .memo-fit-grid {

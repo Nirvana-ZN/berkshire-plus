@@ -7,6 +7,8 @@ import {
   canAbandonRun,
   collectMetricKeys,
   candidateSurfacedReason,
+  selectionAuditLines,
+  selectionExclusionLabel,
   formatEvidenceText,
   CURRENT_FETCH_TIMEOUT_MS,
   discoveryChangeLabels,
@@ -113,6 +115,7 @@ interface DiscoveryRow {
   rank: number | null
   metrics: Record<string, MetricValue>
   metrics_unavailable_reason: string | null
+  selection_audit?: Record<string, unknown> | null
   override: DiscoveryOverride | null
 }
 
@@ -2157,7 +2160,14 @@ onBeforeUnmount(() => {
                     <td>{{ row.code }}</td>
                     <td>{{ verdictLabel(row.original_verdict) }}</td>
                     <td>{{ verdictLabel(row.verdict) }}</td>
-                    <td>{{ row.reason ? formatEvidenceText(row.reason) : '—' }}</td>
+                    <td>
+                      {{ row.reason ? formatEvidenceText(row.reason) : '—' }}
+                      <p v-if="row.reason">{{ selectionExclusionLabel(row.reason) }}</p>
+                      <details v-if="view.stage !== 'safety'">
+                        <summary>准入、状态与排名证据</summary>
+                        <p v-for="line in selectionAuditLines(row.selection_audit)" :key="line">{{ line }}</p>
+                      </details>
+                    </td>
                     <td>{{ row.rank ?? '—' }}</td>
                     <td>{{ row.metrics_unavailable_reason || '可用' }}</td>
                     <td v-for="metric in view.metricKeys" :key="metric">

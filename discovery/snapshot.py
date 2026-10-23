@@ -49,6 +49,8 @@ from discovery.company_payload import (
     verify_company_payload_digest,
 )
 from discovery.constants import CHINA_MARKET_TIMEZONE
+from discovery.fundamentals import (freeze_fundamentals, fundamentals_from_payload,
+                                    operating_state, plain, snapshot_payload)
 from discovery.rulers import (
     canonical_payload as canonical_ruler_payload,
     latest as latest_discovery_ruler,
@@ -800,9 +802,13 @@ def build_production_snapshot(
     algorithm_version: str = BUILD_VERSION,
     expected_lock_job_id: int | None = None,
     snapshot_at: datetime | None = None,
+    operating_policy: Mapping[str, object] | None = None,
+    fill_id: int | None = None,
 ) -> ProductionSnapshot:
     """Bulk-read the latest completed discovery fill without hiding gaps."""
 
+    if fill_id is not None and (type(fill_id) is not int or fill_id <= 0):
+        raise ValueError('fill_id must be a positive integer')
     lock = session.get(JobLock, 1)
     if lock is not None and lock.job_id is not None:
         adopted = (
@@ -812,8 +818,11 @@ def build_production_snapshot(
         )
         if not adopted:
             raise ValueError("discovery data is being mutated")
+    fill_query = select(DiscoveryDataFill)
+    if fill_id is not None:
+        fill_query = fill_query.where(DiscoveryDataFill.id == fill_id)
     fill = session.scalars(
-        select(DiscoveryDataFill)
+        fill_query
         .order_by(DiscoveryDataFill.id.desc())
         .limit(1)
     ).first()
@@ -937,6 +946,7 @@ def build_production_snapshot(
     financial_by_code: dict[str, list[dict[str, object]]] = {
         code: [] for code in security_codes
     }
+    fundamentals_by_code: dict[str, dict[str, object]] = {}
     valuation_by_code: dict[str, list[dict[str, object]]] = {
         code: [] for code in security_codes
     }
@@ -991,6 +1001,8 @@ def build_production_snapshot(
                 payload_text,
                 expected_code=checkpoint.code,
             )
+            if payload['schema_version'] != COMPANY_PAYLOAD_SCHEMA_VERSION:
+                raise ValueError(PAYLOAD_SCHEMA_RESTART_GUIDANCE)
             captured_at = datetime.fromisoformat(
                 payload["captured_at"]
             ).astimezone(timezone.utc)
@@ -1035,7 +1047,18 @@ def build_production_snapshot(
                 raise ValueError("payload valuation count mismatch")
         except (KeyError, TypeError, ValueError) as error:
             raise ValueError(restart_guidance) from error
-        _feed_entry(financial_hasher, first_done, code, payload["financial_rows"])
+        fundamental = fundamentals_from_payload(payload, code=code)
+        fundamental = freeze_fundamentals(
+            fundamental.annuals + fundamental.interims + fundamental.extensions,
+            fundamental.actions, fundamental.coverage, code=code, cutoff_at=cutoff,
+            current_mcap=fundamental.current_mcap,
+        )
+        policy = payload['operating_policy'] if operating_policy is None else plain(operating_policy)
+        fundamentals_by_code[code] = {**snapshot_payload(fundamental), 'operating_policy': policy,
+                                      'operating_result': plain(operating_state(fundamental, policy)),
+                                      'schema_version': COMPANY_PAYLOAD_SCHEMA_VERSION}
+        _feed_entry(financial_hasher, first_done, code,
+                    {'financial_rows': payload['financial_rows'], **fundamentals_by_code[code]})
         _feed_entry(
             valuation_hasher, first_done, code, payload["valuation_points"]
         )
@@ -1121,6 +1144,13 @@ def build_production_snapshot(
             security.code, {"financial": None, "valuation": None}
         )
         valuation_fetched_at = payload_captured_at.get(security.code)
+        fundamental_fields = fundamentals_by_code.get(security.code)
+        if fundamental_fields is None:
+            empty = freeze_fundamentals((), (), (), code=security.code, cutoff_at=cutoff, current_mcap=None)
+            policy = plain(operating_policy or {})
+            fundamental_fields = {**snapshot_payload(empty), 'operating_policy': policy,
+                                  'operating_result': plain(operating_state(empty, policy)),
+                                  'schema_version': COMPANY_PAYLOAD_SCHEMA_VERSION}
         companies.append(
             CompanySnapshotInput(
                 code=security.code,
@@ -1141,6 +1171,7 @@ def build_production_snapshot(
                     "snapshot_at": security.snapshot_at,
                 },
                 fields={
+                    **fundamental_fields,
                     "price": price,
                     "pe": None if latest is None else latest["pe"],
                     "pb": None if latest is None else latest["pb"],
@@ -1152,6 +1183,7 @@ def build_production_snapshot(
                     "price": price_source,
                     "security": security.provenance,
                     "financial_history": "checkpoint_payload:field_sources",
+                    "fundamentals": "checkpoint_payload:point_in_time_evidence",
                     "valuation_history": sorted(
                         {
                             str(row["source"])
@@ -1166,6 +1198,7 @@ def build_production_snapshot(
                     "valuation": source_as_of["valuation"],
                     "valuation_fetched_at": valuation_fetched_at,
                     "fill": fill.updated_at,
+                    "decision_cutoff_at": fundamental_fields['decision_cutoff_at'],
                 },
             )
         )

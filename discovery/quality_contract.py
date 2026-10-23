@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Literal, Mapping
 
-from discovery.builds import BUILD_VERSION
+from discovery.builds import BUILD_VERSION, CANDIDATE_BUILD_VERSION
 from discovery.industry import IndustryBranch
 
 QualityValuationPolicy = Literal["configured", "pb"]
@@ -49,7 +49,9 @@ QUALITY_BRANCH_DATA_CONTRACT: Mapping[
     }
 )
 QUALITY_DATA_CONTRACTS = MappingProxyType(
-    {BUILD_VERSION: QUALITY_BRANCH_DATA_CONTRACT}
+    {BUILD_VERSION: QUALITY_BRANCH_DATA_CONTRACT,
+     'discovery-v7': QUALITY_BRANCH_DATA_CONTRACT,  # historical hypothesis validation only
+     CANDIDATE_BUILD_VERSION: QUALITY_BRANCH_DATA_CONTRACT}
 )
 
 

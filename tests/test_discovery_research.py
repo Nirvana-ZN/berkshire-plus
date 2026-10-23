@@ -269,19 +269,8 @@ def _seed_finalists(
         ruler_entry = frozen.ruler_payloads[track]
         assert ruler_entry is not None
         ruler = ruler_entry["payload"]
-        if track == "quality_discount":
-            from tests.test_discovery_tracks_quality import (
-                _classify,
-                frozen_company,
-            )
-        elif track == "deep_value":
-            from tests.test_discovery_tracks_deep_value import (
-                _classify,
-                frozen_company,
-            )
-        else:
-            from tests.test_discovery_tracks_garp import _classify, frozen_company
-        track_metrics = dict(_classify(frozen_company()).metrics)
+        from tests.test_discovery_overrides import _competition_metrics
+        track_metrics = _competition_metrics(track, "600000.SH")
         if track == "deep_value":
             track_metrics.update(
                 cumulative_fcf="100",
@@ -916,7 +905,7 @@ def test_concurrent_third_and_fourth_company_cannot_both_pass(
                     codes[2:],
                 )
             )
-        assert sorted(response.status_code for response in responses) == [200, 409]
+        assert sorted(response.status_code for response in responses) == [200, 409], [r.json() for r in responses]
         with app.state.session_factory() as session:
             accepted = session.scalar(
                 select(func.count(func.distinct(ResearchJob.code)))
@@ -1221,6 +1210,7 @@ def test_shutdown_tolerates_transient_lock_then_startup_cleans_stale_job(
             str(tmp_path / "app.db"), timeout=0.1
         )
         locker.execute("BEGIN IMMEDIATE")
+        locker.create_function("selection_writer_version", 0, lambda: 8)
         locker.execute("UPDATE users SET name = name WHERE id = 1")
         started = monotonic()
         client.__exit__(None, None, None)

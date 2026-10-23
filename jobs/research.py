@@ -3,15 +3,16 @@ from __future__ import annotations
 import json
 import logging
 import os
-from dataclasses import replace
+from dataclasses import fields, replace
 from datetime import datetime, timezone
 from decimal import Decimal
+from hashlib import sha256
 from pathlib import Path
 
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
-from app.discovery_models import DiscoveryResult, DiscoveryRun
+from app.discovery_models import DiscoveryInputSnapshot, DiscoveryResult, DiscoveryRun
 from app.envfile import TAVILY_API_KEY
 from app.models import (
     Financial,
@@ -29,6 +30,8 @@ from ledger.quotes import BookSnapshot, project_book
 from ledger.rules import sync_thesis_ceiling_rule
 from market.sentiment import is_extreme_greed
 from research.evaluate import EvalInput, has_min_financials, render_markdown, run_checklist
+from research.evidence import freeze_research_context, read_research_context
+from research.llm import DEFAULT_MODEL
 from research.thesis import (
     band_bounds,
     dynamic_sizing,
@@ -64,6 +67,7 @@ def create_research_job(
     screen_run_id: int | None = None,
     discovery_run_id: int | None = None,
     discovery_track: str | None = None,
+    assumption_id: int | None = None,
 ) -> ResearchJob:
     now = _now()
     job = ResearchJob(
@@ -75,11 +79,122 @@ def create_research_job(
         code=code,
         status="queued",
         error=None,
+        evidence_context_json=json.dumps(_capture_evidence_context(
+            session, code=code, cutoff=now, discovery_run_id=discovery_run_id, assumption_id=assumption_id),
+            ensure_ascii=False, sort_keys=True, separators=(',', ':'), allow_nan=False),
         created_at=now,
         updated_at=now,
     )
     session.add(job)
     return job
+
+
+def _capture_evidence_context(session: Session, *, code: str, cutoff: datetime,
+                              discovery_run_id: int | None, assumption_id: int | None = None) -> dict[str, object]:
+    """Creation-time capture only. A discovery run keeps its original cutoff."""
+    from discovery.evidence_store import load_coverage, load_coverage_references, load_evidence_as_of
+    from discovery.fundamentals import freeze_fundamentals, fundamentals_from_payload, snapshot_payload
+
+    policy, snapshot, reason = {}, None, None
+    if discovery_run_id is not None:
+        frozen = session.scalar(select(DiscoveryInputSnapshot).where(
+            DiscoveryInputSnapshot.run_id == discovery_run_id, DiscoveryInputSnapshot.code == code))
+        if frozen is None:
+            reason = 'discovery_frozen_input_missing'
+        else:
+            cutoff = frozen.snapshot_at
+            fields = json.loads(frozen.fields_json)
+            if 'fundamental_fingerprint' not in fields:
+                reason = 'discovery_legacy_fundamentals_missing'
+            else:
+                snapshot = fundamentals_from_payload(fields, code=code)
+                cutoff = snapshot.cutoff_at
+                policy = fields.get('operating_policy') or {}
+        origin = 'discovery_frozen_snapshot'
+    else:
+        records = load_evidence_as_of(session, code, cutoff)
+        coverage = load_coverage(session, code, cutoff=cutoff)
+        references = load_coverage_references(session, code, cutoff, coverage)
+        snapshot = freeze_fundamentals(tuple({row.evidence_id: row for row in (*records, *references)}.values()),
+            (), coverage, code=code, cutoff_at=cutoff, current_mcap=None)
+        origin = 'evidence_repository_at_job_creation'
+    records = () if snapshot is None else snapshot.annuals + snapshot.interims + snapshot.extensions
+    context = freeze_research_context(records, None, cutoff)
+    if assumption_id is not None:
+        from research.valuation import freeze_assumptions
+        from research.evidence import with_frozen_valuation
+        valuation = freeze_assumptions(session, assumption_id=assumption_id,
+            user_id=LOCAL_USER_ID, code=code, context=context)
+        context = with_frozen_valuation(context, valuation)
+    frozen = {'version': 'research-job-context-v1', 'code': code, 'origin': origin, 'reason': reason,
+        'fundamentals': snapshot_payload(snapshot) if snapshot else None,
+        'operating_policy': policy, 'research': context}
+    return {**frozen, 'fingerprint': _context_digest(frozen)}
+
+
+def _context_digest(value):
+    return sha256(json.dumps(value, ensure_ascii=False, sort_keys=True,
+        separators=(',', ':'), allow_nan=False).encode('utf-8')).hexdigest()
+
+
+def _job_evidence_context(job: ResearchJob):
+    """No source/file reads on execution or replay, including old queued jobs."""
+    from discovery.fundamentals import fundamentals_from_payload
+
+    if job.evidence_context_json is None:
+        return None, {}, None, None
+    frozen = json.loads(job.evidence_context_json)
+    if (frozen.get('version') != 'research-job-context-v1' or frozen.get('code') != job.code
+            or frozen.get('fingerprint') != _context_digest({key: value for key, value in frozen.items() if key != 'fingerprint'})):
+        raise ValueError('invalid frozen research job context')
+    context = frozen['research']
+    read_research_context(context)
+    snapshot = (fundamentals_from_payload(frozen['fundamentals'], code=job.code)
+                if frozen.get('fundamentals') is not None else None)
+    return snapshot, frozen['operating_policy'], context, frozen['fingerprint']
+
+
+def _exact_input_value(value):
+    """Normalize auxiliary financial numbers once, before prompt construction."""
+    from collections.abc import Mapping
+    if isinstance(value, Mapping):
+        return {key: _exact_input_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_exact_input_value(item) for item in value]
+    if isinstance(value, (Decimal, int, float)) and not isinstance(value, bool):
+        number = Decimal(str(value))
+        if not number.is_finite():
+            raise ValueError('model input contains a nonfinite number')
+        return str(number)
+    return value
+
+
+def _model_capture(payload: EvalInput, prompt: str | None, *, model: str, credibility_gate: bool):
+    from discovery.fundamentals import plain, snapshot_payload
+    data = {field.name: getattr(payload, field.name) for field in fields(payload)
+        if field.name not in {'reports_dir', 'input_frozen', 'frozen_prompt', 'model_input_fingerprint'}}
+    data['fundamentals'] = snapshot_payload(payload.fundamentals) if payload.fundamentals else None
+    captured = {'version': 'research-model-input-v1', 'input': plain(data),
+                'prompt': prompt, 'model': model, 'credibility_gate': credibility_gate}
+    return {**captured, 'fingerprint': _context_digest(captured)}
+
+
+def _read_model_capture(job: ResearchJob, reports_dir: Path):
+    from discovery.fundamentals import fundamentals_from_payload
+    capture = json.loads(job.model_input_json)
+    if (capture.get('version') != 'research-model-input-v1'
+            or capture.get('fingerprint') != _context_digest({key: value for key, value in capture.items() if key != 'fingerprint'})):
+        raise ValueError('frozen model input integrity mismatch')
+    data = dict(capture['input'])
+    if data.get('job_id') != job.id or data.get('code') != job.code or data.get('name') != job.name:
+        raise ValueError('frozen model input job mismatch')
+    data['price'] = Decimal(data['price']) if data['price'] is not None else None
+    data['fundamentals'] = fundamentals_from_payload(data['fundamentals'], code=job.code) if data['fundamentals'] else None
+    for key in ('financials', 'search_hits', 'notices', 'precedents', 'risk_flags'):
+        data[key] = tuple(data[key])
+    return (EvalInput(**data, reports_dir=reports_dir, input_frozen=True,
+        frozen_prompt=capture['prompt'], model_input_fingerprint=capture['fingerprint']),
+        capture['model'], capture['credibility_gate'])
 
 
 def _json_optional(value: Decimal | None) -> int | float | None:
@@ -395,8 +510,8 @@ def execute_research(
             llm=llm,
             quote_client=quote_client,
             reports_dir=reports_dir,
-            book=load_book_dict(session),
-            web_search=web_search_enabled(session),
+            book={} if job.model_input_json is not None else load_book_dict(session),
+            web_search=False if job.model_input_json is not None else web_search_enabled(session),
             as_of_date=_now().date().isoformat(),
             market=market,
             lock_owner_token=lock_owner_token,
@@ -613,45 +728,34 @@ def _run_one(
     user_id = job.user_id
     job_name = job.name
     job_code = job.code
+    if job.status == 'done':
+        return  # Published artifacts are read-only; refreshed inputs require a new job.
     if require_research_lease:
         _claim_research_lease(session, job_id, lock_owner_token)
     job.status = "running"
     job.updated_at = _now()
     session.commit()
-    row = session.get(Setting, LLM_MODEL_KEY)
-    model = (row.value or "").strip() if row is not None else ""
-    if model and hasattr(llm, "model"):
-        llm.model = model
     try:
-        ensure_financials(session, job_code, market)
-        rows = load_financials(session, job_code)
-        saved_price = _saved_price(
-            session, name=job_name, code=job_code
-        )
-        industry_name = _industry_of(
-            session, job_code, industry
-        )
-        precedents = _load_industry_precedents(
-            session,
-            user_id=user_id,
-            code=job_code,
-            industry=industry_name,
-        )
-        risk_flags = _load_discovery_risk_flags(
-            session,
-            code=job_code,
-            discovery_run_id=job.discovery_run_id,
-            discovery_track=job.discovery_track,
-            financials=rows,
-        )
-        credibility_gate = gate_is_open(session)
-        session.rollback()
-        if not credibility_gate:
-            credibility_gate = is_extreme_greed(session, market)
-            session.commit()
-        output = run_checklist(
-            llm,
-            EvalInput(
+        existing_capture = job.model_input_json
+        if existing_capture is not None:
+            payload, model, credibility_gate = _read_model_capture(job, reports_dir)
+        else:
+            row = session.get(Setting, LLM_MODEL_KEY)
+            model = ((row.value or '').strip() if row is not None else '') or getattr(llm, 'model', '') or os.environ.get('OPENAI_MODEL') or DEFAULT_MODEL
+            fundamentals, operating_policy, research_context, input_fingerprint = _job_evidence_context(job)
+            ensure_financials(session, job_code, market)
+            rows = load_financials(session, job_code)
+            saved_price = _saved_price(session, name=job_name, code=job_code)
+            industry_name = _industry_of(session, job_code, industry)
+            precedents = _load_industry_precedents(session, user_id=user_id, code=job_code, industry=industry_name)
+            risk_flags = _load_discovery_risk_flags(session, code=job_code,
+                discovery_run_id=job.discovery_run_id, discovery_track=job.discovery_track, financials=rows)
+            credibility_gate = gate_is_open(session)
+            session.rollback()
+            if not credibility_gate:
+                credibility_gate = is_extreme_greed(session, market)
+                session.commit()
+            payload = EvalInput(
                 name=job_name,
                 code=job_code,
                 financials=tuple(rows),
@@ -670,14 +774,43 @@ def _run_one(
                 notices=tuple(_fetch_notices(market, job_code)),
                 precedents=precedents,
                 risk_flags=risk_flags,
-            ),
-        )
+                fundamentals=fundamentals,
+                operating_policy=operating_policy,
+                research_context=research_context,
+                frozen_input_fingerprint=input_fingerprint,
+            )
+            payload = replace(payload, financials=tuple(_exact_input_value(payload.financials)),
+                valuation=_exact_input_value(payload.valuation), book=_exact_input_value(payload.book),
+                notices=tuple(_exact_input_value(payload.notices)), precedents=tuple(_exact_input_value(payload.precedents)))
+        if hasattr(llm, 'model'):
+            llm.model = model
+
+        def capture_before_model(final_payload, prompt):
+            if require_research_lease:
+                _claim_research_lease(session, job_id, lock_owner_token)
+            if existing_capture is not None:
+                current = session.scalar(select(ResearchJob.model_input_json).where(ResearchJob.id == job_id))
+                if current != existing_capture:
+                    raise ValueError('frozen model input changed before replay')
+                session.commit()
+                return final_payload.model_input_fingerprint
+            capture = _model_capture(final_payload, prompt, model=model, credibility_gate=credibility_gate)
+            stored = session.execute(update(ResearchJob).where(
+                ResearchJob.id == job_id, ResearchJob.model_input_json.is_(None)).values(
+                    model_input_json=json.dumps(capture, ensure_ascii=False, sort_keys=True,
+                        separators=(',', ':'), allow_nan=False)))
+            if int(stored.rowcount or 0) != 1:
+                raise ValueError('research model input was already captured')
+            session.commit()  # Durable before an external model call or insufficient-data result.
+            return capture['fingerprint']
+
+        output = run_checklist(llm, payload, before_model=capture_before_model)
         if credibility_gate:
             apply_credibility_gate(output.structured)
             output = replace(
                 output,
                 markdown=render_markdown(
-                    job_name, output.structured, web_search=web_search
+                    job_name, output.structured, web_search=payload.web_search
                 ),
             )
         if require_research_lease:

@@ -169,7 +169,8 @@ def _summary(
                     "metric": value,
                     "revenue_cagr": value,
                     "return_on_capital": value,
-                    "peg": value,
+                    "deducted_peg": value,
+                    "roic_gross_5y": value,
                 },
                 track="garp",
                 stage="track_gate",
@@ -325,7 +326,7 @@ def test_threshold_markers_cover_endpoints_ties_and_unresolved_keys() -> None:
         ["1", "2", "2", "3"],
         thresholds={
             "revenue_cagr_min": "1",
-            "return_on_capital_min": "2",
+            "roic_gross_min": "0.02",
             "peg_max": "3",
             "readiness_min": "0.5",
         },
@@ -333,7 +334,7 @@ def test_threshold_markers_cover_endpoints_ties_and_unresolved_keys() -> None:
     markers = {marker["id"]: marker for marker in summary["threshold_markers"]}
 
     assert markers["revenue_cagr_min"]["position"] == "0"
-    assert markers["return_on_capital_min"]["position"] == "50"
+    assert markers["roic_gross_min"]["position"] == "0"
     assert markers["peg_max"]["position"] == "100"
     assert markers["revenue_cagr_min"]["direction"] == "gte"
     assert markers["peg_max"]["direction"] == "lte"
@@ -624,6 +625,8 @@ def test_metric_aggregation_is_one_pass_over_cells(
             return counted()
 
         def __contains__(self, key: object) -> bool:
+            if key == "metric_results":
+                return super().__contains__(key)
             raise AssertionError("aggregation rescanned a result mapping")
 
     rows = [
@@ -841,8 +844,8 @@ def test_retired_build_historical_summaries_remain_identical(
     historical = rulers.validate_ruler_version(
         ruler, allow_retired_algorithm=True
     )
-    with pytest.raises(ValueError):
-        rulers.canonical_payload(historical)
+    # v8 remains a callable candidate contract even when production is unavailable.
+    assert rulers.canonical_payload(historical) == ruler.payload_json
     assert build_stage_summary(stage, rows, ruler_version=ruler) == before_track
     assert build_stage_summary(
         _stage(counts=(1, 1, 0, 0)),
@@ -882,7 +885,9 @@ def test_uncalibrated_track_is_explicitly_unavailable() -> None:
 
 
 def _activate(session, track: str, threshold: str, reason: str):
-    from discovery.rulers import activate
+    # Append retained historical rows for GET-only replay; no activation capability.
+    from app.models import RulerVersion
+    from discovery.rulers import canonical_payload, payload_digest
 
     payload = discovery_ruler_payload(track)
     if track == "quality_discount":
@@ -890,8 +895,12 @@ def _activate(session, track: str, threshold: str, reason: str):
     elif track == "deep_value":
         payload["thresholds"]["normalized_pe_max"] = threshold
     else:
-        payload["thresholds"]["return_on_capital_min"] = threshold
-    return activate(session, payload, reason)
+        payload["thresholds"]["roic_gross_min"] = str(Decimal(threshold) / 100)
+    row = RulerVersion(user_id=1, scope=f"discovery:{track}", digest=payload_digest(payload),
+        reason=reason, payload_json=canonical_payload(payload), activated_at=SNAPSHOT_AT)
+    session.add(row)
+    session.flush()
+    return row
 
 
 def test_routes_attach_attempt_local_summaries_without_market_queries(
@@ -924,8 +933,8 @@ def test_routes_attach_attempt_local_summaries_without_market_queries(
         import hashlib
 
         bomb_json = garp.payload_json.replace(
-            '"return_on_capital_min":"2"',
-            '"return_on_capital_min":"1e100000000"',
+            '"roic_gross_min":"0.02"',
+            '"roic_gross_min":"1e100000000"',
         )
         bomb_ruler = RulerVersion(
             user_id=1,

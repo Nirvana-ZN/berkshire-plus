@@ -13,6 +13,7 @@ const LOCK_LABEL: Record<string, string> = {
   review: '组合审视',
   discovery: '每周发现',
   discovery_data: '全市场抓取',
+  tracking: '独立跟踪',
 }
 
 const lock = ref<LockInfo | null>(null)
@@ -30,6 +31,7 @@ const lockLink = computed(() => {
     return `/research/${lock.value.job_id}`
   }
   if (lock.value.type === 'funnel') return '/screen'
+  if (lock.value.type === 'tracking') return '/tracking'
   if (lock.value.type === 'review') return '/positions'
   if (lock.value.type === 'discovery' || lock.value.type === 'discovery_data') {
     return '/discover'
@@ -83,6 +85,7 @@ onBeforeUnmount(() => {
         <RouterLink to="/positions">看仓</RouterLink>
         <RouterLink to="/screen">选股</RouterLink>
         <RouterLink to="/discover">每周发现</RouterLink>
+        <RouterLink to="/tracking">独立跟踪</RouterLink>
         <RouterLink to="/index-funds">指数基金</RouterLink>
         <RouterLink to="/settings">设置</RouterLink>
       </nav>

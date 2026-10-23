@@ -79,37 +79,16 @@ def test_effective_verdict_rejects_non_value_objects() -> None:
 
 
 def _competition_metrics(track: str, code: str) -> dict[str, object]:
-    shared = {"code": code, "branch": "nonfinancial", "risk_flags": []}
-    if track == "quality_discount":
-        return {
-            **shared,
-            "quality_branch": "nonfinancial",
-            "pe_percentile": "20",
-            "roe_downside_volatility": "0.1",
-            "cash_conversion": "1.2",
-            "valuation_pe_observations": "60",
-            "roe_observations": "5",
-            "cash_conversion_observations": "5",
-        }
-    if track == "deep_value":
-        return {
-            **shared,
-            "normalized_pe": "8",
-            "cumulative_fcf": "100",
-            "interest_coverage": "5",
-            "normalized_earnings_observations": "5",
-            "fcf_observations": "5",
-            "interest_coverage_observations": "1",
-        }
-    return {
-        **shared,
-        "revenue_cagr": "10",
-        "deducted_profit_cagr": "12",
-        "return_on_capital": "15",
-        "revenue_growth_observations": "5",
-        "deducted_profit_growth_observations": "5",
-        "roic_observations": "5",
-    }
+    from discovery.tracks import quality_discount, deep_value, garp
+    from tests.test_selection_v8 import candidate, company
+    from tests.test_discovery_tracks_deep_value import frozen_company as deep_company
+    classifier = {'quality_discount': quality_discount.classify, 'deep_value': deep_value.classify, 'garp': garp.classify}[track]
+    base = deep_company() if track == 'deep_value' else None
+    if base is not None:
+        from dataclasses import replace
+        base = replace(base, fields={**base.fields, 'financial_history': tuple({**row,
+            'values': {**row['values'], 'capex': '10'}} for row in base.fields['financial_history'])})
+    return {**classifier(company(base, cap='200'), candidate(track)).metrics, 'code': code}
 
 
 def _competition_execution_evidence(context, metrics_by_code):
@@ -149,7 +128,7 @@ def _competition_execution_evidence(context, metrics_by_code):
     return tuple(evidence)
 
 
-def _workflow_app(tmp_path, *, clock=None):
+def _workflow_app(tmp_path, *, clock=None, fail_first_competition=False):
     from dataclasses import replace
 
     from app.db import create_session_factory, init_db
@@ -167,27 +146,15 @@ def _workflow_app(tmp_path, *, clock=None):
 
     db_path = tmp_path / "task6.db"
     _seed_api_snapshot(db_path)
-    engine = init_db(db_path)
-    factory = create_session_factory(engine)
-    with factory() as session:
-        for track in ("quality_discount", "deep_value", "garp"):
-            payload_json, digest = discovery_ruler_values(track)
-            session.add(
-                RulerVersion(
-                    user_id=1,
-                    scope=f"discovery:{track}",
-                    digest=digest,
-                    reason="Task 6",
-                    payload_json=payload_json,
-                    activated_at=SNAPSHOT_AT,
-                )
-            )
-        session.commit()
-    engine.dispose()
 
     def execute(context):
         from discovery.snapshot import canonical_json
 
+        if (fail_first_competition and context.track == "garp"
+                and context.stage == "competition" and context.attempt == 1):
+            return TrackExecutionOutcome(
+                status="failed", error="network", failure_kind="transient",
+            )
         metrics = {
             code: _competition_metrics(context.track, code)
             for code in context.candidate_codes
@@ -225,6 +192,7 @@ def _workflow_app(tmp_path, *, clock=None):
                     "security": "2026-09-17",
                     "financial": "2026-09-17",
                     "valuation": "2026-09-17",
+                    "decision_cutoff_at": SNAPSHOT_AT.isoformat(),
                 },
             )
 
@@ -412,14 +380,23 @@ def test_startup_and_duplicate_create_ignore_prior_week_queue(
     from tests.test_discovery_common import _add_common_stage, _freeze_run
 
     db_path = tmp_path / "rollover-startup.db"
+    from tests.test_selection_release import seed_published_release
+    from discovery.rulers import require_ready
+    seed_published_release(db_path)
     engine = init_db(db_path)
     factory = create_session_factory(engine)
     with factory() as session:
+        ruler_ids = {
+            track: require_ready(session, track)[0].id
+            for track in ("quality_discount", "deep_value", "garp")
+        }
         old = _freeze_run(
-            session, [company("600000.SH")], week_key="2026-W38"
+            session, [company("600000.SH")], week_key="2026-W38",
+            ruler_ids=ruler_ids, published=True,
         )
         current = _freeze_run(
-            session, [company("600000.SH")], week_key="2026-W39"
+            session, [company("600000.SH")], week_key="2026-W39",
+            ruler_ids=ruler_ids, published=True,
         )
         old.current = True
         current.current = True
@@ -593,9 +570,9 @@ def test_retry_preserves_exact_attempt_chains(tmp_path) -> None:
     from app.discovery_models import DiscoveryResult, DiscoveryStage
     from tests.discovery_helpers import SNAPSHOT_AT
 
-    app = _workflow_app(tmp_path)
+    app = _workflow_app(tmp_path, fail_first_competition=True)
     with TestClient(app) as client:
-        run_id = _advance_to_competition(client)
+        run_id = client.post("/api/discoveries", json={"sync": True}).json()["id"]
         with app.state.session_factory() as session:
             competition = session.scalar(
                 select(DiscoveryStage).where(
@@ -605,20 +582,8 @@ def test_retry_preserves_exact_attempt_chains(tmp_path) -> None:
                 )
             )
             assert competition is not None
-            competition.status = "failed"
-            competition.failure_kind = "transient"
-            competition.error = "network"
-            competition.total_count = 0
-            competition.pass_count = 0
-            competition.drop_count = 0
-            competition.insufficient_count = 0
-            session.query(DiscoveryResult).filter_by(
-                run_id=run_id,
-                track="garp",
-                stage="competition",
-                attempt=competition.attempt,
-            ).delete(synchronize_session=False)
-            session.commit()
+            assert competition.status == "failed"
+            assert competition.failure_kind == "transient"
         retried = client.post(
             f"/api/discoveries/{run_id}/tracks/garp"
             "/stages/competition/retry",

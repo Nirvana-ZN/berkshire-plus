@@ -19,19 +19,24 @@ def decimal_series(*values: str | None) -> tuple[Decimal | None, ...]:
     return tuple(Decimal(value) if value is not None else None for value in values)
 
 
-def discovery_ruler_payload(track: str) -> dict[str, object]:
+def discovery_ruler_payload(track: str, *, build_version=BUILD_VERSION) -> dict[str, object]:
+    if build_version == "discovery-v8" and track in {"quality_discount", "deep_value", "garp"}:
+        import json
+        from discovery.rulers import canonical_payload
+        from tests.test_selection_v8 import candidate
+        return json.loads(canonical_payload(candidate(track)))
     if track == "quality_discount":
         from tests.test_discovery_tracks_quality import quality_payload
 
-        return quality_payload()
+        return quality_payload(build_version=build_version)
     if track == "deep_value":
         from tests.test_discovery_tracks_deep_value import deep_value_payload
 
-        return deep_value_payload()
+        return deep_value_payload(build_version=build_version)
     if track == "garp":
         from tests.test_discovery_tracks_garp import garp_payload
 
-        return garp_payload()
+        return garp_payload(build_version=build_version)
     return {
         "scope": "weekly-discovery",
         "track": track,
@@ -49,7 +54,7 @@ def discovery_ruler_payload(track: str) -> dict[str, object]:
             ["code", "asc", "nulls_last"],
         ],
         "industry_version": "test-industry-v1",
-        "algorithm_version": BUILD_VERSION,
+        "algorithm_version": build_version,
     }
 
 
@@ -62,6 +67,7 @@ def discovery_ruler_values(track: str) -> tuple[str, str]:
 
 def ruler_payloads_json(
     ruler_ids: dict[str, int | None] | None = None,
+    *, build_version: str = BUILD_VERSION,
 ) -> str:
     from discovery.snapshot import _sha256, canonical_json
 
@@ -74,7 +80,7 @@ def ruler_payloads_json(
         payload = {
             "scope": "weekly-discovery",
             "track": track,
-            "algorithm_version": BUILD_VERSION,
+            "algorithm_version": build_version,
         }
         values[track] = {
             "id": ruler_id,
@@ -92,6 +98,7 @@ def add_unfrozen_run(
     financial_version: str = "financial-v1",
     valuation_version: str = "valuation-v1",
     ruler_ids: dict[str, int] | None = None,
+    build_version: str = BUILD_VERSION,
 ):
     from app.discovery_models import DiscoveryRun
 
@@ -110,8 +117,8 @@ def add_unfrozen_run(
         quality_discount_ruler_version_id=ids["quality_discount"],
         deep_value_ruler_version_id=ids["deep_value"],
         garp_ruler_version_id=ids["garp"],
-        algorithm_version=BUILD_VERSION,
-        ruler_payloads_json=ruler_payloads_json(ids),
+        algorithm_version=build_version,
+        ruler_payloads_json=ruler_payloads_json(ids, build_version=build_version),
         input_fingerprint=None,
     )
     session.add(run)
@@ -125,6 +132,7 @@ def versions(
     financial_version: str = "financial-v1",
     valuation_version: str = "valuation-v1",
     ruler_ids: dict[str, int] | None = None,
+    build_version: str = BUILD_VERSION,
 ):
     from discovery.snapshot import SnapshotVersions
 
@@ -133,7 +141,7 @@ def versions(
         financial_version=financial_version,
         valuation_version=valuation_version,
         ruler_version_ids=ruler_ids or RULER_IDS,
-        algorithm_version=BUILD_VERSION,
+        algorithm_version=build_version,
     )
 
 
