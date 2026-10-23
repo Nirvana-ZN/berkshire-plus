@@ -229,3 +229,26 @@ def evidence_identity(record: EvidenceRecord) -> str:
     encoded = json.dumps(payload, ensure_ascii=False, allow_nan=False,
                          sort_keys=True, separators=(",", ":"))
     return sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def validate_manual_verification(record: EvidenceRecord) -> None:
+    """Reject invalid asserted manual trust without changing retained content.
+
+    Internal/provider records need not carry a manual receipt. When one exists,
+    a verified version must have observed the review itself, not just the source.
+    Readers call this only after cutoff/version selection so a later honest
+    correction can supersede an invalid legacy version without rewriting it.
+    """
+    if record.status != 'verified' or '_verification' not in record.values:
+        return
+    try:
+        receipt = json.loads(record.values['_verification'])
+        if not isinstance(receipt, dict) or receipt.get('method') != 'human_review':
+            raise ValueError('invalid manual receipt')
+        _text(receipt.get('reviewer'), 'reviewer')
+        reviewed = datetime.fromisoformat(receipt['reviewed_at'].replace('Z', '+00:00'))
+        _aware(reviewed, 'reviewed_at')
+    except (KeyError, TypeError, AttributeError, ValueError) as error:
+        raise ValueError(f'manual_review_invalid:{record.evidence_id}') from error
+    if reviewed > record.observed_at:
+        raise ValueError(f'manual_review_after_observation:{record.evidence_id}')

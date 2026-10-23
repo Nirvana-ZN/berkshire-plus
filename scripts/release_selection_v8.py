@@ -91,7 +91,7 @@ def _proofs(snapshot):
 
 def _source_metrics(snapshot, ruler, branch):
     """Source completeness independent of candidate counts or economic success."""
-    from discovery.fundamentals import _facts_calculation, period_order, ttm_amount
+    from discovery.fundamentals import _facts_calculation, period_order, ttm_amount, cash_debt_sources
     from discovery.selection_contract import _dilution
     from discovery.fundamental_types import MetricResult
     rows = snapshot.annuals + snapshot.interims
@@ -101,8 +101,6 @@ def _source_metrics(snapshot, ruler, branch):
     def inputs(fields, years=1):
         required = [(field, str(year)) for year in range(end - years + 1, end + 1) for field in fields]
         return _facts_calculation(snapshot.annuals, required, lambda *values: sum(values)) if end else missing
-    def balance(fields):
-        return _facts_calculation(rows, [(field, latest) for field in fields], lambda *values: sum(values)) if latest else missing
     result = {}
     if branch == 'bank':
         if ruler.track != 'garp':
@@ -147,7 +145,7 @@ def _source_metrics(snapshot, ruler, branch):
         result['normalized_earnings'] = inputs(('deducted_net_income',), 5)
     if ruler.track == 'deep_value':
         result['five_year_fcf'] = inputs(('ocf', 'capex'), 5)
-        result['usable_cash_debt'] = balance(('cash', 'restricted_cash', 'interest_debt'))
+        result['usable_cash_debt'] = cash_debt_sources(snapshot)
         result['current_market_cap'] = cap
     # Operating confirmation compares the same cumulative period year-on-year;
     # an available TTM alone does not prove that comparison.
@@ -228,7 +226,8 @@ def release_report(session: Session, *, fill_id: int):
     from app.models import DiscoveryDataFill, DiscoveryDataCheckpoint
     from discovery.common import classify_common
     from discovery.constants import china_market_date
-    from discovery.fundamentals import fundamentals_from_payload, _fact, classification_identity, period_order
+    from discovery.fundamentals import (fundamentals_from_payload, _fact, classification_identity,
+                                        period_order, cash_debt_sources)
     from discovery.industry import classify_industry_branch
     from discovery.field_dictionary import SELECTION_FIELD_DICTIONARY
     from discovery.rulers import canonical_payload, payload_digest
@@ -323,6 +322,8 @@ def release_report(session: Session, *, fill_id: int):
             latest = max((row.period for row in all_rows), key=period_order, default=None)
             for field in SELECTION_FIELD_DICTIONARY:
                 value = _fact(all_rows, field, latest)[0] if latest else None
+                if field == 'restricted_cash':
+                    value = cash_debt_sources(fundamental)
                 for bucket in buckets:
                     record(bucket, 'source:' + field, value is not None and trusted(value))
         for track, classifier in (('quality_discount', quality), ('deep_value', deep), ('garp', garp)):

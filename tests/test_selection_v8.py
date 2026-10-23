@@ -428,4 +428,3 @@ def test_legacy_frozen_coverage_ids_without_proof_stay_unavailable():
     item = replace(item, fields={**item.fields, **payload})
     metric = classify(item, candidate()).metrics['metric_results']['economic_dilution']
     assert metric['status'] == 'missing'
-

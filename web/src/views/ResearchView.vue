@@ -460,6 +460,7 @@ onBeforeUnmount(stopPoll)
         <details><summary>冻结来源（{{ sourceEvidence.length }}）</summary>
           <article v-for="source in sourceEvidence" :key="text(source.evidence_id)">
             <h3>{{ text(source.kind) }} · {{ text(source.period) }}</h3>
+            <p class="source-evidence-id">证据编号：{{ text(source.evidence_id) }}</p>
             <p>状态：{{ text(record(source.source_proof).status) }} · 缺口：{{ text(record(source.source_proof).reason) }}</p>
             <p><a v-if="sourceUrl(source.source_url)" :href="sourceUrl(source.source_url)" target="_blank" rel="noopener noreferrer">原始来源</a> · {{ text(record(source.source_proof).report_location) }}</p>
             <p>{{ text(record(source.source_proof).excerpt) }}</p>
@@ -717,6 +718,7 @@ onBeforeUnmount(stopPoll)
 }
 
 .evidence-audit p, .evidence-audit article { overflow-wrap: anywhere; }
+.source-evidence-id { min-width: 0; white-space: normal; overflow-wrap: anywhere; }
 .scenario-scroll { max-width: 100%; overflow-x: auto; }
 
 @media (max-width: 820px) {

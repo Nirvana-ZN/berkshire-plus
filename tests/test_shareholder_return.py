@@ -44,6 +44,14 @@ def metrics(rows=(), windows=(), **inputs):
         **dict(mcap=D('1000'), fcf=D('100'), deducted_profit=D('200')) | inputs)
 
 
+@pytest.mark.parametrize('complete', ['true', 'false'])
+def test_terminal_date_cannot_certify_shareholder_coverage(complete):
+    proof, window = receipt(kind='dividend', stage='paid', end='9999-12-31', complete=complete)
+    assert window.complete is False and window.end == date.max
+    assert window.evidence_ids == (proof.evidence_id,)
+    assert metrics((proof,), (window,))['dividend_paid'].value is None
+
+
 def covered(rows, **options):
     proof, window = receipt(rows, **options)
     return (*rows, proof), (window,)

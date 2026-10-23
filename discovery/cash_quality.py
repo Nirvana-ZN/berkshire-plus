@@ -45,6 +45,17 @@ def _calculate(inputs: tuple[MetricResult, ...], operation: Callable[..., Decima
     return MetricResult(None, 'untrusted', 'cash_metrics_numeric_range', ())
 
 
+def cash_balance_inputs(*, cash: Decimal | None, restricted_cash: Decimal | None,
+                        debt: Decimal | None) -> dict[str, MetricResult]:
+    """Shared balance domains and cross-field checks, independent of FCF/yields."""
+    c, r, d = (_input(name, value) for name, value in (
+        ('cash', cash), ('restricted_cash', restricted_cash), ('debt', debt)))
+    usable = _calculate((c, r), lambda cash, restricted: cash - restricted)
+    if usable.value is not None and usable.value < 0:
+        usable = MetricResult(None, 'untrusted', 'restricted_cash_exceeds_cash', ())
+    return {'usable_cash': usable, 'net_debt': _calculate((d, usable), lambda debt, cash: debt - cash)}
+
+
 def cash_metrics(*, cash: Decimal | None, restricted_cash: Decimal | None,
                  debt: Decimal | None, fcf: Decimal | None,
                  mcap: Decimal | None) -> dict[str, MetricResult]:
@@ -56,13 +67,9 @@ def cash_metrics(*, cash: Decimal | None, restricted_cash: Decimal | None,
     amounts/nonfinite/domain failures return untrusted. Independent metrics survive.
     No source trust, normalization window or industry identity is inferred here.
     """
-    c, r, d, f, m = (_input(name, value) for name, value in (
-        ('cash', cash), ('restricted_cash', restricted_cash), ('debt', debt),
-        ('fcf', fcf), ('mcap', mcap)))
-    usable = _calculate((c, r), lambda cash, restricted: cash - restricted)
-    if usable.value is not None and usable.value < 0:
-        usable = MetricResult(None, 'untrusted', 'restricted_cash_exceeds_cash', ())
-    net_debt = _calculate((d, usable), lambda debt, cash: debt - cash)
+    balance = cash_balance_inputs(cash=cash, restricted_cash=restricted_cash, debt=debt)
+    usable, net_debt = balance['usable_cash'], balance['net_debt']
+    f, m = _input('fcf', fcf), _input('mcap', mcap)
     positive_fcf = f
     if f.value is not None and f.value <= 0:
         positive_fcf = MetricResult(None, 'untrusted', 'fcf_not_positive', ())

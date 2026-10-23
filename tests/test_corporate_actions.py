@@ -305,6 +305,10 @@ def test_complete_coverage_requires_observation_and_review_after_entire_shanghai
     payload = reviewed_coverage(rows, published_at=observed, observed_at=observed)
     payload['values']['end'] = end
     payload['verification']['reviewed_at'] = reviewed
+    if datetime.fromisoformat(reviewed) > datetime.fromisoformat(observed):
+        with pytest.raises(ValueError, match='manual_review_after_observation'):
+            parse_source_evidence(payload)
+        return
     receipt = parse_source_evidence(payload)
     original_id = receipt.evidence_id
     original_values = dict(receipt.values)
@@ -335,3 +339,14 @@ def test_early_zero_event_receipt_stays_incomplete_until_new_reviewed_version():
     assert later.supersedes_id == original.evidence_id
     assert parse_event_coverage(later, ()).complete is True
     assert parse_event_coverage(original, ()) == original_window
+
+
+@pytest.mark.parametrize('complete', ['true', 'false'])
+def test_terminal_date_cannot_certify_capital_coverage(complete):
+    from market.evidence import parse_event_coverage, parse_source_evidence
+    payload = reviewed_coverage(())
+    payload['values'].update(end='9999-12-31', complete=complete)
+    receipt = parse_source_evidence(payload)
+    window = parse_event_coverage(receipt, ())
+    assert window.complete is False and window.end == date.max
+    assert window.evidence_ids == (receipt.evidence_id,)

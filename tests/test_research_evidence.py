@@ -451,9 +451,10 @@ def test_retry_reuses_exact_input_even_when_search_empty_or_data_insufficient(tm
     from sqlalchemy import select
     from sqlalchemy.orm import Session
     from app.db import init_db
-    from app.models import ResearchArtifact
+    from app.models import ResearchArtifact, ResearchJob, Setting
     from jobs.research import create_research_job, _run_one
     from research.llm import FakeLLM
+    from research.evaluate import _write_report
 
     engine = init_db(tmp_path / 'retry.db')
     monkeypatch.setattr('jobs.research.ensure_financials', lambda *args: None)
@@ -468,16 +469,42 @@ def test_retry_reuses_exact_input_even_when_search_empty_or_data_insufficient(tm
     monkeypatch.setattr('jobs.research.fetch_valuation', lambda *args: {'eps': 2})
     monkeypatch.setattr('jobs.research._fetch_notices', lambda *args: [{'title': 'old notice'}])
     monkeypatch.setattr('research.evaluate.fetch_hits', lambda *args: hits)
+    report_attempts = []
+    def fail_first_null_report(payload, markdown):
+        with Session(engine) as stored:
+            captured_job = stored.get(ResearchJob, payload.job_id)
+            capture = json.loads(captured_job.model_input_json)
+            assert captured_job.status == 'running'
+            assert capture['prompt'] is None
+            assert capture['model'] == 'synthetic-original-model'
+            assert stored.scalar(select(ResearchArtifact)) is None
+            report_attempts.append(captured_job.model_input_json)
+        raise RuntimeError('synthetic report-write failure after durable null capture')
+    if price is None:
+        monkeypatch.setattr('research.evaluate._write_report', fail_first_null_report)
     with Session(engine) as session:
+        session.merge(Setting(key='llm_model', value='synthetic-original-model'))
         job = create_research_job(session, name='Synthetic', code='000001.SZ')
         session.commit()
         first = FakeLLM(error=RuntimeError('synthetic first-attempt failure'))
+        first.model = 'ignored-first-client-model'
         _run_one(session, job, llm=first, quote_client=None, reports_dir=tmp_path,
             book={'positions': [], 'cash_balance': 100}, web_search=True, as_of_date='2026-10-02')
         session.refresh(job)
         captured = job.model_input_json
+        assert job.status == 'failed'
         assert captured
         assert json.loads(captured)['prompt'] == (first.prompts[0] if price is not None else None)
+        assert json.loads(captured)['model'] == first.model == 'synthetic-original-model'
+        assert json.loads(captured)['credibility_gate'] is False
+        assert session.scalar(select(ResearchArtifact)) is None
+        if price is None:
+            assert report_attempts == [captured]
+            assert 'report-write failure' in job.error
+            assert first.calls == []
+            monkeypatch.setattr('research.evaluate._write_report', _write_report)
+        session.get(Setting, 'llm_model').value = 'changed-setting-model'
+        session.commit()
 
         def forbidden(*args, **kwargs):
             raise AssertionError('Retry attempted to reread a mutable source')
@@ -487,16 +514,21 @@ def test_retry_reuses_exact_input_even_when_search_empty_or_data_insufficient(tm
             monkeypatch.setattr('jobs.research.' + name, forbidden)
         monkeypatch.setattr('research.evaluate.fetch_hits', forbidden)
         second = FakeLLM()
+        second.model = 'changed-retry-client-model'
         _run_one(session, job, llm=second, quote_client=None, reports_dir=tmp_path,
             book={'positions': [{'name': 'new holding'}]}, web_search=False, as_of_date='2027-12-31')
         session.refresh(job)
         assert job.status == 'done'
         assert job.model_input_json == captured
+        assert second.model == 'synthetic-original-model'
         assert second.prompts == first.prompts
         artifact = session.scalars(select(ResearchArtifact).order_by(ResearchArtifact.id.desc())).first()
         result = json.loads(artifact.structured_json)
         assert result['as_of']['date'] == '2026-10-02'
         assert result['search_hits'] == hits
+        assert result['evidence_contract']['model_input_fingerprint'] == json.loads(captured)['fingerprint']
+        if price is None:
+            assert result['as_of']['price'] is None and second.calls == []
     engine.dispose()
 
 

@@ -17,7 +17,8 @@ from urllib.parse import urlparse
 
 from discovery.constants import CHINA_MARKET_TIMEZONE
 from discovery.field_dictionary import SELECTION_FIELD_DICTIONARY
-from discovery.fundamental_types import CoverageWindow, EvidenceRecord, evidence_identity
+from discovery.fundamental_types import (CoverageWindow, EvidenceRecord, evidence_identity,
+                                         validate_manual_verification)
 
 CAPITAL_TEXT_FIELDS = frozenset({
     'economic_event_id', 'action', 'stage', 'effective_at',
@@ -292,6 +293,7 @@ def parse_source_evidence(payload: Mapping[str, object]) -> EvidenceRecord:
         supersedes_id=payload.get('supersedes_id'), date_only=date_only, archive_verified=False,
     )
     identity = evidence_identity(row)
+    validate_manual_verification(replace(row, evidence_id=identity))
     if payload.get('evidence_id') is not None and payload['evidence_id'] != identity:
         raise ValueError('evidence identity conflicts with canonical content')
     return replace(row, evidence_id=identity)
@@ -332,7 +334,8 @@ def parse_event_coverage(receipt: EvidenceRecord, records: Sequence[EvidenceReco
         raise ValueError('capital event lies outside the asserted coverage interval')
     reviewed = receipt.status == 'verified' and receipt.values.get('_verification') is not None
     timely = False
-    if reviewed:
+    # The terminal date has no representable next day: it cannot be closed.
+    if reviewed and end != date.max:
         review = json.loads(_text(receipt.values['_verification'], '_verification'))
         _review({'verification': review})
         reviewed_at = _time(review['reviewed_at'], 'reviewed_at')
@@ -383,7 +386,8 @@ def parse_shareholder_coverage(receipt: EvidenceRecord, records: Sequence[Eviden
             raise ValueError('shareholder execution lies outside the asserted coverage interval')
     reviewed = receipt.status == 'verified' and receipt.values.get('_verification') is not None
     timely = False
-    if reviewed:
+    # Preserve the requested interval and mark it incomplete at the date limit.
+    if reviewed and end != date.max:
         review = json.loads(_text(receipt.values['_verification'], '_verification'))
         _review({'verification': review})
         reviewed_at = _time(review['reviewed_at'], 'reviewed_at')

@@ -12,7 +12,8 @@ from sqlalchemy.orm import Session
 from app.selection_models import FundamentalCoverage, FundamentalEvidence
 from discovery.constants import CHINA_MARKET_TIMEZONE
 from discovery.field_dictionary import FIELD_DICTIONARY, SELECTION_FIELD_DICTIONARY
-from discovery.fundamental_types import CoverageWindow, EvidenceRecord, evidence_identity
+from discovery.fundamental_types import (CoverageWindow, EvidenceRecord, evidence_identity,
+                                         validate_manual_verification)
 
 
 def _json(value: object) -> str:
@@ -70,6 +71,7 @@ def append_evidence(session: Session, record: EvidenceRecord) -> str:
     if evidence_identity(record) != record.evidence_id:
         raise ValueError('evidence identity conflicts with canonical content')
     _validate_numeric_values(record)
+    validate_manual_verification(record)
     existing = session.get(FundamentalEvidence, record.evidence_id)
     if existing is not None:
         if evidence_identity(_record(existing)) != record.evidence_id:
@@ -183,8 +185,11 @@ def select_evidence_as_of(records: Sequence[EvidenceRecord], *, code: str,
                 seen.add(parent_id)
                 superseded.add(parent_id)
                 parent_id = by_id[parent_id].supersedes_id
-    return tuple(sorted((row for row in visible if row.evidence_id not in superseded),
-                        key=lambda row: (row.kind, row.period, available_at(row, historical=historical), row.evidence_id)))
+    selected = tuple(sorted((row for row in visible if row.evidence_id not in superseded),
+                            key=lambda row: (row.kind, row.period, available_at(row, historical=historical), row.evidence_id)))
+    for row in selected:
+        validate_manual_verification(row)
+    return selected
 
 
 def append_coverage(session: Session, window: CoverageWindow, *,

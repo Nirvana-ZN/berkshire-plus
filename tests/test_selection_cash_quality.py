@@ -119,6 +119,26 @@ def test_bank_applicability_is_explicit_in_track_adapter():
         cash_metrics_for_branch(branch='typo', **kwargs)
 
 
+@pytest.mark.parametrize('basis,status', [('fixture-consolidated-cny', 'verified'), ('other-basis', 'untrusted')])
+def test_cash_source_readiness_keeps_basis_cutoff_and_all_input_identities(basis, status):
+    from discovery.fundamentals import cash_debt_sources, freeze_fundamentals
+    from discovery.fundamental_types import evidence_identity
+    from tests.selection_helpers import evidence
+    cash = evidence('2025', cash='60', interest_debt='20')
+    restricted = replace(evidence('2025', restricted_cash='0'), basis_id=basis)
+    restricted = replace(restricted, evidence_id=evidence_identity(restricted))
+    future = replace(evidence('2026H1', cash='-1', restricted_cash='0', interest_debt='0'),
+                     observed_at=datetime(2026, 11, 1, tzinfo=timezone.utc))
+    future = replace(future, evidence_id=evidence_identity(future))
+    snapshot = freeze_fundamentals((cash, restricted, future), (), (), code=cash.code,
+        cutoff_at=cash.observed_at, current_mcap=None)
+    result = cash_debt_sources(snapshot)
+    assert result.status == status
+    assert set(result.evidence_ids) == {cash.evidence_id, restricted.evidence_id}
+    assert result.value == (D('-40') if status == 'verified' else None)
+    assert result.reason == (None if status == 'verified' else 'incomparable_basis')
+
+
 OBSERVED = datetime(2026, 10, 22, 8, tzinfo=timezone.utc)
 DAY = date(2026, 10, 21)
 SOURCE = 'https://datacenter-web.eastmoney.com/api/data/v1/get?reportName=RPT_VALUEANALYSIS_DET'

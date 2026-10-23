@@ -149,6 +149,22 @@ def _facts_calculation(rows, requirements, fn):
                                                          for field, period in requirements), fn))
 
 
+def cash_debt_sources(snapshot: FundamentalSnapshot) -> MetricResult:
+    """Latest comparable cash sources using the metric's domains, not its gates."""
+    from discovery.cash_quality import cash_balance_inputs
+    rows = _snapshot_rows(snapshot)
+    latest = max((row.period for row in rows), key=period_order, default=None)
+    if latest is None:
+        return MetricResult(None, 'missing', 'financial_reports_missing', ())
+    requirements = [(field, latest) for field in ('cash', 'restricted_cash', 'interest_debt')]
+    facts = tuple(_fact(rows, field, period)[0] for field, period in requirements)
+    sources = _on_basis(rows, requirements, _arithmetic(facts, lambda *_: Decimal(0)))
+    if sources.status != 'verified':
+        return sources
+    balance = cash_balance_inputs(cash=facts[0].value, restricted_cash=facts[1].value, debt=facts[2].value)
+    return replace(balance['net_debt'], evidence_ids=sources.evidence_ids)
+
+
 def classification_identity(snapshot) -> tuple[MetricResult, str | None]:
     """Trusted classification identity, independent of metric applicability."""
     rows = tuple(row for row in snapshot.extensions if row.kind == 'company_classification'

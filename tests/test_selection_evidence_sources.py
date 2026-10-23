@@ -81,6 +81,26 @@ def test_verified_manual_import_needs_a_review_receipt():
         parse_source_evidence({**payload(), 'status': 'verified'})
 
 
+@pytest.mark.parametrize('reviewed,valid', [
+    ('2026-10-01T00:00:00Z', True),
+    ('2026-10-01T08:00:00+08:00', True),
+    ('2026-09-30T23:00:00+02:00', True),
+    ('2026-10-01T08:00:00.000001+08:00', False),
+])
+def test_generic_manual_review_must_precede_verified_observation(reviewed, valid):
+    from discovery.evidence_store import available_at
+    from market.evidence import parse_source_evidence
+    data = {**payload(), 'status': 'verified', 'verification': {
+        'method': 'human_review', 'reviewer': 'synthetic', 'reviewed_at': reviewed}}
+    if not valid:
+        with pytest.raises(ValueError, match='manual_review_after_observation'):
+            parse_source_evidence(data)
+    else:
+        row = parse_source_evidence(data)
+        assert row.status == 'verified'
+        assert available_at(row) == max(row.published_at, row.observed_at)
+
+
 def test_provider_uses_only_audited_columns_and_never_claims_trust():
     from market.evidence import parse_source_evidence
     data = {**payload(), 'source': 'eastmoney', 'report': 'RPT_F10_FINANCE_GINCOME',
@@ -160,7 +180,8 @@ def test_raw_provider_failure_or_unidentified_row_is_not_empty_coverage():
 def test_explicit_human_review_is_preserved_without_archive_promotion():
     from market.evidence import parse_source_evidence
     review = {'method': 'human_review', 'reviewer': 'fixture-reviewer', 'reviewed_at': '2026-10-02T00:00:00+00:00'}
-    row = parse_source_evidence({**payload(), 'status': 'verified', 'verification': review})
+    row = parse_source_evidence({**payload(), 'status': 'verified', 'verification': review,
+                                 'observed_at': review['reviewed_at']})
     assert row.status == 'verified'
     assert json.loads(row.values['_verification']) == review
     assert row.archive_verified is False

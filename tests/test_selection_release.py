@@ -163,6 +163,55 @@ def seed_published_release(db_path):
         patch.setattr('scripts.release_selection_v8.datetime', FixtureReleaseClock)
         return publish_release(db_path, fill_id=fill_id, reason='synthetic API fixture', backup_dir=directory / 'backups')
 
+
+@pytest.mark.parametrize('overrides,reason', [
+    ({'restricted_cash': '-1'}, 'restricted_cash_invalid'),
+    ({'restricted_cash': '61'}, 'restricted_cash_exceeds_cash'),
+    ({'cash': '-1'}, 'cash_invalid'),
+    ({'interest_debt': '-1'}, 'debt_invalid'),
+])
+def test_retained_cash_domain_invalid_blocks_actual_release(tmp_path, monkeypatch, overrides, reason):
+    from discovery.fundamentals import fundamentals_from_payload
+    from discovery.snapshot import build_production_snapshot
+    from scripts.release_selection_v8 import release_report, _frozen_companies, _contracts
+    from discovery.tracks.deep_value import classify
+    engine, fill_id = retained_release_fill(tmp_path, monkeypatch, financial_overrides=overrides)
+    with Session(engine) as session:
+        report = release_report(session, fill_id=fill_id)
+        assert report['eligible'] is False
+        for item in (report['coverage']['tracks']['deep_value']['usable_cash_debt'],
+                     report['coverage']['sources']['restricted_cash'],
+                     report['coverage']['branches']['nonfinancial']['metrics']['source:restricted_cash'],
+                     report['coverage']['industries']['制造业']['metrics']['source:restricted_cash']):
+            assert (item['trusted'], item['applicable'], item['status']) == (0, 1, 'insufficient')
+        companies = _frozen_companies(build_production_snapshot(session, fill_id=fill_id))
+        snapshot = fundamentals_from_payload(companies[0].fields, code=companies[0].code)
+        from discovery.fundamentals import cash_debt_sources
+        source = cash_debt_sources(snapshot)
+        assert source.status == 'untrusted' and source.reason == reason and source.evidence_ids
+        ruler = _contracts(companies, companies[0].fields['operating_policy'])['deep_value']
+        result = classify(companies[0], ruler)
+        assert result.verdict != 'pass'
+    engine.dispose()
+
+
+@pytest.mark.parametrize('overrides', [
+    {'cash': '0', 'restricted_cash': '0', 'interest_debt': '0'},
+    {'cash': '60', 'restricted_cash': '60', 'interest_debt': '0'},
+    {'cash': '60', 'restricted_cash': '0', 'interest_debt': '0', 'ocf': '0', 'capex': '10'},
+    {'cash': '60', 'restricted_cash': '0', 'interest_debt': '20', 'ocf': '10', 'capex': '10'},
+])
+def test_cash_source_readiness_accepts_zero_net_cash_and_nonpositive_fcf(tmp_path, monkeypatch, overrides):
+    from scripts.release_selection_v8 import release_report
+    engine, fill_id = retained_release_fill(tmp_path, monkeypatch, financial_overrides=overrides)
+    with Session(engine) as session:
+        report = release_report(session, fill_id=fill_id)
+        assert report['eligible'] is True, report['blockers']
+        for item in (report['coverage']['tracks']['deep_value']['usable_cash_debt'],
+                     report['coverage']['sources']['restricted_cash']):
+            assert (item['trusted'], item['applicable'], item['status']) == (1, 1, 'ready')
+    engine.dispose()
+
 def test_real_import_fill_qualified_report_and_zero_is_trusted(tmp_path, monkeypatch):
     from scripts.release_selection_v8 import release_report
     engine, fill_id = retained_release_fill(tmp_path, monkeypatch)

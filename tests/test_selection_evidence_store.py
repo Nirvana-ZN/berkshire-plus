@@ -40,6 +40,74 @@ def test_append_is_idempotent_and_reloads_aware_utc(store):
         assert session.execute(text('SELECT count(*) FROM fundamental_evidence')).scalar_one() == 1
 
 
+def test_legacy_invalid_manual_receipt_is_rejected_until_honest_append_only_correction(store):
+    import json
+    from dataclasses import fields
+    from app.selection_models import FundamentalEvidence
+    from discovery.evidence_store import append_evidence, available_at, load_evidence_as_of
+    from discovery.fundamentals import (fundamentals_from_payload, freeze_fundamentals,
+        snapshot_payload, plain, _digest, operating_state)
+    from discovery.tracks.deep_value import classify
+    from tests.test_selection_v8 import company, candidate
+    from tests.test_discovery_tracks_deep_value import _company
+
+    base = company(_company(), cap='200', restricted=None)
+    snap = fundamentals_from_payload(base.fields, code=base.code)
+    old = next(row for row in snap.interims if row.period == '2026H1')
+    observed = datetime(2026, 9, 2, tzinfo=timezone.utc)
+    reviewed = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    bad = identity(old, observed_at=observed, supersedes_id=old.evidence_id,
+        values={**old.values, 'restricted_cash': '0', '_verification': json.dumps({
+            'method': 'human_review', 'reviewer': 'synthetic', 'reviewed_at': reviewed.isoformat()})})
+    good = identity(bad, observed_at=reviewed, supersedes_id=bad.evidence_id)
+    records = snap.annuals + snap.interims + snap.extensions
+    args = dict(code=base.code, cutoff_at=snap.cutoff_at, current_mcap=snap.current_mcap)
+
+    # Simulate bytes persisted before the validation fix by INSERT only. Never
+    # rewrite evidence or use the new importer to claim this is a valid receipt.
+    with Session(store) as session:
+        for row in records:
+            append_evidence(session, row)
+        with pytest.raises(ValueError, match='manual_review_after_observation'):
+            append_evidence(session, bad)
+        raw = {field.name: getattr(bad, field.name) for field in fields(bad) if field.name != 'values'}
+        session.add(FundamentalEvidence(**raw, values_json=json.dumps(dict(bad.values)), available_at=available_at(bad)))
+        session.commit()
+        before = tuple(session.execute(text('SELECT * FROM fundamental_evidence WHERE evidence_id=:id'), {'id': bad.evidence_id}).one())
+        assert old in load_evidence_as_of(session, base.code, old.observed_at)
+        with pytest.raises(ValueError, match='manual_review_after_observation'):
+            load_evidence_as_of(session, base.code, snap.cutoff_at)
+        with pytest.raises(ValueError, match='manual_review_after_observation'):
+            freeze_fundamentals((*records, bad), (), snap.coverage, **args)
+
+        # Reconstruct the exact old frozen representation without invoking the
+        # newly guarded freeze producer, then send it to the actual classifier.
+        legacy_data = {field.name: getattr(snap, field.name) for field in fields(snap) if field.name != 'fingerprint'}
+        legacy_data['interims'] = tuple(bad if row == old else row for row in snap.interims)
+        legacy = replace(snap, **legacy_data, fingerprint=_digest(legacy_data))
+        frozen = snapshot_payload(legacy)
+        frozen_before = json.dumps(plain(frozen), sort_keys=True)
+        legacy_company = replace(base, fields={**base.fields, **frozen})
+        result = classify(legacy_company, candidate('deep_value'))
+        assert result.verdict == 'insufficient' and result.reason == 'selection_evidence_invalid'
+        assert json.dumps(plain(frozen), sort_keys=True) == frozen_before
+
+        append_evidence(session, good)
+        session.commit()
+        with pytest.raises(ValueError, match='manual_review_after_observation'):
+            load_evidence_as_of(session, base.code, snap.cutoff_at)
+        later_rows = load_evidence_as_of(session, base.code, reviewed)
+        assert good in later_rows and bad not in later_rows
+        later = freeze_fundamentals(later_rows, (), snap.coverage, **{**args, 'cutoff_at': reviewed})
+        corrected = replace(base, snapshot_at=reviewed,
+            fields={**base.fields, **snapshot_payload(later), 'operating_result': plain(operating_state(later, {}))},
+            as_of={**base.as_of, 'decision_cutoff_at': reviewed.isoformat(), 'fill': reviewed.isoformat()})
+        corrected_result = classify(corrected, candidate('deep_value'))
+        assert 'metric_results' in corrected_result.metrics, corrected_result
+        assert corrected_result.metrics['metric_results']['debt_burden']['status'] == 'verified'
+        assert tuple(session.execute(text('SELECT * FROM fundamental_evidence WHERE evidence_id=:id'), {'id': bad.evidence_id}).one()) == before
+
+
 def test_coverage_proofs_load_original_status_and_successor_chain_at_cutoff(store):
     from discovery.evidence_store import append_evidence, load_evidence_as_of, load_coverage_references
     original = identity(evidence('2025'), kind='capital_event_coverage', status='untrusted')
@@ -262,12 +330,16 @@ def test_direct_append_rejects_nonfinite_or_nonnumeric_registered_financial_valu
 
 
 def test_direct_append_preserves_exact_numeric_strings_nulls_and_text_metadata(store):
+    import json
     from discovery.evidence_store import append_evidence, load_evidence_as_of
+    verification = json.dumps({'method': 'human_review',
+        'reviewer': 'Human reviewer; literal NaN is provenance text here.',
+        'reviewed_at': '2026-10-01T00:00:00Z'})
     row = identity(evidence('2025'), values={
         'inventory': '0.00', 'restricted_cash': None, 'revenue': '9007199254740993.01',
         'disclosure_text': 'No non-operating occupation reported.',
         '_report_location': 'physical page 12; consolidated balance sheet',
-        '_verification': 'Human review; literal NaN is provenance text here.',
+        '_verification': verification,
     })
     with Session(store) as session:
         assert append_evidence(session, row) == row.evidence_id
@@ -280,4 +352,12 @@ def test_direct_append_preserves_exact_numeric_strings_nulls_and_text_metadata(s
         assert loaded.values['restricted_cash'] is None
         assert loaded.values['revenue'] == '9007199254740993.01'
         assert loaded.values['disclosure_text'] == 'No non-operating occupation reported.'
-        assert loaded.values['_verification'] == 'Human review; literal NaN is provenance text here.'
+        assert loaded.values['_verification'] == verification
+
+
+def test_direct_append_rejects_prose_as_a_verified_manual_receipt(store):
+    from discovery.evidence_store import append_evidence
+    row = identity(evidence('2025'), values={
+        '_verification': 'Human review; literal NaN is provenance text here.'})
+    with Session(store) as session, pytest.raises(ValueError, match='manual_review_invalid'):
+        append_evidence(session, row)
